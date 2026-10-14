@@ -3318,7 +3318,6 @@ impl eframe::App for CraftApp {
                         );
                     });
                 });
-            }
             // The egui X button can't be relied on: keep the flag unless
             // our own Cancel/Add/Download closed it.
             self.show_add = open && self.show_add;
@@ -4424,6 +4423,13 @@ impl CraftApp {
                     HitKind::CtxItem(_, id) => format!("ctx:#{id}"),
                     HitKind::TitleDrag => "titledrag".to_string(),
                     HitKind::Resize(_) => "rzwin".to_string(),
+                    HitKind::Btn(_) => "btn".to_string(),
+                    HitKind::Check(_) => "check".to_string(),
+                    HitKind::Slider(..) => "slider".to_string(),
+                    HitKind::Field(f) => format!("field:{f}"),
+                    HitKind::ComboAnchor => "combo".to_string(),
+                    HitKind::DetTab(t) => format!("dettab:{t}"),
+                    HitKind::DetParts => "detparts".to_string(),
                 };
             }
             if clk || sec {
