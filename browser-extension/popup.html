@@ -1,0 +1,27 @@
+<!doctype html>
+<html>
+<head><meta charset="utf-8"><style>
+body { width: 320px; font: 13px system-ui, sans-serif; margin: 10px; background: #1e1f22; color: #e0e0e0; }
+h3 { margin: 0 0 8px; }
+.row { display: flex; gap: 6px; margin-bottom: 8px; align-items: center; }
+input[type=text] { flex: 1; padding: 5px; background: #2a2b2f; border: 1px solid #3a3b44; color: #e0e0e0; border-radius: 6px; }
+button { padding: 5px 10px; cursor: pointer; background: #2a2b2f; color: #e0e0e0; border: 1px solid #3a3b44; border-radius: 6px; }
+button:hover { background: #35363e; }
+.item { border-top: 1px solid #333; padding: 6px 0; }
+.item a { word-break: break-all; color: #60a6d9; }
+#status { color: #45b36b; min-height: 1.2em; }
+label.toggle { display: flex; gap: 6px; align-items: center; margin-bottom: 8px; }
+</style></head>
+<body>
+<h3>Download Craft</h3>
+<label class="toggle"><input type="checkbox" id="auto"> Capture downloads automatically</label>
+<div class="row">
+  <input type="text" id="url" placeholder="https://…/file.zip">
+  <button id="send">Send</button>
+</div>
+<div id="status"></div>
+<div id="videos"></div>
+<div id="list"></div>
+<script src="popup.js"></script>
+</body>
+</html>

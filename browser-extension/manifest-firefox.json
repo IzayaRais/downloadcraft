@@ -1,0 +1,45 @@
+{
+  "manifest_version": 3,
+  "name": "Send to Download Craft",
+  "version": "0.3.5",
+  "description": "Automatically sends downloads to your Download Craft download manager.",
+  "permissions": [
+    "nativeMessaging",
+    "contextMenus",
+    "downloads",
+    "storage",
+    "scripting"
+  ],
+  "host_permissions": [
+    "http://*/*",
+    "https://*/*"
+  ],
+  "background": {
+    "service_worker": "background.js"
+  },
+  "content_scripts": [
+    {
+      "matches": [
+        "http://*/*",
+        "https://*/*"
+      ],
+      "js": [
+        "content.js"
+      ]
+    }
+  ],
+  "action": {
+    "default_popup": "popup.html",
+    "default_icon": "icons/icon.png"
+  },
+  "icons": {
+    "16": "icons/icon.png",
+    "48": "icons/icon.png",
+    "128": "icons/icon.png"
+  },
+  "browser_specific_settings": {
+    "gecko": {
+      "id": "send-to-download-craft@example"
+    }
+  }
+}
