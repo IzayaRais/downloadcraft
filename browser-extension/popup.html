@@ -16,6 +16,13 @@ label.toggle { display: flex; gap: 6px; align-items: center; margin-bottom: 8px;
 <h3>Download Craft</h3>
 <label class="toggle"><input type="checkbox" id="auto"> Capture downloads automatically</label>
 <div class="row">
+  <input type="text" id="minSize" placeholder="Min KB (e.g. 100)" style="max-width:110px">
+  <button id="saveFilters" title="Save capture filters">Save filters</button>
+</div>
+<div class="row">
+  <input type="text" id="block" placeholder="Blocked hosts, comma separated">
+</div>
+<div class="row">
   <input type="text" id="url" placeholder="https://…/file.zip">
   <button id="send">Send</button>
 </div>

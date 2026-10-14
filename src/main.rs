@@ -1,9 +1,11 @@
 mod app;
 mod cli;
+mod confirm;
 mod engine;
 mod manual;
 mod model;
 mod native_host;
+mod progress;
 
 use app::CraftApp;
 use clap::Parser;
@@ -34,6 +36,15 @@ fn main() -> eframe::Result<()> {
     let args: Vec<String> = std::env::args().collect();
     if args.iter().any(|a| a == "--native-host") {
         return native_host::run();
+    }
+    // IDM-style standalone "Download File Info" dialog (one OS window per
+    // captured download, always on top). Spawned by the native host.
+    if args.iter().any(|a| a == "--confirm-download") {
+        return confirm::run();
+    }
+    // IDM-style standalone per-download progress window.
+    if args.iter().any(|a| a == "--progress") {
+        return progress::run();
     }
     // CLI mode when a subcommand is given (`--help` works too).
     if args.len() > 1 {
@@ -87,38 +98,7 @@ fn main() -> eframe::Result<()> {
             cc.egui_ctx.set_fonts(fonts);
 
             cc.egui_ctx.set_visuals(app::dark_visuals());
-            let mut style = (*cc.egui_ctx.style()).clone();
-            style.text_styles.insert(
-                egui::TextStyle::Body,
-                egui::FontId::new(12.0, egui::FontFamily::Proportional),
-            );
-            style.text_styles.insert(
-                egui::TextStyle::Button,
-                egui::FontId::new(12.0, egui::FontFamily::Proportional),
-            );
-            style.text_styles.insert(
-                egui::TextStyle::Heading,
-                egui::FontId::new(16.0, egui::FontFamily::Proportional),
-            );
-            style.text_styles.insert(
-                egui::TextStyle::Small,
-                egui::FontId::new(10.0, egui::FontFamily::Proportional),
-            );
-            style.text_styles.insert(
-                egui::TextStyle::Monospace,
-                egui::FontId::new(11.0, egui::FontFamily::Monospace),
-            );
-            for w in [
-                &mut style.visuals.widgets.inactive,
-                &mut style.visuals.widgets.hovered,
-                &mut style.visuals.widgets.active,
-                &mut style.visuals.widgets.noninteractive,
-                &mut style.visuals.widgets.open,
-            ] {
-                w.corner_radius = egui::CornerRadius::same(6);
-            }
-            style.spacing.icon_width = 14.0;
-            cc.egui_ctx.set_style(style);
+            app::apply_widget_theme(&cc.egui_ctx);
 
             Ok(Box::new(CraftApp::new(rt.clone())))
         }),

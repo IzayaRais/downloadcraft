@@ -223,6 +223,49 @@ impl RateLimiter {
     }
 }
 
+/// Map an HTTP failure to an actionable message. A bare `403` on a
+/// googlevideo link almost always means a stale/session-locked stream URL
+/// (they expire and are IP/session-bound) — retrying the same URL is
+/// pointless, so callers fail fast on these instead of burning retries.
+fn http_status_err(url: &str, e: reqwest::Error) -> anyhow::Error {
+    let status = e.status();
+    if status == Some(reqwest::StatusCode::FORBIDDEN) {
+        if url.contains("googlevideo.com")
+            || url.contains("youtube.com")
+            || url.contains("youtu.be")
+        {
+            return anyhow!(
+                "YouTube refused this link (403) — stream links expire and are locked to the browser session that created them: replay the video, reopen the ⬇ Download this video menu for a fresh quality row, and download that (progressive ≤720p saves as one ready file)"
+            );
+        }
+        return anyhow!(
+            "server refused (403 Forbidden) — it likely needs login or cookies: open the page in your browser and capture it with the Download Craft extension"
+        );
+    }
+    if status == Some(reqwest::StatusCode::UNAUTHORIZED) {
+        return anyhow!(
+            "server needs a login (401) — add the username/password in the Add dialog's advanced section, or capture via the browser extension"
+        );
+    }
+    match status {
+        Some(s) => anyhow!("HTTP {s}"),
+        None => anyhow!("network: {e}"),
+    }
+}
+
+fn is_final_http_error(e: &anyhow::Error) -> bool {
+    let s = e.to_string();
+    s.contains("403") || s.contains("401")
+}
+
+fn is_googlevideo_url(url: &str) -> bool {
+    url.contains("googlevideo.com")
+}
+
+fn is_youtube_page(url: &str) -> bool {
+    url.contains("youtube.com") || url.contains("youtu.be")
+}
+
 /// Verify a finished file against an expected SHA-256 hex digest.
 /// Returns Ok(()) when no digest was requested.
 pub async fn verify_checksum(path: &PathBuf, expected_hex: &str) -> Result<()> {
@@ -706,7 +749,27 @@ fn with_ratebypass(u: &str) -> String {
     }
 }
 
+/// True for HLS/DASH playlists: the progressive engine cannot consume these
+/// as a single file (they need segment-assembly + transmux).
+fn is_playlist_url(u: &str) -> bool {
+    let low = u.to_ascii_lowercase();
+    let base = low.split(['?', '#']).next().unwrap_or(&low);
+    base.ends_with(".m3u8") || base.ends_with(".mpd") || low.contains("m3u8") && low.contains("playlist")
+}
+
+fn has_direct_ext(u: &str) -> bool {
+    let low = u.to_ascii_lowercase();
+    let base = low.split(['?', '#']).next().unwrap_or(&low);
+    [".mp4", ".webm", ".mkv", ".mov", ".m4v", ".mp3", ".m4a", ".aac", ".flac", ".ogg", ".wav", ".avi"]
+        .iter()
+        .any(|e| base.ends_with(e))
+}
+
 /// Generic page scan: og:video / contentUrl / twitter stream / bare media links.
+/// Covers YouTube-alternatives (Vimeo/FB/TikTok/Dailymotion-style pages expose
+/// the same og:video + ld+json VideoObject tags) plus bare file links.
+/// HLS (.m3u8) / DASH (.mpd) playlists are detected but NOT returned as
+/// downloadable files — the engine does segmented progressive HTTP only.
 fn resolve_generic(html: &str, page_url: &str) -> Option<(String, String)> {
     let title = meta_content(html, "og:title")
         .or_else(|| tag_text(html, "title"))
@@ -716,26 +779,53 @@ fn resolve_generic(html: &str, page_url: &str) -> Option<(String, String)> {
         "og:video",
         "og:video:secure_url",
         "twitter:player:stream",
+        "twitter:player",
     ] {
         if let Some(u) = meta_content(html, prop) {
-            if u.starts_with("http") {
+            if u.starts_with("http") && !is_playlist_url(&u) {
                 let e = guess_ext(&u);
                 return Some((with_ratebypass(&u), with_ext(&title, &e)));
             }
         }
     }
-    for key in ["\"contentUrl\":\"", "\"contentURL\":\""] {
+    // ld+json VideoObject: {"@type":"VideoObject","contentUrl":"https://..."}
+    for key in [
+        "\"contentUrl\":\"",
+        "\"contentURL\":\"",
+        "\"embedUrl\":\"",
+        "\"embedURL\":\"",
+    ] {
         let mut search = html;
         while let Some(p) = search.find(key) {
             let rest = &search[p + key.len()..];
             if let Some(end) = rest.find('"') {
                 let u = rest[..end].replace("\\/", "/");
-                if u.starts_with("http") {
+                if u.starts_with("http") && !is_playlist_url(&u) {
                     let e = guess_ext(&u);
                     return Some((with_ratebypass(&u), with_ext(&title, &e)));
                 }
             }
             search = &search[p + key.len()..];
+        }
+    }
+    // Vimeo-style progressive config: "url":"https://...mp4..." + quality tag.
+    // Only accepted when the URL itself carries a direct media extension.
+    for key in ["\"url\":\"https://", "\"url\":\"http://"] {
+        let mut search = html;
+        let mut best: Option<String> = None;
+        for _ in 0..8 {
+            let Some(p) = search.find(key) else { break };
+            let rest = &search[p + 7..];
+            let Some(end) = rest.find('"') else { break };
+            let u = rest[..end].replace("\\/", "/");
+            if u.starts_with("http") && has_direct_ext(&u) && !is_playlist_url(&u) {
+                best = Some(u);
+            }
+            search = &search[p + key.len()..];
+        }
+        if let Some(u) = best {
+            let e = guess_ext(&u);
+            return Some((with_ratebypass(&u), with_ext(&title, &e)));
         }
     }
     // bare https://....mp4/.webm/.mkv/.mp3 links
@@ -837,9 +927,228 @@ fn with_ext(title: &str, ext: &str) -> String {
     }
 }
 
+/// Resolve a possibly-relative HLS URI against its playlist URL.
+fn hls_abs(base: &str, uri: &str) -> String {
+    if uri.starts_with("http://") || uri.starts_with("https://") {
+        return uri.to_string();
+    }
+    if let Ok(b) = url::Url::parse(base) {
+        if let Ok(u) = b.join(uri) {
+            return u.to_string();
+        }
+    }
+    uri.to_string()
+}
+
+/// Pick the highest-BANDWIDTH variant from a master playlist.
+/// Returns None when this is already a media playlist.
+fn hls_pick_variant(text: &str, base: &str) -> Option<String> {
+    let mut best: Option<(u64, String)> = None;
+    let mut lines = text.lines().peekable();
+    while let Some(line) = lines.next() {
+        let t = line.trim();
+        if t.starts_with("#EXT-X-STREAM-INF") {
+            // Tag form: #EXT-X-STREAM-INF:BANDWIDTH=800000,RESOLUTION=...
+            // (the first kv carries the tag prefix before the colon).
+            let bw = t
+                .split([':', ',', ' '])
+                .find_map(|kv| {
+                    let kv = kv.trim();
+                    kv.strip_prefix("BANDWIDTH=")
+                        .or_else(|| kv.strip_prefix("bandwidth="))
+                        .and_then(|v| v.parse::<u64>().ok())
+                })
+                .unwrap_or(0);
+            // Next non-empty, non-comment line is the variant URI.
+            let mut uri: Option<String> = None;
+            while let Some(n) = lines.next() {
+                let n = n.trim();
+                if n.is_empty() || n.starts_with('#') {
+                    continue;
+                }
+                uri = Some(n.to_string());
+                break;
+            }
+            if let Some(u) = uri {
+                let abs = hls_abs(base, &u);
+                if best.as_ref().map(|(b, _)| bw > *b).unwrap_or(true) {
+                    best = Some((bw, abs));
+                }
+            }
+        }
+    }
+    best.map(|(_, u)| u)
+}
+
+fn hls_segments(text: &str, base: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    for line in text.lines() {
+        let t = line.trim();
+        if t.is_empty() || t.starts_with('#') {
+            continue;
+        }
+        out.push(hls_abs(base, t));
+    }
+    out
+}
+
+/// Plain HLS VOD download (clean-room, no IDM code): fetch playlist, follow
+/// the best variant, concat media segments. Encrypted (EXT-X-KEY) and live
+/// (no ENDLIST, ever-growing) playlists are rejected with guidance —
+/// and DRM (Widevine/FairPlay) is never bypassed.
+async fn download_hls(
+    playlist_url: &str,
+    dest: &PathBuf,
+    opts: &EngineOpts,
+    shared: &Arc<SharedState>,
+) -> Result<()> {
+    const MAX_SEGS: usize = 2000;
+    let client = opts.build_client()?;
+    if let Some(parent) = dest.parent() {
+        tokio::fs::create_dir_all(parent).await?;
+    }
+    // 1. Master playlist?
+    let mut pl_url = playlist_url.to_string();
+    let mut text = opts
+        .get(&client, &pl_url)
+        .send()
+        .await
+        .map_err(|e| anyhow!("playlist fetch: {e}"))?
+        .error_for_status()
+        .map_err(|e| anyhow!("playlist HTTP: {e}"))?
+        .text()
+        .await
+        .map_err(|e| anyhow!("playlist read: {e}"))?;
+    if text.contains("#EXT-X-STREAM-INF") {
+        pl_url = hls_pick_variant(&text, &pl_url).ok_or_else(|| {
+            anyhow!("could not pick a variant from this master playlist — use the extension MP4 qualities")
+        })?;
+        text = opts
+            .get(&client, &pl_url)
+            .send()
+            .await
+            .map_err(|e| anyhow!("variant fetch: {e}"))?
+            .error_for_status()
+            .map_err(|e| anyhow!("variant HTTP: {e}"))?
+            .text()
+            .await
+            .map_err(|e| anyhow!("variant read: {e}"))?;
+    }
+    if text.contains("#EXT-X-KEY") {
+        return Err(anyhow!(
+            "this HLS stream is encrypted (EXT-X-KEY) — encrypted/DRM streams are not downloaded. Use the extension MP4 qualities when the site offers them"
+        ));
+    }
+    let segs = hls_segments(&text, &pl_url);
+    if segs.is_empty() {
+        return Err(anyhow!("playlist has no media segments — it may be live or expired"));
+    }
+    if segs.len() > MAX_SEGS {
+        return Err(anyhow!(
+            "playlist too large ({} segments) — live streams are not supported",
+            segs.len()
+        ));
+    }
+    let is_live = !text.contains("#EXT-X-ENDLIST") && text.contains("#EXT-X-MEDIA-SEQUENCE");
+    if is_live {
+        return Err(anyhow!(
+            "this looks like a live stream (no ENDLIST) — live capture is not supported; only finished VOD playlists"
+        ));
+    }
+    // Progress: single-part view (segment count unknown in bytes yet).
+    {
+        let mut totals = shared.part_total.lock().unwrap();
+        let mut dones = shared.part_done.lock().unwrap();
+        totals.clear();
+        dones.clear();
+        totals.push((0, segs.len() as u64));
+        dones.push(0);
+    }
+    shared.downloaded.store(0, Ordering::SeqCst);
+    let limiter = std::sync::Arc::new(RateLimiter::new(opts.speed_limit_bps));
+    let tmp = dest.with_extension("dcpart");
+    let mut out = tokio::fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(true)
+        .open(&tmp)
+        .await?;
+    let max_retries = opts.max_retries.max(1);
+    for seg_url in &segs {
+        wait_if_paused(shared).await?;
+        if shared.cancelled.load(Ordering::SeqCst) {
+            return Err(anyhow!("cancelled"));
+        }
+        let mut attempt = 0;
+        loop {
+            attempt += 1;
+            let got = opts.get(&client, seg_url).send().await;
+            match got {
+                Ok(resp) => {
+                    let resp = resp.error_for_status().map_err(|e| anyhow!("segment HTTP: {e}"))?;
+                    use futures_util::StreamExt;
+                    let mut stream = resp.bytes_stream();
+                    let mut ok = true;
+                    while let Some(chunk) = stream.next().await {
+                        wait_if_paused(shared).await?;
+                        match chunk {
+                            Ok(bytes) => {
+                                use tokio::io::AsyncWriteExt;
+                                out.write_all(&bytes).await.map_err(|e| anyhow!(io_message(&e)))?;
+                                shared.downloaded.fetch_add(bytes.len() as u64, Ordering::SeqCst);
+                                if let Ok(mut g) = shared.part_done.lock() {
+                                    if let Some(slot) = g.first_mut() {
+                                        *slot = slot.saturating_add(1);
+                                    }
+                                }
+                                limiter.consume(bytes.len() as u64).await;
+                            }
+                            Err(e) => {
+                                ok = false;
+                                if attempt >= max_retries {
+                                    return Err(anyhow!("segment network: {e}"));
+                                }
+                                break;
+                            }
+                        }
+                    }
+                    if ok {
+                        break;
+                    }
+                }
+                Err(e) => {
+                    if attempt >= max_retries {
+                        return Err(anyhow!("segment fetch: {e}"));
+                    }
+                }
+            }
+            tokio::time::sleep(std::time::Duration::from_secs(1 << attempt.min(4))).await;
+        }
+    }
+    use tokio::io::AsyncWriteExt;
+    out.flush().await.map_err(|e| anyhow!(io_message(&e)))?;
+    drop(out);
+    // Adopt byte total now that assembly is done.
+    let final_len = tokio::fs::metadata(&tmp).await.map(|m| m.len()).unwrap_or(0);
+    shared.total.store(final_len, Ordering::SeqCst);
+    shared.has_total.store(true, Ordering::SeqCst);
+    tokio::fs::rename(&tmp, dest)
+        .await
+        .map_err(|e| anyhow!(io_message(&e)))?;
+    if !opts.expected_sha256.trim().is_empty() {
+        if let Err(e) = verify_checksum(dest, &opts.expected_sha256).await {
+            let _ = tokio::fs::remove_file(dest).await;
+            return Err(e);
+        }
+    }
+    Ok(())
+}
+
 /// Entry point used by the UI. Downloads `url` to `dest` with N connections.
 /// If `url` is an HTML page (e.g. YouTube), a direct media stream is
 /// auto-detected first, like the video capture in classic download managers.
+/// Plain (non-encrypted) HLS VOD playlists (.m3u8) are assembled
+/// segment-by-segment; DASH (.mpd) and encrypted HLS are rejected loudly.
 pub async fn download(
     mut url: String,
     mut dest: PathBuf,
@@ -847,6 +1156,18 @@ pub async fn download(
     mut opts: EngineOpts,
     shared: Arc<SharedState>,
 ) -> Result<()> {
+    // Route playlists before the progressive path so we never save a
+    // playlist file as if it were the video.
+    if is_playlist_url(&url) {
+        if url.to_ascii_lowercase().split(['?', '#']).next().unwrap_or("").ends_with(".mpd")
+            || url.contains(".mpd")
+        {
+            return Err(anyhow!(
+                "this is a DASH manifest (.mpd) — not supported yet (needs segment muxing). Use the browser extension qualities (MP4) or the page link for a progressive stream"
+            ));
+        }
+        return download_hls(&url, &dest, &opts, &shared).await;
+    }
     let client = opts.build_client()?;
 
     if let Some(parent) = dest.parent() {
@@ -947,27 +1268,76 @@ pub async fn download(
     }
 
     let conns = connections.clamp(1, 16);
-    let use_segmented =
-        supports_range && matches!(total_opt, Some(t) if t >= 1024 * 1024) && conns > 1;
 
     // One shared bucket so N segments together honor the global cap.
     let limiter = std::sync::Arc::new(RateLimiter::new(opts.speed_limit_bps));
-    let r = if use_segmented {
-        segmented(
-            &client,
-            &opts,
-            &url,
-            &dest,
-            total_opt.unwrap(),
-            conns,
-            shared,
-            limiter,
-        )
-        .await
-    } else {
-        single_stream(&client, &opts, &url, &dest, shared, limiter).await
-    };
-    r?;
+    // Transfer attempts (max 2). When a googlevideo link 403s on the first
+    // attempt and we know the watch page (referer), the stream URL was
+    // almost surely stale/session-locked: resolve ONE fresh link via the
+    // player API and retry once instead of failing outright.
+    let mut retried_fresh = false;
+    loop {
+        let use_segmented =
+            supports_range && matches!(total_opt, Some(t) if t >= 1024 * 1024) && conns > 1;
+        let r = if use_segmented {
+            segmented(
+                &client,
+                &opts,
+                &url,
+                &dest,
+                total_opt.unwrap(),
+                conns,
+                shared.clone(),
+                limiter.clone(),
+            )
+            .await
+        } else {
+            single_stream(&client, &opts, &url, &dest, shared.clone(), limiter.clone()).await
+        };
+        match r {
+            Ok(()) => break,
+            Err(e)
+                if !retried_fresh
+                    && is_final_http_error(&e)
+                    && is_googlevideo_url(&url)
+                    && is_youtube_page(&opts.referer) =>
+            {
+                retried_fresh = true;
+                match resolve_media(&client, &opts, &opts.referer, &shared).await {
+                    Some((fresh, _)) if fresh != url && is_googlevideo_url(&fresh) => {
+                        // Drop partials of the refused stream: resuming them
+                        // against a different URL would corrupt the file.
+                        let _ = tokio::fs::remove_file(dest.with_extension("dcpart")).await;
+                        for i in 0..16 {
+                            let _ = tokio::fs::remove_file(
+                                dest.with_extension(format!("dcpart{i}")),
+                            )
+                            .await;
+                        }
+                        shared.downloaded.store(0, Ordering::SeqCst);
+                        url = fresh;
+                        let (t3, r3, _, _) = probe(&client, &opts, &url).await;
+                        total_opt = t3;
+                        supports_range = r3;
+                        shared.resumable.store(r3, Ordering::SeqCst);
+                        if let Some(t) = total_opt {
+                            shared.total.store(t, Ordering::SeqCst);
+                            shared.has_total.store(true, Ordering::SeqCst);
+                        } else {
+                            shared.has_total.store(false, Ordering::SeqCst);
+                        }
+                        continue;
+                    }
+                    _ => {
+                        return Err(anyhow!(
+                            "{e:#} (a fresh link was tried and also refused — replay the video in your browser and pick a new quality row)"
+                        ));
+                    }
+                }
+            }
+            Err(e) => return Err(e),
+        }
+    }
     // Integrity gate: a mismatched file is deleted and reported as failure
     // rather than left on disk looking complete.
     if !opts.expected_sha256.trim().is_empty() {
@@ -998,6 +1368,7 @@ async fn single_stream(
             Err(e) => {
                 if shared.cancelled.load(Ordering::SeqCst)
                     || e.to_string() == "cancelled"
+                    || is_final_http_error(&e)
                     || attempt >= max_retries
                 {
                     return Err(e);
@@ -1029,11 +1400,19 @@ async fn single_stream_once(
     req = req.header(reqwest::header::RANGE, format!("bytes={start_at}-"));
     let resp = match req.send().await?.error_for_status() {
         Ok(r) => r,
-        Err(_) if start_at == 0 => {
-            // server dislikes Range: fall back to a plain GET
-            opts.get(client, url).send().await?.error_for_status()?
+        Err(e) => {
+            let mapped = http_status_err(url, e);
+            if start_at == 0 && !is_final_http_error(&mapped) {
+                // server dislikes Range (but isn't refusing us): plain GET
+                opts.get(client, url)
+                    .send()
+                    .await?
+                    .error_for_status()
+                    .map_err(|e| http_status_err(url, e))?
+            } else {
+                return Err(mapped);
+            }
         }
-        Err(e) => return Err(e.into()),
     };
     if std::env::var("DOWNLOAD_CRAFT_DEBUG").is_ok() {
         eprintln!(
@@ -1258,7 +1637,10 @@ async fn download_range(
                 if shared.cancelled.load(Ordering::SeqCst) {
                     return Err(e);
                 }
-                if e.to_string() == "cancelled" || attempt >= max_retries {
+                if e.to_string() == "cancelled"
+                    || is_final_http_error(&e)
+                    || attempt >= max_retries
+                {
                     return Err(e);
                 }
                 tokio::time::sleep(std::time::Duration::from_secs(1 << attempt.min(4))).await;
@@ -1284,7 +1666,8 @@ async fn download_range_once(
         .header(reqwest::header::RANGE, format!("bytes={}-{}", start, end))
         .send()
         .await?
-        .error_for_status()?;
+        .error_for_status()
+        .map_err(|e| http_status_err(url, e))?;
 
     let mut file = tokio::fs::File::create(part).await?;
     let mut stream = resp.bytes_stream();
@@ -1418,6 +1801,38 @@ mod tests {
         assert_eq!(sanitize_filename(""), "download.bin");
     }
 
+    #[test]
+    fn hls_helpers() {
+        // playlists recognised, mpd rejected from generic resolve
+        assert!(is_playlist_url("https://cdn.example/v/playlist.m3u8?x=1"));
+        assert!(is_playlist_url("https://cdn.example/v/manifest.mpd"));
+        assert!(!is_playlist_url("https://cdn.example/v/clip.mp4"));
+        assert!(has_direct_ext("https://cdn.example/a/b.mp4?token=1"));
+        assert!(!has_direct_ext("https://cdn.example/a/playlist.m3u8"));
+        // master variant pick: highest bandwidth wins
+        let master = "#EXTM3U\n#EXT-X-STREAM-INF:BANDWIDTH=800000,RESOLUTION=640x360\nlow.m3u8\n#EXT-X-STREAM-INF:BANDWIDTH=5000000,RESOLUTION=1920x1080\nhi.m3u8\n";
+        assert_eq!(
+            hls_pick_variant(master, "https://cdn.example/v/master.m3u8").as_deref(),
+            Some("https://cdn.example/v/hi.m3u8")
+        );
+        assert_eq!(hls_pick_variant("#EXTM3U\n#EXT-X-TARGETDURATION:6\n", "https://h/x.m3u8"), None);
+        // media segments: comments skipped, relative resolved
+        let media = "#EXTM3U\n#EXT-X-TARGETDURATION:6\n#EXTINF:6.0,\nseg0.ts\n#EXTINF:6.0,\nhttps://other.example/s1.ts\n#EXT-X-ENDLIST\n";
+        assert_eq!(
+            hls_segments(media, "https://cdn.example/v/pl.m3u8"),
+            vec![
+                "https://cdn.example/v/seg0.ts".to_string(),
+                "https://other.example/s1.ts".to_string()
+            ]
+        );
+        // ld+json embedUrl accepted, playlists skipped
+        let ld = r#"<html><head><title>T</title><script type="application/ld+json">{"@type":"VideoObject","embedUrl":"https://cdn.example/e/v.mp4"}</script></head></html>"#;
+        let hit = resolve_generic(ld, "https://example.com/p").expect("ld+json");
+        assert_eq!(hit.0, "https://cdn.example/e/v.mp4");
+        let pl = r#"<html><head><meta property="og:video" content="https://cdn.example/v/pl.m3u8"></head></html>"#;
+        assert_eq!(resolve_generic(pl, "https://example.com/p"), None);
+    }
+
     #[tokio::test]
     async fn limiter_and_checksum() {
         // Unlimited limiter never waits.
@@ -1502,6 +1917,9 @@ mod tests {
             ("HTTP/1.1 500 Internal Server Error", String::new(), &[])
         } else if path == "/norange" {
             ("HTTP/1.1 200 OK", "Accept-Ranges: none\r\n".to_string(), &body[..])
+        } else if path == "/forbidden" {
+            // Permanent refusal: engine must fail fast with guidance.
+            ("HTTP/1.1 403 Forbidden", String::new(), &[])
         } else if let Some((start, end)) = range {
             let end = end.min(len.saturating_sub(1));
             if start >= len {
@@ -1643,6 +2061,30 @@ mod tests {
         .await
         .expect("flaky retry");
         assert_eq!(std::fs::read(&dest).unwrap(), want);
+
+        // 6. Hard 403: fail fast with an actionable message (no retry storm).
+        let dest = dir.join("denied.bin");
+        let err = download(
+            format!("{base}/forbidden"),
+            dest.clone(),
+            4,
+            matrix_opts(),
+            Arc::new(SharedState::new()),
+        )
+        .await
+        .expect_err("403 must fail");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("403"),
+            "refusal must name the status, got: {msg}"
+        );
+        assert!(is_final_http_error(&anyhow!("HTTP 403 Forbidden")));
+        assert!(!is_final_http_error(&anyhow!("network: reset by peer")));
+        assert!(is_googlevideo_url("https://r1---sn-abc.googlevideo.com/videoplayback?x=1"));
+        assert!(!is_googlevideo_url("https://cdn.example/v.mp4"));
+        assert!(is_youtube_page("https://www.youtube.com/watch?v=x"));
+        assert!(is_youtube_page("https://youtu.be/x"));
+        assert!(!is_youtube_page("https://vimeo.com/1"));
 
         srv.abort();
         std::fs::remove_dir_all(&dir).ok();

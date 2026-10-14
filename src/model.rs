@@ -64,6 +64,10 @@ pub struct DownloadItem {
     /// multi-protocol managers (no reference code copied).
     #[serde(default)]
     pub checksum_sha256: String,
+    /// Free-text note from the IDM-style Download File Info dialog.
+    /// Empty = none. Never used for engine behavior.
+    #[serde(default)]
+    pub description: String,
     /// Replace an existing destination file instead of auto-renaming.
     #[serde(default)]
     pub overwrite_existing: bool,
@@ -89,6 +93,7 @@ impl DownloadItem {
             password: String::new(),
             resumable: false,
             checksum_sha256: String::new(),
+            description: String::new(),
             overwrite_existing: false,
         }
     }

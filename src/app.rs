@@ -7,6 +7,9 @@ use std::sync::Arc;
 use std::time::Instant;
 
 // ---------- theme (AB-style dark) ----------
+/// Unified geometry: every card, modal, field, and button across ALL
+/// windows (main, Add-download dialog, progress) uses this radius.
+pub const RADIUS: f32 = 10.0;
 const BG: egui::Color32 = egui::Color32::from_rgb(18, 19, 26);
 const SURFACE: egui::Color32 = egui::Color32::from_rgb(26, 27, 36);
 const SURFACE_LT: egui::Color32 = egui::Color32::from_rgb(36, 37, 50);
@@ -83,6 +86,45 @@ pub fn visuals_for(theme: &str) -> egui::Visuals {
     }
 }
 
+/// Widget-level theme shared by EVERY window: rounded controls, roomy
+/// buttons, consistent spacing. Call after each `set_visuals` (theme
+/// switches) so visuals + geometry never drift apart again.
+pub fn apply_widget_theme(ctx: &egui::Context) {
+    let mut style = (*ctx.style()).clone();
+    for w in [
+        &mut style.visuals.widgets.inactive,
+        &mut style.visuals.widgets.hovered,
+        &mut style.visuals.widgets.active,
+        &mut style.visuals.widgets.open,
+    ] {
+        w.corner_radius = egui::CornerRadius::same(RADIUS as u8);
+    }
+    style.text_styles.insert(
+        egui::TextStyle::Body,
+        egui::FontId::new(12.0, egui::FontFamily::Proportional),
+    );
+    style.text_styles.insert(
+        egui::TextStyle::Button,
+        egui::FontId::new(12.0, egui::FontFamily::Proportional),
+    );
+    style.text_styles.insert(
+        egui::TextStyle::Heading,
+        egui::FontId::new(16.0, egui::FontFamily::Proportional),
+    );
+    style.text_styles.insert(
+        egui::TextStyle::Small,
+        egui::FontId::new(10.0, egui::FontFamily::Proportional),
+    );
+    style.text_styles.insert(
+        egui::TextStyle::Monospace,
+        egui::FontId::new(11.0, egui::FontFamily::Monospace),
+    );
+    style.spacing.button_padding = egui::Vec2::new(14.0, 10.0);
+    style.spacing.item_spacing = egui::Vec2::new(8.0, 10.0);
+    style.spacing.icon_width = 14.0;
+    ctx.set_style(style);
+}
+
 // ---------- Material Icons codepoints (font bundled under assets/fonts) ----------
 const MI_SEARCH: &str = "\u{e8b6}";
 const MI_ADD_LINK: &str = "\u{e178}";
@@ -155,7 +197,7 @@ fn section_card(ui: &mut egui::Ui, title: &str, body: impl FnOnce(&mut egui::Ui)
     egui::Frame::new()
         .fill(SURFACE)
         .stroke(egui::Stroke::new(1.0_f32, CARD_BD))
-        .corner_radius(8.0)
+        .corner_radius(RADIUS)
         .inner_margin(egui::Margin::same(10))
         .show(ui, |ui| {
             ui.label(egui::RichText::new(title).strong().size(13.0));
@@ -251,7 +293,7 @@ fn icon_btn(ui: &mut egui::Ui, glyph: &str, tip: &str) -> egui::Response {
         [30.0, 30.0],
         egui::Button::new(egui::RichText::new(glyph).size(16.0).color(DIM))
             .fill(egui::Color32::TRANSPARENT)
-            .corner_radius(6.0),
+            .corner_radius(RADIUS),
     )
     .on_hover_text(tip)
 }
@@ -326,6 +368,8 @@ enum ButtonId {
     SChrome,
     SEdge,
     SFirefox,
+    SBrave,
+    SOpera,
     SClose,
     DResume,
     DClose,
@@ -899,6 +943,7 @@ pub struct CraftApp {
     browser_msg: String,
     pending_browser_install: Option<String>,
     last_inbox_check: Instant,
+    last_prog_write: Instant,
     col_order: Vec<SortCol>,
     col_w: std::collections::HashMap<SortCol, f32>,
     // ---- power features ----
@@ -994,6 +1039,7 @@ impl CraftApp {
             browser_msg: String::new(),
             pending_browser_install: None,
             last_inbox_check: Instant::now(),
+            last_prog_write: Instant::now(),
             col_order: vec![
                 SortCol::Name,
                 SortCol::Size,
@@ -1055,7 +1101,7 @@ impl CraftApp {
         app.load_ui_state();
         // Zero-config browser integration: the native host always points
         // at this binary (silent unless something needed fixing).
-        for b in ["chrome", "edge", "firefox"] {
+        for b in ["chrome", "edge", "brave", "opera", "vivaldi", "firefox"] {
             match ensure_native_host(b) {
                 Ok(true) => app.push_log(format!("Browser host ready for {b}.")),
                 Err(e) => app.push_log(format!("Browser host ({b}) unavailable: {e}")),
@@ -1063,6 +1109,8 @@ impl CraftApp {
             }
         }
         app.poll_inbox();
+        app.merge_queue_from_disk();
+        app.check_wake();
         app
     }
 
@@ -1081,6 +1129,97 @@ impl CraftApp {
         crate::model::config_dir().map(|p| p.join("queue.json"))
     }
 
+    /// Publish live per-download numbers for standalone progress windows
+    /// (`progress.json`, ~1/s while anything is active; removed when idle).
+    fn write_progress_snapshot(&mut self) {
+        let Some(path) = crate::model::config_dir().map(|p| p.join("progress.json")) else {
+            return;
+        };
+        if self.tasks.is_empty() {
+            if path.exists() {
+                let _ = std::fs::remove_file(&path);
+            }
+            return;
+        }
+        if self.last_prog_write.elapsed().as_millis() < 1000 {
+            return;
+        }
+        self.last_prog_write = Instant::now();
+        let mut items = serde_json::Map::new();
+        for (id, task) in self.tasks.iter() {
+            let speed = self
+                .downloads
+                .iter()
+                .find(|d| d.id == *id)
+                .map(|d| d.speed_bps)
+                .unwrap_or(0.0);
+            let totals = task.shared.part_total.lock().unwrap().clone();
+            let dones = task.shared.part_done.lock().unwrap().clone();
+            let parts: Vec<[u64; 3]> = totals
+                .iter()
+                .zip(dones.iter())
+                .map(|((s, e), d)| [*s, *e, *d])
+                .collect();
+            items.insert(
+                id.to_string(),
+                serde_json::json!({
+                    "downloaded": task.shared.downloaded.load(Ordering::SeqCst),
+                    "total": if task.shared.has_total.load(Ordering::SeqCst) {
+                        Some(task.shared.total.load(Ordering::SeqCst))
+                    } else {
+                        None
+                    },
+                    "speed": speed,
+                    "resumable": task.shared.resumable.load(Ordering::SeqCst),
+                    "parts": parts,
+                }),
+            );
+        }
+        if let Ok(json) = serde_json::to_string_pretty(&serde_json::json!({
+            "items": serde_json::Value::Object(items)
+        })) {
+            Self::atomic_write(&path, json.as_bytes());
+        }
+    }
+
+    /// Run pause/resume/cancel orders left by standalone progress windows.
+    fn check_cmd(&mut self) {
+        let path = match crate::model::config_dir() {
+            Some(p) => p.join("cmd.json"),
+            None => return,
+        };
+        let data = match std::fs::read_to_string(&path) {
+            Ok(d) => d,
+            Err(_) => return,
+        };
+        let _ = std::fs::remove_file(&path); // claim first: at-most-once
+        let cmds: Vec<serde_json::Value> = serde_json::from_str(&data).unwrap_or_default();
+        for c in cmds {
+            let id = c.get("id").and_then(|x| x.as_u64()).unwrap_or(u64::MAX);
+            let act = c.get("action").and_then(|x| x.as_str()).unwrap_or("");
+            match act {
+                "pause" => self.pause(id),
+                "resume" => self.resume(id),
+                "cancel" => self.cancel_task(id),
+                _ => {}
+            }
+        }
+    }
+
+    /// Pop a standalone IDM-style progress window for one download.
+    fn spawn_progress(id: u64) {
+        let Ok(exe) = std::env::current_exe() else {
+            return;
+        };
+        let mut cmd = std::process::Command::new(exe);
+        cmd.arg("--progress").arg(id.to_string());
+        #[cfg(windows)]
+        {
+            use std::os::windows::process::CommandExt;
+            cmd.creation_flags(0x00000008);
+        }
+        let _ = cmd.spawn();
+    }
     fn ui_state_path() -> Option<std::path::PathBuf> {
         crate::model::config_dir().map(|p| p.join("ui.json"))
     }
@@ -1521,8 +1660,33 @@ impl CraftApp {
         self.rt.spawn(async move {
             let out = match opts.build_client() {
                 Ok(client) => {
-                    let (total, _, _, disp) =
+                    let (mut total, _, ctype, mut disp) =
                         crate::engine::probe(&client, &opts, &url).await;
+                    // Page URLs (YouTube watch / generic video pages) answer
+                    // HEAD with HTML and no length → resolve the media stream
+                    // first so the dialog shows the real size + title (IDM-style).
+                    let is_page = ctype
+                        .as_deref()
+                        .map(|c| c.contains("text/html"))
+                        .unwrap_or(false)
+                        || url.contains("youtube.com")
+                        || url.contains("youtu.be");
+                    if total.is_none() && is_page {
+                        let shared =
+                            std::sync::Arc::new(crate::engine::SharedState::new());
+                        if let Some((media_url, title)) =
+                            crate::engine::resolve_media(&client, &opts, &url, &shared).await
+                        {
+                            let (t2, _, _, _) =
+                                crate::engine::probe(&client, &opts, &media_url).await;
+                            if total.is_none() {
+                                total = t2;
+                            }
+                            if disp.is_none() && !title.trim().is_empty() {
+                                disp = Some(crate::engine::sanitize_filename(&title));
+                            }
+                        }
+                    }
                     (total, disp)
                 }
                 Err(_) => (None, None),
@@ -2017,16 +2181,51 @@ impl CraftApp {
         if items.is_empty() {
             return false;
         }
-        // First item that is a valid, not-yet-queued URL.
-        let next = items
-            .iter()
-            .find(|i| {
-                is_download_url(&i.url) && !self.downloads.iter().any(|d| d.url == i.url)
-            })
-            .map(|i| (i.url.clone(), i.filename.clone()));
-        let Some((url, filename)) = next else {
-            // Nothing actionable (invalid or duplicates): drop the file.
-            let _ = std::fs::remove_file(&path);
+        // Standalone Download File Info dialogs (spawned per capture, IDM
+        // style) claim their inbox entry on open. Entries younger than
+        // CONFIRM_GRACE_SECS are left alone so the dialog wins the race;
+        // only entries it never claimed (crashed spawn, old version) fall
+        // through to this in-canvas prompt.
+        const CONFIRM_GRACE_SECS: i64 = 10;
+        let now_ts = chrono::Local::now().timestamp();
+        let age_secs = |rfc: &str| -> i64 {
+            chrono::DateTime::parse_from_rfc3339(rfc)
+                .map(|dt| now_ts - dt.timestamp())
+                .unwrap_or(i64::MAX)
+        };
+        let mut keep: Vec<crate::native_host::InboxItem> = Vec::new();
+        let mut next: Option<(String, Option<String>, String, String)> = None;
+        for i in items.into_iter() {
+            if next.is_none()
+                && is_download_url(&i.url)
+                && !self.downloads.iter().any(|d| d.url == i.url)
+                && age_secs(&i.received_at) >= CONFIRM_GRACE_SECS
+            {
+                next = Some((
+                    i.url.clone(),
+                    i.filename.clone(),
+                    i.referer
+                        .clone()
+                        .or_else(|| i.page_url.clone())
+                        .unwrap_or_default(),
+                    i.cookie.clone().unwrap_or_default(),
+                ));
+            } else if is_download_url(&i.url)
+                && !self.downloads.iter().any(|d| d.url == i.url)
+            {
+                // Young (dialog likely opening) or a later old entry: keep.
+                keep.push(i);
+            }
+            // Invalid URLs and already-queued duplicates are dropped.
+        }
+        let Some((url, filename, referer, cookie)) = next else {
+            // Nothing actionable now: keep young entries, drop the file only
+            // when fully drained.
+            if keep.is_empty() {
+                let _ = std::fs::remove_file(&path);
+            } else if let Ok(json) = serde_json::to_string_pretty(&keep) {
+                Self::atomic_write(&path, json.as_bytes());
+            }
             return false;
         };
         if self.show_add {
@@ -2036,17 +2235,81 @@ impl CraftApp {
         self.add_file = filename
             .filter(|f| !f.trim().is_empty())
             .unwrap_or_else(|| filename_from_url(&url));
+        self.add_referer = referer;
+        self.add_cookie = cookie;
         self.add_checksum.clear();
         self.probe_done_for.clear(); // force a fresh size/name probe
         self.show_add = true;
-        let remaining: Vec<_> = items.into_iter().filter(|i| i.url != url).collect();
-        if remaining.is_empty() {
+        if keep.is_empty() {
             let _ = std::fs::remove_file(&path);
-        } else if let Ok(json) = serde_json::to_string_pretty(&remaining) {
+        } else if let Ok(json) = serde_json::to_string_pretty(&keep) {
             Self::atomic_write(&path, json.as_bytes());
         }
         self.push_log("Browser extension sent a download — confirm in Add download.");
         true
+    }
+
+    /// Merge queue entries written by other processes (standalone Download
+    /// File Info dialogs, CLI) into this window's in-memory list.
+    fn merge_queue_from_disk(&mut self) {
+        let path = match Self::queue_path() {
+            Some(p) => p,
+            None => return,
+        };
+        let data = match std::fs::read_to_string(&path) {
+            Ok(d) => d,
+            Err(_) => return,
+        };
+        let items: Vec<DownloadItem> = serde_json::from_str(&data).unwrap_or_default();
+        for mut it in items {
+            if self
+                .downloads
+                .iter()
+                .any(|d| d.id == it.id || d.url == it.url)
+            {
+                continue;
+            }
+            if it.status.is_active() {
+                it.status = Status::Queued;
+            }
+            it.speed_bps = 0.0;
+            it.selected = false;
+            self.next_id = self.next_id.max(it.id + 1);
+            self.downloads.push(it);
+        }
+    }
+
+    /// Consume `%APPDATA%/download_craft/wake.json` (`{"start":[ids]}`):
+    /// start IDs queued by a standalone dialog's "Start Download".
+    fn check_wake(&mut self) {
+        let path = match crate::model::config_dir() {
+            Some(p) => p.join("wake.json"),
+            None => return,
+        };
+        let data = match std::fs::read_to_string(&path) {
+            Ok(d) => d,
+            Err(_) => return,
+        };
+        let _ = std::fs::remove_file(&path); // claim first: at-most-once
+        let ids: Vec<u64> = serde_json::from_str::<serde_json::Value>(&data)
+            .ok()
+            .and_then(|v| v.get("start").cloned())
+            .and_then(|v| serde_json::from_value(v).ok())
+            .unwrap_or_default();
+        if ids.is_empty() {
+            return;
+        }
+        self.merge_queue_from_disk();
+        for id in ids {
+            let ready = self.downloads.iter().any(|d| {
+                d.id == id && matches!(d.status, Status::Queued) && !self.tasks.contains_key(&id)
+            });
+            if ready {
+                self.queue_running = true;
+                self.start(id);
+                Self::spawn_progress(id);
+            }
+        }
     }
 
     fn matches_filter(d: &DownloadItem, filter: &str) -> bool {
@@ -2155,11 +2418,7 @@ fn install_native_host(browser: &str) -> Result<String, String> {
     )
     .map_err(|e| e.to_string())?;
 
-    let key = match browser {
-        "chrome" => r"HKCU\Software\Google\Chrome\NativeMessagingHosts\com.download_craft",
-        "edge" => r"HKCU\Software\Microsoft\Edge\NativeMessagingHosts\com.download_craft",
-        _ => r"HKCU\Software\Mozilla\NativeMessagingHosts\com.download_craft",
-    };
+    let key = native_host_key(browser);
     let out = std::process::Command::new("reg")
         .args(["add", key, "/ve", "/d", &manifest_path.to_string_lossy(), "/f"])
         .output()
@@ -2168,17 +2427,36 @@ fn install_native_host(browser: &str) -> Result<String, String> {
         return Err(String::from_utf8_lossy(&out.stderr).to_string());
     }
     // Best-effort cleanup of the legacy host registration.
-    let legacy_key = match browser {
-        "chrome" => r"HKCU\Software\Google\Chrome\NativeMessagingHosts\com.idm_rust",
-        "edge" => r"HKCU\Software\Microsoft\Edge\NativeMessagingHosts\com.idm_rust",
-        _ => r"HKCU\Software\Mozilla\NativeMessagingHosts\com.idm_rust",
-    };
+    let legacy_key = legacy_host_key(browser);
     let _ = std::process::Command::new("reg")
         .args(["delete", legacy_key, "/f"])
         .output();
     Ok(manifest_path.to_string_lossy().to_string())
 }
 
+/// Registry key for a Chromium-family / Firefox native host (HKCU, no admin).
+/// Opera / Brave / Vivaldi share the Chromium layout with vendor keys.
+fn native_host_key(browser: &str) -> &'static str {
+    match browser {
+        "chrome" => r"HKCU\Software\Google\Chrome\NativeMessagingHosts\com.download_craft",
+        "edge" => r"HKCU\Software\Microsoft\Edge\NativeMessagingHosts\com.download_craft",
+        "brave" => r"HKCU\Software\BraveSoftware\Brave-Browser\NativeMessagingHosts\com.download_craft",
+        "opera" => r"HKCU\Software\Opera Software\NativeMessagingHosts\com.download_craft",
+        "vivaldi" => r"HKCU\Software\Vivaldi\NativeMessagingHosts\com.download_craft",
+        _ => r"HKCU\Software\Mozilla\NativeMessagingHosts\com.download_craft",
+    }
+}
+
+fn legacy_host_key(browser: &str) -> &'static str {
+    match browser {
+        "chrome" => r"HKCU\Software\Google\Chrome\NativeMessagingHosts\com.idm_rust",
+        "edge" => r"HKCU\Software\Microsoft\Edge\NativeMessagingHosts\com.idm_rust",
+        "brave" => r"HKCU\Software\BraveSoftware\Brave-Browser\NativeMessagingHosts\com.idm_rust",
+        "opera" => r"HKCU\Software\Opera Software\NativeMessagingHosts\com.idm_rust",
+        "vivaldi" => r"HKCU\Software\Vivaldi\NativeMessagingHosts\com.idm_rust",
+        _ => r"HKCU\Software\Mozilla\NativeMessagingHosts\com.idm_rust",
+    }
+}
 /// IDM-style zero-config: verify the native host is registered to THIS
 /// binary on every launch, reinstalling silently when missing or stale
 /// (first run, portable exe moved or renamed, etc.).
@@ -2207,11 +2485,7 @@ fn ensure_native_host(browser: &str) -> Result<bool, String> {
                 .unwrap_or(false)
         })
         .unwrap_or(false);
-    let key = match browser {
-        "chrome" => r"HKCU\Software\Google\Chrome\NativeMessagingHosts\com.download_craft",
-        "edge" => r"HKCU\Software\Microsoft\Edge\NativeMessagingHosts\com.download_craft",
-        _ => r"HKCU\Software\Mozilla\NativeMessagingHosts\com.download_craft",
-    };
+    let key = native_host_key(browser);
     let registered = std::process::Command::new("reg")
         .args(["query", key, "/ve"])
         .output()
@@ -2271,16 +2545,6 @@ fn clipboard_watch(tx: std::sync::mpsc::Sender<String>) {
     }
 }
 
-fn status_text(d: &DownloadItem) -> String {
-    match &d.status {
-        Status::Queued => "Added".to_string(),
-        Status::Downloading => format!("{}% Downloading", (d.progress() * 100.0) as u32),
-        Status::Paused => format!("{}% Paused", (d.progress() * 100.0) as u32),
-        Status::Completed => "Finished".to_string(),
-        Status::Failed(_) => "Failed".to_string(),
-    }
-}
-
 // Column widths.
 const CHECK_W: f32 = 32.0;
 const SIZE_W: f32 = 90.0;
@@ -2305,6 +2569,7 @@ impl eframe::App for CraftApp {
 
         self.poll_tasks();
         self.poll_verify_jobs();
+        self.write_progress_snapshot();
         // TEMPORARY input diagnostics (removed after the hover investigation).
         if self.diag_last.elapsed().as_secs() >= 1 {
             self.diag_last = Instant::now();
@@ -2342,6 +2607,9 @@ impl eframe::App for CraftApp {
         self.check_scheduler();
         if self.last_inbox_check.elapsed().as_secs() >= 2 {
             self.last_inbox_check = Instant::now();
+            self.merge_queue_from_disk();
+            self.check_wake();
+            self.check_cmd();
             if self.poll_inbox() {
                 // Extension sent something: pop the app up with the
                 // prefilled Add dialog.
@@ -2356,6 +2624,7 @@ impl eframe::App for CraftApp {
         // theme (re-applied when the user switches it)
         if self.theme_applied != self.theme {
             ctx.set_visuals(visuals_for(&self.theme));
+            apply_widget_theme(ctx);
             self.theme_applied = self.theme.clone();
         }
 
@@ -2819,7 +3088,7 @@ impl eframe::App for CraftApp {
                     egui::Frame::new()
                         .fill(SURFACE)
                         .stroke(egui::Stroke::new(1.0_f32, PRIMARY))
-                        .corner_radius(8.0)
+                        .corner_radius(RADIUS)
                         .inner_margin(egui::Margin {
                             left: 12,
                             right: 8,
@@ -2913,7 +3182,7 @@ impl eframe::App for CraftApp {
                     // ---- header bar (fixed, scrolls horizontally with body) ----
                     egui::Frame::new()
                         .fill(HEADER_BG)
-                        .corner_radius(6.0)
+                        .corner_radius(RADIUS)
                         .show(ui, |ui| {
                             ui.spacing_mut().item_spacing.x = 0.0;
                             ui.horizontal(|ui| {
@@ -2982,7 +3251,7 @@ impl eframe::App for CraftApp {
                                 .show(ui, |ui| {
                                     for id in &ids {
                                         let id = *id;
-                                        let (sel, fname, cat, size_s, prog, spd, stxt, eta, date, st) = {
+                                        let (sel, fname, cat, size_s, prog, spd, eta, date, st) = {
                                             let d = self
                                                 .downloads
                                                 .iter()
@@ -2997,7 +3266,6 @@ impl eframe::App for CraftApp {
                                                     .unwrap_or_else(|| "--".into()),
                                                 d.progress(),
                                                 d.speed_bps,
-                                                status_text(d),
                                                 format_eta(d),
                                                 relative_time(&d.created_at),
                                                 d.status.clone(),
@@ -3011,19 +3279,19 @@ impl eframe::App for CraftApp {
                                         if sel {
                                             ui.painter().rect_filled(
                                                 rrect.expand(2.0),
-                                                8.0,
+                                                RADIUS,
                                                 SEL_BG,
                                             );
                                             ui.painter().rect_stroke(
                                                 rrect.expand(2.0),
-                                                8.0,
+                                                RADIUS,
                                                 egui::Stroke::new(1.0_f32, SEL_BD),
                                                 egui::StrokeKind::Inside,
                                             );
                                         } else if self.man.hover(&rrect) {
                                             ui.painter().rect_filled(
                                                 rrect.expand(2.0),
-                                                8.0,
+                                                RADIUS,
                                                 HOVER_BG,
                                             );
                                         }
@@ -3072,15 +3340,17 @@ impl eframe::App for CraftApp {
                                         }
                                         SortCol::Status => match &st {
                                             Status::Downloading => {
-                                                centered_label_at(
+                                                status_pill_at(
                                                     &p,
                                                     egui::Rect::from_min_size(
                                                         crect.min,
                                                         egui::vec2(w, 24.0),
                                                     ),
-                                                    &stxt,
-                                                    12.0,
-                                                    TXT,
+                                                    &format!(
+                                                        "{}%",
+                                                        (prog * 100.0) as u32
+                                                    ),
+                                                    PRIMARY,
                                                 );
                                                 paint_progress(
                                                     &p,
@@ -3238,7 +3508,7 @@ impl eframe::App for CraftApp {
                         ui.separator();
                         if pbusy {
                             ui.spinner();
-                        } else if let Some(sz) = psize {
+                        } else if let Some(sz) = psize.filter(|s| *s > 0) {
                             ui.label(
                                 egui::RichText::new(format_bytes(sz)).size(12.0).strong(),
                             );
@@ -3260,7 +3530,7 @@ impl eframe::App for CraftApp {
                     if self.add_adv {
                         egui::Frame::new()
                             .fill(BG)
-                            .corner_radius(6.0)
+                            .corner_radius(RADIUS)
                             .inner_margin(egui::Margin::same(8))
                             .show(ui, |ui| {
                                 let v = self.slider_get(SliderId::AddConns);
@@ -3471,8 +3741,8 @@ impl eframe::App for CraftApp {
                 });
                 section_card(ui, "Browser integration", |ui| {
                 ui.small("Load browser-extension/ unpacked once — its ID is pinned, no pasting needed.");
-                ui.small("The native host below reinstalls itself automatically on every launch.");
-                ui.small(format!("Extension ID: {EXTENSION_ID}"));
+                ui.small("One-time setup: host auto-repairs on every launch (like IDM) — no need to click Install each time; buttons below are manual repair only.");
+                ui.small(format!("Extension ID: {EXTENSION_ID}"));// auto host status lives in the log (see Queues/Log on repair)
                 ui.horizontal(|ui| {
                     let r = mbutton(ui, &self.man, "Install Chrome", 110.0, 32.0, false);
                     self.hits.push((HitKind::Btn(ButtonId::SChrome), r));
@@ -3480,6 +3750,13 @@ impl eframe::App for CraftApp {
                     self.hits.push((HitKind::Btn(ButtonId::SEdge), r));
                     let r = mbutton(ui, &self.man, "Install Firefox", 110.0, 32.0, false);
                     self.hits.push((HitKind::Btn(ButtonId::SFirefox), r));
+                });
+                ui.horizontal(|ui| {
+                    let r = mbutton(ui, &self.man, "Install Brave", 110.0, 32.0, false);
+                    self.hits.push((HitKind::Btn(ButtonId::SBrave), r));
+                    let r = mbutton(ui, &self.man, "Install Opera", 110.0, 32.0, false);
+                    self.hits.push((HitKind::Btn(ButtonId::SOpera), r));
+                    ui.small("Brave/Opera/Vivaldi share the Chrome extension (developer mode → Load unpacked).");
                 });
                 if !bmsg.is_empty() {
                     ui.small(&bmsg);
@@ -4178,6 +4455,7 @@ impl CraftApp {
         if download {
             self.queue_running = true;
             self.start(id);
+            Self::spawn_progress(id);
         }
     }
 
@@ -4228,6 +4506,8 @@ impl CraftApp {
             ButtonId::SChrome => self.pending_browser_install = Some("chrome".to_string()),
             ButtonId::SEdge => self.pending_browser_install = Some("edge".to_string()),
             ButtonId::SFirefox => self.pending_browser_install = Some("firefox".to_string()),
+            ButtonId::SBrave => self.pending_browser_install = Some("brave".to_string()),
+            ButtonId::SOpera => self.pending_browser_install = Some("opera".to_string()),
             ButtonId::SClose => {
                 if self.add_dir.trim().is_empty() {
                     self.add_dir = dirs::download_dir()
@@ -4297,7 +4577,7 @@ impl CraftApp {
                         1.0_f32,
                         egui::Color32::from_rgb(45, 47, 65),
                     ))
-                    .corner_radius(8.0)
+                    .corner_radius(RADIUS)
                     .inner_margin(egui::Margin::same(6))
                     .show(ui, |ui| {
                         ui.spacing_mut().item_spacing.y = 0.0;
