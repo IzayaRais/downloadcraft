@@ -1,5 +1,7 @@
 # Download Craft
 
+![Download Craft GUI](Screenshot.png)
+
 A lightweight, offline-first download manager for Windows, written in pure
 Rust with an `egui` GUI. Multi-connection segmented HTTP(S) downloads,
 queue management, scheduler, browser-extension integration, and a CLI that
