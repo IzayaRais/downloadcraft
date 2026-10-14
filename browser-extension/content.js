@@ -7,7 +7,7 @@
   // Must match manifest version + background.js EXT_VER. The background
   // rejects messages from any other version with a "reload this tab"
   // error, so a stale script can never fail mysteriously.
-  const EXT_VER = "0.4.9";
+  const EXT_VER = "0.5.0";
   // Generation guard: when the worker re-injects this script (after an
   // update), older live instances must go quiet instead of fighting over
   // the button. The newest instance always wins.
@@ -193,13 +193,14 @@
           disp: contOf(mime),
           kind: "a",
           itag: f.itag || 0,
+          br: f.bitrate || 0,
         };
       })
       .slice(0, 6);
     return { videoId: id, title, streams, videoOnly, audio };
   }
 
-  function sendDownload(url, filename, mime, size) {
+  function sendDownload(url, filename, mime, size, pair) {
     // A tab running a stale script (extension reloaded without a tab
     // reload) has no extension APIs left — fail loudly, not mysteriously.
     try {
@@ -218,7 +219,7 @@
       if (!filename) filename = safeFilename(document.title) ;
     }
     try {
-      chrome.runtime.sendMessage({ type: "download", url: sendUrl, filename, ver: EXT_VER, pageUrl: location.href, referer: location.href, mime: mime || null, size: size || null }, (res) => {
+      chrome.runtime.sendMessage({ type: "download", url: sendUrl, filename, ver: EXT_VER, pageUrl: location.href, referer: location.href, mime: mime || null, size: size || null, pairUrl: (pair && pair.url) || null, pairMime: (pair && pair.mime) || null }, (res) => {
       if (chrome.runtime.lastError) {
         toast("Download Craft: " + chrome.runtime.lastError.message);
         return;
@@ -521,6 +522,12 @@
       menu.appendChild(h);
     }
     const sizePairs = [];
+    // Video-only rows bundle the best audio track so the app can merge
+    // them to a single file (IDM's "MKV file" behavior).
+    const bestAudio = (info.audio || []).slice().sort((a, b) => (b.br || 0) - (a.br || 0))[0] || null;
+    const pairFor = (st) => (st.kind === "v" && bestAudio && bestAudio.url !== st.url)
+      ? { url: bestAudio.url, mime: bestAudio.mime }
+      : null;
     const section = (head, list, nameFn) => {
       if (!list.length) return;
       const h = document.createElement("div");
@@ -532,7 +539,7 @@
         const b = mkItem(
           base,
           st.url.slice(0, 120),
-          () => sendDownload(st.url, nameFn(st), st.mime, st._size || null),
+          () => sendDownload(st.url, nameFn(st), st.mime, st._size || null, pairFor(st)),
         );
         sizePairs.push({ btn: b, st, base });
       });

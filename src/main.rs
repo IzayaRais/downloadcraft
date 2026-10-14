@@ -1,7 +1,10 @@
+mod aes128;
 mod app;
+mod basket;
 mod cli;
 mod confirm;
 mod engine;
+mod grabber;
 mod manual;
 mod model;
 mod native_host;
@@ -45,6 +48,13 @@ fn main() -> eframe::Result<()> {
     // IDM-style standalone per-download progress window.
     if args.iter().any(|a| a == "--progress") {
         return progress::run();
+    }
+    // P3.3 companions: drop basket + mini status.
+    if args.iter().any(|a| a == "--basket") {
+        return basket::run_basket();
+    }
+    if args.iter().any(|a| a == "--mini") {
+        return basket::run_mini();
     }
     // CLI mode when a subcommand is given (`--help` works too).
     if args.len() > 1 {

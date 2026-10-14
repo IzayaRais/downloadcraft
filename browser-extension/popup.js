@@ -70,14 +70,22 @@ chrome.storage.local.get(["downloadCraftVideos", "downloadCraftLinks", "download
     };
     const dispOf = (st) => st.disp || String(st.mime || "").replace("video/", "").split(";")[0];
     const sizeJobs = [];
+    const bestAudio = (arr) => (arr || []).slice().sort((a, b) => {
+      const bn = (x) => { const m = String(x.label || "").match(/(\d+)k/); return m ? parseInt(m[1], 10) : 0; };
+      return bn(b) - bn(a);
+    })[0] || null;
+    const bestA = bestAudio(v.audio);
     const qbtn = (st, fname) => {
       const btn = document.createElement("button");
       btn.style.marginRight = "4px";
       btn.style.marginBottom = "4px";
       const base = `${st.label} · ${dispOf(st)}${st.kind === "v" ? " (no audio)" : st.kind === "a" ? " (audio)" : ""}`;
       btn.textContent = base;
+      const pair = (st.kind === "v" && bestA && bestA.url !== st.url)
+        ? { url: bestA.url, mime: bestA.mime }
+        : null;
       btn.onclick = () => {
-        chrome.runtime.sendMessage({ type: "download", url: st.url, filename: fname, size: st._size || null }, (res) => {
+        chrome.runtime.sendMessage({ type: "download", url: st.url, filename: fname, size: st._size || null, pairUrl: (pair && pair.url) || null, pairMime: (pair && pair.mime) || null }, (res) => {
           $("status").textContent = res && res.ok ? "Sent ✓ — confirm in Download Craft" : "App not reachable.";
         });
       };

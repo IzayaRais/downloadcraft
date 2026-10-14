@@ -190,3 +190,34 @@ and progress windows (their duplicated style blocks deleted). All cards
 (settings, toast, header bar, context menu, advanced frame), row
 select/hover rects, and icon buttons unified to RADIUS (was a 6/8/10 mix).
 Paint-only change: no hit-testing or behavior touched. 14/14 green.
+
+### 13. P1 stream assembly complete (2026-10-15)
+- HLS: 4–8 parallel segments, ranged-HEAD byte totals, `hlsmap` resume,
+  AES-128 via vendored `src/aes128.rs` (computed S-boxes, FIPS-197 B + NIST
+  SP 800-38A green, cross-checked against .NET; my first memorized vectors
+  were corrupt — fixed from .NET output, not memory).
+- Adaptive: `download_adaptive()` + `ffmpeg_mux()` + full pair plumbing
+  (menu → inbox → confirm → queue → `start()`); ext v0.5.0 bundles best
+  audio with every video-only row.
+- DASH: BaseURL + number-SegmentTemplate (+init), best V+A, ffmpeg mux,
+  DRM/live/Timeline refused. 19/19 tests green (HLS plain+AES, DASH
+  video-only, mux-error paths, all fixtures local).
+
+### 14. P2 YouTube decipher complete (2026-10-15)
+Server-side `signatureCipher` decipher from YouTube's public `base.js`
+(detect reverse/splice/swap chains, apply to `s`, assemble URL) + `n`-fix
+when a second simple-shape function exists (else untouched + ratebypass) +
+button-naming guidance errors. Fixture-tested parse→apply→assemble→n.
+Honest note: exotic player shapes fall back safely; extension fresh links
+remain the primary path. 20/20 tests green.
+
+### 15. P3 convenience parity complete (2026-10-15)
+- Grabber (`src/grabber.rs` + toolbar button + dialog): presets, custom
+  exts, same-site depth-1 crawl, preview, queue-all deduped.
+- Rules + templates: ordered ext→folder rules (max 8) + `{name}{ext}`
+  `{date}` `{host}` templates with preview, everywhere including confirm.
+- Basket (`--basket`: paste + drop .txt/.url) and Mini (`--mini`: live
+  counts/speed/bar, pause-all/resume) standalone windows, both smoke-tested.
+- Speed windows (overnight-capable, live atomic cap, no restart needed) +
+  opt-in GitHub update check. 24/24 tests green, roadmap all-DONE except
+  forever-out-of-scope (DRM, IDM code).

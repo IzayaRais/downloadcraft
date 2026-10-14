@@ -10,7 +10,7 @@ let lastHostError = "";
 // Must match manifest version + content.js EXT_VER. Tabs running an older
 // content script are rejected with a "reload the tab" error instead of
 // failing mysteriously (their extension APIs are gone after a reload).
-const EXT_VER = "0.4.9";
+const EXT_VER = "0.5.0";
 
 function markSeen(url) {
   seen.set(url, Date.now());
@@ -78,6 +78,8 @@ async function sendToHost(url, filename, extra) {
       cookie,
       mime: (extra && extra.mime) || null,
       size: (extra && extra.size) || null,
+      pairUrl: (extra && extra.pairUrl) || null,
+      pairMime: (extra && extra.pairMime) || null,
     });
     return !!res && (res.type === "ok" || res.type === "pong");
   } catch (e) {
@@ -298,6 +300,8 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
           referer: msg.referer || pageUrl,
           mime: msg.mime || null,
           size: msg.size || null,
+          pairUrl: msg.pairUrl || null,
+          pairMime: msg.pairMime || null,
         });
         hostOk = ok;
         setBadge();

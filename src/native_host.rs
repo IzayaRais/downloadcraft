@@ -32,6 +32,11 @@ struct Incoming {
     /// the dialog prefers this over probing.
     #[serde(default)]
     size: Option<u64>,
+    /// Adaptive pair audio URL (video-only + audio merge).
+    #[serde(default)]
+    pub pair_url: Option<String>,
+    #[serde(default)]
+    pub pair_mime: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -62,6 +67,10 @@ pub struct InboxItem {
     pub mime: Option<String>,
     #[serde(default)]
     pub size: Option<u64>,
+    #[serde(default)]
+    pub pair_url: Option<String>,
+    #[serde(default)]
+    pub pair_mime: Option<String>,
 }
 
 pub fn inbox_path() -> Option<std::path::PathBuf> {
@@ -121,6 +130,8 @@ fn queue_download(msg: &Incoming) -> Result<(), String> {
             cookie: msg.cookie.clone().filter(|s| !s.trim().is_empty()),
             mime: msg.mime.clone().filter(|s| !s.trim().is_empty()),
             size: msg.size.filter(|s| *s > 0),
+            pair_url: msg.pair_url.clone().filter(|s| s.starts_with("http")),
+            pair_mime: msg.pair_mime.clone().filter(|s| !s.trim().is_empty()),
         });
         let json = serde_json::to_string_pretty(&items).map_err(|e| e.to_string())?;
         let tmp = path.with_extension("tmp");
@@ -155,6 +166,12 @@ fn spawn_confirm(msg: &Incoming) {
     }
     if let Some(s) = msg.size.filter(|s| *s > 0) {
         cmd.arg("--size").arg(s.to_string());
+    }
+    if let Some(p) = msg.pair_url.clone().filter(|s| s.starts_with("http")) {
+        cmd.arg("--pair-url").arg(p);
+        if let Some(m) = msg.pair_mime.clone().filter(|s| !s.trim().is_empty()) {
+            cmd.arg("--pair-mime").arg(m);
+        }
     }
     #[cfg(windows)]
     {

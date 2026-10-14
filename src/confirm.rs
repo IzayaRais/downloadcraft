@@ -73,6 +73,8 @@ struct UiPrefs {
     user_agent: String,
     proxy_url: String,
     timeout_secs: u64,
+    rename_template: String,
+    folder_rules: Vec<crate::model::FolderRule>,
 }
 
 fn load_prefs() -> UiPrefs {
@@ -110,6 +112,32 @@ fn load_prefs() -> UiPrefs {
     }
     if let Some(n) = v.get("timeout_secs").and_then(|x| x.as_u64()) {
         p.timeout_secs = n.clamp(5, 600);
+    }
+    if let Some(s) = v.get("rename_template").and_then(|x| x.as_str()) {
+        if !s.trim().is_empty() {
+            p.rename_template = s.to_string();
+        }
+    }
+    if p.rename_template.trim().is_empty() {
+        p.rename_template = "{name}".to_string();
+    }
+    if let Some(arr) = v.get("folder_rules").and_then(|x| x.as_array()) {
+        let rules: Vec<crate::model::FolderRule> = arr
+            .iter()
+            .filter_map(|r| {
+                Some(crate::model::FolderRule {
+                    exts: r.get("exts")?.as_str()?.to_string(),
+                    folder: r.get("folder")?.as_str()?.to_string(),
+                })
+            })
+            .take(8)
+            .collect();
+        if !rules.is_empty() {
+            p.folder_rules = rules;
+        }
+    }
+    if p.folder_rules.is_empty() {
+        p.folder_rules = crate::model::default_folder_rules();
     }
     p
 }
@@ -198,10 +226,14 @@ struct ConfirmApp {
     description: String,
     referer: String,
     cookie: String,
+    pair_url: String,
+    pair_mime: String,
     connections: usize,
     user_agent: String,
     proxy_url: String,
     timeout_secs: u64,
+    rename_template: String,
+    folder_rules: Vec<crate::model::FolderRule>,
     probing: bool,
     probe_size: Option<u64>,
     probe_rx: Option<Receiver<(Option<u64>, Option<String>)>>,
@@ -226,6 +258,18 @@ const CATEGORIES: &[&str] = &[
 impl ConfirmApp {
     fn effective_dir(&self) -> String {
         if self.remember_path {
+            // Ordered user rules first, category fallback second (mirrors app).
+            if let Some(rule) = self
+                .folder_rules
+                .iter()
+                .find(|r| r.matches(&self.filename))
+            {
+                if !rule.folder.trim().is_empty() {
+                    let mut p = std::path::PathBuf::from(&self.save_base);
+                    p.push(rule.folder.trim());
+                    return p.to_string_lossy().to_string();
+                }
+            }
             let mut p = std::path::PathBuf::from(&self.save_base);
             p.push(self.category.clone());
             p.to_string_lossy().to_string()
@@ -316,6 +360,10 @@ impl ConfirmApp {
         item.referer = self.referer.clone();
         item.cookie = self.cookie.clone();
         item.description = self.description.trim().to_string();
+        if self.pair_url.starts_with("http") {
+            item.pair_url = self.pair_url.clone();
+            item.pair_mime = self.pair_mime.clone();
+        }
         items.push(item);
         if !write_queue(&items) {
             self.notice = "Could not write queue.json.".to_string();
@@ -372,6 +420,8 @@ pub fn run() -> eframe::Result<()> {
         .unwrap_or_else(|| filename_from_url(&url));
     let referer = get("--referer").unwrap_or_default();
     let cookie = get("--cookie").unwrap_or_default();
+    let pair_url = get("--pair-url").filter(|s| s.starts_with("http")).unwrap_or_default();
+    let pair_mime = get("--pair-mime").unwrap_or_default();
     // Browser-measured size (menu HEAD/Range): trust it, skip probing.
     let known_size: Option<u64> = get("--size")
         .and_then(|s| s.parse::<u64>().ok())
@@ -392,17 +442,21 @@ pub fn run() -> eframe::Result<()> {
     );
     let mut app = ConfirmApp {
         url: url.trim().to_string(),
-        filename: engine::sanitize_filename(&filename),
+        filename: crate::model::apply_rename_template(&prefs.rename_template, &engine::sanitize_filename(&filename), url.trim()),
         category,
         remember_path: prefs.category_folders,
         save_base: prefs.save_dir,
         description: String::new(),
         referer,
         cookie,
+        pair_url,
+        pair_mime,
         connections: prefs.connections,
         user_agent: prefs.user_agent,
         proxy_url: prefs.proxy_url,
         timeout_secs: prefs.timeout_secs,
+        rename_template: prefs.rename_template,
+        folder_rules: prefs.folder_rules,
         probing: false,
         probe_size: known_size,
         probe_rx: None,
@@ -473,7 +527,11 @@ impl eframe::App for ConfirmApp {
                     // Prefer the server/video title when our name is a bare
                     // URL guess.
                     if self.filename == filename_from_url(&self.url) {
-                        self.filename = n;
+                        self.filename = crate::model::apply_rename_template(
+                            &self.rename_template,
+                            &n,
+                            &self.url,
+                        );
                         self.category = category_of(&self.filename).to_string();
                     }
                 }
@@ -579,6 +637,9 @@ impl eframe::App for ConfirmApp {
                 }
             });
             ui.weak(format!("→ {}", self.effective_dir()));
+            if self.pair_url.starts_with("http") {
+                ui.weak("video-only + audio — merged to one file on completion (needs ffmpeg)");
+            }
             if self.show_adv {
                 egui::Frame::new()
                     .corner_radius(crate::app::RADIUS)

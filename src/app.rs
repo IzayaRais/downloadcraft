@@ -192,6 +192,45 @@ fn modal_width(ctx: &egui::Context, max_w: f32) -> f32 {
     (ctx.screen_rect().width() * 0.90).clamp(320.0, max_w)
 }
 
+/// Static field keys for the capped dynamic rows (rules ≤8, windows ≤6).
+/// `HitKind::Field` needs `&'static str`, so a fixed pool stands in for
+/// per-row dynamic ids.
+fn rule_ext_key(i: usize) -> &'static str {
+    match i {
+        0 => "rule_ext_0", 1 => "rule_ext_1", 2 => "rule_ext_2", 3 => "rule_ext_3",
+        4 => "rule_ext_4", 5 => "rule_ext_5", 6 => "rule_ext_6",
+        _ => "rule_ext_7",
+    }
+}
+fn rule_dir_key(i: usize) -> &'static str {
+    match i {
+        0 => "rule_dir_0", 1 => "rule_dir_1", 2 => "rule_dir_2", 3 => "rule_dir_3",
+        4 => "rule_dir_4", 5 => "rule_dir_5", 6 => "rule_dir_6",
+        _ => "rule_dir_7",
+    }
+}
+fn win_start_key(i: usize) -> &'static str {
+    match i {
+        0 => "win_s_0", 1 => "win_s_1", 2 => "win_s_2",
+        3 => "win_s_3", 4 => "win_s_4",
+        _ => "win_s_5",
+    }
+}
+fn win_end_key(i: usize) -> &'static str {
+    match i {
+        0 => "win_e_0", 1 => "win_e_1", 2 => "win_e_2",
+        3 => "win_e_3", 4 => "win_e_4",
+        _ => "win_e_5",
+    }
+}
+fn win_lim_key(i: usize) -> &'static str {
+    match i {
+        0 => "win_l_0", 1 => "win_l_1", 2 => "win_l_2",
+        3 => "win_l_3", 4 => "win_l_4",
+        _ => "win_l_5",
+    }
+}
+
 /// Section card used inside the Settings modal.
 fn section_card(ui: &mut egui::Ui, title: &str, body: impl FnOnce(&mut egui::Ui)) {
     egui::Frame::new()
@@ -376,6 +415,18 @@ enum ButtonId {
     AbClose,
     TAdd,
     TDismiss,
+    GrabStart,
+    GrabQueue,
+    GrabClose,
+    GrabPreset,
+    RuleAdd,
+    RuleDel(usize),
+    RuleUp(usize),
+    RuleDown(usize),
+    RuleReset,
+    WinAdd,
+    WinDel(usize),
+    UpdCheck,
 }
 
 /// Checkbox identity for manual routing.
@@ -386,6 +437,9 @@ enum CheckId {
     Unlimited,
     SchedOn,
     AddOverwrite,
+    GrabDepth,
+    WinOn,
+    UpdOn,
 }
 
 /// Slider identity for manual routing (values live in self fields/items).
@@ -423,15 +477,15 @@ fn mbutton(
     let (rect, _) = ui.allocate_exact_size(egui::vec2(w, h), egui::Sense::hover());
     let p = ui.painter();
     if primary {
-        p.rect_filled(rect, 6.0, egui::Color32::from_rgb(108, 62, 220));
+        p.rect_filled(rect, RADIUS, egui::Color32::from_rgb(108, 62, 220));
     } else {
-        p.rect_filled(rect, 6.0, SURFACE);
+        p.rect_filled(rect, RADIUS, SURFACE);
         if man.hover(&rect) {
-            p.rect_filled(rect, 6.0, SURFACE_LT);
+            p.rect_filled(rect, RADIUS, SURFACE_LT);
         }
         p.rect_stroke(
             rect,
-            6.0,
+            RADIUS,
             egui::Stroke::new(1.0, egui::Color32::from_rgb(45, 47, 65)),
             egui::StrokeKind::Inside,
         );
@@ -862,6 +916,7 @@ enum ToolId {
     StopAll,
     Queues,
     Settings,
+    Grabber,
 }
 
 /// Manual hit-test targets. Layout records (kind, rect) every frame;
@@ -972,6 +1027,28 @@ pub struct CraftApp {
     add_checksum: String,
     add_overwrite: bool,
     verify_jobs: Vec<(u64, std::sync::mpsc::Receiver<anyhow::Result<String>>)>,
+    // ---- P3: site grabber ----
+    show_grabber: bool,
+    grab_url: String,
+    grab_preset: usize,
+    grab_exts: String,
+    grab_depth: bool,
+    grab_busy: bool,
+    grab_results: Vec<crate::grabber::GrabLink>,
+    grab_notice: String,
+    grab_rx: Option<std::sync::mpsc::Receiver<Result<Vec<crate::grabber::GrabLink>, String>>>,
+    // ---- P3: folder rules + rename templates ----
+    folder_rules: Vec<crate::model::FolderRule>,
+    rename_template: String,
+    // ---- P3: speed windows + update checker ----
+    speed_windows: Vec<crate::model::SpeedWindow>,
+    speed_windows_on: bool,
+    speed_limit_live: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    update_check_on: bool,
+    update_status: String,
+    update_busy: bool,
+    update_rx: Option<std::sync::mpsc::Receiver<String>>,
+    update_auto_done: bool,
     // TEMPORARY input diagnostics (removed after the hover investigation):
     // ring buffer of recent pointer/selection/action states, flushed to
     // input.log so pointer delivery can be verified without watching.
@@ -1074,6 +1151,29 @@ impl CraftApp {
             add_checksum: String::new(),
             add_overwrite: false,
             verify_jobs: Vec::new(),
+            show_grabber: false,
+            grab_url: String::new(),
+            grab_preset: 0,
+            grab_exts: crate::grabber::preset_exts("Mixed"),
+            grab_depth: false,
+            grab_busy: false,
+            grab_results: Vec::new(),
+            grab_notice: String::new(),
+            grab_rx: None,
+            folder_rules: crate::model::default_folder_rules(),
+            rename_template: "{name}".to_string(),
+            speed_windows: vec![crate::model::SpeedWindow {
+                start: "02:00".to_string(),
+                end: "06:00".to_string(),
+                limit_kbps: 0,
+            }],
+            speed_windows_on: false,
+            speed_limit_live: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(u64::MAX)),
+            update_check_on: false,
+            update_status: String::new(),
+            update_busy: false,
+            update_rx: None,
+            update_auto_done: false,
             diag_lines: Vec::new(),
             diag_last: Instant::now(),
             diag_acts: 0,
@@ -1201,6 +1301,8 @@ impl CraftApp {
                 "pause" => self.pause(id),
                 "resume" => self.resume(id),
                 "cancel" => self.cancel_task(id),
+                "pause_all" => self.stop_all(),
+                "resume_all" => self.start_queue(),
                 _ => {}
             }
         }
@@ -1251,6 +1353,11 @@ impl CraftApp {
                 "connections_default": self.connections_default,
                 "speed_limit_kbps": self.speed_limit_kbps,
                 "save_dir": self.add_dir,
+                "folder_rules": self.folder_rules,
+                "rename_template": self.rename_template,
+                "speed_windows": self.speed_windows,
+                "speed_windows_on": self.speed_windows_on,
+                "update_check_on": self.update_check_on,
             });
             if let Ok(json) = serde_json::to_string_pretty(&v) {
                 Self::atomic_write(&path, json.as_bytes());
@@ -1339,6 +1446,48 @@ impl CraftApp {
                         if !s.is_empty() {
                             self.add_dir = s.to_string();
                         }
+                    }
+                    if let Some(arr) = g("folder_rules").and_then(|x| x.as_array()) {
+                        let rules: Vec<crate::model::FolderRule> = arr
+                            .iter()
+                            .filter_map(|r| {
+                                Some(crate::model::FolderRule {
+                                    exts: r.get("exts")?.as_str()?.to_string(),
+                                    folder: r.get("folder")?.as_str()?.to_string(),
+                                })
+                            })
+                            .take(8)
+                            .collect();
+                        if !rules.is_empty() {
+                            self.folder_rules = rules;
+                        }
+                    }
+                    if let Some(s) = g("rename_template").and_then(|x| x.as_str()) {
+                        if !s.trim().is_empty() {
+                            self.rename_template = s.to_string();
+                        }
+                    }
+                    if let Some(arr) = g("speed_windows").and_then(|x| x.as_array()) {
+                        let wins: Vec<crate::model::SpeedWindow> = arr
+                            .iter()
+                            .filter_map(|r| {
+                                Some(crate::model::SpeedWindow {
+                                    start: r.get("start")?.as_str()?.to_string(),
+                                    end: r.get("end")?.as_str()?.to_string(),
+                                    limit_kbps: r.get("limit_kbps")?.as_u64()?,
+                                })
+                            })
+                            .take(6)
+                            .collect();
+                        if !wins.is_empty() {
+                            self.speed_windows = wins;
+                        }
+                    }
+                    if let Some(b) = g("speed_windows_on").and_then(|x| x.as_bool()) {
+                        self.speed_windows_on = b;
+                    }
+                    if let Some(b) = g("update_check_on").and_then(|x| x.as_bool()) {
+                        self.update_check_on = b;
                     }
                 }
             }
@@ -1627,6 +1776,14 @@ impl CraftApp {
     /// Final save folder for a file (optionally into a category subfolder).
     fn save_dir_for(&self, filename: &str) -> String {
         if self.category_folders {
+            // Ordered user rules first (P3.2), category fallback second.
+            if let Some(rule) = self.folder_rules.iter().find(|r| r.matches(filename)) {
+                if !rule.folder.trim().is_empty() {
+                    let mut p = std::path::PathBuf::from(&self.add_dir);
+                    p.push(rule.folder.trim());
+                    return p.to_string_lossy().to_string();
+                }
+            }
             let cat = category_of(filename);
             let mut p = std::path::PathBuf::from(&self.add_dir);
             p.push(cat);
@@ -1694,14 +1851,128 @@ impl CraftApp {
             let _ = tx.send(out);
         });
     }
+    /// Start a site-grabber crawl on the Tokio runtime (P3.1).
+    fn start_grab(&mut self) {
+        let url = self.grab_url.trim().to_string();
+        if !is_download_url(&url) {
+            self.grab_notice = "Need an http(s) page URL.".to_string();
+            return;
+        }
+        let (tx, rx) = std::sync::mpsc::channel();
+        self.grab_rx = Some(rx);
+        self.grab_busy = true;
+        self.grab_results.clear();
+        self.grab_notice.clear();
+        let exts = crate::grabber::parse_ext_list(&self.grab_exts);
+        let depth_1 = self.grab_depth;
+        let ua = if self.user_agent.trim().is_empty() {
+            format!("download_craft/{}", env!("CARGO_PKG_VERSION"))
+        } else {
+            self.user_agent.clone()
+        };
+        let opts = EngineOpts {
+            user_agent: ua,
+            timeout_secs: self.timeout_secs,
+            proxy_url: self.proxy_url.clone(),
+            ..Default::default()
+        };
+        self.rt.spawn(async move {
+            let out = match opts.build_client() {
+                Ok(client) => crate::grabber::grab_site(&client, &opts, &url, &exts, depth_1, crate::grabber::MAX_PAGES_DEFAULT)
+                    .await
+                    .map_err(|e| e.to_string()),
+                Err(e) => Err(format!("{e:#}")),
+            };
+            let _ = tx.send(out);
+        });
+    }
+
+    /// Queue all grabber results (deduped against the queue).
+    fn queue_grab_results(&mut self) {
+        if self.grab_results.is_empty() {
+            self.grab_notice = "Grab a page first.".to_string();
+            return;
+        }
+        let mut n = 0;
+        let results = std::mem::take(&mut self.grab_results);
+        for l in results {
+            if self.downloads.iter().any(|d| d.url == l.url) {
+                continue;
+            }
+            let fname = crate::model::apply_rename_template(&self.rename_template, &l.name, &l.url);
+            let id = self.next_id;
+            self.next_id += 1;
+            let dir = self.save_dir_for(&fname);
+            self.downloads.push(DownloadItem::new(
+                id,
+                l.url,
+                fname,
+                dir,
+                self.connections_default,
+            ));
+            n += 1;
+        }
+        self.save_queue();
+        self.push_log(format!("Grabber queued {n} link(s)."));
+        self.grab_notice.clear();
+    }
+
+    /// Recompute the live scheduler cap from speed windows (P3.4).
+    /// u64::MAX = no window active (per-download caps apply as usual).
+    fn refresh_speed_limit(&self) {        let v = if self.speed_windows_on {
+            let now = chrono::Local::now();
+            let now_min = (now.format("%H").to_string().parse::<u16>().unwrap_or(0)) * 60
+                + now.format("%M").to_string().parse::<u16>().unwrap_or(0);
+            self.speed_windows
+                .iter()
+                .find(|w| w.active_at(now_min))
+                .map(|w| w.limit_kbps * 1024)
+                .unwrap_or(u64::MAX)
+        } else {
+            u64::MAX
+        };
+        self.speed_limit_live.store(v, Ordering::SeqCst);
+    }
+
+    /// One-line status for the Speed windows section.
+    fn speed_window_status(&self) -> String {
+        if !self.speed_windows_on {
+            return "Windows off — global limit applies.".to_string();
+        }
+        let now = chrono::Local::now();
+        let now_min = now.format("%H").to_string().parse::<u16>().unwrap_or(0) * 60
+            + now.format("%M").to_string().parse::<u16>().unwrap_or(0);
+        match self.speed_windows.iter().find(|w| w.active_at(now_min)) {
+            Some(w) if w.limit_kbps == 0 => {
+                format!("Active now: {}–{} full speed.", w.start, w.end)
+            }
+            Some(w) => format!("Active now: {}–{} at {} KB/s.", w.start, w.end, w.limit_kbps),
+            None => "No window active right now.".to_string(),
+        }
+    }
+
+    /// One-shot opt-in update check against GitHub releases (P3.4).
+    fn start_update_check(&mut self) {
+        if self.update_busy {
+            return;
+        }
+        let (tx, rx) = std::sync::mpsc::channel();
+        self.update_rx = Some(rx);
+        self.update_busy = true;
+        self.update_status.clear();
+        self.rt.spawn(async move {
+            let _ = tx.send(update_check_async().await);
+        });
+    }
+
     /// Queue one URL programmatically (used by inbox + import).
-    fn queue_url(&mut self, url: String, filename: Option<String>, autostart: bool) {
-        if !is_download_url(&url) || self.downloads.iter().any(|d| d.url == url) {
+    fn queue_url(&mut self, url: String, filename: Option<String>, autostart: bool) {        if !is_download_url(&url) || self.downloads.iter().any(|d| d.url == url) {
             return;
         }
         let fname = filename
             .filter(|f| !f.trim().is_empty())
             .unwrap_or_else(|| filename_from_url(&url));
+        let fname = crate::model::apply_rename_template(&self.rename_template, &fname, &url);
         let id = self.next_id;
         self.next_id += 1;
         let dir = self.save_dir_for(&fname);
@@ -1846,10 +2117,22 @@ impl CraftApp {
             allow_rename: true,
             expected_sha256: item.checksum_sha256.clone(),
             overwrite_existing: item.overwrite_existing,
+            global_limit: Some(self.speed_limit_live.clone()),
         };
         let shared2 = shared.clone();
+        // Adaptive pairs (video-only + audio) merge via ffmpeg on completion.
+        let pair = if item.pair_url.starts_with("http") {
+            Some(item.pair_url.clone())
+        } else {
+            None
+        };
         let handle = self.rt.spawn(async move {
-            let r = download(url, dest, conns, opts, shared2.clone()).await;
+            let r = match pair {
+                Some(a) => {
+                    crate::engine::download_adaptive(url, Some(a), dest, conns, opts, shared2.clone()).await
+                }
+                None => download(url, dest, conns, opts, shared2.clone()).await,
+            };
             if let Err(e) = r {
                 shared2.set_error(format!("{e:#}"));
                 eprintln!("download failed: {e:#}");
@@ -2234,6 +2517,7 @@ impl CraftApp {
         self.add_url = url.clone();
         self.add_file = filename
             .filter(|f| !f.trim().is_empty())
+            .map(|f| crate::model::apply_rename_template(&self.rename_template, &f, &url))
             .unwrap_or_else(|| filename_from_url(&url));
         self.add_referer = referer;
         self.add_cookie = cookie;
@@ -2501,9 +2785,52 @@ fn ensure_native_host(browser: &str) -> Result<bool, String> {
     Ok(true)
 }
 
+/// Opt-in update check (P3.4): compare the running version against the
+/// latest GitHub release tag. Network failures become a status string —
+/// never a popup, never an auto-download.
+async fn update_check_async() -> String {
+    let current = env!("CARGO_PKG_VERSION");
+    let client = match reqwest::Client::builder()
+        .user_agent(format!("download_craft/{current}"))
+        .connect_timeout(std::time::Duration::from_secs(15))
+        .build()
+    {
+        Ok(c) => c,
+        Err(e) => return format!("Update check failed: {e:#}"),
+    };
+    let resp = client
+        .get("https://api.github.com/repos/hungry-detective/downloadcraft/releases/latest")
+        .header("Accept", "application/vnd.github+json")
+        .send()
+        .await;
+    let resp = match resp {
+        Ok(r) => r,
+        Err(e) => return format!("Update check failed (network): {e:#}"),
+    };
+    if !resp.status().is_success() {
+        return format!("Update check failed: HTTP {}", resp.status());
+    }
+    let v: serde_json::Value = match resp.json().await {
+        Ok(v) => v,
+        Err(e) => return format!("Update check failed (parse): {e:#}"),
+    };
+    let tag = v.get("tag_name").and_then(|t| t.as_str()).unwrap_or("");
+    if tag.is_empty() {
+        return "Update check failed: no releases found.".to_string();
+    }
+    if crate::model::is_newer_version(current, tag) {
+        let url = v
+            .get("html_url")
+            .and_then(|u| u.as_str())
+            .unwrap_or("https://github.com/hungry-detective/downloadcraft/releases");
+        format!("Update available: {tag} (you have v{current}) — {url}")
+    } else {
+        format!("Up to date (v{current}).")
+    }
+}
+
 /// Best-effort desktop toast (ignored when unsupported).
-fn notify(title: &str, body: &str) {
-    let _ = notify_rust::Notification::new()
+fn notify(title: &str, body: &str) {    let _ = notify_rust::Notification::new()
         .summary(title)
         .body(body)
         .show();
@@ -2610,6 +2937,25 @@ impl eframe::App for CraftApp {
             self.merge_queue_from_disk();
             self.check_wake();
             self.check_cmd();
+            self.refresh_speed_limit();
+            // Opt-in update check, once per session (silent unless newer).
+            if self.update_check_on && !self.update_auto_done {
+                self.update_auto_done = true;
+                self.start_update_check();
+            }
+            if let Some(rx) = self.update_rx.as_ref() {
+                let mut got = None;
+                while let Ok(m) = rx.try_recv() {
+                    got = Some(m);
+                }
+                if let Some(m) = got {
+                    self.update_busy = false;
+                    self.update_status = m.clone();
+                    if m.starts_with("Update available") {
+                        self.push_log(m);
+                    }
+                }
+            }
             if self.poll_inbox() {
                 // Extension sent something: pop the app up with the
                 // prefilled Add dialog.
@@ -3079,6 +3425,8 @@ impl eframe::App for CraftApp {
                     ui.add_space(10.0);
                     let r = tool_button(ui, &self.man, MI_QUEUE, "Open Queues", true);
                     self.hits.push((HitKind::Tool(ToolId::Queues), r));
+                    let r = tool_button(ui, &self.man, MI_CLOUD_DL, "Site Grabber", true);
+                    self.hits.push((HitKind::Tool(ToolId::Grabber), r));
                     let r = tool_button(ui, &self.man, MI_SETTINGS, "Settings", true);
                     self.hits.push((HitKind::Tool(ToolId::Settings), r));
                 });
@@ -3425,6 +3773,7 @@ impl eframe::App for CraftApp {
         if self.show_add
             || self.show_settings
             || self.show_queues
+            || self.show_grabber
             || self.show_about
             || self.details_id.is_some()
         {
@@ -3467,7 +3816,11 @@ impl eframe::App for CraftApp {
                 if let Some(n) = nm {
                     self.probe_name = Some(n.clone());
                     if self.add_file.trim().is_empty() {
-                        self.add_file = n;
+                        self.add_file = crate::model::apply_rename_template(
+                            &self.rename_template,
+                            &n,
+                            &self.add_url,
+                        );
                     }
                 }
             }
@@ -3596,6 +3949,98 @@ impl eframe::App for CraftApp {
                     .map(|p| p.to_string_lossy().to_string())
                     .unwrap_or_else(|| "C:\\Downloads".to_string());
             }
+        }
+
+        // ================= site grabber (P3.1) =================
+        if self.show_grabber {
+            // Collect finished crawl without holding borrows across UI code.
+            let mut got_grab: Option<Result<Vec<crate::grabber::GrabLink>, String>> = None;
+            if let Some(rx) = self.grab_rx.as_ref() {
+                while let Ok(r) = rx.try_recv() {
+                    got_grab = Some(r);
+                }
+            }
+            if let Some(r) = got_grab {
+                self.grab_busy = false;
+                match r {
+                    Ok(links) => {
+                        self.grab_results = links;
+                        self.grab_notice.clear();
+                    }
+                    Err(e) => self.grab_notice = e,
+                }
+            }
+            if self.grab_busy {
+                ctx.request_repaint();
+            }
+            let mut open = self.show_grabber;
+            let grab_w = modal_width(ctx, 560.0);
+            egui::Window::new("Site Grabber")
+                .id(egui::Id::new("grab_modal"))
+                .order(egui::Order::Foreground)
+                .open(&mut open)
+                .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
+                .pivot(egui::Align2::CENTER_CENTER)
+                .collapsible(false)
+                .resizable(false)
+                .default_width(grab_w)
+                .min_width(grab_w.min(320.0))
+                .max_width(grab_w)
+                .frame(modal_frame())
+                .show(ctx, |ui| {
+                    ui.spacing_mut().item_spacing.y = 10.0;
+                    ui.horizontal(|ui| {
+                        let r = mtext(ui, "grab_url", &mut self.grab_url, "https://gallery…", f32::INFINITY, false);
+                        self.hits.push((HitKind::Field("grab_url"), r));
+                    });
+                    ui.horizontal(|ui| {
+                        const PRESETS: &[&str] =
+                            &["Mixed", "Video", "Audio", "Images", "Documents", "Archives"];
+                        let cur = PRESETS[self.grab_preset.min(PRESETS.len() - 1)];
+                        let r = mbutton(ui, &self.man, &format!("Preset: {cur}"), 170.0, 32.0, false);
+                        self.hits.push((HitKind::Btn(ButtonId::GrabPreset), r));
+                        let r = mtext(ui, "grab_exts", &mut self.grab_exts, "exts: mp4,zip,…", 220.0, false);
+                        self.hits.push((HitKind::Field("grab_exts"), r));
+                    });
+                    ui.horizontal(|ui| {
+                        let r = mcheck(ui, &self.man, "Include linked pages (same site)", self.grab_depth);
+                        self.hits.push((HitKind::Check(CheckId::GrabDepth), r));
+                    });
+                    if !self.grab_notice.is_empty() {
+                        ui.colored_label(egui::Color32::from_rgb(255, 150, 120), &self.grab_notice);
+                    }
+                    if self.grab_busy {
+                        ui.horizontal(|ui| {
+                            ui.spinner();
+                            ui.label("Crawling…");
+                        });
+                    } else if !self.grab_results.is_empty() {
+                        let n = self.grab_results.len();
+                        ui.label(format!("{n} file link(s) found:"));
+                        egui::ScrollArea::vertical().max_height(180.0).show(ui, |ui| {
+                            for l in self.grab_results.iter().take(40) {
+                                ui.monospace(&l.name);
+                            }
+                            if n > 40 {
+                                ui.weak(format!("…and {} more", n - 40));
+                            }
+                        });
+                    }
+                    ui.horizontal(|ui| {
+                        let r = mbutton(ui, &self.man, "Grab", 110.0, 36.0, false);
+                        self.hits.push((HitKind::Btn(ButtonId::GrabStart), r));
+                        let r = mbutton(ui, &self.man, "Queue all", 130.0, 36.0, true);
+                        self.hits.push((HitKind::Btn(ButtonId::GrabQueue), r));
+                        ui.with_layout(
+                            egui::Layout::right_to_left(egui::Align::Center),
+                            |ui| {
+                                let r = mbutton(ui, &self.man, "Close", 110.0, 36.0, false);
+                                self.hits.push((HitKind::Btn(ButtonId::GrabClose), r));
+                            },
+                        );
+                    });
+                });
+            self.show_grabber = open && self.show_grabber;
         }
 
         if self.show_settings {
@@ -3738,6 +4183,97 @@ impl eframe::App for CraftApp {
                 );
                 self.hits.push((HitKind::Check(CheckId::Tray), r));
                 ui.small("The tray icon appears after ticking this (check the overflow area).");
+                });
+                section_card(ui, "Folders & names", |ui| {
+                ui.horizontal(|ui| {
+                    ui.label("Rename template:");
+                    let r = mtext(ui, "set_tpl", &mut self.rename_template, "{name}{ext}", 220.0, false);
+                    self.hits.push((HitKind::Field("set_tpl"), r));
+                });
+                ui.small(format!(
+                    "Preview: {}  (tokens: {{name}} {{ext}} {{date}} {{host}})",
+                    crate::model::apply_rename_template(
+                        &self.rename_template,
+                        "My Video.mp4",
+                        "https://cdn.example/v"
+                    )
+                ));
+                ui.small("Type → folder rules (first match wins, max 8):");
+                for (i, rule) in self.folder_rules.iter_mut().enumerate().take(8) {
+                    ui.horizontal(|ui| {
+                        let r = mtext(ui, rule_ext_key(i), &mut rule.exts, "mp4,mkv", 130.0, false);
+                        self.hits.push((HitKind::Field(rule_ext_key(i)), r));
+                        ui.label("→");
+                        let r = mtext(ui, rule_dir_key(i), &mut rule.folder, "Video", 130.0, false);
+                        self.hits.push((HitKind::Field(rule_dir_key(i)), r));
+                        let r = mbutton(ui, &self.man, "▲", 34.0, 30.0, false);
+                        self.hits.push((HitKind::Btn(ButtonId::RuleUp(i)), r));
+                        let r2 = mbutton(ui, &self.man, "▼", 34.0, 30.0, false);
+                        self.hits.push((HitKind::Btn(ButtonId::RuleDown(i)), r2));
+                        let r3 = mbutton(ui, &self.man, "×", 34.0, 30.0, false);
+                        self.hits.push((HitKind::Btn(ButtonId::RuleDel(i)), r3));
+                    });
+                }
+                ui.horizontal(|ui| {
+                    let r = mbutton(ui, &self.man, "Add rule", 110.0, 32.0, false);
+                    self.hits.push((HitKind::Btn(ButtonId::RuleAdd), r));
+                    let r = mbutton(ui, &self.man, "Reset defaults", 130.0, 32.0, false);
+                    self.hits.push((HitKind::Btn(ButtonId::RuleReset), r));
+                });
+                });
+                section_card(ui, "Speed windows", |ui| {
+                ui.horizontal(|ui| {
+                    let r = mcheck(ui, &self.man, "Enable speed windows", self.speed_windows_on);
+                    self.hits.push((HitKind::Check(CheckId::WinOn), r));
+                });
+                ui.small("While a window is active its cap overrides the global limit (0 = full speed):");
+                for i in 0..self.speed_windows.len().min(6) {
+                    let (s, e, l) = {
+                        let w = &self.speed_windows[i];
+                        (w.start.clone(), w.end.clone(), w.limit_kbps.to_string())
+                    };
+                    ui.horizontal(|ui| {
+                        let mut s = s;
+                        let r = mtext(ui, win_start_key(i), &mut s, "02:00", 70.0, false);
+                        self.hits.push((HitKind::Field(win_start_key(i)), r));
+                        self.speed_windows[i].start = s;
+                        ui.label("–");
+                        let mut e = e;
+                        let r = mtext(ui, win_end_key(i), &mut e, "06:00", 70.0, false);
+                        self.hits.push((HitKind::Field(win_end_key(i)), r));
+                        self.speed_windows[i].end = e;
+                        let mut l = l;
+                        let r = mtext(ui, win_lim_key(i), &mut l, "KB/s", 90.0, false);
+                        self.hits.push((HitKind::Field(win_lim_key(i)), r));
+                        if let Ok(n) = l.trim().parse::<u64>() {
+                            self.speed_windows[i].limit_kbps = n;
+                        }
+                        ui.label("KB/s");
+                        let r = mbutton(ui, &self.man, "×", 34.0, 30.0, false);
+                        self.hits.push((HitKind::Btn(ButtonId::WinDel(i)), r));
+                    });
+                }
+                ui.horizontal(|ui| {
+                    let r = mbutton(ui, &self.man, "Add window", 120.0, 32.0, false);
+                    self.hits.push((HitKind::Btn(ButtonId::WinAdd), r));
+                    ui.small(self.speed_window_status());
+                });
+                });
+                section_card(ui, "Updates", |ui| {
+                ui.horizontal(|ui| {
+                    let r = mcheck(ui, &self.man, "Check for updates on launch", self.update_check_on);
+                    self.hits.push((HitKind::Check(CheckId::UpdOn), r));
+                    let r = mbutton(ui, &self.man, "Check now", 110.0, 32.0, false);
+                    self.hits.push((HitKind::Btn(ButtonId::UpdCheck), r));
+                });
+                if self.update_busy {
+                    ui.horizontal(|ui| {
+                        ui.spinner();
+                        ui.small("Checking…");
+                    });
+                } else if !self.update_status.is_empty() {
+                    ui.small(&self.update_status);
+                }
                 });
                 section_card(ui, "Browser integration", |ui| {
                 ui.small("Load browser-extension/ unpacked once — its ID is pinned, no pasting needed.");
@@ -4490,6 +5026,65 @@ impl CraftApp {
                 self.show_add = false;
                 self.add_focus_req = false;
             }
+            ButtonId::GrabStart => self.start_grab(),
+            ButtonId::GrabQueue => self.queue_grab_results(),
+            ButtonId::GrabClose => {
+                self.show_grabber = false;
+            }
+            ButtonId::GrabPreset => {
+                self.grab_preset = (self.grab_preset + 1) % 6;
+                const PRESETS: &[&str] =
+                    &["Mixed", "Video", "Audio", "Images", "Documents", "Archives"];
+                self.grab_exts = crate::grabber::preset_exts(PRESETS[self.grab_preset]);
+            }
+            ButtonId::RuleAdd => {
+                if self.folder_rules.len() < 8 {
+                    self.folder_rules.push(crate::model::FolderRule {
+                        exts: String::new(),
+                        folder: String::new(),
+                    });
+                    self.save_ui_state();
+                }
+            }
+            ButtonId::RuleReset => {
+                self.folder_rules = crate::model::default_folder_rules();
+                self.save_ui_state();
+            }
+            ButtonId::RuleDel(i) => {
+                if i < self.folder_rules.len() {
+                    self.folder_rules.remove(i);
+                    self.save_ui_state();
+                }
+            }
+            ButtonId::RuleUp(i) => {
+                if i > 0 && i < self.folder_rules.len() {
+                    self.folder_rules.swap(i - 1, i);
+                    self.save_ui_state();
+                }
+            }
+            ButtonId::RuleDown(i) => {
+                if i + 1 < self.folder_rules.len() {
+                    self.folder_rules.swap(i, i + 1);
+                    self.save_ui_state();
+                }
+            }
+            ButtonId::WinAdd => {
+                if self.speed_windows.len() < 6 {
+                    self.speed_windows.push(crate::model::SpeedWindow {
+                        start: "02:00".to_string(),
+                        end: "06:00".to_string(),
+                        limit_kbps: 0,
+                    });
+                    self.save_ui_state();
+                }
+            }
+            ButtonId::WinDel(i) => {
+                if i < self.speed_windows.len() {
+                    self.speed_windows.remove(i);
+                    self.save_ui_state();
+                }
+            }
+            ButtonId::UpdCheck => self.start_update_check(),
             ButtonId::QStart => self.start_queue(),
             ButtonId::QStop => self.stop_queue(),
             ButtonId::QSchedReset => self.scheduler_started = false,
@@ -4731,6 +5326,10 @@ impl CraftApp {
                             ToolId::StopAll => self.stop_all(),
                             ToolId::Queues => self.show_queues = true,
                             ToolId::Settings => self.show_settings = true,
+                            ToolId::Grabber => {
+                                self.grab_notice.clear();
+                                self.show_grabber = true;
+                            }
                         }
                     }
                 }
@@ -4895,6 +5494,12 @@ impl CraftApp {
                             CheckId::AddOverwrite => {
                                 self.add_overwrite = !self.add_overwrite
                             }
+                            CheckId::GrabDepth => self.grab_depth = !self.grab_depth,
+                            CheckId::WinOn => {
+                                self.speed_windows_on = !self.speed_windows_on;
+                                self.refresh_speed_limit();
+                            }
+                            CheckId::UpdOn => self.update_check_on = !self.update_check_on,
                         }
                         self.save_ui_state();
                     }

@@ -68,6 +68,12 @@ pub struct DownloadItem {
     /// Empty = none. Never used for engine behavior.
     #[serde(default)]
     pub description: String,
+    /// Adaptive pair: companion audio URL for a video-only stream, merged
+    /// with ffmpeg on completion (P1.3). Empty = single-file download.
+    #[serde(default)]
+    pub pair_url: String,
+    #[serde(default)]
+    pub pair_mime: String,
     /// Replace an existing destination file instead of auto-renaming.
     #[serde(default)]
     pub overwrite_existing: bool,
@@ -94,6 +100,8 @@ impl DownloadItem {
             resumable: false,
             checksum_sha256: String::new(),
             description: String::new(),
+            pair_url: String::new(),
+            pair_mime: String::new(),
             overwrite_existing: false,
         }
     }
@@ -329,6 +337,173 @@ pub fn atomic_write(path: &std::path::Path, data: &[u8]) -> std::io::Result<()> 
     Ok(())
 }
 
+/// One type→folder routing rule (P3.2): comma-separated extensions map to a
+/// subfolder under the save directory. First match wins (ordered in UI).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FolderRule {
+    #[serde(default)]
+    pub exts: String,
+    #[serde(default)]
+    pub folder: String,
+}
+
+impl FolderRule {
+    pub fn matches(&self, filename: &str) -> bool {
+        let ext = filename
+            .rsplit('.')
+            .next()
+            .unwrap_or("")
+            .to_ascii_lowercase();
+        if ext.is_empty() || ext == filename.to_ascii_lowercase() {
+            return false;
+        }
+        self.exts
+            .split([',', ';', ' '])
+            .map(|s| s.trim().trim_start_matches('.').to_ascii_lowercase())
+            .any(|e| !e.is_empty() && e == ext)
+    }
+}
+
+pub fn default_folder_rules() -> Vec<FolderRule> {
+    vec![
+        FolderRule { exts: "mp4,mkv,webm,mov,avi".into(), folder: "Video".into() },
+        FolderRule { exts: "mp3,m4a,flac,ogg,wav".into(), folder: "Music".into() },
+        FolderRule { exts: "png,jpg,jpeg,gif,webp,svg".into(), folder: "Image".into() },
+        FolderRule { exts: "pdf,doc,docx,txt,epub".into(), folder: "Document".into() },
+        FolderRule { exts: "zip,rar,7z,tar,gz".into(), folder: "Compressed".into() },
+        FolderRule { exts: "exe,msi".into(), folder: "Apps".into() },
+    ]
+}
+
+/// Render a rename template: {name} stem, {ext} extension with dot,
+/// {date} YYYYMMDD, {host} source host. Empty/blank results fall back to
+/// the original stem; the extension is preserved when missing.
+pub fn apply_rename_template(tpl: &str, filename: &str, url: &str) -> String {
+    let t = tpl.trim();
+    if t.is_empty() {
+        return filename.to_string();
+    }
+    let (stem, ext) = match filename.rfind('.') {
+        Some(i) if i > 0 => (filename[..i].to_string(), filename[i..].to_string()),
+        _ => (filename.to_string(), String::new()),
+    };
+    let host = url::Url::parse(url)
+        .ok()
+        .and_then(|u| u.host_str().map(|h| h.to_string()))
+        .unwrap_or_default();
+    let date = chrono::Local::now().format("%Y%m%d").to_string();
+    let mut out = t
+        .replace("{name}", &stem)
+        .replace("{ext}", &ext)
+        .replace("{date}", &date)
+        .replace("{host}", &host);
+    out = out.trim().to_string();
+    if out.is_empty() || out == ext {
+        return filename.to_string();
+    }
+    if !ext.is_empty() && !out.to_ascii_lowercase().ends_with(&ext.to_ascii_lowercase()) {
+        out.push_str(&ext);
+    }
+    crate::engine::sanitize_filename(&out)
+}
+
+/// Append an item to the shared queue file with a fresh id (used by the
+/// standalone dialogs). Returns the assigned id, or None when the URL is
+/// already queued.
+pub fn append_to_queue(item: &mut DownloadItem) -> Option<u64> {
+    let path = config_dir()?.join("queue.json");
+    let mut items: Vec<DownloadItem> = std::fs::read_to_string(&path)
+        .ok()
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_default();
+    if items.iter().any(|d| d.url == item.url) {
+        return None;
+    }
+    let id = items.iter().map(|d| d.id).max().unwrap_or(0) + 1;
+    item.id = id;
+    item.status = Status::Queued;
+    items.push(item.clone());
+    serde_json::to_string_pretty(&items)
+        .ok()
+        .and_then(|j| atomic_write(&path, j.as_bytes()).ok())?;
+    Some(id)
+}
+
+/// A daily speed window (P3.4): HH:MM–HH:MM at `limit_kbps` (0 = full speed).
+/// Overnight ranges (22:00–06:00) wrap midnight.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SpeedWindow {
+    #[serde(default = "SpeedWindow::d02")]
+    pub start: String,
+    #[serde(default = "SpeedWindow::d06")]
+    pub end: String,
+    #[serde(default)]
+    pub limit_kbps: u64,
+}
+
+impl SpeedWindow {
+    fn d02() -> String {
+        "02:00".to_string()
+    }
+    fn d06() -> String {
+        "06:00".to_string()
+    }
+    pub fn start_min(&self) -> Option<u16> {
+        parse_hhmm(&self.start)
+    }
+    pub fn end_min(&self) -> Option<u16> {
+        parse_hhmm(&self.end)
+    }
+    pub fn active_at(&self, now_min: u16) -> bool {
+        match (self.start_min(), self.end_min()) {
+            (Some(s), Some(e)) => {
+                if s <= e {
+                    now_min >= s && now_min < e
+                } else {
+                    now_min >= s || now_min < e
+                }
+            }
+            _ => false,
+        }
+    }
+}
+
+pub fn parse_hhmm(s: &str) -> Option<u16> {
+    let (h, m) = s.trim().split_once(':')?;
+    let h: u16 = h.parse().ok()?;
+    let m: u16 = m.parse().ok()?;
+    if h > 23 || m > 59 {
+        return None;
+    }
+    Some(h * 60 + m)
+}
+
+/// True when `latest` is newer than `current` (`v` prefix + whitespace OK).
+pub fn is_newer_version(current: &str, latest: &str) -> bool {
+    fn parts(s: &str) -> Vec<u64> {
+        s.trim()
+            .trim_start_matches(['v', 'V'])
+            .split(|c| c == '.' || c == '-' || c == '+')
+            .filter_map(|p| {
+                p.chars()
+                    .take_while(|c| c.is_ascii_digit())
+                    .collect::<String>()
+                    .parse::<u64>()
+                    .ok()
+            })
+            .collect()
+    }
+    let (a, b) = (parts(current), parts(latest));
+    let n = a.len().max(b.len()).max(1);
+    for i in 0..n {
+        let (x, y) = (*a.get(i).unwrap_or(&0), *b.get(i).unwrap_or(&0));
+        if x != y {
+            return y > x;
+        }
+    }
+    false
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -380,5 +555,44 @@ mod tests {
         // conflict_free_dest returns input when nothing exists
         let p = std::path::Path::new("no_such_dir_xyz/no_such_file.bin");
         assert_eq!(conflict_free_dest(p), p.to_path_buf());
+    }
+
+    #[test]
+    fn folder_rules_and_templates() {
+        let rules = default_folder_rules();
+        assert!(rules.iter().find(|r| r.folder == "Video").unwrap().matches("a.MP4"));
+        assert!(!rules.iter().find(|r| r.folder == "Video").unwrap().matches("a.mp3"));
+        assert!(!rules.iter().find(|r| r.folder == "Video").unwrap().matches("noext"));
+        assert_eq!(
+            apply_rename_template("{name} [{date}]{ext}", "Vid.mp4", "https://h/x"),
+            format!("Vid [{}].mp4", chrono::Local::now().format("%Y%m%d"))
+        );
+        assert_eq!(
+            apply_rename_template("{name} from {host}{ext}", "a.mkv", "https://cdn.example/x"),
+            "a from cdn.example.mkv"
+        );
+        assert_eq!(apply_rename_template("prefix_{name}", "a.mp4", "https://h"), "prefix_a.mp4");
+        assert_eq!(apply_rename_template("", "a.mp4", "https://h"), "a.mp4");
+        assert_eq!(apply_rename_template("   ", "a.mp4", "https://h"), "a.mp4");
+    }
+
+    #[test]
+    fn windows_and_versions() {
+        assert_eq!(parse_hhmm("02:00"), Some(120));
+        assert_eq!(parse_hhmm("23:59"), Some(1439));
+        assert_eq!(parse_hhmm("24:00"), None);
+        assert_eq!(parse_hhmm("abc"), None);
+        let w = SpeedWindow { start: "22:00".into(), end: "06:00".into(), limit_kbps: 0 };
+        assert!(w.active_at(23 * 60));
+        assert!(w.active_at(5 * 60));
+        assert!(!w.active_at(12 * 60));
+        let d = SpeedWindow { start: "02:00".into(), end: "06:00".into(), limit_kbps: 0 };
+        assert!(d.active_at(3 * 60));
+        assert!(!d.active_at(7 * 60));
+        assert!(is_newer_version("0.6.0", "v0.7.0"));
+        assert!(!is_newer_version("0.7.0", "0.6.0"));
+        assert!(!is_newer_version("0.6.0", "0.6.0"));
+        assert!(is_newer_version("0.6", "0.6.1"));
+        assert!(!is_newer_version("  v0.6.0 ", "0.6.0"));
     }
 }

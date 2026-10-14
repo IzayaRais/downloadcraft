@@ -1,0 +1,31 @@
+# Remade.wiki submission for DownloadCraft
+# Target repo: https://github.com/replicraft/remade
+# Follow CONTRIBUTING.md: add original (if missing) + one project YAML, then open PR.
+
+# 1) Original entry to add in:
+# apps/frontend/remade-wiki/src/content/catalog/originals.yaml
+# (IDM does not exist yet in originals.yaml as of 2026-10-14)
+
+- slug: internet-download-manager
+  name: Internet Download Manager
+  url: https://www.internetdownloadmanager.com/
+  category: productivity
+  aliases: [IDM]
+
+# 2) Project file to create at:
+# apps/frontend/remade-wiki/src/content/catalog/projects/hungry-detective/downloadcraft.yaml
+
+slug: downloadcraft
+name: DownloadCraft
+repository: https://github.com/hungry-detective/downloadcraft
+originals: [internet-download-manager]
+category: productivity
+languages:
+  - Rust
+platforms:
+  - Windows
+status: experimental
+compatibility: targeting
+description: Independent offline-first download manager with segmented multi-connection downloads, resume via HTTP Range, queue with scheduler, speed limit, browser native-messaging integration, clipboard monitoring, and egui GUI plus CLI.
+license: MIT
+limitations: Early version, Windows-focused, streaming-site video extraction is basic.

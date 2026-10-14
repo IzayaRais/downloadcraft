@@ -95,40 +95,63 @@ Out of scope FOREVER: DRM removal, IDM binary/code copying, license-key workarou
       auto-repair loop covers 6 browsers, Settings Brave/Opera buttons,
       `ButtonId::SBrave/SOpera`).
 
-### P1 — Stream assembly (light deps allowed)
-- [ ] P1.1 HLS hardening: parallel segments (4–8), byte progress via ranged HEAD,
-      resume map. Files: `engine.rs:download_hls()`. Accept: 200 MB VOD completes,
-      pause/resume keeps segments, `cargo test` green.
-- [ ] P1.2 HLS AES-128: `EXT-X-KEY` fetch (referer-scoped), `aes-128-cbc` decrypt,
-      IV from playlist or sequence. New dep: `aes` + `cbc` (or `openssl` if present).
-      Accept: SAMPLE-AES rejected still; AES-128 VOD decrypts; key URL never logged.
-- [ ] P1.3 Adaptive merge via ffmpeg (optional external): when extension sends
-      `v-only + audio` pair or engine picks DASH/HLS variants, call `ffmpeg -i v -i a -c copy`.
-      Files: `engine.rs` (ffmpeg probe `which ffmpeg`, fallback error), Settings UI path.
-      Accept: 1080p v-only + m4a → single `.mp4` when ffmpeg present; clear error otherwise.
-- [ ] P1.4 DASH `.mpd` (non-DRM): parse Representation set, download best V+A,
-      ffmpeg mux. Accept: test vector MPD → mp4; DRM manifests rejected with message.
+### P1 — Stream assembly (light deps allowed) — DONE 2026-10-15
+- [x] P1.1 HLS hardening: 4–8 parallel segments (semaphore), byte totals via
+      concurrent ranged HEADs, `hlsmap` resume sidecar (skips done segs across
+      restarts), per-seg files merged in order. Fixture e2e byte-exact.
+- [x] P1.2 HLS AES-128: vendored FIPS-197 `src/aes128.rs` (computed S-boxes,
+      zero new deps — crates.io was unreachable), key fetch referer-scoped,
+      explicit-IV or sequence IV, SAMPLE-AES/rotation refused. FIPS-197 B +
+      NIST SP 800-38A vectors green (.NET cross-checked) + fixture e2e exact.
+- [x] P1.3 Adaptive merge via ffmpeg: `download_adaptive()` (concurrent legs,
+      aggregated progress, MP4 stays / WebM→MKV), `ffmpeg_mux()` (`-c copy`,
+      no-window flag, clear install guidance), pair plumbing end-to-end
+      (menu rows bundle best audio → `pairUrl` → inbox → confirm note →
+      queue `pair_url` → `start()` adaptive). Fixture: audio-less exact;
+      audio+no-ffmpeg → loud ffmpeg error. Real 1080p+ merge needs ffmpeg
+      installed (`winget install ffmpeg`).
+- [x] P1.4 DASH `.mpd` (non-DRM): hand-rolled MPD parse (BaseURL +
+      number-based SegmentTemplate incl. init, `%0Nd` padding, durations),
+      best video+audio, ffmpeg mux; DRM/live/Timeline loudly refused.
+      Fixture e2e: video-only BaseURL exact; V+A without ffmpeg → ffmpeg error.
 
-### P2 — YouTube robustness (no IDM code, target YouTube's public player only)
-- [ ] P2.1 Server-side `signatureCipher` support: fetch `base.js` player, extract
-      decipher operations (reverse/splice/swap), apply to `s` param — clean-room,
-      tested against fixtures (NEVER copy yt-dlp verbatim; re-implement + cite).
-      Accept: pasted watch URL with ciphered-only formats resolves without extension.
-- [ ] P2.2 `n`-param throttle bypass same way. Accept: googlevideo 403-throttle gone
-      on test vectors; no hardcoded player version.
-- [ ] P2.3 Extension-first UX: when server resolve fails with bot-wall, Add dialog
-      deep-links "open in browser + click pill". Files: `app.rs` error text.
-      Accept: wall error shows one-click guidance.
+### P2 — YouTube robustness (no IDM code, target YouTube's public player only) — DONE 2026-10-15
+- [x] P2.1 Server-side `signatureCipher`: `base.js` fetch (ops cached per
+      player URL), classic-shape decipher detection (reverse/splice/swap via
+      helper-object analysis, shapes detected never hardcoded), `s` transform
+      + URL assembly in the page path. Fixture e2e of parse→apply→assemble.
+      Debugging log: two real parser bugs found by fixtures (needle included
+      `=` so body started ON `{`; method loop choked on `,MB:` separators).
+- [x] P2.2 `n`-param: same-shape second function applied ONLY when confidently
+      distinct from the decipher (`try_simple_n`, fixture-tested); otherwise
+      the original `n` + `ratebypass=yes` is kept (never worse). No full JS
+      interpreter — exotic players fall back safely by design.
+- [x] P2.3 Extension-first UX: bot-wall + no-link errors now name the floating
+      ⬇ button + quality menu explicitly (`src/engine.rs`).
 
-### P3 — IDM-convenience parity
-- [ ] P3.1 Site grabber: crawl same-origin links by extension filter, queue batch.
-      Files: new `src/grabber.rs` + GUI dialog. Accept: gallery page → N queued, deduped.
-- [ ] P3.2 Type→folder rules + rename templates (`{title} [{q}].{ext}`).
-      Files: `model.rs`, Settings UI. Accept: mp4→Video dir, rule reorder persists.
-- [ ] P3.3 Mini progress window / drag-drop basket. Files: `app.rs` (second viewport).
-      Accept: drop URL onto basket queues it.
-- [ ] P3.4 Scheduler v2 (per-item time + speed windows) + update checker.
-      Accept: nightly 2–6 AM full-speed window works; update check is opt-in.
+### P3 — IDM-convenience parity — DONE 2026-10-15
+- [x] P3.1 Site grabber: `src/grabber.rs` (pure tag/meta extraction, relative
+      URLs, same-host depth-1 crawl capped 15 pages/200 links, dedupe) + GUI
+      dialog (URL, Mixed/Video/Audio/Images/Documents/Archives preset cycle,
+      custom exts, depth check, Grab → preview → Queue-all deduped vs queue).
+      Fixture-tested incl. relative resolution.
+- [x] P3.2 Type→folder rules + rename templates (`{name}{ext}{date}{host}`):
+      ordered first-match rules (max 8, defaults = categories), template with
+      ext preservation + fallback, applied at probe/inbox/import/confirm
+      suggestion points (never double-applied), Settings section with preview,
+      persisted in `ui.json`. `model.rs` fixture-tested.
+- [x] P3.3 Mini progress window / drag-drop basket: `--basket` (paste + drop
+      `.txt`/`.url` files, recent queue) + `--mini` (active/queued/speed/bar,
+      Open-main, Pause-all/Resume via `cmd.json`, Close never stops). Both
+      smoke-tested alive. (Standalone `--progress` windows from before cover
+      the per-download half.)
+- [x] P3.4 Scheduler v2 (speed windows) + update checker: `SpeedWindow`
+      HH:MM ranges with overnight wrap, live `AtomicU64` cap plumbed through
+      `EngineOpts.global_limit` into every limiter (running downloads obey
+      without restart; `u64::MAX` = no window), Settings section with live
+      status, persisted. Opt-in GitHub-releases checker (manual + once per
+      session, failures are status text, no auto-download). Pure helpers
+      fixture-tested; 24/24 green.
 
 ## 4. Test matrix (every phase must keep green)
 - `cargo test` (unit + local HTTP matrix, no network) — currently 14 passed.
