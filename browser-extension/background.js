@@ -11,7 +11,7 @@ let lastFallbackError = "";
 // Must match manifest version + content.js EXT_VER. Tabs running an older
 // content script are rejected with a "reload the tab" error instead of
 // failing mysteriously (their extension APIs are gone after a reload).
-const EXT_VER = "0.5.1";
+const EXT_VER = "0.5.2";
 
 function markSeen(url, filename) {
   seen.set(url + "|" + (filename || ""), Date.now());
@@ -103,7 +103,7 @@ async function sendToHost(url, filename, extra) {
 const tabMedia = new Map(); // tabId -> [{url, mime, size, pageUrl, seenAt}]
 const sizeCache = new Map(); // url -> bytes (quality-menu sizes)
 const MEDIA_MIME = /^(video\/|audio\/|application\/(x-mpegurl|vnd\.apple\.mpegurl|dash\+xml|mp4|octet-stream))/i;
-const MEDIA_URL = /\.(mp4|webm|mkv|mov|avi|m4v|mp3|m4a|aac|flac|ogg|wav|m3u8|mpd)(\?|#|$)/i;
+const MEDIA_URL = /\.(mp4|webm|mkv|mov|avi|m4v|mp3|m4a|aac|flac|ogg|wav|m3u8|mpd|m4s|ts|cmfv|cmfa)(\?|#|$)/i;
 
 function noteMedia(tabId, entry) {
   if (tabId === undefined || tabId < 0) return;
@@ -355,8 +355,25 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         return { ok: false, error: (e && e.message) || String(e) };
       }
     }
-    if (msg.type === "getMedia") {
-      // Popup passes its tab; content scripts arrive with sender.tab.
+    // Presence pre-check: which urls are already queued (no side effects).
+    // Lets menus mark "✓ Queued" rows instead of sending dupes that bounce
+    // back as "already in queue" errors.
+    if (msg.type === "isQueued" && Array.isArray(msg.urls)) {
+      try {
+        const urls = msg.urls
+          .filter((u) => typeof u === "string" && /^https?:\/\//i.test(u))
+          .slice(0, 25);
+        if (!urls.length) return { queued: [] };
+        const res = await chrome.runtime.sendNativeMessage(HOST, { type: "query", urls });
+        if (res && res.type === "queued" && Array.isArray(res.urls)) {
+          return { queued: res.urls };
+        }
+        return { queued: [] };
+      } catch (e) {
+        return { queued: [] };
+      }
+    }
+    if (msg.type === "getMedia") {      // Popup passes its tab; content scripts arrive with sender.tab.
       const tabId = (msg.tabId !== undefined)
         ? msg.tabId
         : (sender && sender.tab && sender.tab.id);

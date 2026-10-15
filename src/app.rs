@@ -126,30 +126,53 @@ pub fn apply_widget_theme(ctx: &egui::Context) {
 }
 
 // ---------- Material Icons codepoints (font bundled under assets/fonts) ----------
-const MI_SEARCH: &str = "\u{e8b6}";
-const MI_ADD_LINK: &str = "\u{e178}";
-const MI_DOWNLOAD: &str = "\u{f090}";
-const MI_PLAY: &str = "\u{e037}";
-const MI_STOP: &str = "\u{e047}";
-const MI_QUEUE: &str = "\u{e03d}";
-const MI_SETTINGS: &str = "\u{e8b8}";
-const MI_FOLDER: &str = "\u{e2c7}";
-const MI_IMAGE: &str = "\u{e3f4}";
-const MI_MUSIC: &str = "\u{e405}";
-const MI_MOVIE: &str = "\u{e02c}";
-const MI_GRID: &str = "\u{e9b0}";
-const MI_DOC: &str = "\u{e873}";
-const MI_ARCHIVE: &str = "\u{e149}";
-const MI_FILE: &str = "\u{e24d}";
-const MI_AUDIO_FILE: &str = "\u{eb82}";
-const MI_VIDEO_FILE: &str = "\u{eb87}";
-const MI_APPS: &str = "\u{e5c3}";
-const MI_MENU: &str = "\u{e5d2}";
-const MI_CLOUD_DL: &str = "\u{e2c0}";
-const MI_PASTE: &str = "\u{e14f}";
-const MI_REFRESH: &str = "\u{e5d5}";
-const MI_CHECK: &str = "\u{e5ca}";
-const MI_FOLDER_OPEN: &str = "\u{e2c8}";
+pub(crate) const MI_SEARCH: &str = "\u{e8b6}";
+pub(crate) const MI_ADD_LINK: &str = "\u{e178}";
+pub(crate) const MI_DOWNLOAD: &str = "\u{f090}";
+pub(crate) const MI_PLAY: &str = "\u{e037}";
+pub(crate) const MI_STOP: &str = "\u{e047}";
+pub(crate) const MI_QUEUE: &str = "\u{e03d}";
+pub(crate) const MI_SETTINGS: &str = "\u{e8b8}";
+pub(crate) const MI_FOLDER: &str = "\u{e2c7}";
+pub(crate) const MI_IMAGE: &str = "\u{e3f4}";
+pub(crate) const MI_MUSIC: &str = "\u{e405}";
+pub(crate) const MI_MOVIE: &str = "\u{e02c}";
+pub(crate) const MI_GRID: &str = "\u{e9b0}";
+pub(crate) const MI_DOC: &str = "\u{e873}";
+pub(crate) const MI_ARCHIVE: &str = "\u{e149}";
+pub(crate) const MI_FILE: &str = "\u{e24d}";
+pub(crate) const MI_AUDIO_FILE: &str = "\u{eb82}";
+pub(crate) const MI_VIDEO_FILE: &str = "\u{eb87}";
+pub(crate) const MI_APPS: &str = "\u{e5c3}";
+pub(crate) const MI_MENU: &str = "\u{e5d2}";
+pub(crate) const MI_CLOUD_DL: &str = "\u{e2c0}";
+pub(crate) const MI_PASTE: &str = "\u{e14f}";
+pub(crate) const MI_REFRESH: &str = "\u{e5d5}";
+pub(crate) const MI_CHECK: &str = "\u{e5ca}";
+pub(crate) const MI_FOLDER_OPEN: &str = "\u{e2c8}";
+pub(crate) const MI_PAUSE: &str = "\u{e034}";
+pub(crate) const MI_COPY: &str = "\u{e14d}";
+pub(crate) const MI_PALETTE: &str = "\u{e40a}";
+pub(crate) const MI_PUBLIC: &str = "\u{e80b}";
+pub(crate) const MI_UPDATE: &str = "\u{e923}";
+pub(crate) const MI_SPEED: &str = "\u{e9e4}";
+
+/// Material Icons (Apache-2.0, Google) as fallback font for UI glyphs.
+/// Every window (main, confirm, progress, basket, mini) must call this —
+/// otherwise icon glyphs render as tofu boxes.
+pub fn setup_fonts(cc: &eframe::CreationContext<'_>) {
+    let mut fonts = egui::FontDefinitions::default();
+    fonts.font_data.insert(
+        "material".to_owned(),
+        std::sync::Arc::new(egui::FontData::from_static(include_bytes!(
+            "../assets/fonts/MaterialIcons-Regular.ttf"
+        ))),
+    );
+    if let Some(fam) = fonts.families.get_mut(&egui::FontFamily::Proportional) {
+        fam.push("material".to_owned());
+    }
+    cc.egui_ctx.set_fonts(fonts);
+}
 
 fn file_icon(cat: &str) -> &'static str {
     match cat {
@@ -415,6 +438,9 @@ enum ButtonId {
     AbClose,
     TAdd,
     TDismiss,
+    ThemeDark,
+    ThemeBlack,
+    ThemeLight,
     GrabStart,
     GrabQueue,
     GrabClose,
@@ -997,6 +1023,7 @@ pub struct CraftApp {
     clipboard_toast: Option<String>,
     browser_msg: String,
     pending_browser_install: Option<String>,
+    settings_page: String,
     last_inbox_check: Instant,
     last_prog_write: Instant,
     /// Every queue id ever seen this session (seeded from disk at load).
@@ -1119,6 +1146,7 @@ impl CraftApp {
             clipboard_toast: None,
             browser_msg: String::new(),
             pending_browser_install: None,
+            settings_page: "Appearance".to_string(),
             last_inbox_check: Instant::now(),
             last_prog_write: Instant::now(),
             known_ids: std::collections::HashSet::new(),
@@ -1310,6 +1338,23 @@ impl CraftApp {
                 "cancel" => self.cancel_task(id),
                 "pause_all" => self.stop_all(),
                 "resume_all" => self.start_queue(),
+                "limit" => {
+                    if let Some(k) = c.get("kbps").and_then(|x| x.as_u64()) {
+                        self.speed_limit_kbps = k;
+                        self.refresh_speed_limit();
+                        self.save_ui_state();
+                        self.push_log(format!("Speed limit set to {k} KB/s from a progress window."));
+                    }
+                }
+                "finish" => {
+                    if let Some(v) = c.get("value").and_then(|x| x.as_str()) {
+                        if ["nothing", "shutdown", "sleep", "hibernate"].contains(&v) {
+                            self.finish_action = v.to_string();
+                            self.save_ui_state();
+                            self.push_log(format!("Finish action set to {v} from a progress window."));
+                        }
+                    }
+                }
                 _ => {}
             }
         }
@@ -2427,12 +2472,14 @@ impl CraftApp {
                         None => !cancelled && dl > 0,
                     };
                     // Snapshot what follow-up actions need (borrow ends at block end).
-                    // A pre-existing file only counts when this run actually
-                    // wrote bytes into it (dl > 0): otherwise a failed retry
-                    // over an old finished file would mask as success.
+                    // A pre-existing file only counts when the size was never
+                    // known AND this run actually wrote bytes (dl > 0): a
+                    // shortfall against a KNOWN total must stay Failed, or a
+                    // truncated retry over an old finished file masks as success.
                     // (Covers empty files too.)
                     let file_done = !cancelled
                         && !complete
+                        && d.total_bytes.is_none()
                         && dl > 0
                         && d.dest_path().exists();
                     if cancelled {
@@ -4183,7 +4230,7 @@ impl eframe::App for CraftApp {
         if self.show_settings {
             let mut open = true;
             let bmsg = self.browser_msg.clone();
-            let set_w = modal_width(ctx, 620.0);
+            let set_w = modal_width(ctx, 700.0);
             egui::Window::new("Settings")
                 .id(egui::Id::new("settings_modal"))
                 .order(egui::Order::Foreground)
@@ -4197,8 +4244,54 @@ impl eframe::App for CraftApp {
                 .max_width(set_w)
                 .frame(modal_frame())
                 .show(ctx, |ui| {
+                // Two-pane settings: rail on the left, page content scrolling.
+                ui.horizontal(|ui| {
+                ui.vertical(|ui| {
+                    ui.set_width(180.0);
+                    ui.spacing_mut().item_spacing.y = 2.0;
+                    ui.add_space(4.0);
+                    const PANES: &[(&str, &str)] = &[
+                        ("Appearance", MI_PALETTE),
+                        ("Download Engine", MI_DOWNLOAD),
+                        ("Categories & Rules", MI_FOLDER),
+                        ("Browser Integration", MI_PUBLIC),
+                        ("Updates", MI_UPDATE),
+                    ];
+                    for (name, icon) in PANES {
+                        let r = side_nav_row(
+                            ui,
+                            &self.man,
+                            self.settings_page == *name,
+                            icon,
+                            name,
+                            None,
+                            false,
+                        );
+                        self.hits.push((HitKind::SideRow(format!("set:{name}")), r));
+                    }
+                });
+                ui.separator();
                 egui::ScrollArea::vertical().max_height(440.0).show(ui, |ui| {
                 ui.spacing_mut().item_spacing.y = 8.0;
+                // Appearance pane: theme + what the theme changes.
+                if self.settings_page == "Appearance" {
+                section_card(ui, "Appearance", |ui| {
+                ui.label("Theme (applies instantly):");
+                ui.horizontal(|ui| {
+                    for (label, id, key) in [
+                        ("Dark", ButtonId::ThemeDark, "dark"),
+                        ("Black", ButtonId::ThemeBlack, "black"),
+                        ("Light", ButtonId::ThemeLight, "light"),
+                    ] {
+                        let sel = self.theme == key;
+                        let r = mbutton(ui, &self.man, &format!("{}{label}", if sel { "✓ " } else { "" }), 100.0, 32.0, sel);
+                        self.hits.push((HitKind::Btn(id), r));
+                    }
+                });
+                ui.small("Fonts, radius, and accent stay identical — only the palette changes.");
+                });
+                }
+                if self.settings_page == "Download Engine" {
                 section_card(ui, "Downloads", |ui| {
                 ui.horizontal(|ui| {
                     ui.label("Save folder:");
@@ -4321,6 +4414,8 @@ impl eframe::App for CraftApp {
                 self.hits.push((HitKind::Check(CheckId::Tray), r));
                 ui.small("The tray icon appears after ticking this (check the overflow area).");
                 });
+                } // end Download Engine pane
+                if self.settings_page == "Categories & Rules" {
                 section_card(ui, "Folders & names", |ui| {
                 ui.horizontal(|ui| {
                     ui.label("Rename template:");
@@ -4358,6 +4453,8 @@ impl eframe::App for CraftApp {
                     self.hits.push((HitKind::Btn(ButtonId::RuleReset), r));
                 });
                 });
+                } // end Categories & Rules pane
+                if self.settings_page == "Download Engine" {
                 section_card(ui, "Speed windows", |ui| {
                 ui.horizontal(|ui| {
                     let r = mcheck(ui, &self.man, "Enable speed windows", self.speed_windows_on);
@@ -4396,6 +4493,8 @@ impl eframe::App for CraftApp {
                     ui.small(self.speed_window_status());
                 });
                 });
+                } // end Download Engine pane (Speed windows)
+                if self.settings_page == "Updates" {
                 section_card(ui, "Updates", |ui| {
                 ui.horizontal(|ui| {
                     let r = mcheck(ui, &self.man, "Check for updates on launch", self.update_check_on);
@@ -4412,6 +4511,8 @@ impl eframe::App for CraftApp {
                     ui.small(&self.update_status);
                 }
                 });
+                } // end Updates pane
+                if self.settings_page == "Browser Integration" {
                 section_card(ui, "Browser integration", |ui| {
                 ui.small("Load browser-extension/ unpacked once — its ID is pinned, no pasting needed.");
                 ui.small("One-time setup: host auto-repairs on every launch (like IDM) — no need to click Install each time; buttons below are manual repair only.");
@@ -4435,6 +4536,7 @@ impl eframe::App for CraftApp {
                     ui.small(&bmsg);
                 }
                 });
+                } // end Browser Integration pane
                 ui.add_space(4.0);
                 ui.horizontal(|ui| {
                     ui.with_layout(
@@ -4445,7 +4547,8 @@ impl eframe::App for CraftApp {
                         },
                     );
                 });
-                });
+                }); // end content scroll
+                }); // end horizontal (rail + content)
             });
             let was_open = self.show_settings;
             self.show_settings = open;
@@ -5248,6 +5351,18 @@ impl CraftApp {
                 self.show_settings = false;
                 self.save_ui_state();
             }
+            ButtonId::ThemeDark => {
+                self.theme = "dark".to_string();
+                self.save_ui_state();
+            }
+            ButtonId::ThemeBlack => {
+                self.theme = "black".to_string();
+                self.save_ui_state();
+            }
+            ButtonId::ThemeLight => {
+                self.theme = "light".to_string();
+                self.save_ui_state();
+            }
             ButtonId::DResume => {
                 if let Some(did) = self.details_id {
                     let paused = matches!(
@@ -5526,6 +5641,9 @@ impl CraftApp {
                     if clk {
                         if key == "Queues" {
                             self.show_queues = true;
+                        } else if let Some(page) = key.strip_prefix("set:") {
+                            self.settings_page = page.to_string();
+                            self.show_settings = true;
                         } else {
                             self.filter = key.clone();
                         }

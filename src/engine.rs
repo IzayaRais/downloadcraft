@@ -1926,6 +1926,7 @@ async fn download_hls(
                             }
                         };
                         use futures_util::StreamExt;
+                        let expect_len = resp.content_length();
                         let mut buf = Vec::new();
                         let mut stream = resp.bytes_stream();
                         let mut bad: Option<anyhow::Error> = None;
@@ -1955,6 +1956,21 @@ async fn download_hls(
                             }
                             tokio::time::sleep(std::time::Duration::from_secs(1 << attempt.min(4))).await;
                             continue;
+                        }
+                        // A clean-but-short socket close yields no error —
+                        // enforce the advertised length when the server gave one.
+                        if let Some(n) = expect_len {
+                            if buf.len() as u64 != n {
+                                sub_saturating(&shared.downloaded, attempt_bytes);
+                                if attempt >= max_retries {
+                                    abort.store(true, Ordering::SeqCst);
+                                    return Err(anyhow!(
+                                        "segment short: got {} of {n} bytes", buf.len()
+                                    ));
+                                }
+                                tokio::time::sleep(std::time::Duration::from_secs(1 << attempt.min(4))).await;
+                                continue;
+                            }
                         }
                         buf
                     }
@@ -2792,7 +2808,21 @@ async fn dash_rep_download(
             match opts.get(client, &url).send().await {
                 Ok(resp) => match resp.error_for_status() {
                     Ok(r) => {
-                        return r.bytes().await.map_err(|e| anyhow!("segment network: {e}"));
+                        let expect = r.content_length();
+                        let body = r.bytes().await.map_err(|e| anyhow!("segment network: {e}"))?;
+                        // Same clean-but-short guard as HLS segments.
+                        if let Some(n) = expect {
+                            if body.len() as u64 != n {
+                                if attempt >= max_retries {
+                                    return Err(anyhow!(
+                                        "segment short: got {} of {n} bytes", body.len()
+                                    ));
+                                }
+                                tokio::time::sleep(std::time::Duration::from_secs(1 << attempt.min(4))).await;
+                                continue;
+                            }
+                        }
+                        return Ok(body.to_vec());
                     }
                     Err(e) => {
                         let m = http_status_err(&url, e);
@@ -3109,6 +3139,23 @@ async fn single_stream_once(
     }
     file.flush().await.map_err(|e| anyhow!(io_message(&e)))?;
     drop(file);
+    // Unknown totals (chunked / lengthless responses) can end cleanly yet
+    // short after a dropped socket: re-probe once, and if the server now
+    // reports MORE than we received, fail so the retry loop resumes instead
+    // of finalizing a truncated file as "Completed".
+    if !shared.has_total.load(Ordering::SeqCst) {
+        let got = tokio::fs::metadata(&tmp).await.map(|m| m.len()).unwrap_or(0);
+        let (t, _, _, _) = probe(client, opts, url).await;
+        if let Some(total) = t {
+            shared.total.store(total, Ordering::SeqCst);
+            shared.has_total.store(true, Ordering::SeqCst);
+            if total > got {
+                return Err(anyhow!(
+                    "stream ended short ({got} of {total} bytes) — resuming"
+                ));
+            }
+        }
+    }
     tokio::fs::rename(&tmp, dest)
         .await
         .map_err(|e| anyhow!(io_message(&e)))?;
@@ -3310,6 +3357,16 @@ async fn download_range_once(
         limiter.consume(bytes.len() as u64).await;
     }
     file.flush().await.map_err(|e| anyhow!(io_message(&e)))?;
+    drop(file);
+    // A clean-but-early socket close yields a short stream with no error —
+    // never accept a short part (the retry loop re-fetches the range).
+    let wrote = tokio::fs::metadata(part).await.map(|m| m.len()).unwrap_or(0);
+    let want = end.saturating_sub(start).saturating_add(1);
+    if wrote != want {
+        return Err(anyhow!(
+            "segment short: got {wrote} of {want} bytes — retrying the range"
+        ));
+    }
     Ok(())
 }
 

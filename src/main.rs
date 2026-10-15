@@ -1,3 +1,8 @@
+#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+//! Download Craft: GUI + CLI + native host + standalone dialogs.
+//! Release builds run without a console window; all diagnostics go to
+//! %APPDATA%/download_craft/crash.log and the in-app log/queues panels.
+
 mod aes128;
 mod app;
 mod basket;
@@ -94,19 +99,7 @@ fn main() -> eframe::Result<()> {
         crate::model::APP_NAME,
         options,
         Box::new(|cc| {
-            // Material Icons (Apache-2.0, Google) as fallback font for UI glyphs.
-            let mut fonts = egui::FontDefinitions::default();
-            fonts.font_data.insert(
-                "material".to_owned(),
-                Arc::new(egui::FontData::from_static(include_bytes!(
-                    "../assets/fonts/MaterialIcons-Regular.ttf"
-                ))),
-            );
-            if let Some(fam) = fonts.families.get_mut(&egui::FontFamily::Proportional) {
-                fam.push("material".to_owned());
-            }
-            cc.egui_ctx.set_fonts(fonts);
-
+            crate::app::setup_fonts(cc);
             cc.egui_ctx.set_visuals(app::dark_visuals());
             app::apply_widget_theme(&cc.egui_ctx);
 

@@ -211,6 +211,20 @@ button-naming guidance errors. Fixture-tested parse→apply→assemble→n.
 Honest note: exotic player shapes fall back safely; extension fresh links
 remain the primary path. 20/20 tests green.
 
+### 17. Pasted-spec hardening round (2026-10-15)
+1. No console window in release builds (`windows_subsystem`), logs already
+   file/in-app bound. 2. Truncation: part-length enforcement, unknown-total
+   re-probe resume, advertised-length checks on HLS/DASH segments, and the
+   phantom-Completed guard now requires unknown totals. 3. Filename
+   placeholders/hashes skipped in URL guessing. 4. Progress window: compact
+   tabs (Info/Speed/On Completion), mini part bars + chunk map, live global
+   speed cap + finish-action commands, aligned buttons. 5. Settings two-pane
+   sidebar (Appearance/Download Engine/Categories & Rules/Browser/Updates)
+   with theme buttons; Material Icons registered in every window and
+   unicode glyphs replaced (no more tofu). 6. Extension `query` presence
+   pre-check marks ✓ Queued rows; sniffer covers m4s/ts; ghost-lock risk
+   contained by stale-stealing locks. 24/24 tests green.
+
 ### 15. P3 convenience parity complete (2026-10-15)
 - Grabber (`src/grabber.rs` + toolbar button + dialog): presets, custom
   exts, same-site depth-1 crawl, preview, queue-all deduped.

@@ -124,6 +124,22 @@ function renderVideos(box, videos, pageUrl) {
     (v.videoOnly || []).forEach((st) => qbtn(st, tagged(st)));
     (v.audio || []).forEach((st) => qbtn(st, tagged(st)));
     box.appendChild(wrap);
+    // Presence pre-check (same as the in-page menu).
+    try {
+      const urls = sizeJobs.map((j) => j.st.url).filter(Boolean).slice(0, 25);
+      if (urls.length) {
+        chrome.runtime.sendMessage({ type: "isQueued", urls }, (res) => {
+          if (chrome.runtime.lastError) return;
+          const hit = new Set((res && res.queued) || []);
+          for (const j of sizeJobs) {
+            if (!hit.has(j.st.url) || !j.btn.isConnected) continue;
+            if (!j.btn.textContent.includes("✓ Queued")) {
+              j.btn.textContent = `${j.btn.textContent} ✓ Queued`;
+            }
+          }
+        });
+      }
+    } catch (e) { /* ignore */ }
     // IDM-style sizes (best-effort; googlevideo may 403 HEAD off-session).
     try {
       const urls = sizeJobs.map((j) => j.st.url).filter(Boolean).slice(0, 12);

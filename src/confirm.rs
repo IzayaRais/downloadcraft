@@ -30,19 +30,11 @@ fn ui_path() -> Option<std::path::PathBuf> {
 }
 
 fn read_queue() -> Vec<DownloadItem> {
+    let _guard = crate::model::fs_lock("queue");
     queue_path()
         .and_then(|p| std::fs::read_to_string(p).ok())
         .and_then(|s| serde_json::from_str(&s).ok())
         .unwrap_or_default()
-}
-
-fn write_queue(items: &[DownloadItem]) -> bool {
-    match queue_path() {
-        Some(p) => serde_json::to_string_pretty(items)
-            .map(|j| atomic_write(&p, j.as_bytes()).is_ok())
-            .unwrap_or(false),
-        None => false,
-    }
 }
 
 /// Claim (remove) our URL from the native inbox so the main window does not
@@ -307,15 +299,8 @@ impl ConfirmApp {
         if self.filename.trim().is_empty() {
             self.filename = filename_from_url(&self.url);
         }
-        let mut items = read_queue();
-        if items.iter().any(|d| d.url == self.url.trim()) {
-            self.notice = "Already in queue.".to_string();
-            self.done = true;
-            return;
-        }
-        let id = items.iter().map(|d| d.id).max().unwrap_or(0) + 1;
         let mut item = DownloadItem::new(
-            id,
+            0, // id assigned atomically under the queue lock below
             self.url.trim().to_string(),
             engine::sanitize_filename(self.filename.trim()),
             self.effective_dir(),
@@ -328,11 +313,14 @@ impl ConfirmApp {
             item.pair_url = self.pair_url.clone();
             item.pair_mime = self.pair_mime.clone();
         }
-        items.push(item);
-        if !write_queue(&items) {
-            self.notice = "Could not write queue.json.".to_string();
-            return;
-        }
+        let id = match crate::model::append_to_queue(&mut item) {
+            Some(id) => id,
+            None => {
+                self.notice = "Already in queue.".to_string();
+                self.done = true;
+                return;
+            }
+        };
         save_remember_category(self.remember_path);
         if start {
             // Tell the main app to start this id (consumed on next poll /
@@ -477,6 +465,7 @@ pub fn run() -> eframe::Result<()> {
             ..Default::default()
         },
         Box::new(|cc| {
+            crate::app::setup_fonts(cc);
             cc.egui_ctx.set_visuals(crate::app::dark_visuals());
             // ABDM-style: big rounded fields + pill buttons.
             crate::app::apply_widget_theme(&cc.egui_ctx);
@@ -544,7 +533,7 @@ impl eframe::App for ConfirmApp {
                     egui::TextEdit::singleline(&mut self.url).hint_text("https://..."),
                 );
                 if ui
-                    .add_sized([44.0, 38.0], egui::Button::new("⧉"))
+                    .add_sized([44.0, 38.0], egui::Button::new(crate::app::MI_COPY))
                     .on_hover_text("Copy URL")
                     .clicked()
                 {
@@ -576,7 +565,7 @@ impl eframe::App for ConfirmApp {
                             ui.label(egui::RichText::new(format_bytes(sz)).size(14.0).strong());
                             ui.colored_label(
                                 egui::Color32::from_rgb(80, 200, 120),
-                                egui::RichText::new("✔").size(14.0),
+                                egui::RichText::new(crate::app::MI_CHECK).size(14.0),
                             );
                         } else {
                             ui.weak("size unknown");
@@ -591,7 +580,7 @@ impl eframe::App for ConfirmApp {
                     egui::TextEdit::singleline(&mut self.save_base),
                 );
                 if ui
-                    .add_sized([44.0, 38.0], egui::Button::new("🗀"))
+                    .add_sized([44.0, 38.0], egui::Button::new(crate::app::MI_FOLDER_OPEN))
                     .on_hover_text("Browse folder")
                     .clicked()
                 {
@@ -607,7 +596,7 @@ impl eframe::App for ConfirmApp {
                     egui::TextEdit::singleline(&mut self.filename).hint_text("Filename"),
                 );
                 if ui
-                    .add_sized([44.0, 38.0], egui::Button::new("⟳"))
+                    .add_sized([44.0, 38.0], egui::Button::new(crate::app::MI_REFRESH))
                     .on_hover_text("Re-check name and size")
                     .clicked()
                 {
@@ -615,7 +604,7 @@ impl eframe::App for ConfirmApp {
                     self.start_probe();
                 }
                 if ui
-                    .add_sized([44.0, 38.0], egui::Button::new("⚙"))
+                    .add_sized([44.0, 38.0], egui::Button::new(crate::app::MI_SETTINGS))
                     .on_hover_text("Advanced")
                     .clicked()
                 {

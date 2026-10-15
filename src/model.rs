@@ -272,11 +272,31 @@ pub fn format_eta(item: &DownloadItem) -> String {
     }
 }
 
+/// Last-resort filename from a URL. Placeholder segments that carry no
+/// real name (`videoplayback`, `watch`, `play`, API paths…) and raw
+/// hash-looking segments are skipped in favor of an earlier meaningful
+/// segment; otherwise a timestamped default.
 pub fn filename_from_url(raw: &str) -> String {
+    const PLACEHOLDERS: &[&str] = &[
+        "videoplayback", "watch", "play", "player", "download", "media",
+        "api", "v", "video", "audio", "file", "get", "stream", "content",
+    ];
     if let Ok(u) = url::Url::parse(raw) {
-        if let Some(seg) = u.path_segments().and_then(|mut s| s.next_back()) {
-            let clean = seg.split('?').next().unwrap_or(seg);
-            if !clean.is_empty() {
+        if let Some(segs) = u.path_segments() {
+            let all: Vec<&str> = segs.filter(|s| !s.is_empty()).collect();
+            for seg in all.iter().rev() {
+                let clean = seg.split('?').next().unwrap_or(seg);
+                let low = clean.to_ascii_lowercase();
+                if clean.is_empty() || PLACEHOLDERS.contains(&low.as_str()) {
+                    continue;
+                }
+                // Raw hash/blob ids (32+ hex chars, no extension) are not names.
+                let is_hash = clean.len() >= 32
+                    && clean.bytes().all(|b| b.is_ascii_hexdigit())
+                    && !clean.contains('.');
+                if is_hash {
+                    continue;
+                }
                 return percent_decode(clean);
             }
         }
@@ -630,6 +650,10 @@ mod tests {
         assert!(!is_download_url("not a url"));
         assert_eq!(filename_from_url("https://h/x/my%20file.zip?a=b"), "my file.zip");
         assert_eq!(filename_from_url("https://h/x/%D9%81%D8%A7%D8%B1%D8%B3%DB%8C.mp3"), "فارسی.mp3");
+        // placeholders and raw hashes fall back instead of becoming the name
+        let fb = filename_from_url("https://h/watch?v=x");
+        assert!(fb.starts_with("download_") && fb.ends_with(".bin"), "{fb}");
+        assert_eq!(filename_from_url("https://h/v/abc123/videoplayback?x=1"), "abc123");
     }
 
     #[test]

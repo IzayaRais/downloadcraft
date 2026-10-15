@@ -36,6 +36,11 @@ struct Incoming {
     pub pair_url: Option<String>,
     #[serde(default)]
     pub pair_mime: Option<String>,
+    /// Batch presence check (`{"type":"query"}`): which of these URLs are
+    /// already queued. Answered from queue.json without side effects.
+    /// (Only read on Incoming; stored nowhere.)
+    #[serde(default)]
+    pub urls: Option<Vec<String>>,
 }
 
 #[derive(Debug, Serialize)]
@@ -48,6 +53,33 @@ struct Reply {
     queued: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     error: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    urls: Option<Vec<String>>,
+}
+
+impl Reply {
+    fn ok() -> Self {
+        Reply { kind: "ok".into(), version: None, queued: Some(true), error: None, urls: None }
+    }
+    fn err(e: impl Into<String>) -> Self {
+        Reply { kind: "error".into(), version: None, queued: None, error: Some(e.into()), urls: None }
+    }
+}
+
+/// Which of `urls` are already in the shared queue (read-only, locked).
+fn queued_urls(urls: &[String]) -> Vec<String> {
+    if urls.is_empty() {
+        return Vec::new();
+    }
+    let _guard = crate::model::fs_lock("queue");
+    let items: Vec<crate::model::DownloadItem> = crate::model::config_dir()
+        .and_then(|d| std::fs::read_to_string(d.join("queue.json")).ok())
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_default();
+    urls.iter()
+        .filter(|u| items.iter().any(|d| &d.url == *u))
+        .cloned()
+        .collect()
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -70,6 +102,11 @@ pub struct InboxItem {
     pub pair_url: Option<String>,
     #[serde(default)]
     pub pair_mime: Option<String>,
+    /// Batch presence check (`{"type":"query"}`): which of these URLs are
+    /// already queued. Answered from queue.json without side effects.
+    /// (Only read on Incoming; stored nowhere.)
+    #[serde(default)]
+    pub urls: Option<Vec<String>>,
 }
 
 pub fn inbox_path() -> Option<std::path::PathBuf> {
@@ -154,6 +191,7 @@ fn queue_download(msg: &Incoming) -> Result<bool, String> {
         size: msg.size.filter(|s| *s > 0),
         pair_url: msg.pair_url.clone().filter(|s| s.starts_with("http")),
         pair_mime: msg.pair_mime.clone().filter(|s| !s.trim().is_empty()),
+        urls: None,
     };
     // Same URL re-captured: refresh metadata instead of ignoring it (the
     // filename/referer/cookie may be corrected this time).
@@ -226,12 +264,7 @@ pub fn run() -> eframe::Result<()> {
         match read_message() {
             HostFrame::Eof => break,
             HostFrame::Bad(e) => {
-                write_message(&Reply {
-                    kind: "error".into(),
-                    version: None,
-                    queued: None,
-                    error: Some(e),
-                });
+                write_message(&Reply::err(e));
                 continue;
             }
             HostFrame::Msg(msg) => match msg.kind.as_str() {
@@ -240,39 +273,40 @@ pub fn run() -> eframe::Result<()> {
                 version: Some(1),
                 queued: None,
                 error: None,
+                urls: None,
             }),
+            "query" => {
+                // Presence check only: no queueing, no dialogs, no locks held
+                // beyond the read.
+                let urls = msg.urls.clone().unwrap_or_default();
+                let hits = queued_urls(&urls);
+                write_message(&Reply {
+                    kind: "queued".into(),
+                    version: None,
+                    queued: None,
+                    error: None,
+                    urls: Some(hits),
+                });
+            }
             "download" => {
                 let url = msg.url.clone().unwrap_or_default();
                 let ok = url.starts_with("http://") || url.starts_with("https://");
                 if !ok {
-                    write_message(&Reply {
-                        kind: "error".into(),
-                        version: None,
-                        queued: None,
-                        error: Some("need http/https url".into()),
-                    });
+                    write_message(&Reply::err("need http/https url"));
                     continue;
                 }
                 // Blob/media-source URLs are not directly downloadable by the
                 // engine — reject loudly so the extension can fall back to the
                 // page URL instead of queueing a dead link.
                 if url.starts_with("blob:") {
-                    write_message(&Reply {
-                        kind: "error".into(),
-                        version: None,
-                        queued: None,
-                        error: Some("blob: URLs need the page URL — send the page link instead".into()),
-                    });
+                    write_message(&Reply::err(
+                        "blob: URLs need the page URL — send the page link instead",
+                    ));
                     continue;
                 }
                 match queue_download(&msg) {
                     Ok(_is_new) => {
-                        write_message(&Reply {
-                            kind: "ok".into(),
-                            version: None,
-                            queued: Some(true),
-                            error: None,
-                        });
+                        write_message(&Reply::ok());
                         // IDM-style: pop the standalone Download File Info
                         // window in front. The inbox entry doubles as a
                         // fallback — the dialog claims it on open, and the
@@ -280,20 +314,10 @@ pub fn run() -> eframe::Result<()> {
                         // never claimed (see poll_inbox age gate).
                         spawn_confirm(&msg);
                     }
-                    Err(e) => write_message(&Reply {
-                        kind: "error".into(),
-                        version: None,
-                        queued: None,
-                        error: Some(e),
-                    }),
+                    Err(e) => write_message(&Reply::err(e)),
                 }
             }
-            _ => write_message(&Reply {
-                kind: "error".into(),
-                version: None,
-                queued: None,
-                error: Some("unknown message".into()),
-            }),
+            _ => write_message(&Reply::err("unknown message")),
             }
         }
     }

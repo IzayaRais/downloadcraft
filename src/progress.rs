@@ -69,7 +69,48 @@ fn read_snap(id: u64) -> Snap {
     out
 }
 
-/// Append a command for the main app (`pause`/`resume`/`cancel`/`*_all`).
+fn read_ui_prefs() -> (String, String) {
+    let v: serde_json::Value = config_dir()
+        .and_then(|p| std::fs::read_to_string(p.join("ui.json")).ok())
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or(serde_json::Value::Null);
+    let lim = v
+        .get("speed_limit_kbps")
+        .and_then(|x| x.as_u64())
+        .unwrap_or(0)
+        .to_string();
+    let fin = v
+        .get("finish_action")
+        .and_then(|x| x.as_str())
+        .unwrap_or("nothing")
+        .to_string();
+    (lim, fin)
+}
+
+/// Command with a payload (`limit` kbps, `finish` action).
+fn send_cmd_kv(action: &str, k: &str, v: serde_json::Value) {
+    let Some(p) = cmd_path() else { return };
+    let _guard = crate::model::fs_lock("cmd");
+    let mut val: serde_json::Value = std::fs::read_to_string(&p)
+        .ok()
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_else(|| serde_json::json!([]));
+    if let Some(arr) = val.as_array_mut() {
+        let mut obj = serde_json::Map::new();
+        obj.insert("action".to_string(), serde_json::Value::String(action.to_string()));
+        obj.insert(k.to_string(), v);
+        arr.push(serde_json::Value::Object(obj));
+        if let Ok(json) = serde_json::to_string_pretty(&val) {
+            if let Some(parent) = p.parent() {
+                let _ = std::fs::create_dir_all(parent);
+            }
+            let tmp = p.with_extension("tmp");
+            if std::fs::write(&tmp, json).is_ok() {
+                let _ = std::fs::rename(&tmp, &p);
+            }
+        }
+    }
+}
 fn send_cmd(id: u64, action: &str) {
     let Some(p) = cmd_path() else { return };
     let _guard = crate::model::fs_lock("cmd");
@@ -127,6 +168,10 @@ struct ProgressApp {
     last_poll: Instant,
     item: Option<DownloadItem>,
     snap: Snap,
+    tab: u8, // 0 info, 1 speed, 2 on-completion
+    limit_input: String,
+    limit_known: Option<u64>,
+    finish_sel: String,
 }
 
 impl ProgressApp {
@@ -160,12 +205,18 @@ pub fn run() -> eframe::Result<()> {
             eprintln!("--progress needs <id>");
             std::process::exit(2);
         });
+    // Seed controls from shared settings (global limit + finish action).
+    let (limit_input, finish_sel) = read_ui_prefs();
     let mut app = ProgressApp {
         id,
         centered: false,
         last_poll: Instant::now() - Duration::from_secs(10),
         item: None,
         snap: Snap::default(),
+        tab: 0,
+        limit_input,
+        limit_known: None,
+        finish_sel,
     };
     app.refresh();
     let title = app
@@ -176,7 +227,7 @@ pub fn run() -> eframe::Result<()> {
 
     let mut viewport = egui::ViewportBuilder::default()
         .with_title(title)
-        .with_inner_size([460.0, 520.0])
+        .with_inner_size([470.0, 560.0])
         .with_min_inner_size([420.0, 420.0])
         .with_always_on_top()
         .with_resizable(true);
@@ -190,6 +241,7 @@ pub fn run() -> eframe::Result<()> {
             ..Default::default()
         },
         Box::new(|cc| {
+            crate::app::setup_fonts(cc);
             cc.egui_ctx.set_visuals(crate::app::dark_visuals());
             crate::app::apply_widget_theme(&cc.egui_ctx);
             Ok(Box::new(app))
@@ -203,7 +255,7 @@ impl eframe::App for ProgressApp {
             self.centered = true;
             let mon = ctx.input(|i| i.viewport().monitor_size);
             if let Some(m) = mon {
-                let (w, h) = (460.0, 520.0);
+                let (w, h) = (470.0, 560.0);
                 if m.x > w && m.y > h {
                     ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(
                         egui::Pos2::new((m.x - w) / 2.0, (m.y - h) / 2.0),
@@ -236,7 +288,73 @@ impl eframe::App for ProgressApp {
             let failed = matches!(item.status, crate::model::Status::Failed(_));
 
             ui.heading(item.filename.clone());
-            ui.add_space(4.0);
+            // Tab bar: Info | Speed | On Completion.
+            ui.horizontal(|ui| {
+                for (i, name) in [(0u8, "Info"), (1, "Speed"), (2, "On Completion")] {
+                    let sel = self.tab == i;
+                    if ui
+                        .selectable_label(sel, name)
+                        .on_hover_text(match i {
+                            0 => "Progress and parts",
+                            1 => "Live speed cap (applies instantly)",
+                            _ => "What happens when the queue drains",
+                        })
+                        .clicked()
+                    {
+                        self.tab = i;
+                    }
+                }
+            });
+            ui.separator();
+            if self.tab == 1 {
+                // ---- Speed tab: live global cap (main app applies via the
+                // shared atomic, no restart). Thread count is fixed at start:
+                // changing it mid-transfer would discard part files, so it
+                // is shown read-only with that explanation.
+                ui.label(format!("This download runs {} thread(s) (fixed at start).", item.connections));
+                ui.add_space(4.0);
+                ui.horizontal(|ui| {
+                    ui.label("Global cap KB/s (0 = unlimited):");
+                    ui.add(
+                        egui::TextEdit::singleline(&mut self.limit_input)
+                            .desired_width(90.0),
+                    );
+                    if ui.button("Apply").clicked() {
+                        match self.limit_input.trim().parse::<u64>() {
+                            Ok(k) => {
+                                send_cmd_kv("limit", "kbps", serde_json::Value::from(k));
+                                self.limit_known = Some(k);
+                            }
+                            Err(_) => {
+                                self.limit_known = None;
+                            }
+                        }
+                    }
+                });
+                ui.small(match self.limit_known {
+                    Some(k) => format!("Sent cap {k} KB/s — main app applies it live."),
+                    None => "Type a number and Apply.".to_string(),
+                });
+                ui.small("Tip: Settings → Speed windows automates caps by time of day.");
+            } else if self.tab == 2 {
+                // ---- On Completion tab.
+                ui.label("When the queue drains:");
+                for name in ["nothing", "shutdown", "sleep", "hibernate"] {
+                    if ui
+                        .selectable_label(self.finish_sel == name, name)
+                        .clicked()
+                    {
+                        self.finish_sel = name.to_string();
+                        send_cmd_kv("finish", "value", serde_json::Value::from(name));
+                    }
+                }
+                ui.add_space(4.0);
+                if ui.button("Open download folder").clicked() {
+                    if let Some(dir) = item.dest_path().parent() {
+                        open_path(dir);
+                    }
+                }
+            } else {
             egui::Frame::new()
                 .corner_radius(crate::app::RADIUS)
                 .inner_margin(egui::Margin::same(10))
@@ -309,36 +427,75 @@ impl eframe::App for ProgressApp {
                     .show_percentage(),
             );
 
-            // Part Info (ABDM-style per-segment table).
+            // Compact segment view: mini bars + one unified chunk map
+            // (replaces the bulky per-part text table).
             if !self.snap.parts.is_empty() {
                 ui.add_space(4.0);
-                egui::CollapsingHeader::new("Part Info")
-                    .default_open(true)
-                    .show(ui, |ui| {
-                        egui::Grid::new("pg_parts")
-                            .striped(true)
-                            .spacing([10.0, 4.0])
-                            .show(ui, |ui| {
-                                ui.weak("#");
-                                ui.weak("Status");
-                                ui.weak("Downloaded");
-                                ui.weak("Total");
-                                ui.end_row();
-                                for (i, (s, e, d)) in self.snap.parts.iter().enumerate() {
-                                    let len = e.saturating_sub(*s) + 1;
-                                    ui.label(format!("{}", i + 1));
-                                    if *d >= len {
-                                        ui.colored_label(green, "Complete");
-                                    } else {
-                                        ui.label("Receiving Data");
-                                    }
-                                    ui.label(format_bytes(*d));
-                                    ui.label(format_bytes(len));
-                                    ui.end_row();
-                                }
-                            });
+                let n = self.snap.parts.len();
+                // Unified chunk map: one cell per part, filled by fraction.
+                let bar_w = ui.available_width();
+                let (rrect, _) = ui.allocate_exact_size(
+                    egui::vec2(bar_w, 12.0),
+                    egui::Sense::hover(),
+                );
+                let p = ui.painter();
+                p.rect_filled(rrect, 6.0, egui::Color32::from_rgb(30, 31, 42));
+                let gap = 2.0;
+                let cw = (bar_w - gap * (n as f32 - 1.0).max(0.0)) / n as f32;
+                for (i, (s, e, d)) in self.snap.parts.iter().enumerate() {
+                    let len = e.saturating_sub(*s) + 1;
+                    let f = if len > 0 { (*d as f32 / len as f32).clamp(0.0, 1.0) } else { 0.0 };
+                    let x0 = rrect.min.x + i as f32 * (cw + gap);
+                    let cell = egui::Rect::from_min_size(
+                        egui::pos2(x0, rrect.min.y),
+                        egui::vec2(cw.max(1.0), 12.0),
+                    );
+                    if f >= 1.0 {
+                        p.rect_filled(cell, 3.0, green);
+                    } else if f > 0.0 {
+                        p.rect_filled(cell, 3.0, egui::Color32::from_rgb(30, 31, 42));
+                        let fill = egui::Rect::from_min_size(
+                            cell.min,
+                            egui::vec2(cell.width() * f, 12.0),
+                        );
+                        p.rect_filled(fill, 3.0, egui::Color32::from_rgb(96, 165, 250));
+                    }
+                }
+                // Mini bars (up to 16), two per row with part numbers.
+                ui.add_space(4.0);
+                let mut idx = 0;
+                while idx < n.min(16) {
+                    ui.horizontal(|ui| {
+                        for k in 0..2 {
+                            let i = idx + k;
+                            if i >= n.min(16) {
+                                break;
+                            }
+                            let (s, e, d) = self.snap.parts[i];
+                            let len = e.saturating_sub(s) + 1;
+                            let f = if len > 0 {
+                                (d as f32 / len as f32).clamp(0.0, 1.0)
+                            } else {
+                                0.0
+                            };
+                            ui.label(format!("#{} ", i + 1));
+                            ui.add(
+                                egui::ProgressBar::new(f)
+                                    .desired_width(150.0)
+                                    .desired_height(8.0)
+                                    .corner_radius(4)
+                                    .show_percentage(),
+                            );
+                            ui.add_space(8.0);
+                        }
                     });
+                    idx += 2;
+                }
+                if n > 16 {
+                    ui.weak(format!("…and {} more parts", n - 16));
+                }
             }
+            } // end Info tab
 
             ui.add_space(8.0);
             ui.horizontal(|ui| {
@@ -352,7 +509,11 @@ impl eframe::App for ProgressApp {
                         }
                     }
                 } else if !failed {
-                    let label = if paused { "Resume" } else { "⏸ Pause" };
+                    let label = if paused {
+                        "Resume".to_string()
+                    } else {
+                        format!("{} Pause", crate::app::MI_PAUSE)
+                    };
                     if ui.add_sized([110.0, 38.0], egui::Button::new(label)).clicked() {
                         send_cmd(self.id, if paused { "resume" } else { "pause" });
                     }

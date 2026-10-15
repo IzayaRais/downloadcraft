@@ -7,7 +7,7 @@
   // Must match manifest version + background.js EXT_VER. The background
   // rejects messages from any other version with a "reload this tab"
   // error, so a stale script can never fail mysteriously.
-  const EXT_VER = "0.5.1";
+  const EXT_VER = "0.5.2";
   // Generation guard: when the worker re-injects this script (after an
   // update), older live instances must go quiet instead of fighting over
   // the button. The newest instance always wins.
@@ -299,8 +299,32 @@
     return false;
   }
 
-  function fmtSize(n) {
-    if (!n || n <= 0) return "";
+  // Presence pre-check: rows already in the app queue get a "✓ Queued"
+  // tag and toast instead of re-sending into an "already in queue" error.
+  function markQueuedRows(pairs) {
+    try {
+      const urls = pairs.map((p) => p.st.url).filter(Boolean).slice(0, 25);
+      if (!urls.length) return;
+      chrome.runtime.sendMessage({ type: "isQueued", urls }, (res) => {
+        if (chrome.runtime.lastError) return;
+        if (!alive()) return;
+        const hit = new Set((res && res.queued) || []);
+        if (!hit.size) return;
+        for (const p of pairs) {
+          if (!hit.has(p.st.url) || !p.btn.isConnected) continue;
+          if (!p.btn.textContent.includes("✓ Queued")) {
+            p.btn.textContent = `${p.btn.textContent} ✓ Queued`;
+          }
+          p.btn.onclick = (ev) => {
+            ev.stopPropagation();
+            toast("Download Craft: already in queue");
+          };
+        }
+      });
+    } catch (e) { /* best-effort */ }
+  }
+
+  function fmtSize(n) {    if (!n || n <= 0) return "";
     const u = ["B", "KB", "MB", "GB"];
     let v = n, i = 0;
     while (v >= 1024 && i < u.length - 1) { v /= 1024; i++; }
@@ -570,6 +594,7 @@
     section("Video only (no audio)", info.videoOnly || [], (st) => tagged(fname, st));
     section("Audio only", info.audio || [], (st) => tagged(fname, st));
     enrichSizes(sizePairs);
+    markQueuedRows(sizePairs);
     appendSniffed(menu, new Set([
       ...info.streams.map((s) => s.url),
       ...(info.videoOnly || []).map((s) => s.url),
