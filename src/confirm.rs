@@ -51,6 +51,7 @@ fn claim_inbox(url: &str) {
     let Some(path) = crate::native_host::inbox_path() else {
         return;
     };
+    let _guard = crate::model::fs_lock("inbox");
     let data = match std::fs::read_to_string(&path) {
         Ok(d) => d,
         Err(_) => return,
@@ -159,47 +160,10 @@ fn save_remember_category(value: bool) {
     }
 }
 
-/// True when another `download_craft` process (i.e. the main window) is
-/// already running besides this dialog.
+/// True when the main window is already running (fresh heartbeat).
+/// Replaces process-name counting (two dialogs used to look "live").
 fn main_app_running() -> bool {
-    let me = std::env::current_exe()
-        .ok()
-        .and_then(|p| {
-            p.file_name()
-                .map(|s| s.to_string_lossy().to_lowercase().to_string())
-        })
-        .unwrap_or_else(|| "download_craft.exe".to_string());
-    #[cfg(windows)]
-    {
-        let out = std::process::Command::new("tasklist")
-            .args([
-                "/FI",
-                &format!("IMAGENAME eq {me}"),
-                "/FO",
-                "CSV",
-                "/NH",
-            ])
-            .output();
-        match out {
-            Ok(o) => {
-                let body = String::from_utf8_lossy(&o.stdout).to_lowercase();
-                body.lines().filter(|l| l.contains(".exe")).count() >= 2
-            }
-            Err(_) => false,
-        }
-    }
-    #[cfg(not(windows))]
-    {
-        let out = std::process::Command::new("pgrep").arg("-c").arg(&me).output();
-        match out {
-            Ok(o) => String::from_utf8_lossy(&o.stdout)
-                .trim()
-                .parse::<u32>()
-                .map(|n| n >= 2)
-                .unwrap_or(false),
-            Err(_) => false,
-        }
-    }
+    crate::model::is_main_live()
 }
 
 /// Launch the main window detached (fire-and-forget).
@@ -374,6 +338,7 @@ impl ConfirmApp {
             // Tell the main app to start this id (consumed on next poll /
             // at its startup when we launch it below).
             if let Some(p) = wake_path() {
+                let _guard = crate::model::fs_lock("wake");
                 let mut ids: Vec<u64> = std::fs::read_to_string(&p)
                     .ok()
                     .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
@@ -404,12 +369,33 @@ impl ConfirmApp {
 /// Entry point for `--confirm-download`. Never returns normally
 /// (runs the dialog window until it closes).
 pub fn run() -> eframe::Result<()> {
+    // Index-iterated flag parsing: a VALUE that looks like a flag (e.g. a
+    // `Content-Disposition` filename of `--referer`) must not shift parsing.
+    // Only the token immediately following a known flag is consumed.
+    const KNOWN: &[&str] = &[
+        "--url",
+        "--filename",
+        "--referer",
+        "--cookie",
+        "--mime",
+        "--size",
+        "--pair-url",
+        "--pair-mime",
+    ];
     let args: Vec<String> = std::env::args().collect();
-    let get = |name: &str| -> Option<String> {
-        args.iter()
-            .position(|a| a == name)
-            .and_then(|i| args.get(i + 1).cloned())
-    };
+    let mut map: std::collections::HashMap<&str, String> = std::collections::HashMap::new();
+    let mut i = 0;
+    while i < args.len() {
+        if let Some(flag) = KNOWN.iter().find(|k| **k == args[i].as_str()) {
+            if i + 1 < args.len() {
+                map.insert(*flag, args[i + 1].clone());
+                i += 2;
+                continue;
+            }
+        }
+        i += 1;
+    }
+    let mut get = |name: &str| -> Option<String> { map.remove(name) };
     let url = get("--url").unwrap_or_default();
     if !is_download_url(&url) {
         eprintln!("--confirm-download needs --url <http(s)://...>");

@@ -221,3 +221,23 @@ remain the primary path. 20/20 tests green.
 - Speed windows (overnight-capable, live atomic cap, no restart needed) +
   opt-in GitHub update check. 24/24 tests green, roadmap all-DONE except
   forever-out-of-scope (DRM, IDM code).
+
+### 16. Full bug audit fixes (2026-10-15)
+Three-layer audit (engine / app+IPC / extension), everything fixed:
+- IPC integrity: `model::fs_lock` guards every queue/inbox/wake/cmd
+  read-modify-write; `save_queue` merges foreign ids via `known_ids`
+  (own deletions stay deleted); `alloc_id` refreshes under lock; corrupt
+  queue files quarantine instead of nuking; inbox capped at 200 with
+  metadata refresh on re-capture; host survives malformed frames.
+- Engine: real `$RepresentationID$`, HLS byte rollback, resume-map file
+  checks, saturating counters/arithmetics, poison-proof mutexes, per-job
+  locks + unique work dirs, decrypt abort, cleanup-on-error, typed final
+  HTTP errors, rep-level startNumber, char-safe template expansion.
+- App: concurrency-capped start_queue, phantom-completion guard, immediate
+  cancel/pause state, finish-action ignores paused/failed with a log line,
+  heartbeat liveness instead of process counting, safe argv parsing,
+  xdg-open fallback.
+- Extension v0.5.1: erase-after-ack capture, per-tab popup peek, debounced
+  gated observer, same-video itag swaps, re-merging sniff section, single
+  delegated click closer, validated filters/URLs, referrer on sizing,
+  Firefox ESR floor declared. 24/24 tests green.

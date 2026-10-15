@@ -28,10 +28,102 @@ impl Status {
 
 fn shorten(s: &str, n: usize) -> String {
     if s.len() <= n {
-        s.to_string()
-    } else {
-        format!("{}…", &s[..n])
+        return s.to_string();
     }
+    // Byte slicing panics on multibyte boundaries (called every frame via
+    // Status::label with network-controlled error text) — cut at a char edge.
+    let cut = s
+        .char_indices()
+        .take_while(|(i, _)| *i < n)
+        .last()
+        .map(|(i, c)| i + c.len_utf8())
+        .unwrap_or(0);
+    format!("{}…", &s[..cut])
+}
+
+/// Best-effort interprocess file lock (no new deps): `config/<name>.lock
+/// created with `create_new`. Stale locks (mtime older than 20 s — no
+/// operation legitimately holds one longer) are stolen. All shared-file
+/// read-modify-writes (queue, inbox, wake, cmd) take the matching lock so
+/// the GUI, dialogs, CLI, and native host stop clobbering each other.
+/// If the lock can never be acquired we proceed anyway (single-user box:
+///
+/// better to risk a race than deadlock the UI).
+pub struct FsGuard {
+    path: std::path::PathBuf,
+    ours: bool,
+}
+
+impl FsGuard {
+    /// Whether this guard actually holds the lock (a `false` guard means
+    /// another process is inside the critical section right now).
+    pub fn owned(&self) -> bool {
+        self.ours
+    }
+}
+
+impl Drop for FsGuard {
+    fn drop(&mut self) {
+        if self.ours {
+            let _ = std::fs::remove_file(&self.path);
+        }
+    }
+}
+
+pub fn fs_lock(name: &str) -> FsGuard {
+    let path = match config_dir() {
+        Some(d) => d.join(format!("{name}.lock")),
+        None => return FsGuard { path: std::path::PathBuf::new(), ours: false },
+    };
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    for _ in 0..100 {
+        let mut opts = std::fs::OpenOptions::new();
+        match opts.write(true).create_new(true).open(&path) {
+            Ok(mut f) => {
+                use std::io::Write;
+                let _ = writeln!(f, "{}", std::process::id());
+                return FsGuard { path, ours: true };
+            }
+            Err(_) => {
+                let stale = std::fs::metadata(&path)
+                    .and_then(|m| m.modified())
+                    .map(|t| t.elapsed().map(|e| e.as_secs() > 20).unwrap_or(true))
+                    .unwrap_or(true);
+                if stale {
+                    let _ = std::fs::remove_file(&path);
+                    continue;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+        }
+    }
+    FsGuard { path, ours: false }
+}
+
+/// Liveness heartbeat for the main window (`main.lock` timestamp, refreshed
+/// every few seconds). Standalone dialogs use this instead of counting
+/// process names (two dialogs used to look like "main is running").
+pub fn touch_heartbeat() {
+    if let Some(p) = config_dir().map(|d| d.join("main.lock")) {
+        if let Some(parent) = p.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        let _ = std::fs::write(&p, chrono::Local::now().to_rfc3339());
+    }
+}
+
+pub fn is_main_live() -> bool {
+    let Some(p) = config_dir().map(|d| d.join("main.lock")) else {
+        return false;
+    };
+    let Ok(data) = std::fs::read_to_string(&p) else {
+        return false;
+    };
+    chrono::DateTime::parse_from_rfc3339(data.trim())
+        .map(|dt| chrono::Local::now().timestamp() - dt.timestamp() < 30)
+        .unwrap_or(false)
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -408,9 +500,11 @@ pub fn apply_rename_template(tpl: &str, filename: &str, url: &str) -> String {
 }
 
 /// Append an item to the shared queue file with a fresh id (used by the
-/// standalone dialogs). Returns the assigned id, or None when the URL is
-/// already queued.
+/// standalone dialogs). Holds the queue lock across read-assign-write so
+/// concurrent writers can no longer collide on ids. Returns the assigned
+/// id, or None when the URL is already queued.
 pub fn append_to_queue(item: &mut DownloadItem) -> Option<u64> {
+    let _guard = fs_lock("queue");
     let path = config_dir()?.join("queue.json");
     let mut items: Vec<DownloadItem> = std::fs::read_to_string(&path)
         .ok()

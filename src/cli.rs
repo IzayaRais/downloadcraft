@@ -168,6 +168,7 @@ pub fn run(cli: Cli) -> anyhow::Result<()> {
             checksum,
             overwrite,
         } => {
+            let _guard = crate::model::fs_lock("queue");
             if !is_download_url(&url) {
                 anyhow::bail!("not an http(s) URL: {url}");
             }
@@ -249,6 +250,7 @@ pub fn run(cli: Cli) -> anyhow::Result<()> {
             Ok(())
         }
         Commands::Remove { id } => {
+            let _guard = crate::model::fs_lock("queue");
             let mut items = load_queue();
             let n = items.len();
             items.retain(|d| d.id != id);
@@ -260,6 +262,7 @@ pub fn run(cli: Cli) -> anyhow::Result<()> {
             Ok(())
         }
         Commands::Redownload { id } => {
+            let _guard = crate::model::fs_lock("queue");
             let mut items = load_queue();
             let d = items
                 .iter_mut()
@@ -279,6 +282,7 @@ pub fn run(cli: Cli) -> anyhow::Result<()> {
             run_id(id)
         }
         Commands::Clear => {
+            let _guard = crate::model::fs_lock("queue");
             let mut items = load_queue();
             let n = items.len();
             items.retain(|d| !matches!(d.status, crate::model::Status::Completed));
@@ -287,6 +291,7 @@ pub fn run(cli: Cli) -> anyhow::Result<()> {
             Ok(())
         }
         Commands::Import { file } => {
+            let _guard = crate::model::fs_lock("queue");
             let data = std::fs::read_to_string(&file)?;
             let mut items = load_queue();
             let mut n = 0;

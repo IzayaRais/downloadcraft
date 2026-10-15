@@ -999,6 +999,10 @@ pub struct CraftApp {
     pending_browser_install: Option<String>,
     last_inbox_check: Instant,
     last_prog_write: Instant,
+    /// Every queue id ever seen this session (seeded from disk at load).
+    /// Lets `save_queue` tell foreign additions (merge) apart from our own
+    /// deletions (drop) when another process changed the file meanwhile.
+    known_ids: std::collections::HashSet<u64>,
     col_order: Vec<SortCol>,
     col_w: std::collections::HashMap<SortCol, f32>,
     // ---- power features ----
@@ -1117,6 +1121,7 @@ impl CraftApp {
             pending_browser_install: None,
             last_inbox_check: Instant::now(),
             last_prog_write: Instant::now(),
+            known_ids: std::collections::HashSet::new(),
             col_order: vec![
                 SortCol::Name,
                 SortCol::Size,
@@ -1211,6 +1216,7 @@ impl CraftApp {
         app.poll_inbox();
         app.merge_queue_from_disk();
         app.check_wake();
+        crate::model::touch_heartbeat();
         app
     }
 
@@ -1253,8 +1259,8 @@ impl CraftApp {
                 .find(|d| d.id == *id)
                 .map(|d| d.speed_bps)
                 .unwrap_or(0.0);
-            let totals = task.shared.part_total.lock().unwrap().clone();
-            let dones = task.shared.part_done.lock().unwrap().clone();
+            let totals = task.shared.part_total.lock().unwrap_or_else(|e| e.into_inner()).clone();
+            let dones = task.shared.part_done.lock().unwrap_or_else(|e| e.into_inner()).clone();
             let parts: Vec<[u64; 3]> = totals
                 .iter()
                 .zip(dones.iter())
@@ -1288,6 +1294,7 @@ impl CraftApp {
             Some(p) => p.join("cmd.json"),
             None => return,
         };
+        let _guard = crate::model::fs_lock("cmd");
         let data = match std::fs::read_to_string(&path) {
             Ok(d) => d,
             Err(_) => return,
@@ -1900,8 +1907,7 @@ impl CraftApp {
                 continue;
             }
             let fname = crate::model::apply_rename_template(&self.rename_template, &l.name, &l.url);
-            let id = self.next_id;
-            self.next_id += 1;
+            let id = self.alloc_id();
             let dir = self.save_dir_for(&fname);
             self.downloads.push(DownloadItem::new(
                 id,
@@ -1973,8 +1979,7 @@ impl CraftApp {
             .filter(|f| !f.trim().is_empty())
             .unwrap_or_else(|| filename_from_url(&url));
         let fname = crate::model::apply_rename_template(&self.rename_template, &fname, &url);
-        let id = self.next_id;
-        self.next_id += 1;
+        let id = self.alloc_id();
         let dir = self.save_dir_for(&fname);
         self.downloads.push(DownloadItem::new(
             id,
@@ -2037,23 +2042,102 @@ impl CraftApp {
         let _ = crate::model::atomic_write(path, data);
     }
 
-    fn save_queue(&self) {
+    fn save_queue(&mut self) {
+        let _guard = crate::model::fs_lock("queue");
+        let Some(path) = Self::queue_path() else {
+            return;
+        };
+        let mut items = self.downloads.clone();
+        for it in &mut items {
+            it.speed_bps = 0.0;
+        }
+        // Union with foreign additions made since our last sync (confirm /
+        // basket / CLI). Our own deletions stay deleted: ids we have ever
+        // seen but no longer hold are dropped, unknown ids are merged in.
+        if let Ok(data) = std::fs::read_to_string(&path) {
+            if let Ok(disk) = serde_json::from_str::<Vec<DownloadItem>>(&data) {
+                for it in disk {
+                    if items.iter().any(|d| d.id == it.id || d.url == it.url) {
+                        continue;
+                    }
+                    if self.known_ids.contains(&it.id) {
+                        continue; // deleted here; do not resurrect
+                    }
+                    let mut it = it;
+                    it.speed_bps = 0.0;
+                    it.selected = false;
+                    items.push(it);
+                }
+            }
+        }
+        for it in &items {
+            self.known_ids.insert(it.id);
+        }
+        if let Some(m) = items.iter().map(|d| d.id).max() {
+            self.next_id = self.next_id.max(m + 1);
+        }
+        if let Ok(json) = serde_json::to_string_pretty(&items) {
+            Self::atomic_write(&path, json.as_bytes());
+        }
+    }
+
+    /// Fresh id that cannot collide with other processes' additions: refresh
+    /// from disk under the queue lock, then take max+1.
+    fn alloc_id(&mut self) -> u64 {
+        let _guard = crate::model::fs_lock("queue");
         if let Some(path) = Self::queue_path() {
-            let mut items = self.downloads.clone();
-            for it in &mut items {
-                it.speed_bps = 0.0;
+            if let Ok(data) = std::fs::read_to_string(&path) {
+                if let Ok(disk) = serde_json::from_str::<Vec<DownloadItem>>(&data) {
+                    for it in &disk {
+                        self.known_ids.insert(it.id);
+                        self.next_id = self.next_id.max(it.id + 1);
+                    }
+                }
             }
-            if let Ok(json) = serde_json::to_string_pretty(&items) {
-                Self::atomic_write(&path, json.as_bytes());
+        }
+        let id = self.next_id;
+        self.next_id += 1;
+        self.known_ids.insert(id);
+        id
+    }
+
+    /// Parse queue items tolerantly: one bad entry (schema drift, partial
+    /// write) must not nuke the whole queue. Returns (good, had_bad).
+    fn parse_queue_items(data: &str) -> (Vec<DownloadItem>, bool) {
+        if let Ok(items) = serde_json::from_str::<Vec<DownloadItem>>(data) {
+            return (items, false);
+        }
+        let mut good = Vec::new();
+        let mut bad = false;
+        if let Ok(arr) = serde_json::from_str::<Vec<serde_json::Value>>(data) {
+            for v in arr {
+                match serde_json::from_value::<DownloadItem>(v) {
+                    Ok(it) => good.push(it),
+                    Err(_) => bad = true,
+                }
             }
+        } else {
+            bad = true;
+        }
+        (good, bad)
+    }
+
+    fn quarantine_queue_file(data: &str) {
+        if let Some(dir) = crate::model::config_dir() {
+            let name = format!("queue.corrupt-{}.json", chrono::Local::now().format("%Y%m%d-%H%M%S"));
+            let _ = std::fs::write(dir.join(name), data);
         }
     }
 
     fn load_queue(&mut self) {
         if let Some(path) = Self::queue_path() {
             if let Ok(data) = std::fs::read_to_string(path) {
-                if let Ok(items) = serde_json::from_str::<Vec<DownloadItem>>(&data) {
-                    for mut it in items {
+                let (items, had_bad) = Self::parse_queue_items(&data);
+                if had_bad {
+                    Self::quarantine_queue_file(&data);
+                    self.push_log("Queue file had unreadable entries — kept the good ones, quarantined the rest.");
+                }
+                for mut it in items {
                         if it.status.is_active() {
                             it.status = Status::Queued;
                         }
@@ -2072,13 +2156,13 @@ impl CraftApp {
                         it.speed_bps = 0.0;
                         it.selected = false;
                         self.next_id = self.next_id.max(it.id + 1);
+                        self.known_ids.insert(it.id);
                         self.downloads.push(it);
                     }
                     self.push_log(format!("Loaded {} item(s).", self.downloads.len()));
                 }
             }
         }
-    }
 
     fn start(&mut self, id: u64) {
         let idx = match self.downloads.iter().position(|d| d.id == id) {
@@ -2188,6 +2272,14 @@ impl CraftApp {
             }
             self.push_log(format!("Paused #{id}"));
             self.save_queue();
+        } else if let Some(d) = self.downloads.iter_mut().find(|d| d.id == id) {
+            // Taskless (queued) items pause directly so the button never
+            // looks dead; the pump skips Paused.
+            if matches!(d.status, Status::Queued) {
+                d.status = Status::Paused;
+                self.push_log(format!("Paused #{id}"));
+                self.save_queue();
+            }
         }
     }
 
@@ -2216,6 +2308,15 @@ impl CraftApp {
             t.shared.cancelled.store(true, Ordering::SeqCst);
             t.handle.abort();
         }
+        // Reflect the stop immediately (the finish handler would only get
+        // here on its next poll): a cancelled transfer rests Paused with
+        // its partial state kept for resume.
+        if let Some(d) = self.downloads.iter_mut().find(|d| d.id == id) {
+            if !matches!(d.status, Status::Completed) {
+                d.status = Status::Paused;
+            }
+        }
+        self.save_queue();
     }
 
     fn remove(&mut self, id: u64) {
@@ -2236,7 +2337,10 @@ impl CraftApp {
 
     fn start_queue(&mut self) {
         self.queue_running = true;
-        // Resume paused ones directly, then fill the rest up to the limit.
+        // Resume paused ones directly, but never above the concurrent limit:
+        // paused items with live tasks count, the rest stay queued for
+        // fill_next (previously ALL paused resumed at once, ignoring the cap).
+        let cap = self.max_concurrent.max(1);
         let ids: Vec<u64> = self
             .downloads
             .iter()
@@ -2244,6 +2348,9 @@ impl CraftApp {
             .map(|d| d.id)
             .collect();
         for id in ids {
+            if self.tasks.len() >= cap {
+                break;
+            }
             self.resume(id);
         }
         self.fill_next();
@@ -2320,9 +2427,14 @@ impl CraftApp {
                         None => !cancelled && dl > 0,
                     };
                     // Snapshot what follow-up actions need (borrow ends at block end).
-                    // Any finished file on disk still counts (covers empty files too).
-                    let file_done =
-                        !cancelled && !complete && d.dest_path().exists();
+                    // A pre-existing file only counts when this run actually
+                    // wrote bytes into it (dl > 0): otherwise a failed retry
+                    // over an old finished file would mask as success.
+                    // (Covers empty files too.)
+                    let file_done = !cancelled
+                        && !complete
+                        && dl > 0
+                        && d.dest_path().exists();
                     if cancelled {
                         d.status = Status::Paused;
                     } else if complete || file_done {
@@ -2390,6 +2502,9 @@ impl CraftApp {
     }
 
     /// Runs the configured end-of-queue action once everything drained.
+    /// Only actively-workable items block it (Queued/Downloading). Paused
+    /// or failed leftovers no longer veto silently — they get one log line
+    /// so the user knows why the action still fired.
     fn maybe_finish_action(&mut self) {
         if !self.had_active || !self.queue_running {
             return;
@@ -2398,16 +2513,23 @@ impl CraftApp {
             return;
         }
         let pending = self.downloads.iter().any(|d| {
-            matches!(
-                d.status,
-                Status::Queued | Status::Downloading | Status::Paused | Status::Failed(_)
-            )
+            matches!(d.status, Status::Queued | Status::Downloading)
         });
         if pending {
             return;
         }
+        let leftovers = self
+            .downloads
+            .iter()
+            .filter(|d| matches!(d.status, Status::Paused | Status::Failed(_)))
+            .count();
         self.queue_running = false;
         self.had_active = false;
+        if leftovers > 0 {
+            self.push_log(format!(
+                "Queue drained with {leftovers} paused/failed item(s) left — finish action still runs."
+            ));
+        }
         match self.finish_action.as_str() {
             "shutdown" => {
                 self.push_log("Queue done — shutting down.");
@@ -2451,17 +2573,25 @@ impl CraftApp {
     /// Returns true when the window should be brought to the front.
     /// Leftover items stay in the inbox for later polls.
     fn poll_inbox(&mut self) -> bool {
+        const MAX_INBOX: usize = 200;
+        const CONFIRM_GRACE_SECS: i64 = 10;
         let path = match crate::native_host::inbox_path() {
             Some(p) => p,
             None => return false,
         };
+        let _guard = crate::model::fs_lock("inbox");
         let data = match std::fs::read_to_string(&path) {
             Ok(d) => d,
             Err(_) => return false,
         };
-        let items: Vec<crate::native_host::InboxItem> =
-            serde_json::from_str(&data).unwrap_or_default();
+        // Never destroy the inbox on parse failure (disk-full truncation,
+        // foreign bytes) — leave it for the next poll/owner.
+        let items: Vec<crate::native_host::InboxItem> = match serde_json::from_str(&data) {
+            Ok(v) => v,
+            Err(_) => return false,
+        };
         if items.is_empty() {
+            let _ = std::fs::remove_file(&path);
             return false;
         }
         // Standalone Download File Info dialogs (spawned per capture, IDM
@@ -2469,7 +2599,6 @@ impl CraftApp {
         // CONFIRM_GRACE_SECS are left alone so the dialog wins the race;
         // only entries it never claimed (crashed spawn, old version) fall
         // through to this in-canvas prompt.
-        const CONFIRM_GRACE_SECS: i64 = 10;
         let now_ts = chrono::Local::now().timestamp();
         let age_secs = |rfc: &str| -> i64 {
             chrono::DateTime::parse_from_rfc3339(rfc)
@@ -2501,16 +2630,26 @@ impl CraftApp {
             }
             // Invalid URLs and already-queued duplicates are dropped.
         }
-        let Some((url, filename, referer, cookie)) = next else {
-            // Nothing actionable now: keep young entries, drop the file only
-            // when fully drained.
+        // Cap the inbox (newest first by received_at) so a stuck producer
+        // can't grow it without bound.
+        if keep.len() > MAX_INBOX {
+            keep.sort_by(|a, b| b.received_at.cmp(&a.received_at));
+            keep.truncate(MAX_INBOX);
+        }
+        let write_keep = |keep: &Vec<crate::native_host::InboxItem>| {
             if keep.is_empty() {
                 let _ = std::fs::remove_file(&path);
             } else if let Ok(json) = serde_json::to_string_pretty(&keep) {
                 Self::atomic_write(&path, json.as_bytes());
             }
+        };
+        let Some((url, filename, referer, cookie)) = next else {
+            // Nothing actionable now: keep young entries, drop the file only
+            // when fully drained.
+            write_keep(&keep);
             return false;
         };
+        write_keep(&keep);
         if self.show_add {
             return false; // user is typing; retry on a later poll
         }
@@ -2524,11 +2663,6 @@ impl CraftApp {
         self.add_checksum.clear();
         self.probe_done_for.clear(); // force a fresh size/name probe
         self.show_add = true;
-        if keep.is_empty() {
-            let _ = std::fs::remove_file(&path);
-        } else if let Ok(json) = serde_json::to_string_pretty(&keep) {
-            Self::atomic_write(&path, json.as_bytes());
-        }
         self.push_log("Browser extension sent a download — confirm in Add download.");
         true
     }
@@ -2544,7 +2678,7 @@ impl CraftApp {
             Ok(d) => d,
             Err(_) => return,
         };
-        let items: Vec<DownloadItem> = serde_json::from_str(&data).unwrap_or_default();
+        let (items, _) = Self::parse_queue_items(&data);
         for mut it in items {
             if self
                 .downloads
@@ -2559,6 +2693,7 @@ impl CraftApp {
             it.speed_bps = 0.0;
             it.selected = false;
             self.next_id = self.next_id.max(it.id + 1);
+            self.known_ids.insert(it.id);
             self.downloads.push(it);
         }
     }
@@ -2570,6 +2705,7 @@ impl CraftApp {
             Some(p) => p.join("wake.json"),
             None => return,
         };
+        let _guard = crate::model::fs_lock("wake");
         let data = match std::fs::read_to_string(&path) {
             Ok(d) => d,
             Err(_) => return,
@@ -2934,6 +3070,7 @@ impl eframe::App for CraftApp {
         self.check_scheduler();
         if self.last_inbox_check.elapsed().as_secs() >= 2 {
             self.last_inbox_check = Instant::now();
+            crate::model::touch_heartbeat();
             self.merge_queue_from_disk();
             self.check_wake();
             self.check_cmd();
@@ -4956,8 +5093,7 @@ impl CraftApp {
                 .unwrap_or_else(|| "C:\\Downloads".to_string());
         }
         let final_dir = self.save_dir_for(&self.add_file);
-        let id = self.next_id;
-        self.next_id += 1;
+        let id = self.alloc_id();
         let mut item = DownloadItem::new(
             id,
             self.add_url.trim().to_string(),

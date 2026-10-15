@@ -69,9 +69,10 @@ fn read_snap(id: u64) -> Snap {
     out
 }
 
-/// Append a command for the main app (`pause`/`resume`/`cancel`).
+/// Append a command for the main app (`pause`/`resume`/`cancel`/`*_all`).
 fn send_cmd(id: u64, action: &str) {
     let Some(p) = cmd_path() else { return };
+    let _guard = crate::model::fs_lock("cmd");
     let mut v: serde_json::Value = std::fs::read_to_string(&p)
         .ok()
         .and_then(|s| serde_json::from_str(&s).ok())
@@ -91,8 +92,23 @@ fn send_cmd(id: u64, action: &str) {
     }
 }
 
-fn fmt_eta(left: u64, speed: f64) -> String {
-    if speed <= 1.0 {
+/// Open a file/folder with the OS default handler on any platform.
+fn open_path(p: &std::path::Path) {
+    #[cfg(windows)]
+    {
+        let _ = std::process::Command::new("explorer").arg(p).spawn();
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let _ = std::process::Command::new("open").arg(p).spawn();
+    }
+    #[cfg(all(not(windows), not(target_os = "macos")))]
+    {
+        let _ = std::process::Command::new("xdg-open").arg(p).spawn();
+    }
+}
+
+fn fmt_eta(left: u64, speed: f64) -> String {    if speed <= 1.0 {
         return "-".to_string();
     }
     let secs = (left as f64 / speed) as u64;
@@ -328,22 +344,11 @@ impl eframe::App for ProgressApp {
             ui.horizontal(|ui| {
                 if done {
                     if ui.add_sized([110.0, 38.0], egui::Button::new("Open file")).clicked() {
-                        let p = item.dest_path();
-                        #[cfg(windows)]
-                        {
-                            let _ = std::process::Command::new("explorer")
-                                .arg(p)
-                                .spawn();
-                        }
+                        open_path(&item.dest_path());
                     }
                     if ui.add_sized([110.0, 38.0], egui::Button::new("Open folder")).clicked() {
                         if let Some(dir) = item.dest_path().parent() {
-                            #[cfg(windows)]
-                            {
-                                let _ = std::process::Command::new("explorer")
-                                    .arg(dir)
-                                    .spawn();
-                            }
+                            open_path(dir);
                         }
                     }
                 } else if !failed {

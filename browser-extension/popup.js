@@ -8,7 +8,9 @@ chrome.runtime.sendMessage({ type: "getState" }, (res) => {
   $("auto").checked = !!res.autoCapture;
   if (res.minSizeKB !== undefined) $("minSize").value = String(res.minSizeKB);
   if (typeof res.blockHosts === "string") $("block").value = res.blockHosts;
-  if (!res.hostOk) {
+  if (res.fallbackError) {
+    $("status").textContent = "Browser re-download failed: " + res.fallbackError;
+  } else if (!res.hostOk) {
     $("status").textContent = "App not connected — open Download Craft once (Install Chrome host)." +
       (res.hostError ? " [" + res.hostError + "]" : "");
   }
@@ -24,22 +26,41 @@ $("saveFilters").onclick = () => {
     minSizeKB: $("minSize").value.trim(),
     blockHosts: $("block").value.trim(),
   }, (res) => {
-    $("status").textContent = res && res.ok ? "Filters saved ✓" : "Could not save filters.";
+    if (chrome.runtime.lastError || !res) {
+      $("status").textContent = "Extension background unreachable.";
+    } else {
+      $("status").textContent = res.ok ? "Filters saved ✓" : ("Could not save filters. " + (res.error || ""));
+    }
   });
 };
 
 $("send").onclick = () => {
   const url = $("url").value.trim();
   if (!url) return;
+  if (!/^https?:\/\//i.test(url) || url.length > 4000) {
+    $("status").textContent = "Only http(s) links up to 4000 chars can be sent.";
+    return;
+  }
   chrome.runtime.sendMessage({ type: "download", url }, (res) => {
-    const ok = res && res.ok;
-    $("status").textContent = ok ? "Sent to Download Craft ✓" : "App not reachable — open Download Craft once.";
+    if (chrome.runtime.lastError || !res) {
+      $("status").textContent = "App not reachable — open Download Craft once.";
+    } else {
+      $("status").textContent = res.ok ? "Sent to Download Craft ✓" : ("App not reachable. " + (res.error || ""));
+    }
   });
 };
 
-chrome.storage.local.get(["downloadCraftVideos", "downloadCraftLinks", "downloadCraftNet", "downloadCraftPage"], ({ downloadCraftVideos, downloadCraftLinks, downloadCraftNet, downloadCraftPage }) => {
-  const box = $("videos");
-  (downloadCraftVideos || []).forEach((v) => {
+function fmtSize(n) {
+  if (!n || n <= 0) return "";
+  const u = ["B", "KB", "MB", "GB"];
+  let v = n, i = 0;
+  while (v >= 1024 && i < u.length - 1) { v /= 1024; i++; }
+  return i === 0 ? `${n} ${u[i]}` : `${v.toFixed(v >= 100 ? 0 : 1)} ${u[i]}`;
+}
+const dispOf = (st) => st.disp || String(st.mime || "").replace("video/", "").split(";")[0];
+
+function renderVideos(box, videos, pageUrl) {
+  (videos || []).forEach((v) => {
     const wrap = document.createElement("div");
     wrap.className = "item";
     const t = document.createElement("div");
@@ -55,20 +76,16 @@ chrome.storage.local.get(["downloadCraftVideos", "downloadCraftLinks", "download
     linkBtn.onclick = () => {
       const name = String(v.title || "youtube_video").replace(/[<>:"/\\|?*]/g, "_");
       const fname = name.endsWith(".mp4") ? name : name + ".mp4";
-      const url = v.pageUrl || location.href;
-      chrome.runtime.sendMessage({ type: "download", url, filename: fname }, (res) => {
+      const url = v.pageUrl || pageUrl;
+      if (!url || !/^https?:\/\//i.test(url)) {
+        $("status").textContent = "No page URL for this video.";
+        return;
+      }
+      chrome.runtime.sendMessage({ type: "download", url, filename: fname, pageUrl: url }, (res) => {
         $("status").textContent = res && res.ok ? "Sent ✓ — confirm in Download Craft" : "App not reachable.";
       });
     };
     wrap.appendChild(linkBtn);
-    const fmtSize = (n) => {
-      if (!n || n <= 0) return "";
-      const u = ["B", "KB", "MB", "GB"];
-      let v = n, i = 0;
-      while (v >= 1024 && i < u.length - 1) { v /= 1024; i++; }
-      return i === 0 ? `${n} ${u[i]}` : `${v.toFixed(v >= 100 ? 0 : 1)} ${u[i]}`;
-    };
-    const dispOf = (st) => st.disp || String(st.mime || "").replace("video/", "").split(";")[0];
     const sizeJobs = [];
     const bestAudio = (arr) => (arr || []).slice().sort((a, b) => {
       const bn = (x) => { const m = String(x.label || "").match(/(\d+)k/); return m ? parseInt(m[1], 10) : 0; };
@@ -85,7 +102,7 @@ chrome.storage.local.get(["downloadCraftVideos", "downloadCraftLinks", "download
         ? { url: bestA.url, mime: bestA.mime }
         : null;
       btn.onclick = () => {
-        chrome.runtime.sendMessage({ type: "download", url: st.url, filename: fname, size: st._size || null, pairUrl: (pair && pair.url) || null, pairMime: (pair && pair.mime) || null }, (res) => {
+        chrome.runtime.sendMessage({ type: "download", url: st.url, filename: fname, pageUrl, size: st._size || null, pairUrl: (pair && pair.url) || null, pairMime: (pair && pair.mime) || null }, (res) => {
           $("status").textContent = res && res.ok ? "Sent ✓ — confirm in Download Craft" : "App not reachable.";
         });
       };
@@ -111,7 +128,7 @@ chrome.storage.local.get(["downloadCraftVideos", "downloadCraftLinks", "download
     try {
       const urls = sizeJobs.map((j) => j.st.url).filter(Boolean).slice(0, 12);
       if (urls.length) {
-        chrome.runtime.sendMessage({ type: "getSizes", urls }, (res) => {
+        chrome.runtime.sendMessage({ type: "getSizes", urls, referer: pageUrl }, (res) => {
           if (chrome.runtime.lastError) return;
           const sizes = (res && res.sizes) || {};
           for (const j of sizeJobs) {
@@ -124,10 +141,11 @@ chrome.storage.local.get(["downloadCraftVideos", "downloadCraftLinks", "download
       }
     } catch (e) { /* ignore */ }
   });
-  const list = $("list");
-  const net = (downloadCraftNet || []).filter((n) =>
-    !((downloadCraftLinks || []).some((l) => l.url === n.url)));
-  net.forEach((n) => {
+}
+
+function renderLinks(list, links, net, pageUrl) {
+  const have = new Set((links || []).map((l) => l.url));
+  (net || []).filter((n) => !have.has(n.url)).forEach((n) => {
     const div = document.createElement("div");
     div.className = "item";
     const a = document.createElement("a");
@@ -137,14 +155,15 @@ chrome.storage.local.get(["downloadCraftVideos", "downloadCraftLinks", "download
       ? "Send stream (needs app resolve)"
       : "Download stream";
     btn.onclick = () => {
-      chrome.runtime.sendMessage({ type: "download", url: n.url, pageUrl: downloadCraftPage || undefined }, (res) => {
+      chrome.runtime.sendMessage({ type: "download", url: n.url, pageUrl: pageUrl || undefined }, (res) => {
         $("status").textContent = res && res.ok ? "Sent ✓" : "App not reachable.";
       });
     };
     div.append(a, document.createElement("br"), btn);
     list.append(div);
   });
-  (downloadCraftLinks || []).forEach((l) => {
+  (links || []).forEach((l) => {
+    if (!/^https?:\/\//i.test(l.url)) return; // defense-in-depth: never offer odd schemes
     const div = document.createElement("div");
     div.className = "item";
     const a = document.createElement("a");
@@ -152,11 +171,59 @@ chrome.storage.local.get(["downloadCraftVideos", "downloadCraftLinks", "download
     const btn = document.createElement("button");
     btn.textContent = "Download with Download Craft";
     btn.onclick = () => {
-      chrome.runtime.sendMessage({ type: "download", url: l.url }, (res) => {
+      chrome.runtime.sendMessage({ type: "download", url: l.url, pageUrl: pageUrl || undefined }, (res) => {
         $("status").textContent = res && res.ok ? "Sent ✓" : "App not reachable.";
       });
     };
     div.append(a, document.createElement("br"), btn);
     list.append(div);
   });
-});
+}
+
+// Per-tab state: ask the ACTIVE tab's content script first (always fresh,
+// never another tab's leftovers); fall back to the stored snapshot.
+async function activeTab() {
+  try {
+    const tabs = await chrome.tabs.query({ active: true, currentWindow: true });
+    return (tabs && tabs[0]) || null;
+  } catch (e) {
+    return null;
+  }
+}
+
+(async () => {
+  const box = $("videos");
+  const list = $("list");
+  const tab = await activeTab();
+  const tabUrl = (tab && tab.url && /^https?:\/\//i.test(tab.url)) ? tab.url : null;
+  if (tab && tab.id !== undefined) {
+    try {
+      const peek = await chrome.tabs.sendMessage(tab.id, { type: "peekState" });
+      if (peek && (peek.videos || peek.links || peek.net)) {
+        renderVideos(box, peek.videos, peek.page || tabUrl);
+        renderLinks(list, peek.links, peek.net, peek.page || tabUrl);
+        return;
+      }
+    } catch (e) {
+      /* content unreachable (no script on this page): fall through */
+    }
+  }
+  // Fallback: last stored snapshot, filtered to this tab's page when known.
+  chrome.storage.local.get(
+    ["downloadCraftVideos", "downloadCraftLinks", "downloadCraftNet", "downloadCraftPage"],
+    ({ downloadCraftVideos, downloadCraftLinks, downloadCraftNet, downloadCraftPage }) => {
+      const samePage = (p) => !tabUrl || !p || p.split("#")[0] === tabUrl.split("#")[0];
+      renderVideos(
+        box,
+        (downloadCraftVideos || []).filter((v) => samePage(v.pageUrl || downloadCraftPage)),
+        downloadCraftPage || tabUrl
+      );
+      renderLinks(
+        list,
+        (downloadCraftLinks || []).filter(() => samePage(downloadCraftPage)),
+        (downloadCraftNet || []).filter(() => samePage(downloadCraftPage)),
+        downloadCraftPage || tabUrl
+      );
+    }
+  );
+})();

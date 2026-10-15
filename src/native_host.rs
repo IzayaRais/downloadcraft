@@ -10,7 +10,6 @@
 //! imports as queued (auto-started) downloads.
 
 use serde::{Deserialize, Serialize};
-use std::io::Read;
 
 #[derive(Debug, Deserialize)]
 struct Incoming {
@@ -77,20 +76,40 @@ pub fn inbox_path() -> Option<std::path::PathBuf> {
     crate::model::config_dir().map(|p| p.join("native_inbox.json"))
 }
 
-fn read_message() -> Option<Incoming> {
+/// One stdin frame: clean EOF (browser gone → exit the host) vs a broken
+/// frame (reply with an error and keep serving — one bad message must not
+/// kill the host and abandon everything behind it).
+enum HostFrame {
+    Eof,
+    Bad(String),
+    Msg(Incoming),
+}
+
+fn read_message() -> HostFrame {
+    use std::io::Read;
     let mut len_buf = [0u8; 4];
-    if std::io::stdin().read_exact(&mut len_buf).is_err() {
-        return None; // browser closed the pipe
+    match std::io::stdin().read_exact(&mut len_buf) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => return HostFrame::Eof,
+        Err(_) => return HostFrame::Eof, // pipe broken: nothing more to serve
     }
     let len = u32::from_le_bytes(len_buf) as usize;
-    if len == 0 || len > 4 * 1024 * 1024 {
-        return None;
+    if len == 0 {
+        return HostFrame::Eof; // clean close
+    }
+    if len > 4 * 1024 * 1024 {
+        // Length prefix is corrupt; the stream cannot be resynced, so the
+        // only honest action is to exit rather than misparse everything.
+        return HostFrame::Eof;
     }
     let mut buf = vec![0u8; len];
     if std::io::stdin().read_exact(&mut buf).is_err() {
-        return None;
+        return HostFrame::Eof;
     }
-    serde_json::from_slice(&buf).ok()
+    match serde_json::from_slice::<Incoming>(&buf) {
+        Ok(m) => HostFrame::Msg(m),
+        Err(e) => HostFrame::Bad(format!("bad message: {e}")),
+    }
 }
 
 fn write_message(reply: &Reply) {
@@ -104,41 +123,59 @@ fn write_message(reply: &Reply) {
     }
 }
 
-fn queue_download(msg: &Incoming) -> Result<(), String> {
+fn queue_download(msg: &Incoming) -> Result<bool, String> {
+    const MAX_INBOX: usize = 200;
     let url = msg.url.clone().unwrap_or_default();
     let path = inbox_path().ok_or_else(|| "no config dir".to_string())?;
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
     }
-    let mut items: Vec<InboxItem> = std::fs::read_to_string(&path)
-        .ok()
-        .and_then(|s| serde_json::from_str(&s).ok())
-        .unwrap_or_default();
-    // De-dupe identical URLs.
-    if !items.iter().any(|i| i.url == url) {
-        let referer = msg
-            .referer
-            .clone()
-            .or_else(|| msg.page_url.clone())
-            .filter(|s| !s.trim().is_empty());
-        items.push(InboxItem {
-            url,
-            filename: msg.filename.clone(),
-            received_at: chrono::Local::now().to_rfc3339(),
-            page_url: msg.page_url.clone(),
-            referer,
-            cookie: msg.cookie.clone().filter(|s| !s.trim().is_empty()),
-            mime: msg.mime.clone().filter(|s| !s.trim().is_empty()),
-            size: msg.size.filter(|s| *s > 0),
-            pair_url: msg.pair_url.clone().filter(|s| s.starts_with("http")),
-            pair_mime: msg.pair_mime.clone().filter(|s| !s.trim().is_empty()),
-        });
-        let json = serde_json::to_string_pretty(&items).map_err(|e| e.to_string())?;
-        let tmp = path.with_extension("tmp");
-        std::fs::write(&tmp, json).map_err(|e| e.to_string())?;
-        std::fs::rename(&tmp, &path).map_err(|e| e.to_string())?;
+    let _guard = crate::model::fs_lock("inbox");
+    // Never destroy pending captures on an unreadable inbox.
+    let data = std::fs::read_to_string(&path).ok();
+    let mut items: Vec<InboxItem> = match data {
+        None => Vec::new(), // no file yet
+        Some(s) => serde_json::from_str(&s)
+            .map_err(|_| "inbox unreadable — kept for the next poll".to_string())?,
+    };
+    let referer = msg
+        .referer
+        .clone()
+        .or_else(|| msg.page_url.clone())
+        .filter(|s| !s.trim().is_empty());
+    let fresh = InboxItem {
+        url: url.clone(),
+        filename: msg.filename.clone(),
+        received_at: chrono::Local::now().to_rfc3339(),
+        page_url: msg.page_url.clone(),
+        referer,
+        cookie: msg.cookie.clone().filter(|s| !s.trim().is_empty()),
+        mime: msg.mime.clone().filter(|s| !s.trim().is_empty()),
+        size: msg.size.filter(|s| *s > 0),
+        pair_url: msg.pair_url.clone().filter(|s| s.starts_with("http")),
+        pair_mime: msg.pair_mime.clone().filter(|s| !s.trim().is_empty()),
+    };
+    // Same URL re-captured: refresh metadata instead of ignoring it (the
+    // filename/referer/cookie may be corrected this time).
+    let is_new = match items.iter_mut().find(|i| i.url == url) {
+        Some(existing) => {
+            *existing = fresh;
+            false
+        }
+        None => {
+            items.push(fresh);
+            true
+        }
+    };
+    if items.len() > MAX_INBOX {
+        items.sort_by(|a, b| b.received_at.cmp(&a.received_at));
+        items.truncate(MAX_INBOX);
     }
-    Ok(())
+    let json = serde_json::to_string_pretty(&items).map_err(|e| e.to_string())?;
+    let tmp = path.with_extension("tmp");
+    std::fs::write(&tmp, json).map_err(|e| e.to_string())?;
+    std::fs::rename(&tmp, &path).map_err(|e| e.to_string())?;
+    Ok(is_new)
 }
 
 /// Fire-and-forget the standalone Download File Info dialog (detached, so
@@ -185,8 +222,19 @@ fn spawn_confirm(msg: &Incoming) {
 /// Entry point when launched with `--native-host`. Never returns normally.
 pub fn run() -> eframe::Result<()> {
     // Keep stderr quiet; any panic text would corrupt the pipe (stdout stays clean).
-    while let Some(msg) = read_message() {
-        match msg.kind.as_str() {
+    loop {
+        match read_message() {
+            HostFrame::Eof => break,
+            HostFrame::Bad(e) => {
+                write_message(&Reply {
+                    kind: "error".into(),
+                    version: None,
+                    queued: None,
+                    error: Some(e),
+                });
+                continue;
+            }
+            HostFrame::Msg(msg) => match msg.kind.as_str() {
             "ping" => write_message(&Reply {
                 kind: "pong".into(),
                 version: Some(1),
@@ -218,7 +266,7 @@ pub fn run() -> eframe::Result<()> {
                     continue;
                 }
                 match queue_download(&msg) {
-                    Ok(()) => {
+                    Ok(_is_new) => {
                         write_message(&Reply {
                             kind: "ok".into(),
                             version: None,
@@ -246,6 +294,7 @@ pub fn run() -> eframe::Result<()> {
                 queued: None,
                 error: Some("unknown message".into()),
             }),
+            }
         }
     }
     Ok(())

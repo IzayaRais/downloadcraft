@@ -119,6 +119,7 @@ fn send_cmd(action: &str) {
     let Some(p) = config_dir().map(|d| d.join("cmd.json")) else {
         return;
     };
+    let _guard = crate::model::fs_lock("cmd");
     let mut v: serde_json::Value = std::fs::read_to_string(&p)
         .ok()
         .and_then(|s| serde_json::from_str(&s).ok())

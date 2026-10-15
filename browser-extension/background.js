@@ -7,20 +7,21 @@ const GRACE_MS = 15_000; // ignore our own fallback re-downloads
 const seen = new Map(); // url -> timestamp (loop guard)
 let hostOk = true;
 let lastHostError = "";
+let lastFallbackError = "";
 // Must match manifest version + content.js EXT_VER. Tabs running an older
 // content script are rejected with a "reload the tab" error instead of
 // failing mysteriously (their extension APIs are gone after a reload).
-const EXT_VER = "0.5.0";
+const EXT_VER = "0.5.1";
 
-function markSeen(url) {
-  seen.set(url, Date.now());
+function markSeen(url, filename) {
+  seen.set(url + "|" + (filename || ""), Date.now());
   if (seen.size > 200) {
     const cut = Date.now() - GRACE_MS;
     for (const [u, t] of seen) if (t < cut) seen.delete(u);
   }
 }
-function freshSeen(url) {
-  const t = seen.get(url);
+function freshSeen(url, filename) {
+  const t = seen.get(url + "|" + (filename || ""));
   return t !== undefined && Date.now() - t < GRACE_MS;
 }
 
@@ -46,18 +47,24 @@ function hostBlocked(url, blockHosts) {
   }
 }
 
-// Curated cookies for ONE url only (same-host). Never logged; capped.
+// Curated cookies for ONE url only (same-host). Never logged. Whole
+// name=value pairs only — a byte cut could split a pair and corrupt auth.
 async function cookiesFor(url) {
   try {
     if (!chrome.cookies || !chrome.cookies.getAll) return null;
     const list = await chrome.cookies.getAll({ url });
     if (!list || !list.length) return null;
-    const s = list
+    const pairs = list
       .filter((c) => c && c.name)
       .slice(0, 40)
-      .map((c) => `${c.name}=${c.value || ""}`)
-      .join("; ");
-    return s.length > 6000 ? s.slice(0, 6000) : s;
+      .map((c) => `${c.name}=${c.value || ""}`);
+    let s = "";
+    for (const p of pairs) {
+      const add = (s ? "; " : "") + p;
+      if ((s + add).length > 6000) break;
+      s += add;
+    }
+    return s || null;
   } catch (e) {
     return null;
   }
@@ -107,7 +114,7 @@ function noteMedia(tabId, entry) {
   if (list.some((e) => e.url === entry.url)) return;
   list.push({ ...entry, seenAt: Date.now() });
   if (list.length > 25) list.splice(0, list.length - 25);
-  // Persist latest for the popup (best-effort).
+  // Legacy global snapshot: fallback only (popup prefers per-tab peek).
   try {
     chrome.storage.local.set({ downloadCraftNet: list.slice(-25) });
   } catch (e) { /* ignore */ }
@@ -143,7 +150,12 @@ try {
           const minB = Math.max(0, (parseInt(cfg.minSizeKB, 10) || 100)) * 1024;
           const isPlaylist = /m3u8|mpd|mpegurl|dash/i.test(details.url) || /m3u8|mpd|mpegurl|dash/i.test(ctype);
           if (!isPlaylist && clen > 0 && clen < minB) return;
-          noteMedia(details.tabId, { url: details.url, mime, size: clen || 0 });
+          noteMedia(details.tabId, {
+            url: details.url,
+            mime,
+            size: clen || 0,
+            pageUrl: details.documentUrl || null,
+          });
         } catch (e) { /* never break navigation */ }
         })();
       },
@@ -158,6 +170,16 @@ try {
     chrome.tabs.onRemoved.addListener((tabId) => {
       tabMedia.delete(tabId);
       try { chrome.action.setBadgeText({ text: "", tabId }).catch(() => {}); } catch (e) {}
+    });
+  }
+  // New navigation (same tab, new video): drop the previous video's URLs so
+  // itag-swaps and menus can never graft stale streams.
+  if (chrome.tabs && chrome.tabs.onUpdated) {
+    chrome.tabs.onUpdated.addListener((tabId, info) => {
+      if (info.status === "loading" && info.url !== undefined) {
+        tabMedia.delete(tabId);
+        try { chrome.action.setBadgeText({ text: "", tabId }).catch(() => {}); } catch (e) {}
+      }
     });
   }
 } catch (e) { /* ignore */ }
@@ -224,8 +246,8 @@ async function refreshOpenTabs() {
 
 chrome.contextMenus.onClicked.addListener((info, tab) => {
   const url = info.linkUrl || info.srcUrl;
-  if (url) {
-    markSeen(url);
+  if (url && /^https?:\/\//i.test(url)) {
+    markSeen(url, null);
     const pageUrl = (tab && tab.url) || null;
     sendToHost(url, null, { pageUrl }).then((ok) => {
       hostOk = ok;
@@ -238,28 +260,43 @@ chrome.contextMenus.onClicked.addListener((info, tab) => {
 chrome.downloads.onCreated.addListener(async (item) => {
   const url = item.finalUrl || item.url;
   if (!url || !/^https?:\/\//i.test(url)) return; // blobs/data stay in browser
-  if (freshSeen(url)) return; // our own fallback re-download
   const cfg = await settings();
   if (!cfg.autoCapture) return;
   if (hostBlocked(url, cfg.blockHosts)) return; // P0.1 site filter
+  if (freshSeen(url, item.filename)) return; // our own fallback re-download
+  // Honor the size filter here too (sniffer-only before): tiny files stay
+  // in the browser. Unknown sizes (0/undefined) still capture.
+  const minB = Math.max(0, (parseInt(cfg.minSizeKB, 10) || 0)) * 1024;
+  const known = item.fileSize || item.totalBytes || 0;
+  if (minB > 0 && known > 0 && known < minB) return;
   try {
     await chrome.downloads.cancel(item.id);
   } catch (e) {
-    /* already finished */
-  }
-  try {
-    await chrome.downloads.erase({ id: item.id });
-  } catch (e) {
-    /* keep going */
+    // Already finished (fast download): cancelling is impossible, and
+    // re-sending would deliver a SECOND copy — leave the browser's file.
+    return;
   }
   const ok = await sendToHost(url, item.filename);
+  // Erase the browser entry only once the app confirmed receipt.
+  if (ok) {
+    try {
+      await chrome.downloads.erase({ id: item.id });
+    } catch (e) {
+      /* already gone */
+    }
+  }
   hostOk = ok;
   setBadge();
   if (!ok) {
     // Native host missing: hand the file back to the browser so nothing is lost.
-    markSeen(url);
+    markSeen(url, item.filename);
     chrome.downloads.download({ url, saveAs: false }, () => {
-      void chrome.runtime.lastError;
+      if (chrome.runtime.lastError) {
+        lastFallbackError = chrome.runtime.lastError.message || "browser re-download failed";
+        setBadge();
+      } else {
+        lastFallbackError = "";
+      }
     });
   }
 });
@@ -269,6 +306,9 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   (async () => {
     if (!msg || typeof msg !== "object") return { ok: false };
     if (msg.type === "download" && msg.url) {
+      if (!/^https?:\/\//i.test(msg.url) || msg.url.length > 4000) {
+        return { ok: false, error: "only http(s) links up to 4000 chars can be sent" };
+      }
       if (msg.ver && msg.ver !== EXT_VER) {
         // Stale tab script (extension reloaded without a tab refresh):
         // push the current script into the tab so the *next* click works.
@@ -292,7 +332,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
           error: `page runs script v${msg.ver}, app expects v${EXT_VER} — reload this tab (Ctrl+R), then click again`,
         };
       }
-      markSeen(msg.url);
+      markSeen(msg.url, msg.filename);
       try {
         const pageUrl = msg.pageUrl || (sender && sender.tab && sender.tab.url) || null;
         const ok = await sendToHost(msg.url, msg.filename, {
@@ -316,15 +356,28 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       }
     }
     if (msg.type === "getMedia") {
-      const tabId = sender && sender.tab && sender.tab.id;
+      // Popup passes its tab; content scripts arrive with sender.tab.
+      const tabId = (msg.tabId !== undefined)
+        ? msg.tabId
+        : (sender && sender.tab && sender.tab.id);
       const list = (tabId !== undefined && tabMedia.get(tabId)) || [];
-      return { items: list.slice(-25) };
+      const page = msg.pageUrl || null;
+      const items = list.slice(-25).filter((m) => !page || !m.pageUrl || m.pageUrl === page);
+      return { items };
     }
     if (msg.type === "getSizes" && Array.isArray(msg.urls)) {
       // IDM-style file sizes for the quality menu. HEAD first, then a
       // bytes=0-0 Range fallback (media servers often hide length on HEAD).
-      // Same-origin safe: service-worker fetch under host_permissions.
-      const urls = msg.urls.filter((u) => /^https?:\/\//i.test(u)).slice(0, 12);
+      // Same-origin safe: service-worker fetch under host_permissions, with
+      // the page as referrer. (fetch cannot send Cookie — forbidden header —
+      // so off-session hosts may still 403; sizes stay best-effort.)
+      const seenUrls = new Set();
+      const urls = msg.urls
+        .filter((u) => typeof u === "string" && /^https?:\/\//i.test(u) && !seenUrls.has(u) && (seenUrls.add(u), true))
+        .slice(0, 12);
+      const referrer = (typeof msg.referer === "string" && /^https?:\/\//i.test(msg.referer))
+        ? msg.referer
+        : undefined;
       const out = {};
       await Promise.all(urls.map(async (u) => {
         try {
@@ -333,7 +386,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
           const timer = setTimeout(() => ctl.abort(), 8000);
           let len = 0;
           try {
-            const r = await fetch(u, { method: "HEAD", signal: ctl.signal, credentials: "omit", redirect: "follow" });
+            const r = await fetch(u, { method: "HEAD", signal: ctl.signal, credentials: "omit", redirect: "follow", ...(referrer ? { referrer, referrerPolicy: "unsafe-url" } : {}) });
             len = parseInt(r.headers.get("content-length") || "0", 10) || 0;
           } finally {
             clearTimeout(timer);
@@ -342,7 +395,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
             const ctl2 = new AbortController();
             const t2 = setTimeout(() => ctl2.abort(), 8000);
             try {
-              const r2 = await fetch(u, { method: "GET", headers: { Range: "bytes=0-0" }, signal: ctl2.signal, credentials: "omit", redirect: "follow" });
+              const r2 = await fetch(u, { method: "GET", headers: { Range: "bytes=0-0" }, signal: ctl2.signal, credentials: "omit", redirect: "follow", ...(referrer ? { referrer, referrerPolicy: "unsafe-url" } : {}) });
               const cr = r2.headers.get("content-range") || "";
               const m = cr.match(/\/(\d+)\s*$/);
               len = m ? parseInt(m[1], 10) || 0 : (parseInt(r2.headers.get("content-length") || "0", 10) || 0);
@@ -352,7 +405,14 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
           }
           out[u] = len;
           sizeCache.set(u, len);
-          if (sizeCache.size > 200) sizeCache.clear();
+          // Drop the oldest half instead of wiping the cache outright.
+          if (sizeCache.size > 200) {
+            let n = 0;
+            for (const k of sizeCache.keys()) {
+              sizeCache.delete(k);
+              if (++n >= 100) break;
+            }
+          }
         } catch (e) {
           out[u] = 0;
         }
@@ -364,7 +424,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       // startup, which can predate the app's first run).
       await sendToHostPing();
       const cfg = await settings();
-      return { autoCapture: !!cfg.autoCapture, minSizeKB: cfg.minSizeKB, blockHosts: cfg.blockHosts, hostOk, hostError: lastHostError || null };
+      return { autoCapture: !!cfg.autoCapture, minSizeKB: cfg.minSizeKB, blockHosts: cfg.blockHosts, hostOk, hostError: lastHostError || null, fallbackError: lastFallbackError || null };
     }
     if (msg.type === "setAuto" && typeof msg.value === "boolean") {
       await chrome.storage.local.set({ autoCapture: msg.value });
@@ -372,13 +432,20 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     }
     if (msg.type === "setFilters") {
       const patch = {};
+      let ok = false;
       if (msg.minSizeKB !== undefined) {
-        const n = Math.max(0, Math.min(100000, parseInt(msg.minSizeKB, 10) || 0));
+        const n = parseInt(msg.minSizeKB, 10);
+        if (!Number.isFinite(n) || n < 0 || n > 100000) {
+          return { ok: false, error: "min size must be 0–100000 KB" };
+        }
         patch.minSizeKB = n;
+        ok = true;
       }
       if (typeof msg.blockHosts === "string" && msg.blockHosts.length < 4000) {
         patch.blockHosts = msg.blockHosts;
+        ok = true;
       }
+      if (!ok) return { ok: false, error: "nothing valid to save" };
       await chrome.storage.local.set(patch);
       return { ok: true };
     }

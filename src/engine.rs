@@ -180,6 +180,30 @@ async fn wait_if_paused(shared: &Arc<SharedState>) -> Result<()> {
     }
 }
 
+/// Serialize jobs targeting the same destination (two concurrent writers
+/// would interleave part/work files). Returns None when another job owns
+/// the destination right now — callers fail loudly instead of corrupting.
+fn claim_dest_job(dest: &std::path::Path) -> Option<crate::model::FsGuard> {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    dest.to_string_lossy().hash(&mut h);
+    let g = crate::model::fs_lock(&format!("job-{:x}", h.finish()));
+    g.owned().then_some(g)
+}
+
+static WORK_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Unique sidecar dir per job so concurrent/retried jobs never share part
+/// files (`dcwork-<pid>-<n>`).
+fn unique_work_dir(dest: &std::path::Path) -> std::path::PathBuf {
+    let n = WORK_COUNTER.fetch_add(1, Ordering::SeqCst);
+    let stem = dest
+        .file_stem()
+        .map(|s| s.to_string_lossy().to_string())
+        .unwrap_or_else(|| "dl".to_string());
+    let parent = dest.parent().map(|p| p.to_path_buf()).unwrap_or_default();
+    parent.join(format!("{stem}.dcwork-{}-{n}", std::process::id()))
+}
 /// Shared token-bucket rate limiter (clean-room implementation).
 /// Unlike a naive per-chunk `sleep(bytes/limit)`, the bucket smooths bursts
 /// across all connections: tokens accrue at `limit_bps` and each chunk
@@ -232,7 +256,7 @@ impl RateLimiter {
             return;
         }
         let wait_secs: f64 = {
-            let mut g = self.state.lock().unwrap();
+            let mut g = mutex_guard(&self.state);
             let (ref mut tokens, ref mut last) = *g;
             let now = std::time::Instant::now();
             let elapsed = now.duration_since(*last).as_secs_f64();
@@ -251,6 +275,31 @@ impl RateLimiter {
     }
 }
 
+/// Lock a mutex even when poisoned (a panicking holder must not cascade
+/// into every UI poll and engine task — take the guard anyway).
+fn mutex_guard<'a, T>(m: &'a std::sync::Mutex<T>) -> std::sync::MutexGuard<'a, T> {
+    m.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// Marker for HTTP refusals that must NOT be retried (401/403): the same
+/// request will fail the same way. Attached to the error (instead of
+/// matching "403" substrings in rendered text, which false-positives on
+/// byte counts and wrapped messages).
+#[derive(Debug)]
+struct FinalHttp(String);
+
+impl std::fmt::Display for FinalHttp {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
+impl std::error::Error for FinalHttp {}
+
+fn final_err(msg: String) -> anyhow::Error {
+    anyhow::Error::new(FinalHttp(msg))
+}
+
 /// Map an HTTP failure to an actionable message. A bare `403` on a
 /// googlevideo link almost always means a stale/session-locked stream URL
 /// (they expire and are IP/session-bound) — retrying the same URL is
@@ -262,17 +311,17 @@ fn http_status_err(url: &str, e: reqwest::Error) -> anyhow::Error {
             || url.contains("youtube.com")
             || url.contains("youtu.be")
         {
-            return anyhow!(
-                "YouTube refused this link (403) — stream links expire and are locked to the browser session that created them: replay the video, reopen the ⬇ Download this video menu for a fresh quality row, and download that (progressive ≤720p saves as one ready file)"
+            return final_err(
+                "YouTube refused this link (403) — stream links expire and are locked to the browser session that created them: replay the video, reopen the ⬇ Download this video menu for a fresh quality row, and download that (progressive ≤720p saves as one ready file)".to_string(),
             );
         }
-        return anyhow!(
-            "server refused (403 Forbidden) — it likely needs login or cookies: open the page in your browser and capture it with the Download Craft extension"
+        return final_err(
+            "server refused (403 Forbidden) — it likely needs login or cookies: open the page in your browser and capture it with the Download Craft extension".to_string(),
         );
     }
     if status == Some(reqwest::StatusCode::UNAUTHORIZED) {
-        return anyhow!(
-            "server needs a login (401) — add the username/password in the Add dialog's advanced section, or capture via the browser extension"
+        return final_err(
+            "server needs a login (401) — add the username/password in the Add dialog's advanced section, or capture via the browser extension".to_string(),
         );
     }
     match status {
@@ -282,8 +331,14 @@ fn http_status_err(url: &str, e: reqwest::Error) -> anyhow::Error {
 }
 
 fn is_final_http_error(e: &anyhow::Error) -> bool {
-    let s = e.to_string();
-    s.contains("403") || s.contains("401")
+    e.downcast_ref::<FinalHttp>().is_some()
+}
+
+/// Saturating counter decrement (plain `fetch_sub` wraps to u64::MAX on
+/// underflow — which once painted a stuck-full progress bar).
+fn sub_saturating(a: &std::sync::atomic::AtomicU64, n: u64) {
+    a.fetch_update(Ordering::SeqCst, Ordering::SeqCst, |v| Some(v.saturating_sub(n)))
+        .ok();
 }
 
 fn is_googlevideo_url(url: &str) -> bool {
@@ -1639,6 +1694,9 @@ async fn download_hls(
     shared: &Arc<SharedState>,
 ) -> Result<()> {
     const MAX_SEGS: usize = 2000;
+    let _job = claim_dest_job(dest).ok_or_else(|| {
+        anyhow!("this destination is already downloading elsewhere — wait for it or remove the duplicate queue entry")
+    })?;
     let client = opts.build_client()?;
     if let Some(parent) = dest.parent() {
         tokio::fs::create_dir_all(parent).await?;
@@ -1712,7 +1770,9 @@ async fn download_hls(
         None => None,
     };
     let key_iv_hex: Option<String> = key.as_ref().and_then(|(_, iv)| iv.clone());
-    // 3. Resume map: {playlist, count, done:[idx]}.
+    // 3. Resume map: {playlist, count, done:[idx]}. Entries only count
+    // when their part file is still on disk (cleanups must not brick
+    // the merge into "segment missing").
     let map_path = dest.with_extension("hlsmap");
     let mut done: std::collections::HashSet<usize> = std::collections::HashSet::new();
     if let Ok(raw) = std::fs::read_to_string(&map_path) {
@@ -1723,8 +1783,11 @@ async fn download_hls(
                 if let Some(arr) = v.get("done").and_then(|x| x.as_array()) {
                     for x in arr {
                         if let Some(i) = x.as_u64() {
-                            if (i as usize) < segs.len() {
-                                done.insert(i as usize);
+                            let i = i as usize;
+                            if i < segs.len()
+                                && dest.with_extension(format!("hls{i}")).exists()
+                            {
+                                done.insert(i);
                             }
                         }
                     }
@@ -1777,8 +1840,8 @@ async fn download_hls(
     }
     // Progress: one slot per segment.
     {
-        let mut totals = shared.part_total.lock().unwrap();
-        let mut dones = shared.part_done.lock().unwrap();
+        let mut totals = mutex_guard(&shared.part_total);
+        let mut dones = mutex_guard(&shared.part_done);
         totals.clear();
         dones.clear();
         for i in 0..segs.len() {
@@ -1787,6 +1850,19 @@ async fn download_hls(
         }
     }
     shared.downloaded.store(0, Ordering::SeqCst);
+    // Seed progress from already-resumed segments so the bar doesn't
+    // restart at zero (their bytes are on disk, never re-fetched).
+    {
+        let mut seeded = 0u64;
+        for i in done.iter() {
+            seeded = seeded.saturating_add(
+                std::fs::metadata(dest.with_extension(format!("hls{i}")))
+                    .map(|m| m.len())
+                    .unwrap_or(0),
+            );
+        }
+        shared.downloaded.store(seeded, Ordering::SeqCst);
+    }
     let limiter = std::sync::Arc::new(
         RateLimiter::new(opts.speed_limit_bps).with_global(opts.global_limit.clone()),
     );
@@ -1812,7 +1888,7 @@ async fn download_hls(
             let iv: Option<[u8; 16]> = match (&kb, ivh) {
                 (Some(_), Some(hex)) => Some(parse_hex_iv(&hex).ok_or_else(|| anyhow!("bad EXT-X-IV"))?),
                 (Some(_), None) => {
-                    let seq = (seq0 + idx as u64) as u128;
+                    let seq = (seq0.saturating_add(idx as u64)) as u128;
                     Some(seq.to_be_bytes())
                 }
                 _ => None,
@@ -1827,6 +1903,9 @@ async fn download_hls(
                 if shared.cancelled.load(Ordering::SeqCst) {
                     return Err(anyhow!("cancelled"));
                 }
+                // Bytes added below belong to THIS attempt; a mid-stream
+                // failure rolls them back so progress never overcounts.
+                let mut attempt_bytes: u64 = 0;
                 let got = opts.get(&client, &url).send().await;
                 let data: Vec<u8> = match got {
                     Ok(resp) => {
@@ -1852,11 +1931,13 @@ async fn download_hls(
                         let mut bad: Option<anyhow::Error> = None;
                         while let Some(chunk) = stream.next().await {
                             if abort.load(Ordering::SeqCst) {
+                                sub_saturating(&shared.downloaded, attempt_bytes);
                                 return Err(anyhow!("cancelled"));
                             }
                             match chunk {
                                 Ok(bytes) => {
                                     buf.extend_from_slice(&bytes);
+                                    attempt_bytes += bytes.len() as u64;
                                     shared.downloaded.fetch_add(bytes.len() as u64, Ordering::SeqCst);
                                     limiter.consume(bytes.len() as u64).await;
                                 }
@@ -1867,6 +1948,7 @@ async fn download_hls(
                             }
                         }
                         if let Some(e) = bad {
+                            sub_saturating(&shared.downloaded, attempt_bytes);
                             if attempt >= max_retries {
                                 abort.store(true, Ordering::SeqCst);
                                 return Err(e);
@@ -1885,9 +1967,16 @@ async fn download_hls(
                         continue;
                     }
                 };
-                // Decrypt (AES-128) then store the segment file.
+                // Decrypt (AES-128) then store the segment file. A bad key
+                // fails EVERY segment, so stop the siblings immediately.
                 let plain = match (&kb, iv) {
-                    (Some(k), Some(v)) => aes128_cbc_decrypt(&data, k, &v)?,
+                    (Some(k), Some(v)) => match aes128_cbc_decrypt(&data, k, &v) {
+                        Ok(p) => p,
+                        Err(e) => {
+                            abort.store(true, Ordering::SeqCst);
+                            return Err(e);
+                        }
+                    },
                     _ => data,
                 };
                 tokio::fs::write(&part, &plain).await.map_err(|e| anyhow!(io_message(&e)))?;
@@ -1982,6 +2071,10 @@ pub async fn download(
         }
         return download_hls(&url, &dest, connections, &opts, &shared).await;
     }
+    // Same-destination jobs would interleave part files: serialize them.
+    let _job = claim_dest_job(&dest).ok_or_else(|| {
+        anyhow!("this destination is already downloading elsewhere — wait for it or remove the duplicate queue entry")
+    })?;
     let client = opts.build_client()?;
 
     if let Some(parent) = dest.parent() {
@@ -1995,7 +2088,7 @@ pub async fn download(
     if opts.allow_rename {
         if let Some(n) = disp {
             dest.set_file_name(&n);
-            shared.resolved_name.lock().unwrap().replace(n);
+            mutex_guard(&shared.resolved_name).replace(n);
         }
     }
     let is_html = ctype
@@ -2018,7 +2111,7 @@ pub async fn download(
                     let name = sanitize_filename(&title);
                     if opts.allow_rename {
                         dest.set_file_name(&name);
-                        shared.resolved_name.lock().unwrap().replace(name);
+                        mutex_guard(&shared.resolved_name).replace(name);
                     }
                 }
                 let (t2, r2, ctype2, d2) = probe(&client, &opts, &url).await;
@@ -2039,7 +2132,7 @@ pub async fn download(
                 if opts.allow_rename {
                     if let Some(n) = d2 {
                         dest.set_file_name(&n);
-                        shared.resolved_name.lock().unwrap().replace(n);
+                        mutex_guard(&shared.resolved_name).replace(n);
                     }
                 }
             }
@@ -2074,7 +2167,7 @@ pub async fn download(
                 .file_name()
                 .map(|s| s.to_string_lossy().to_string())
             {
-                shared.resolved_name.lock().unwrap().replace(name);
+                mutex_guard(&shared.resolved_name).replace(name);
             }
         }
     } else if opts.overwrite_existing && dest.exists() {
@@ -2240,6 +2333,9 @@ pub async fn download_adaptive(
     opts: EngineOpts,
     shared: Arc<SharedState>,
 ) -> Result<()> {
+    let _job = claim_dest_job(&dest).ok_or_else(|| {
+        anyhow!("this destination is already downloading elsewhere — wait for it or remove the duplicate queue entry")
+    })?;
     let client = opts.build_client()?;
     if let Some(parent) = dest.parent() {
         tokio::fs::create_dir_all(parent).await?;
@@ -2250,7 +2346,7 @@ pub async fn download_adaptive(
     if opts.allow_rename {
         if let Some(n) = v_disp {
             dest.set_file_name(&n);
-            shared.resolved_name.lock().unwrap().replace(n);
+            mutex_guard(&shared.resolved_name).replace(n);
         }
     }
     let (a_total, a_range, atype, _) = match &audio_url {
@@ -2277,13 +2373,13 @@ pub async fn download_adaptive(
     if audio_url.is_some() && webmish && opts.allow_rename {
         dest.set_extension("mkv");
         if let Some(name) = dest.file_name().map(|s| s.to_string_lossy().to_string()) {
-            shared.resolved_name.lock().unwrap().replace(name);
+            mutex_guard(&shared.resolved_name).replace(name);
         }
     }
     if opts.allow_rename && dest.exists() && !opts.overwrite_existing {
         dest = crate::model::conflict_free_dest(&dest);
         if let Some(name) = dest.file_name().map(|s| s.to_string_lossy().to_string()) {
-            shared.resolved_name.lock().unwrap().replace(name);
+            mutex_guard(&shared.resolved_name).replace(name);
         }
     } else if opts.overwrite_existing && dest.exists() {
         let _ = tokio::fs::remove_file(&dest).await;
@@ -2295,15 +2391,16 @@ pub async fn download_adaptive(
     }
     shared.downloaded.store(0, Ordering::SeqCst);
     {
-        let mut totals = shared.part_total.lock().unwrap();
-        let mut dones = shared.part_done.lock().unwrap();
+        let mut totals = mutex_guard(&shared.part_total);
+        let mut dones = mutex_guard(&shared.part_done);
         totals.clear();
         dones.clear();
         totals.push((0, grand_total));
         dones.push(0);
     }
-    // Work files live in a sidecar dir so part files never collide.
-    let work = dest.with_extension("dcwork");
+    // Work files live in a unique sidecar dir so concurrent jobs and
+    // retries never share part files.
+    let work = unique_work_dir(&dest);
     tokio::fs::create_dir_all(&work).await?;
     let v_dest = work.join("v");
     let a_dest = work.join("a");
@@ -2374,18 +2471,27 @@ pub async fn download_adaptive(
         shared.downloaded.store(sum, Ordering::SeqCst);
     };
     let (rv, ra, _) = tokio::join!(fut_v, fut_a, agg);
-    rv?;
-    ra?;
-    // Mux (or plain move when audio-less).
-    if has_audio {
-        ffmpeg_mux(&v_dest, Some(&a_dest), &dest).await?;
+    // Leg failures must also drop the work dir (unique per job, but litter
+    // accumulates across retries otherwise).
+    if let Err(e) = rv {
         let _ = tokio::fs::remove_dir_all(&work).await;
+        return Err(e);
+    }
+    if let Err(e) = ra {
+        let _ = tokio::fs::remove_dir_all(&work).await;
+        return Err(e);
+    }
+    // Mux (or plain move when audio-less). The unique work dir is removed on
+    // every exit so failed merges never poison the next attempt.
+    let finish: Result<()> = if has_audio {
+        ffmpeg_mux(&v_dest, Some(&a_dest), &dest).await
     } else {
         tokio::fs::rename(&v_dest, &dest)
             .await
-            .map_err(|e| anyhow!(io_message(&e)))?;
-        let _ = tokio::fs::remove_dir_all(&work).await;
-    }
+            .map_err(|e| anyhow!(io_message(&e)))
+    };
+    let _ = tokio::fs::remove_dir_all(&work).await;
+    finish?;
     let final_len = tokio::fs::metadata(&dest).await.map(|m| m.len()).unwrap_or(0);
     shared.total.store(final_len, Ordering::SeqCst);
     shared.has_total.store(true, Ordering::SeqCst);
@@ -2401,6 +2507,7 @@ pub async fn download_adaptive(
 /// One DASH Representation (video or audio track option).
 #[derive(Debug, Clone, Default)]
 struct DashRep {
+    id: String,
     bandwidth: u64,
     width: u64,
     height: u64,
@@ -2502,14 +2609,19 @@ fn dash_seg_count(mpd_duration: Option<f64>, seg_dur: f64) -> Option<usize> {
 }
 
 fn dash_expand(tpl: &str, number: u64, rep_id: &str, bw: u64) -> String {
-    // $Number$, $Number%0Nd$, $RepresentationID$, $Bandwidth$
+    // $Number$, $Number%0Nd$, $RepresentationID$, $Bandwidth$.
+    // Byte-walk would corrupt multibyte template text, so iterate chars.
     let mut out = String::new();
-    let bytes = tpl.as_bytes();
+    let chars: Vec<char> = tpl.chars().collect();
     let mut i = 0;
-    while i < bytes.len() {
-        if bytes[i] == b'$' {
-            if let Some(end) = tpl[i + 1..].find('$') {
-                let tok = &tpl[i + 1..i + 1 + end];
+    while i < chars.len() {
+        if chars[i] == '$' {
+            let mut j = i + 1;
+            while j < chars.len() && chars[j] != '$' {
+                j += 1;
+            }
+            if j < chars.len() {
+                let tok: String = chars[i + 1..j].iter().collect();
                 if tok == "Number" {
                     out.push_str(&number.to_string());
                 } else if let Some(fmt) = tok.strip_prefix("Number%0") {
@@ -2525,13 +2637,15 @@ fn dash_expand(tpl: &str, number: u64, rep_id: &str, bw: u64) -> String {
                 } else if tok == "$" {
                     out.push('$');
                 } else {
-                    out.push_str(&tpl[i..=i + 1 + end]);
+                    out.push('$');
+                    out.push_str(&tok);
+                    out.push('$');
                 }
-                i += end + 2;
+                i = j + 1;
                 continue;
             }
         }
-        out.push(bytes[i] as char);
+        out.push(chars[i]);
         i += 1;
     }
     out
@@ -2593,7 +2707,13 @@ fn parse_mpd(xml: &str) -> Result<(Vec<DashRep>, Vec<DashRep>)> {
                 let q = rblock[p..].find('>').map(|x| x + p).unwrap_or(rblock.len());
                 rblock[p..q.min(rblock.len())].to_string()
             });
+            let rep_start = rep_tpl_tag
+                .as_ref()
+                .and_then(|t| xml_attr(t, "startNumber"))
+                .and_then(|v| v.parse::<u64>().ok())
+                .unwrap_or(set_start);
             let rep = DashRep {
+                id: xml_attr(rtag, "id").unwrap_or_default(),
                 bandwidth: xml_attr(rtag, "bandwidth").and_then(|v| v.parse().ok()).unwrap_or(0),
                 width: xml_attr(rtag, "width").and_then(|v| v.parse().ok()).unwrap_or(0),
                 height: xml_attr(rtag, "height").and_then(|v| v.parse().ok()).unwrap_or(0),
@@ -2608,7 +2728,7 @@ fn parse_mpd(xml: &str) -> Result<(Vec<DashRep>, Vec<DashRep>)> {
                     .as_ref()
                     .and_then(|t| xml_attr(t, "initialization"))
                     .or_else(|| set_tpl_init.clone()),
-                start_number: set_start,
+                start_number: rep_start,
                 seg_dur_secs: rep_tpl_tag
                     .as_ref()
                     .and_then(|t| tpl_secs(t))
@@ -2711,7 +2831,7 @@ async fn dash_rep_download(
             anyhow!("DASH live/dynamic manifests without a known segment count are not supported")
         })?;
         for i in 0..n {
-            let num = rep.start_number + i as u64;
+            let num = rep.start_number.saturating_add(i as u64);
             let seg = dash_expand(&media_tpl, num, rep_id, rep.bandwidth);
             let u = if seg.starts_with("http") { seg } else { hls_abs(mpd_url, &seg) };
             let blob = fetch_blob(u).await?;
@@ -2779,7 +2899,7 @@ pub async fn download_dash(
     // Best video = most pixels (fallback: bandwidth); best audio = bandwidth.
     let v = videos
         .iter()
-        .max_by_key(|r| (r.width as u64 * r.height as u64, r.bandwidth))
+        .max_by_key(|r| ((r.width as u64).saturating_mul(r.height as u64), r.bandwidth))
         .ok_or_else(|| anyhow!("DASH manifest has no video track"))?
         .clone();
     let a = audios.iter().max_by_key(|r| r.bandwidth).cloned();
@@ -2795,27 +2915,27 @@ pub async fn download_dash(
     if a.is_some() && webmish && opts.allow_rename {
         dest.set_extension("mkv");
         if let Some(name) = dest.file_name().map(|s| s.to_string_lossy().to_string()) {
-            shared.resolved_name.lock().unwrap().replace(name);
+            mutex_guard(&shared.resolved_name).replace(name);
         }
     }
     if opts.allow_rename && dest.exists() && !opts.overwrite_existing {
         dest = crate::model::conflict_free_dest(&dest);
         if let Some(name) = dest.file_name().map(|s| s.to_string_lossy().to_string()) {
-            shared.resolved_name.lock().unwrap().replace(name);
+            mutex_guard(&shared.resolved_name).replace(name);
         }
     } else if opts.overwrite_existing && dest.exists() {
         let _ = tokio::fs::remove_file(&dest).await;
     }
     shared.downloaded.store(0, Ordering::SeqCst);
     {
-        let mut totals = shared.part_total.lock().unwrap();
-        let mut dones = shared.part_done.lock().unwrap();
+        let mut totals = mutex_guard(&shared.part_total);
+        let mut dones = mutex_guard(&shared.part_done);
         totals.clear();
         dones.clear();
         totals.push((0, 0));
         dones.push(0);
     }
-    let work = dest.with_extension("dcwork");
+    let work = unique_work_dir(&dest);
     tokio::fs::create_dir_all(&work).await?;
     let v_dest = work.join("v");
     let a_dest = work.join("a");
@@ -2823,23 +2943,24 @@ pub async fn download_dash(
         RateLimiter::new(opts.speed_limit_bps).with_global(opts.global_limit.clone()),
     );
     let count_v = v.seg_dur_secs.and_then(|d| dash_seg_count(mpd_dur, d));
-    let rep_id_v = v
-        .bandwidth
-        .to_string();
-    dash_rep_download(&client, &opts, manifest_url, &v, &rep_id_v, count_v, &v_dest, &shared, &limiter).await?;
-    if let Some(rep) = a {
-        let count_a = rep.seg_dur_secs.and_then(|d| dash_seg_count(mpd_dur, d));
-        let rep_id_a = rep.bandwidth.to_string();
-        dash_rep_download(&client, &opts, manifest_url, &rep, &rep_id_a, count_a, &a_dest, &shared, &limiter).await?;
-        ffmpeg_mux(&v_dest, Some(&a_dest), &dest).await?;
-        let _ = tokio::fs::remove_dir_all(&work).await;
-    } else {
-        // Video-only manifest: deliver the assembled track as-is.
-        tokio::fs::rename(&v_dest, &dest)
-            .await
-            .map_err(|e| anyhow!(io_message(&e)))?;
-        let _ = tokio::fs::remove_dir_all(&work).await;
+    let rep_id_v = if v.id.is_empty() { v.bandwidth.to_string() } else { v.id.clone() };
+    let res: Result<()> = async {
+        dash_rep_download(&client, &opts, manifest_url, &v, &rep_id_v, count_v, &v_dest, &shared, &limiter).await?;
+        if let Some(rep) = a {
+            let count_a = rep.seg_dur_secs.and_then(|d| dash_seg_count(mpd_dur, d));
+            let rep_id_a = if rep.id.is_empty() { rep.bandwidth.to_string() } else { rep.id.clone() };
+            dash_rep_download(&client, &opts, manifest_url, &rep, &rep_id_a, count_a, &a_dest, &shared, &limiter).await?;
+            ffmpeg_mux(&v_dest, Some(&a_dest), &dest).await
+        } else {
+            // Video-only manifest: deliver the assembled track as-is.
+            tokio::fs::rename(&v_dest, &dest)
+                .await
+                .map_err(|e| anyhow!(io_message(&e)))
+        }
     }
+    .await;
+    let _ = tokio::fs::remove_dir_all(&work).await;
+    res?;
     let final_len = tokio::fs::metadata(&dest).await.map(|m| m.len()).unwrap_or(0);
     shared.total.store(final_len, Ordering::SeqCst);
     shared.has_total.store(true, Ordering::SeqCst);
@@ -2940,15 +3061,15 @@ async fn single_stream_once(
     // Adopt server-advertised total when we didn't have one.
     if !shared.has_total.load(Ordering::SeqCst) {
         if let Some(len) = resp.content_length() {
-            shared.total.store(len + start_at, Ordering::SeqCst);
+            shared.total.store(len.saturating_add(start_at), Ordering::SeqCst);
             shared.has_total.store(true, Ordering::SeqCst);
         }
     }
     // Single part view for the details dialog.
     {
         let total = shared.total.load(Ordering::SeqCst);
-        let mut totals = shared.part_total.lock().unwrap();
-        let mut dones = shared.part_done.lock().unwrap();
+        let mut totals = mutex_guard(&shared.part_total);
+        let mut dones = mutex_guard(&shared.part_done);
         totals.clear();
         dones.clear();
         totals.push((0, total));
@@ -3011,8 +3132,8 @@ async fn segmented(
 
     let mut handles = Vec::new();
     {
-        let mut totals = shared.part_total.lock().unwrap();
-        let mut dones = shared.part_done.lock().unwrap();
+        let mut totals = mutex_guard(&shared.part_total);
+        let mut dones = mutex_guard(&shared.part_done);
         totals.clear();
         dones.clear();
         for i in 0..connections {
@@ -3030,7 +3151,7 @@ async fn segmented(
         }
     }
     for i in 0..connections {
-        let (start, end) = shared.part_total.lock().unwrap()[i];
+        let (start, end) = mutex_guard(&shared.part_total)[i];
         let part = dest.with_extension(format!("dcpart{}", i));
         let client = client.clone();
         let url = url.to_string();
@@ -3118,7 +3239,7 @@ async fn download_range(
         // previous attempt's contribution to the global counter first.
         if let Ok(mut g) = shared.part_done.lock() {
             if let Some(slot) = g.get_mut(part_idx) {
-                shared.downloaded.fetch_sub(*slot, Ordering::SeqCst);
+                sub_saturating(&shared.downloaded, *slot);
                 *slot = 0;
             }
         }
@@ -3792,7 +3913,8 @@ mod tests {
             msg.contains("403"),
             "refusal must name the status, got: {msg}"
         );
-        assert!(is_final_http_error(&anyhow!("HTTP 403 Forbidden")));
+        assert!(is_final_http_error(&final_err("HTTP 403 Forbidden".into())));
+        assert!(!is_final_http_error(&anyhow!("HTTP 403 Forbidden")));
         assert!(!is_final_http_error(&anyhow!("network: reset by peer")));
         assert!(is_googlevideo_url("https://r1---sn-abc.googlevideo.com/videoplayback?x=1"));
         assert!(!is_googlevideo_url("https://cdn.example/v.mp4"));

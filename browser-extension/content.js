@@ -7,7 +7,7 @@
   // Must match manifest version + background.js EXT_VER. The background
   // rejects messages from any other version with a "reload this tab"
   // error, so a stale script can never fail mysteriously.
-  const EXT_VER = "0.5.0";
+  const EXT_VER = "0.5.1";
   // Generation guard: when the worker re-injects this script (after an
   // update), older live instances must go quiet instead of fighting over
   // the button. The newest instance always wins.
@@ -213,10 +213,14 @@
     }
     // blob: / mediasource streams cannot be fetched by the desktop app —
     // fall back to the page URL so the engine can resolve it server-side.
+    // The extension keeps audio extensions for audio fallbacks.
     let sendUrl = url;
     if (/^blob:/i.test(url)) {
       sendUrl = location.href;
-      if (!filename) filename = safeFilename(document.title) ;
+      if (!filename) {
+        const base = String(document.title || "media").replace(/[<>:"/\\|?*\u0000-\u001f]/g, "_").trim().replace(/\.+$/, "") || "media";
+        filename = base + mimeExt(mime);
+      }
     }
     try {
       chrome.runtime.sendMessage({ type: "download", url: sendUrl, filename, ver: EXT_VER, pageUrl: location.href, referer: location.href, mime: mime || null, size: size || null, pairUrl: (pair && pair.url) || null, pairMime: (pair && pair.mime) || null }, (res) => {
@@ -308,7 +312,8 @@
     try {
       const urls = pairs.map((p) => p.st.url).filter(Boolean).slice(0, 12);
       if (!urls.length) return;
-      chrome.runtime.sendMessage({ type: "getSizes", urls }, (res) => {
+      chrome.runtime.sendMessage({ type: "getSizes", urls, referer: location.href }, (res) => {
+        if (chrome.runtime.lastError) return;
         if (!alive()) return;
         const sizes = (res && res.sizes) || {};
         for (const p of pairs) {
@@ -356,7 +361,8 @@
   // (stale page URLs 403 in the app).
   function appendSniffed(menu, known, pairs) {
     try {
-      chrome.runtime.sendMessage({ type: "getMedia" }, (res) => {
+      chrome.runtime.sendMessage({ type: "getMedia", pageUrl: location.href }, (res) => {
+        if (chrome.runtime.lastError) return;
         if (!alive() || !menu.isConnected) return;
         const items = ((res && res.items) || [])
           .filter((m) => m && /^https?:\/\//i.test(m.url) && !known.has(m.url));
@@ -381,7 +387,9 @@
         }
         if (swapped.length) enrichSizes(swapped);
         if (!items.length) return;
-        if (menu.querySelector("[data-dc-sniff]")) return; // already merged
+        // Rebuild (never duplicate): late playback can add streams after the
+        // first merge, so refresh the section instead of skipping it.
+        menu.querySelectorAll("[data-dc-sniff]").forEach((el) => el.remove());
         const h = document.createElement("div");
         h.setAttribute("data-dc-sniff", "1");
         h.textContent = "Detected playing streams";
@@ -426,21 +434,35 @@
       if (oldMenu) oldMenu.remove();
     }
     // Rebuild whenever the content signature changes — not just the video
-    // id. Expiries are included so refreshed (re-issued) URLs rebuild the
-    // menu instead of serving the stale 403-prone rows forever.
+    // id. Expiries AND url sets are included so refreshed (re-issued) URLs
+    // rebuild the menu instead of serving the stale 403-prone rows forever.
     const expSig = (l) => (l || []).map((s) => {
       try {
         const m = String(s.url || "").match(/[?&]expire=(\d+)/);
         return m ? m[1] : "0";
       } catch (e) { return "0"; }
     }).join(",");
-    const sig = [
+    const urlSig = (l) => {
+      // Cheap rotation fingerprint: itags + url-length checksum. Same-second
+      // re-issues with identical expiries still rebuild.
+      let h = 0;
+      for (const s of (l || [])) {
+        const u = String(s.url || "");
+        h = (h * 31 + (s.itag || 0)) >>> 0;
+        h = (h * 31 + u.length) >>> 0;
+        for (let i = 0; i < Math.min(u.length, 48); i++) h = (h * 31 + u.charCodeAt(i)) >>> 0;
+      }
+      return String(h);
+    };
+    const sigParts = [
       info.videoId, info.title,
       (info.streams || []).length,
       (info.videoOnly || []).length,
       (info.audio || []).length,
       expSig(info.streams), expSig(info.videoOnly), expSig(info.audio),
-    ].join("|");
+      urlSig(info.streams), urlSig(info.videoOnly), urlSig(info.audio),
+    ];
+    const sig = sigParts.join("|");
     // NOTE: oldBtn/oldMenu were already dropped above when they belonged
     // to an older generation, so reaching here means same-generation DOM.
     if (oldBtn && oldBtn.isConnected) {
@@ -457,13 +479,7 @@
     btn.id = "dc-yt-btn";
     btn.dataset.vid = info.videoId;
     btn.dataset.gen = String(GEN);
-    btn.dataset.sig = [
-      info.videoId, info.title,
-      (info.streams || []).length,
-      (info.videoOnly || []).length,
-      (info.audio || []).length,
-      expSig(info.streams), expSig(info.videoOnly), expSig(info.audio),
-    ].join("|");
+    btn.dataset.sig = sigParts.join("|");
     btn.textContent = "⬇ Download this video";
     btn.title = "Send video to Download Craft";
     btn.style.cssText = [
@@ -565,7 +581,14 @@
     };
     btn.onmouseenter = () => { btn.style.background = "rgba(40,41,55,.85)"; };
     btn.onmouseleave = () => { btn.style.background = "rgba(12,12,16,.68)"; };
-    document.addEventListener("click", () => { menu.style.display = "none"; });
+    // One delegated closer per generation (a per-rebuild listener leaked
+    // and stale closures fought the new menu).
+    if (!window.__dcDocClick) {
+      window.__dcDocClick = true;
+      document.addEventListener("click", () => {
+        document.querySelectorAll("#dc-yt-menu").forEach((m) => { m.style.display = "none"; });
+      });
+    }
     placeInPlayer(btn, menu);
   }
 
@@ -665,7 +688,11 @@
           } else {
             // Ask background for sniffed media URLs for this tab first.
             try {
-              chrome.runtime.sendMessage({ type: "getMedia" }, (res) => {
+              chrome.runtime.sendMessage({ type: "getMedia", pageUrl: location.href }, (res) => {
+                if (chrome.runtime.lastError) {
+                  sendDownload(location.href, undefined, null);
+                  return;
+                }
                 const items = (res && res.items) || [];
                 if (items.length) {
                   const best = items[items.length - 1];
@@ -699,7 +726,8 @@
   // show even for blob: players.
   function pullNetworkMedia() {
     try {
-      chrome.runtime.sendMessage({ type: "getMedia" }, (res) => {
+      chrome.runtime.sendMessage({ type: "getMedia", pageUrl: location.href }, (res) => {
+        if (chrome.runtime.lastError) return;
         if (!alive()) return;
         const items = (res && res.items) || [];
         if (!items.length) return;
@@ -721,6 +749,42 @@
     } catch (e) { /* background unreachable */ }
   }
 
+  // Popup peek: the popup asks the ACTIVE tab directly so it never shows
+  // another tab's stale snapshot (global storage keys are fallback only).
+  try {
+    chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
+      if (!msg || msg.type !== "peekState") return false;
+      if (!alive()) return false;
+      (async () => {
+        try {
+          collectLinks();
+          refreshYouTube();
+        } catch (e) { /* best effort */ }
+        let net = [];
+        try {
+          const r = await chrome.runtime.sendMessage({ type: "getMedia", pageUrl: location.href });
+          net = (r && r.items) || [];
+        } catch (e) { /* ignore */ }
+        let cur = {};
+        try {
+          cur = await new Promise((resolve) => {
+            chrome.storage.local.get(
+              ["downloadCraftVideos", "downloadCraftLinks"],
+              (c) => resolve(c || {})
+            );
+          });
+        } catch (e) { /* ignore */ }
+        sendResponse({
+          videos: cur.downloadCraftVideos || [],
+          links: cur.downloadCraftLinks || [],
+          net,
+          page: location.href,
+        });
+      })();
+      return true;
+    });
+  } catch (e) { /* messaging unavailable */ }
+
   // Initial pass + SPA navigation (YouTube rarely reloads the page).
   // The player response can arrive after the content script runs, so
   // retry a few times before giving up.
@@ -728,7 +792,19 @@
   ensureUniversalButtons();
   pullNetworkMedia();
   try {
-    const mo = new MutationObserver(() => { collectLinks(); ensureUniversalButtons(); });
+    // Debounced + generation-gated: a superseded instance disconnects
+    // instead of fighting the new one, and mutation storms (infinite
+    // scroll) collapse into one pass per 400 ms.
+    let moTimer = 0;
+    const mo = new MutationObserver(() => {
+      if (!alive()) { try { mo.disconnect(); } catch (e) {} return; }
+      clearTimeout(moTimer);
+      moTimer = setTimeout(() => {
+        if (!alive()) return;
+        collectLinks();
+        ensureUniversalButtons();
+      }, 400);
+    });
     mo.observe(document.documentElement, { childList: true, subtree: true });
   } catch (e) { /* observer optional */ }
   setInterval(() => { if (alive()) pullNetworkMedia(); }, 8000);
