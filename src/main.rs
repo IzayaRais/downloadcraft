@@ -9,11 +9,13 @@ mod basket;
 mod cli;
 mod confirm;
 mod engine;
+mod ftp;
 mod grabber;
 mod manual;
 mod model;
 mod native_host;
 mod progress;
+mod settings;
 
 use app::CraftApp;
 use clap::Parser;
@@ -58,6 +60,10 @@ fn main() -> eframe::Result<()> {
     if args.iter().any(|a| a == "--basket") {
         return basket::run_basket();
     }
+    // Standalone Settings window (two-pane, separate OS window).
+    if args.iter().any(|a| a == "--settings") {
+        return settings::run();
+    }
     if args.iter().any(|a| a == "--mini") {
         return basket::run_mini();
     }
@@ -86,8 +92,7 @@ fn main() -> eframe::Result<()> {
     );
     let mut viewport = egui::ViewportBuilder::default()
         .with_inner_size([1050.0, 600.0])
-        .with_min_inner_size([840.0, 480.0])
-        .with_decorations(false);
+        .with_min_inner_size([840.0, 480.0]);
     if let Ok(icon) = eframe::icon_data::from_png_bytes(include_bytes!("../assets/icon.png")) {
         viewport = viewport.with_icon(std::sync::Arc::new(icon));
     }

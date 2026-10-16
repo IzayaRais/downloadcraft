@@ -56,7 +56,7 @@ impl SharedState {
 
 /// Map an I/O error to a user-facing message, with a clear text for a
 /// full disk instead of a raw OS code.
-fn io_message(e: &std::io::Error) -> String {
+pub(crate) fn io_message(e: &std::io::Error) -> String {
     #[cfg(windows)]
     const DISK_FULL: i32 = 112; // ERROR_DISK_FULL
     #[cfg(not(windows))]
@@ -88,6 +88,10 @@ pub struct EngineOpts {
     /// When true, an existing destination file is replaced instead of
     /// auto-renaming to `name (1).ext`.
     pub overwrite_existing: bool,
+    /// Preferred YouTube quality from the extension menu ("720p", "1080p60",
+    /// ...). Empty = best available. Honored at resolve time by picking the
+    /// highest stream at or below it.
+    pub quality_pref: String,
     /// Live scheduler override (speed windows): when present, the rate
     /// limiter honors it over `speed_limit_bps` without restarts.
     pub global_limit: Option<std::sync::Arc<std::sync::atomic::AtomicU64>>,
@@ -108,6 +112,7 @@ impl Default for EngineOpts {
             allow_rename: true,
             expected_sha256: String::new(),
             overwrite_existing: false,
+            quality_pref: String::new(),
             global_limit: None,
         }
     }
@@ -117,10 +122,24 @@ impl EngineOpts {
     pub fn build_client(&self) -> Result<reqwest::Client> {
         // HTTP/1.1 only: several media servers RST or truncate H2 streams
         // from non-browser TLS stacks, while plain H1 range GETs work.
+        // IPv4-only egress: a broken IPv6 path (tunnel/relay) completes TCP
+        // but serves bot-wall 403s and mid-stream cuts on media edges, while
+        // the identical request over IPv4 returns 206 (verified live:
+        // curl -4 206 vs curl -6 connection failure on the same URL that
+        // our Happy-Eyeballs client kept failing). Binding the source to
+        // IPv4 steers every connection at the verified-good path.
+        // P2: pooled keepalive connections (segmented/chunked/HLS/DASH open
+        // dozens of short requests per file) + TCP keepalives so throttled
+        // CDN idle sockets don't die mid-range. H2/IPv6 stay OFF until a
+        // live CDN proof run clears them (see P2 in docs/ENGINE_ROADMAP.md).
         let mut b = reqwest::Client::builder()
             .user_agent(self.user_agent.clone())
             .redirect(reqwest::redirect::Policy::limited(10))
-            .http1_only();
+            .local_address(std::net::IpAddr::from([0, 0, 0, 0]))
+            .http1_only()
+            .pool_idle_timeout(std::time::Duration::from_secs(30))
+            .pool_max_idle_per_host(16)
+            .tcp_keepalive(std::time::Duration::from_secs(60));
         if self.timeout_secs > 0 {
             // Connect timeout ONLY: reqwest's `timeout` limits the whole
             // transfer, which wrongly kills big files on slow links.
@@ -133,23 +152,61 @@ impl EngineOpts {
     }
 
     pub(crate) fn get(&self, client: &reqwest::Client, url: &str) -> reqwest::RequestBuilder {
-        self.apply(client.get(url))
+        self.apply(client.get(url), Some(url))
     }
 
     fn post(&self, client: &reqwest::Client, url: &str) -> reqwest::RequestBuilder {
-        self.apply(client.post(url))
+        self.apply(client.post(url), Some(url))
     }
 
     fn head(&self, client: &reqwest::Client, url: &str) -> reqwest::RequestBuilder {
-        self.apply(client.head(url))
+        self.apply(client.head(url), Some(url))
     }
 
-    fn apply(&self, mut r: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
+    fn apply(
+        &self,
+        mut r: reqwest::RequestBuilder,
+        url: Option<&str>,
+    ) -> reqwest::RequestBuilder {
         r = r
             .header(reqwest::header::ACCEPT, "*/*")
-            .header(reqwest::header::ACCEPT_LANGUAGE, "en-US,en;q=0.9");
-        if !self.referer.trim().is_empty() {
-            r = r.header(reqwest::header::REFERER, self.referer.trim().to_string());
+            .header(reqwest::header::ACCEPT_LANGUAGE, "en-US,en;q=0.9")
+            // Browser streaming headers: FB/IG and other media CDNs throttle
+            // or drop non-browser Range requests. These match what the
+            // extension captures from a real navigation.
+            .header("Sec-Fetch-Dest", "empty")
+            .header("Sec-Fetch-Mode", "cors")
+            .header("Sec-Fetch-Site", "cross-site");
+        // Client Hints: strict googlevideo edges (SABR/adaptive serving)
+        // 403 Range requests that lack them — the legacy progressive edge
+        // doesn't care, which is why small files always worked. Derived
+        // from the configured UA so the two can never disagree (a lying
+        // hint pair is more suspicious than none at all).
+        if let Some(v) = chrome_major(&self.user_agent) {
+            r = r
+                .header(
+                    "sec-ch-ua",
+                    format!("\"Chromium\";v=\"{v}\", \"Google Chrome\";v=\"{v}\", \"Not-A.Brand\";v=\"99\""),
+                )
+                .header("sec-ch-ua-mobile", "?0")
+                .header("sec-ch-ua-platform", "\"Windows\"");
+        }
+        // Default page referer for social CDNs when the caller captured none:
+        // bare CDN hosts (fbcdn/instagram) often 403 Range requests with no
+        // Referer while serving the same bytes with one.
+        let mut referer = self.referer.trim().to_string();
+        if referer.is_empty() {
+            if let Some(u) = url {
+                let low = u.to_ascii_lowercase();
+                if low.contains("fbcdn.net") || low.contains("facebook.com") {
+                    referer = "https://www.facebook.com/".to_string();
+                } else if low.contains("cdninstagram.com") || low.contains("instagram.com") {
+                    referer = "https://www.instagram.com/".to_string();
+                }
+            }
+        }
+        if !referer.is_empty() {
+            r = r.header(reqwest::header::REFERER, referer);
         }
         if !self.cookie.trim().is_empty() {
             r = r.header(reqwest::header::COOKIE, self.cookie.trim().to_string());
@@ -168,7 +225,7 @@ impl EngineOpts {
     }
 }
 
-async fn wait_if_paused(shared: &Arc<SharedState>) -> Result<()> {
+pub(crate) async fn wait_if_paused(shared: &Arc<SharedState>) -> Result<()> {
     loop {
         if shared.cancelled.load(Ordering::SeqCst) {
             return Err(anyhow!("cancelled"));
@@ -203,6 +260,93 @@ fn unique_work_dir(dest: &std::path::Path) -> std::path::PathBuf {
         .unwrap_or_else(|| "dl".to_string());
     let parent = dest.parent().map(|p| p.to_path_buf()).unwrap_or_default();
     parent.join(format!("{stem}.dcwork-{}-{n}", std::process::id()))
+}
+
+/// Resume binding sidecar (P0): ties `.dcpart` bytes to the exact URL +
+/// total (+ connection split) that wrote them. Offset-only resume corrupts
+/// files when a re-capture (new signed URL, same filename) or a changed
+/// server file reuses the name — the old prefix belongs to different bytes.
+/// A missing sidecar (legacy partials, fixture seeds) still resumes by
+/// length once, then gets bound; a mismatch discards the stale prefix.
+#[derive(serde::Serialize, serde::Deserialize)]
+struct ResumeMeta {
+    url: String,
+    total: Option<u64>,
+    conns: usize,
+}
+
+fn resume_meta_path(dest: &std::path::Path) -> std::path::PathBuf {
+    dest.with_extension("dcmeta")
+}
+
+fn read_resume_meta(dest: &std::path::Path) -> Option<ResumeMeta> {
+    let raw = std::fs::read_to_string(resume_meta_path(dest)).ok()?;
+    serde_json::from_str(&raw).ok()
+}
+
+fn write_resume_meta(dest: &std::path::Path, url: &str, total: Option<u64>, conns: usize) {
+    let m = ResumeMeta { url: url.to_string(), total, conns };
+    if let Ok(json) = serde_json::to_string(&m) {
+        let _ = std::fs::write(resume_meta_path(dest), json);
+    }
+}
+
+fn meta_matches(meta: &ResumeMeta, url: &str, total: Option<u64>, conns: usize) -> bool {
+    if meta.url != url || meta.conns != conns {
+        return false;
+    }
+    match (meta.total, total) {
+        (Some(a), Some(b)) => a == b,
+        // Unknown on either side: can't prove staleness, keep resuming.
+        _ => true,
+    }
+}
+
+/// Validated resume offset for `dest` (.dcpart length) against the given
+/// URL/total/split. Drops stale prefixes (and ALL segmented parts `dcpart{i}`
+/// for i in 0..16 — a halved re-split has fewer parts than the failed one)
+/// on mismatch and (re)binds the sidecar.
+pub(crate) fn resume_offset(
+    dest: &std::path::Path,
+    part_ext: &str,
+    url: &str,
+    total: Option<u64>,
+    conns: usize,
+) -> u64 {
+    let part = dest.with_extension(part_ext);
+    let have = std::fs::metadata(&part).map(|m| m.len()).unwrap_or(0);
+    match read_resume_meta(dest) {
+        Some(meta) if meta_matches(&meta, url, total, conns) => {
+            // Adopt a newly learned total into the binding.
+            if meta.total.is_none() && total.is_some() {
+                write_resume_meta(dest, url, total, conns);
+            }
+            // Clamp absurd prefixes (total shrank server-side): the 416
+            // paths handle the restart; never resume past the end.
+            if let Some(t) = total {
+                if t > 0 && have >= t {
+                    return have;
+                }
+            }
+            have
+        }
+        Some(_) => {
+            // Bound to different bytes: discard, never resume across URLs.
+            let _ = std::fs::remove_file(&part);
+            for i in 0..16 {
+                let _ = std::fs::remove_file(dest.with_extension(format!("dcpart{i}")));
+            }
+            let _ = std::fs::remove_file(resume_meta_path(dest));
+            write_resume_meta(dest, url, total, conns);
+            0
+        }
+        None => {
+            // Legacy/unbound partial: resume once by length, then bind it.
+            // (One-time hole for pre-sidecar files; self-heals on next run.)
+            write_resume_meta(dest, url, total, conns);
+            have
+        }
+    }
 }
 /// Shared token-bucket rate limiter (clean-room implementation).
 /// Unlike a naive per-chunk `sleep(bytes/limit)`, the bucket smooths bursts
@@ -277,7 +421,7 @@ impl RateLimiter {
 
 /// Lock a mutex even when poisoned (a panicking holder must not cascade
 /// into every UI poll and engine task — take the guard anyway).
-fn mutex_guard<'a, T>(m: &'a std::sync::Mutex<T>) -> std::sync::MutexGuard<'a, T> {
+pub(crate) fn mutex_guard<'a, T>(m: &'a std::sync::Mutex<T>) -> std::sync::MutexGuard<'a, T> {
     m.lock().unwrap_or_else(|e| e.into_inner())
 }
 
@@ -345,6 +489,77 @@ fn is_googlevideo_url(url: &str) -> bool {
     url.contains("googlevideo.com")
 }
 
+/// Major Chrome version from a UA string ("... Chrome/126.0 ...") for
+/// Client Hints. None when the UA isn't Chrome-based (custom UAs silently
+/// skip hints rather than lie).
+fn chrome_major(ua: &str) -> Option<u32> {
+    let p = ua.find("Chrome/")? + "Chrome/".len();
+    ua[p..]
+        .chars()
+        .take_while(|c| c.is_ascii_digit())
+        .collect::<String>()
+        .parse::<u32>()
+        .ok()
+        .filter(|v| (50..=999).contains(v))
+}
+
+/// Signed, throttled social CDN links (Facebook/Instagram reels): parallel
+/// Range requests get cut, and the URL itself expires mid-download.
+fn is_fragile_cdn(url: &str) -> bool {
+    let low = url.to_ascii_lowercase();
+    low.contains("fbcdn")
+        || low.contains("facebook.com")
+        || low.contains("cdninstagram.com")
+        || low.contains("instagram.com")
+        || low.contains("fbsbx.com")
+        || low.contains("scontent")
+        || low.contains("lookaside.")
+}
+
+/// Facebook progressive URLs sometimes carry `bytestart`/`byteend` slice
+/// selectors (the player fetches previews with them). Such a URL can only
+/// ever return that slice (~1 MB) — downloading it while expecting the full
+/// file size loops forever at the slice length ("got 1192564 of 9495549").
+/// Strip those selectors so the same signed URL serves the full file; the
+/// remaining `oh`/`oe` params keep the auth. No-op for other hosts.
+pub fn normalize_media_url(url: &str) -> String {
+    let low = url.to_ascii_lowercase();
+    let social = low.contains("fbcdn")
+        || low.contains("facebook.com")
+        || low.contains("scontent")
+        || low.contains("fbsbx.com")
+        || low.contains("lookaside.")
+        || low.contains("cdninstagram.com")
+        || low.contains("instagram.com");
+    if !social {
+        return url.to_string();
+    }
+    if !low.contains("bytestart") && !low.contains("byteend") {
+        return url.to_string();
+    }
+    let Ok(mut u) = url::Url::parse(url) else {
+        return url.to_string();
+    };
+    let kept: Vec<(String, String)> = u
+        .query_pairs()
+        .filter(|(k, _)| {
+            let kl = k.to_ascii_lowercase();
+            kl != "bytestart" && kl != "byteend"
+        })
+        .map(|(k, v)| (k.into_owned(), v.into_owned()))
+        .collect();
+    // `query_pairs` borrows `u`, so collect first, then rebuild.
+    u.set_query(None);
+    if !kept.is_empty() {
+        let mut q = url::form_urlencoded::Serializer::new(String::new());
+        for (k, v) in &kept {
+            q.append_pair(k, v);
+        }
+        u.set_query(Some(&q.finish()));
+    }
+    u.to_string()
+}
+
 fn is_youtube_page(url: &str) -> bool {
     url.contains("youtube.com") || url.contains("youtu.be")
 }
@@ -379,25 +594,34 @@ pub async fn probe(
     opts: &EngineOpts,
     url: &str,
 ) -> (Option<u64>, bool, Option<String>, Option<String>) {
-    // Try HEAD first.
+    let dbg = std::env::var("DOWNLOAD_CRAFT_DEBUG").is_ok();
+    // Try HEAD first — but ONLY trust success responses. Error pages
+    // (403/404 with `Content-Length: 0`) must fall through to the Range
+    // fallback: treating 0 as a real total poisons everything downstream
+    // (grand totals of 0, single streams that can never satisfy).
     if let Ok(resp) = opts.head(client, url).send().await {
-        let h = resp.headers();
-        let total = h
-            .get(reqwest::header::CONTENT_LENGTH)
-            .and_then(|v| v.to_str().ok())
-            .and_then(|s| s.parse::<u64>().ok());
-        let accept = h
-            .get(reqwest::header::ACCEPT_RANGES)
-            .and_then(|v| v.to_str().ok())
-            .map(|s| s.contains("bytes"))
-            .unwrap_or(false);
-        let ctype = h
-            .get(reqwest::header::CONTENT_TYPE)
-            .and_then(|v| v.to_str().ok())
-            .map(|s| s.to_string());
-        let disp = disposition_filename(h);
-        if total.is_some() || disp.is_some() {
-            return (total, accept, ctype, disp);
+        if dbg {
+            eprintln!("[dbg] probe HEAD status={}", resp.status());
+        }
+        if resp.status().is_success() {
+            let h = resp.headers();
+            let total = h
+                .get(reqwest::header::CONTENT_LENGTH)
+                .and_then(|v| v.to_str().ok())
+                .and_then(|s| s.parse::<u64>().ok());
+            let accept = h
+                .get(reqwest::header::ACCEPT_RANGES)
+                .and_then(|v| v.to_str().ok())
+                .map(|s| s.contains("bytes"))
+                .unwrap_or(false);
+            let ctype = h
+                .get(reqwest::header::CONTENT_TYPE)
+                .and_then(|v| v.to_str().ok())
+                .map(|s| s.to_string());
+            let disp = disposition_filename(h);
+            if total.is_some() || disp.is_some() {
+                return (total, accept, ctype, disp);
+            }
         }
     }
     // Fallback: GET bytes=0-0, parse Content-Range: bytes 0-0/12345
@@ -408,6 +632,9 @@ pub async fn probe(
         .await
     {
         let status = resp.status();
+        if dbg {
+            eprintln!("[dbg] probe GET 0-0 status={status}");
+        }
         if status == reqwest::StatusCode::PARTIAL_CONTENT {
             if let Some(cr) = resp.headers().get(reqwest::header::CONTENT_RANGE) {
                 if let Ok(s) = cr.to_str() {
@@ -423,36 +650,114 @@ pub async fn probe(
             .and_then(|v| v.to_str().ok())
             .and_then(|s| s.parse::<u64>().ok());
         let disp = disposition_filename(resp.headers());
-        return (total, false, None, disp);
+        // Error statuses teach nothing: a 403 page's `Content-Length: 0` is
+        // not a total (see the HEAD gate above).
+        if status.is_success() {
+            return (total, false, None, disp);
+        }
+        return (None, false, None, disp);
     }
     (None, false, None, None)
 }
 
+/// One-shot Range check for expiring signed CDN links: a single
+/// `GET bytes=0-0` decides the whole strategy. Returns:
+/// - `Ok(Some(total))` on 206 (ranges honored; total from Content-Range or
+///   the caller-kept seed) → caller uses chunked sequential ranges.
+/// - `Ok(None)` on 200/unknown (ranges ignored) → caller uses one plain
+///   stream (resuming is impossible there anyway).
+/// - `Err` on 401/403/410 or network failure → the link is dead/refused;
+///   callers fail fast with the expiry hint instead of burning 100 futile
+///   chunks that each return zero bytes (`got 0 of …`).
+async fn probe_range_once(
+    client: &reqwest::Client,
+    opts: &EngineOpts,
+    url: &str,
+    seed_total: Option<u64>,
+) -> Result<Option<u64>, anyhow::Error> {
+    let resp = opts
+        .get(client, url)
+        .header(reqwest::header::RANGE, "bytes=0-0")
+        .send()
+        .await
+        .map_err(|e| anyhow!("network: {e}"))?;
+    let status = resp.status();
+    if status == reqwest::StatusCode::PARTIAL_CONTENT {
+        if let Some(cr) = resp.headers().get(reqwest::header::CONTENT_RANGE) {
+            if let Ok(s) = cr.to_str() {
+                if let Some(total) = s.split('/').next_back().and_then(|t| t.parse::<u64>().ok()) {
+                    return Ok(Some(total));
+                }
+            }
+        }
+        return Ok(seed_total);
+    }
+    // Consume the one byte so the connection can be reused.
+    let _ = resp.bytes().await;
+    match status {
+        reqwest::StatusCode::UNAUTHORIZED
+        | reqwest::StatusCode::FORBIDDEN
+        | reqwest::StatusCode::GONE => Err(final_err(
+            "link refused (expired or session-locked) — replay the reel and click the download button again for a fresh link".to_string(),
+        )),
+        _ => Ok(None),
+    }
+}
+
 /// Extract `filename` / `filename*` from a Content-Disposition header.
+/// Splits on `;` outside quotes (a quoted `"a;b.mp4"` must survive), matches
+/// parameter names case-insensitively, and prefers RFC 5987 `filename*`.
 fn disposition_filename(h: &reqwest::header::HeaderMap) -> Option<String> {
     let v = h
         .get(reqwest::header::CONTENT_DISPOSITION)?
         .to_str()
         .ok()?;
-    for part in v.split(';') {
-        let p = part.trim();
-        if let Some(rest) = p.strip_prefix("filename*=") {
-            // RFC 5987: charset'lang'percent-encoded
-            if let Some(enc) = rest.split('\'').nth(2) {
-                let name = percent_decode_owned(enc);
-                if !name.trim().is_empty() {
-                    return Some(sanitize_filename(&name));
-                }
+    // Split on semicolons that are NOT inside double quotes.
+    let mut parts: Vec<&str> = Vec::new();
+    let mut start = 0usize;
+    let mut in_q = false;
+    // Byte walk is safe here: we only look for ASCII `;` and `"`.
+    let bytes = v.as_bytes();
+    let mut i = 0usize;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'"' => {
+                in_q = !in_q;
+                i += 1;
+            }
+            b';' if !in_q => {
+                parts.push(v[start..i].trim());
+                i += 1;
+                start = i;
+            }
+            _ => i += 1,
+        }
+    }
+    parts.push(v[start..].trim());
+    let param = |name: &str| -> Option<&str> {
+        parts.iter().find_map(|p| {
+            let (k, val) = p.split_once('=')?;
+            if k.trim().eq_ignore_ascii_case(name) {
+                Some(val.trim())
+            } else {
+                None
+            }
+        })
+    };
+    if let Some(rest) = param("filename*") {
+        // RFC 5987: charset'lang'percent-encoded (value may be quoted).
+        let rest = rest.trim().trim_matches('"');
+        if let Some(enc) = rest.split('\'').nth(2) {
+            let name = percent_decode_owned(enc);
+            if !name.trim().is_empty() {
+                return Some(sanitize_filename(&name));
             }
         }
     }
-    for part in v.split(';') {
-        let p = part.trim();
-        if let Some(rest) = p.strip_prefix("filename=") {
-            let s = rest.trim().trim_matches('"').trim();
-            if !s.is_empty() {
-                return Some(sanitize_filename(s));
-            }
+    if let Some(rest) = param("filename") {
+        let s = rest.trim().trim_matches('"').trim();
+        if !s.is_empty() {
+            return Some(sanitize_filename(s));
         }
     }
     None
@@ -522,15 +827,31 @@ pub fn sanitize_filename(s: &str) -> String {
     out
 }
 
+/// A resolved playable stream: the video URL plus an optional companion
+/// audio URL (adaptive video-only qualities, merged with ffmpeg on
+/// completion — the only way to deliver 1080p+).
+pub struct ResolvedMedia {
+    pub url: String,
+    pub title: String,
+    pub pair_url: Option<String>,
+}
+
+impl ResolvedMedia {
+    fn single(url: String, title: String) -> Self {
+        Self { url, title, pair_url: None }
+    }
+}
+
 /// Try to extract a direct media URL + title from an HTML video page.
-/// Handles YouTube watch pages (progressive MP4 streams) plus generic
-/// pages via og:video / contentUrl / bare .mp4 links.
+/// Handles YouTube watch pages (progressive MP4 streams, else an adaptive
+/// video+audio pair for high qualities) plus generic pages via og:video /
+/// contentUrl / bare .mp4 links.
 pub async fn resolve_media(
     client: &reqwest::Client,
     opts: &EngineOpts,
     page_url: &str,
     shared: &Arc<SharedState>,
-) -> Option<(String, String)> {
+) -> Option<ResolvedMedia> {
     // A failed page fetch must not rule out the player API (it only needs
     // the video id), so default to empty HTML instead of bailing.
     let html = opts
@@ -565,7 +886,7 @@ pub async fn resolve_media(
         }
         if !walled {
             if let Some(hit) = resolve_youtube_full(client, opts, page_url, &html).await {
-                dbg_resolve("page-formats", &hit.0);
+                dbg_resolve("page-formats", &hit.url);
                 return Some(hit);
             }
         }
@@ -583,7 +904,7 @@ pub async fn resolve_media(
             None => eprintln!("[dbg] resolve: none"),
         }
     }
-    hit
+    hit.map(|(u, t)| ResolvedMedia::single(u, t))
 }
 
 fn dbg_resolve(via: &str, url: &str) {
@@ -634,7 +955,7 @@ async fn resolve_youtube_api(
     page_url: &str,
     html: &str,
     video_id: &str,
-) -> Option<(String, String)> {
+) -> Option<ResolvedMedia> {
     fn grab(html: &str, key: &str) -> Option<String> {
         let m = format!("\"{key}\":\"");
         let p = html.find(&m)? + m.len();
@@ -666,7 +987,7 @@ async fn resolve_youtube_api(
     }
     if let Some(hit) = player_api(client, opts, page_url, video_id, &android_ctx, Some(ANDROID_UA)).await
     {
-        dbg_resolve("player-api-android", &hit.0);
+        dbg_resolve("player-api-android", &hit.url);
         return Some(hit);
     }
     let mut web_ctx = serde_json::json!({
@@ -678,11 +999,44 @@ async fn resolve_youtube_api(
         web_ctx["visitorData"] = serde_json::Value::String(visitor);
     }
     if let Some(hit) = player_api(client, opts, page_url, video_id, &web_ctx, None).await {
-        dbg_resolve("player-api", &hit.0);
+        dbg_resolve("player-api", &hit.url);
         return Some(hit);
     }
     dbg_resolve("player-api", "<no-stream>");
     None
+}
+
+/// Best adaptive pair (video-only + audio, both direct URLs) from an
+/// `adaptiveFormats` array: highest video at/below `cap` (closest above
+/// when everything exceeds it) plus highest-bitrate audio.
+/// Returns (video_score, video_url, audio_url).
+fn pick_adaptive_pair(
+    arr: &[serde_json::Value],
+    cap: Option<u64>,
+) -> Option<(u64, String, String)> {
+    let mut bv: Option<(u64, String)> = None;
+    let mut ba: Option<(u64, String)> = None;
+    for f in arr {
+        let url = f.get("url").and_then(|u| u.as_str()).unwrap_or("");
+        let mime = f.get("mimeType").and_then(|m| m.as_str()).unwrap_or("");
+        if url.is_empty() {
+            continue;
+        }
+        if mime.starts_with("video/") {
+            let score = stream_score(f);
+            if better_stream(&bv, score, cap) {
+                bv = Some((score, url.to_string()));
+            }
+        } else if mime.starts_with("audio/") {
+            let br = f.get("bitrate").and_then(|b| b.as_u64()).unwrap_or(0);
+            if ba.as_ref().map(|(b, _)| br > *b).unwrap_or(true) {
+                ba = Some((br, url.to_string()));
+            }
+        }
+    }
+    let (vs, vu) = bv?;
+    let (_, au) = ba?;
+    Some((vs, vu, au))
 }
 
 /// One player-API call with the given client identity. Only `OK`
@@ -695,7 +1049,7 @@ async fn player_api(
     video_id: &str,
     ctx_client: &serde_json::Value,
     ua_override: Option<&str>,
-) -> Option<(String, String)> {
+) -> Option<ResolvedMedia> {
     // Standard UA + referer via our options.
     let mut req = opts
         .post(client, "https://www.youtube.com/youtubei/v1/player?key=AIzaSyAO_FJ2SlqU8Q4STEHLGCilw_Y9_11qcW8&prettyPrint=false");
@@ -732,6 +1086,7 @@ async fn player_api(
         .and_then(|t| t.as_str())
         .unwrap_or("youtube_video")
         .to_string();
+    let cap = quality_cap(&opts.quality_pref);
     let mut best: Option<(u64, String)> = None;
     if let Some(formats) = v.pointer("/streamingData/formats").and_then(|f| f.as_array()) {
         for f in formats {
@@ -740,17 +1095,41 @@ async fn player_api(
             if url.is_empty() || !mime.contains("video/mp4") {
                 continue;
             }
-            let score = f
-                .get("width")
-                .and_then(|w| w.as_u64())
-                .unwrap_or(0)
-                .max(f.get("height").and_then(|h| h.as_u64()).unwrap_or(0));
-            if best.as_ref().map(|(s, _)| score > *s).unwrap_or(true) {
+            let score = stream_score(f);
+            if better_stream(&best, score, cap) {
                 best = Some((score, url.to_string()));
             }
         }
     }
-    best.map(|(_, u)| (with_ratebypass(&u), format!("{title}.mp4")))
+    // Adaptive pair (1080p+ live here, never in progressive): use it when
+    // the menu asked for quality and it beats progressive, or when there is
+    // no progressive stream at all (ciphered-only videos). Default path
+    // (no preference) keeps the single progressive file — no ffmpeg needed.
+    let pair = v
+        .pointer("/streamingData/adaptiveFormats")
+        .and_then(|f| f.as_array())
+        .and_then(|a| pick_adaptive_pair(a, cap));
+    match (best, pair) {
+        (Some((ps, _)), Some((vs, vu, au)))
+            if cap.is_some() && vs > ps =>
+        {
+            Some(ResolvedMedia {
+                url: with_ratebypass(&vu),
+                title: format!("{title}.mp4"),
+                pair_url: Some(with_ratebypass(&au)),
+            })
+        }
+        (None, Some((_, vu, au))) => Some(ResolvedMedia {
+            url: with_ratebypass(&vu),
+            title: format!("{title}.mp4"),
+            pair_url: Some(with_ratebypass(&au)),
+        }),
+        (Some((_, u)), _) => Some(ResolvedMedia::single(
+            with_ratebypass(&u),
+            format!("{title}.mp4"),
+        )),
+        (None, None) => None,
+    }
 }
 
 /// Direct-URL-only page resolve (legacy behavior, kept for fixtures).
@@ -772,17 +1151,68 @@ fn resolve_youtube(html: &str) -> Option<(String, String)> {
             if url.is_empty() || !mime.contains("video/mp4") {
                 continue;
             }
-            let score = f
-                .get("width")
-                .and_then(|w| w.as_u64())
-                .unwrap_or(0)
-                .max(f.get("height").and_then(|h| h.as_u64()).unwrap_or(0));
+            let score = stream_score(f);
             if best.as_ref().map(|(s, _)| score > *s).unwrap_or(true) {
                 best = Some((score, url.to_string()));
             }
         }
     }
     best.map(|(_, u)| (with_ratebypass(&u), format!("{title}.mp4")))
+}
+
+/// Comparable quality score for a stream entry: the height the *label*
+/// promises ("1080p60" → 1080), falling back to dimensions. This matches
+/// `quality_cap` exactly (both parse the same labels), so a "1080p" menu
+/// pick compares equal to a "1080p60" stream — unlike max(width, height),
+/// which scores landscape 1080p as 1920 and would reject it under a 1080
+/// cap (downgrading the user to 360p).
+fn stream_score(f: &serde_json::Value) -> u64 {
+    if let Some(q) = f.get("qualityLabel").and_then(|q| q.as_str()) {
+        let digits: String = q.trim().chars().take_while(|c| c.is_ascii_digit()).collect();
+        if let Ok(n) = digits.parse::<u64>() {
+            if (144..=4320).contains(&n) {
+                return n;
+            }
+        }
+    }
+    let h = f.get("height").and_then(|h| h.as_u64()).unwrap_or(0);
+    if (144..=4320).contains(&h) {
+        return h;
+    }
+    f.get("width")
+        .and_then(|w| w.as_u64())
+        .unwrap_or(0)
+        .max(h)
+}
+
+/// Parse a menu quality ("720p", "1080p60") into a height cap. None =
+/// no preference (best available).
+fn quality_cap(pref: &str) -> Option<u64> {
+    let digits: String = pref.trim().chars().take_while(|c| c.is_ascii_digit()).collect();
+    let n: u64 = digits.parse().ok()?;
+    if (144..=4320).contains(&n) {
+        Some(n)
+    } else {
+        None
+    }
+}
+
+/// Whether `score` beats the current best under an optional height cap:
+/// highest stream at or below the cap wins; when everything exceeds it,
+/// the closest (lowest) wins instead of the biggest.
+fn better_stream(best: &Option<(u64, String)>, score: u64, cap: Option<u64>) -> bool {
+    let Some((b, _)) = best else {
+        return true;
+    };
+    let Some(c) = cap else {
+        return score > *b;
+    };
+    match (score <= c, *b <= c) {
+        (true, false) => true,
+        (true, true) => score > *b,
+        (false, true) => false,
+        (false, false) => score < *b,
+    }
 }
 
 /// YouTube throttles googlevideo streams unless `ratebypass=yes` is set
@@ -1257,14 +1687,15 @@ async fn resolve_youtube_full(
     opts: &EngineOpts,
     _page_url: &str,
     html: &str,
-) -> Option<(String, String)> {
+) -> Option<ResolvedMedia> {
     let v = yt_player_value(html)?;
     let title = v
         .pointer("/videoDetails/title")
         .and_then(|t| t.as_str())
         .unwrap_or("youtube_video")
         .to_string();
-    // Direct progressive MP4 (unchanged legacy behavior).
+    // Direct progressive MP4 (highest at/below the menu quality when set).
+    let cap = quality_cap(&opts.quality_pref);
     let mut best: Option<(u64, String)> = None;
     if let Some(formats) = v.pointer("/streamingData/formats").and_then(|f| f.as_array()) {
         for f in formats {
@@ -1273,12 +1704,8 @@ async fn resolve_youtube_full(
             if url.is_empty() || !mime.contains("video/mp4") {
                 continue;
             }
-            let score = f
-                .get("width")
-                .and_then(|w| w.as_u64())
-                .unwrap_or(0)
-                .max(f.get("height").and_then(|h| h.as_u64()).unwrap_or(0));
-            if best.as_ref().map(|(s, _)| score > *s).unwrap_or(true) {
+            let score = stream_score(f);
+            if better_stream(&best, score, cap) {
                 best = Some((score, url.to_string()));
             }
         }
@@ -1294,12 +1721,35 @@ async fn resolve_youtube_full(
             js_text = player_js_for(client, opts, pu).await;
         }
     }
-    if let Some((_, u)) = best {
+    if let Some((_, u)) = &best {
         let u = match (&js_text, &ops) {
-            (Some(t), Some(o)) => fix_n_param(&u, t, o),
-            _ => u,
+            (Some(t), Some(o)) => fix_n_param(u, t, o),
+            _ => u.clone(),
         };
-        return Some((with_ratebypass(&u), format!("{title}.mp4")));
+        // A requested high quality may still live in adaptive-only: pair it
+        // (same rule as the player-API path) instead of silently dropping to
+        // a small progressive file.
+        if cap.is_some() {
+            if let Some(adaptive) = v.pointer("/streamingData/adaptiveFormats").and_then(|f| f.as_array()) {
+                if let Some((vs, vu, au)) = pick_adaptive_pair(adaptive, cap) {
+                    if vs > best.map(|(s, _)| s).unwrap_or(0) {
+                        let vu = match (&js_text, &ops) {
+                            (Some(t), Some(o)) => fix_n_param(&vu, t, o),
+                            _ => vu,
+                        };
+                        return Some(ResolvedMedia {
+                            url: with_ratebypass(&vu),
+                            title: format!("{title}.mp4"),
+                            pair_url: Some(with_ratebypass(&au)),
+                        });
+                    }
+                }
+            }
+        }
+        return Some(ResolvedMedia::single(
+            with_ratebypass(&u),
+            format!("{title}.mp4"),
+        ));
     }
     // Ciphered progressive MP4: decipher via player ops.
     let (ops, js_text) = match (ops, js_text) {
@@ -1317,19 +1767,15 @@ async fn resolve_youtube_full(
             let Some(u) = decipher_signature_cipher(cipher, &ops) else {
                 continue;
             };
-            let score = f
-                .get("width")
-                .and_then(|w| w.as_u64())
-                .unwrap_or(0)
-                .max(f.get("height").and_then(|h| h.as_u64()).unwrap_or(0));
-            if cbest.as_ref().map(|(s, _)| score > *s).unwrap_or(true) {
+            let score = stream_score(f);
+            if better_stream(&cbest, score, cap) {
                 cbest = Some((score, u));
             }
         }
     }
     cbest.map(|(_, u)| {
         let u = fix_n_param(&u, &js_text, &ops);
-        (with_ratebypass(&u), format!("{title}.mp4"))
+        ResolvedMedia::single(with_ratebypass(&u), format!("{title}.mp4"))
     })
 }
 
@@ -1610,46 +2056,78 @@ fn hls_attr(attrs: &[(String, String)], key: &str) -> Option<String> {
         .map(|(_, v)| v.clone())
 }
 
-/// Parse the first EXT-X-KEY line: None = no/plain key, Some((uri, iv_hex)).
-/// Errors on SAMPLE-AES (DRM-ish, never attempted) and key rotation.
-fn hls_key_info(text: &str) -> Result<Option<(String, Option<String>)>> {
-    let mut uris: Vec<String> = Vec::new();
-    let mut first: Option<(String, Option<String>)> = None;
+/// One segment's encryption: absolute key URI + optional explicit IV hex.
+/// A segment with no entry is plain. Rotation (P3) is just a schedule with
+/// more than one distinct URI — supported, not rejected.
+#[derive(Debug, Clone)]
+struct HlsSegKey {
+    uri: String,
+    iv_hex: Option<String>,
+}
+
+/// Per-segment key schedule from a media playlist: walk lines in order,
+/// each `#EXT-X-KEY` sets the key for subsequent segments until the next
+/// one (`METHOD=NONE` clears back to plain). URIs are resolved against the
+/// playlist URL. Errors on SAMPLE-AES (DRM-ish, never attempted) and
+/// unknown methods — but NOT on rotation.
+fn hls_key_schedule(text: &str, base: &str) -> Result<Vec<Option<HlsSegKey>>> {
+    let mut out: Vec<Option<HlsSegKey>> = Vec::new();
+    let mut current: Option<HlsSegKey> = None;
     for line in text.lines() {
         let t = line.trim();
-        if !t.starts_with("#EXT-X-KEY") {
+        if t.starts_with("#EXT-X-KEY") {
+            let attrs = hls_key_attrs(t);
+            let method = hls_attr(&attrs, "METHOD").unwrap_or_default().to_uppercase();
+            if method == "NONE" || method.is_empty() {
+                current = None;
+                continue;
+            }
+            if method == "SAMPLE-AES" {
+                return Err(anyhow!(
+                    "this HLS stream uses SAMPLE-AES encryption — not supported (DRM-adjacent). Use the extension MP4 qualities when the site offers them"
+                ));
+            }
+            if method != "AES-128" {
+                return Err(anyhow!("unsupported HLS key method {method}"));
+            }
+            let uri = hls_attr(&attrs, "URI").unwrap_or_default();
+            if uri.is_empty() {
+                return Err(anyhow!("HLS AES-128 key has no URI"));
+            }
+            current = Some(HlsSegKey { uri: hls_abs(base, &uri), iv_hex: hls_attr(&attrs, "IV") });
+            continue;
+        }
+        if t.is_empty() || t.starts_with('#') {
+            continue;
+        }
+        out.push(current.clone());
+    }
+    Ok(out)
+}
+
+/// First `#EXT-X-MAP:URI="…"` init section (fragmented MP4 headers that
+/// must lead the assembled stream). `BYTERANGE` sub-ranges are not
+/// supported — the whole object is fetched; playlists needing a byte slice
+/// of the map are rejected loudly at download time.
+fn hls_map_init(text: &str, base: &str) -> Result<Option<String>> {
+    for line in text.lines() {
+        let t = line.trim();
+        if !t.starts_with("#EXT-X-MAP:") {
             continue;
         }
         let attrs = hls_key_attrs(t);
-        let method = hls_attr(&attrs, "METHOD").unwrap_or_default().to_uppercase();
-        if method == "NONE" || method.is_empty() {
-            continue;
-        }
-        if method == "SAMPLE-AES" {
-            return Err(anyhow!(
-                "this HLS stream uses SAMPLE-AES encryption — not supported (DRM-adjacent). Use the extension MP4 qualities when the site offers them"
-            ));
-        }
-        if method != "AES-128" {
-            return Err(anyhow!("unsupported HLS key method {method}"));
-        }
         let uri = hls_attr(&attrs, "URI").unwrap_or_default();
         if uri.is_empty() {
-            return Err(anyhow!("HLS AES-128 key has no URI"));
+            return Err(anyhow!("HLS EXT-X-MAP has no URI — not supported"));
         }
-        if !uris.contains(&uri) {
-            uris.push(uri.clone());
+        if hls_attr(&attrs, "BYTERANGE").is_some_and(|b| !b.trim().is_empty()) {
+            return Err(anyhow!(
+                "this HLS stream needs a byte-range of its init section (EXT-X-MAP BYTERANGE) — not supported yet"
+            ));
         }
-        if first.is_none() {
-            first = Some((uri, hls_attr(&attrs, "IV")));
-        }
+        return Ok(Some(hls_abs(base, &uri)));
     }
-    if uris.len() > 1 {
-        return Err(anyhow!(
-            "this HLS stream rotates encryption keys — not supported yet"
-        ));
-    }
-    Ok(first)
+    Ok(None)
 }
 
 fn hls_media_sequence(text: &str) -> u64 {
@@ -1683,9 +2161,10 @@ fn aes128_cbc_decrypt(data: &[u8], key: &[u8; 16], iv: &[u8; 16]) -> Result<Vec<
 
 /// HLS VOD download (clean-room, no IDM code): fetch playlist, follow the
 /// best variant, fetch segments in parallel (4–8), decrypt AES-128 when
-/// present, resume via a sidecar map, concat in order. Live, oversize,
-/// SAMPLE-AES, and key-rotation playlists are rejected with guidance —
-/// and DRM (Widevine/FairPlay) is never bypassed.
+/// present (incl. key rotation, one fetch per distinct key URI), prepend
+/// the EXT-X-MAP init section when present, resume via a sidecar map,
+/// concat in order. Live, oversize, and SAMPLE-AES playlists are rejected
+/// with guidance — and DRM (Widevine/FairPlay) is never bypassed.
 async fn download_hls(
     playlist_url: &str,
     dest: &PathBuf,
@@ -1728,7 +2207,7 @@ async fn download_hls(
             .await
             .map_err(|e| anyhow!("variant read: {e}"))?;
     }
-    let key = hls_key_info(&text)?;
+    let schedule = hls_key_schedule(&text, &pl_url)?;
     let seq0 = hls_media_sequence(&text);
     let segs = hls_segments(&text, &pl_url);
     if segs.is_empty() {
@@ -1746,30 +2225,66 @@ async fn download_hls(
             "this looks like a live stream (no ENDLIST) — live capture is not supported; only finished VOD playlists"
         ));
     }
-    // 2. Key bytes (once) for AES-128.
-    let key_bytes: Option<[u8; 16]> = match &key {
-        Some((uri, _)) => {
-            let abs = hls_abs(&pl_url, uri);
-            let kb = opts
-                .get(&client, &abs)
+    // 2. Key bytes for AES-128, including rotations (P3): every distinct
+    // key URI is fetched once up front (bounded — a playlist cycling
+    // endless keys is live-ish and refused below).
+    let mut distinct: Vec<String> = Vec::new();
+    for slot in schedule.iter().flatten() {
+        if !distinct.contains(&slot.uri) {
+            distinct.push(slot.uri.clone());
+        }
+    }
+    const MAX_KEYS: usize = 8;
+    if distinct.len() > MAX_KEYS {
+        return Err(anyhow!(
+            "this HLS stream cycles through {} encryption keys — not supported",
+            distinct.len()
+        ));
+    }
+    let mut key_map: std::collections::HashMap<String, [u8; 16]> =
+        std::collections::HashMap::new();
+    for uri in &distinct {
+        let kb = opts
+            .get(&client, uri)
+            .send()
+            .await
+            .map_err(|e| anyhow!("key fetch: {e}"))?
+            .error_for_status()
+            .map_err(|e| anyhow!("key HTTP: {e}"))?
+            .bytes()
+            .await
+            .map_err(|e| anyhow!("key read: {e}"))?;
+        if kb.len() != 16 {
+            return Err(anyhow!("HLS key is not 16 bytes — refusing"));
+        }
+        let mut k = [0u8; 16];
+        k.copy_from_slice(&kb);
+        key_map.insert(uri.clone(), k);
+    }
+    let key_map = std::sync::Arc::new(key_map);
+    let schedule = std::sync::Arc::new(schedule);
+    // 2b. Init section (EXT-X-MAP, P3): fetched once up front (fail fast —
+    // without track headers the merge would be unplayable) and prepended
+    // at merge time. Re-fetched on resume (tiny); counted in progress.
+    let init_bytes: Option<Vec<u8>> = match hls_map_init(&text, &pl_url)? {
+        Some(u) => {
+            let blob = opts
+                .get(&client, &u)
                 .send()
                 .await
-                .map_err(|e| anyhow!("key fetch: {e}"))?
+                .map_err(|e| anyhow!("init fetch: {e}"))?
                 .error_for_status()
-                .map_err(|e| anyhow!("key HTTP: {e}"))?
+                .map_err(|e| anyhow!("init HTTP: {e}"))?
                 .bytes()
                 .await
-                .map_err(|e| anyhow!("key read: {e}"))?;
-            if kb.len() != 16 {
-                return Err(anyhow!("HLS key is not 16 bytes — refusing"));
+                .map_err(|e| anyhow!("init read: {e}"))?;
+            if blob.is_empty() {
+                return Err(anyhow!("HLS init section is empty — refusing"));
             }
-            let mut k = [0u8; 16];
-            k.copy_from_slice(&kb);
-            Some(k)
+            Some(blob.to_vec())
         }
         None => None,
     };
-    let key_iv_hex: Option<String> = key.as_ref().and_then(|(_, iv)| iv.clone());
     // 3. Resume map: {playlist, count, done:[idx]}. Entries only count
     // when their part file is still on disk (cleanups must not brick
     // the merge into "segment missing").
@@ -1881,16 +2396,26 @@ async fn download_hls(
         let limiter = limiter.clone();
         let abort = abort.clone();
         let sem = sem.clone();
-        let kb = key_bytes;
-        let ivh = key_iv_hex.clone();
+        let seg_key = schedule.get(idx).cloned().flatten();
+        let key_map = key_map.clone();
         handles.push(tokio::spawn(async move {
             let _permit = sem.acquire_owned().await.map_err(|e| anyhow!("semaphore: {e}"))?;
-            let iv: Option<[u8; 16]> = match (&kb, ivh) {
-                (Some(_), Some(hex)) => Some(parse_hex_iv(&hex).ok_or_else(|| anyhow!("bad EXT-X-IV"))?),
-                (Some(_), None) => {
-                    let seq = (seq0.saturating_add(idx as u64)) as u128;
-                    Some(seq.to_be_bytes())
-                }
+            // Per-segment key from the schedule (P3 rotation): explicit IV
+            // when the playlist gives one, else the sequence number.
+            let kb: Option<[u8; 16]> = match &seg_key {
+                Some(k) => Some(key_map.get(&k.uri).copied().ok_or_else(|| {
+                    anyhow!("HLS key for segment {idx} was not fetched")
+                })?),
+                None => None,
+            };
+            let iv: Option<[u8; 16]> = match (&kb, seg_key) {
+                (Some(_), Some(k)) => match k.iv_hex {
+                    Some(ref hex) => Some(parse_hex_iv(hex).ok_or_else(|| anyhow!("bad EXT-X-IV"))?),
+                    None => {
+                        let seq = (seq0.saturating_add(idx as u64)) as u128;
+                        Some(seq.to_be_bytes())
+                    }
+                },
                 _ => None,
             };
             let mut attempt = 0u32;
@@ -2038,6 +2563,14 @@ async fn download_hls(
         .await?;
     {
         use tokio::io::AsyncWriteExt;
+        // EXT-X-MAP init section leads the stream (P3); counted in
+        // progress so the bar stays honest.
+        if let Some(init) = &init_bytes {
+            out.write_all(init).await.map_err(|e| anyhow!(io_message(&e)))?;
+            shared.downloaded.fetch_add(init.len() as u64, Ordering::SeqCst);
+            shared.total.fetch_add(init.len() as u64, Ordering::SeqCst);
+            limiter.consume(init.len() as u64).await;
+        }
         for i in 0..segs.len() {
             let part = dest.with_extension(format!("hls{i}"));
             let mut f = tokio::fs::File::open(&part)
@@ -2069,7 +2602,8 @@ async fn download_hls(
 /// If `url` is an HTML page (e.g. YouTube), a direct media stream is
 /// auto-detected first, like the video capture in classic download managers.
 /// Plain (non-encrypted) HLS VOD playlists (.m3u8) are assembled
-/// segment-by-segment; DASH (.mpd) and encrypted HLS are rejected loudly.
+/// segment-by-segment; DASH (.mpd) likewise; `ftp://` URLs go to the
+/// plain-FTP backend.
 pub async fn download(
     mut url: String,
     mut dest: PathBuf,
@@ -2077,8 +2611,49 @@ pub async fn download(
     mut opts: EngineOpts,
     shared: Arc<SharedState>,
 ) -> Result<()> {
+    // Facebook slice URLs (bytestart/byteend) can only ever return that
+    // preview slice: normalize to the full-file URL before any probe, and
+    // drop the stale slice prefix (it starts at ~byte 967, not 0, so it
+    // can never be resumed into a full file).
+    let normalized = normalize_media_url(&url);
+    if normalized != url {
+        url = normalized;
+        let _ = tokio::fs::remove_file(dest.with_extension("dcpart")).await;
+        let _ = tokio::fs::remove_file(dest.with_extension("dcmeta")).await;
+        for i in 0..16 {
+            let _ = tokio::fs::remove_file(dest.with_extension(format!("dcpart{i}"))).await;
+        }
+        shared.downloaded.store(0, Ordering::SeqCst);
+    }
     // Route playlists before the progressive path so we never save a
     // playlist file as if it were the video.
+    if url.to_ascii_lowercase().starts_with("ftp://") || url.to_ascii_lowercase().starts_with("ftps://") {
+        // Plain-FTP backend (P3): own connection, same resume contract.
+        let _job = claim_dest_job(&dest).ok_or_else(|| {
+            anyhow!("this destination is already downloading elsewhere — wait for it or remove the duplicate queue entry")
+        })?;
+        if let Some(parent) = dest.parent() {
+            tokio::fs::create_dir_all(parent).await?;
+        }
+        if opts.allow_rename && dest.exists() && !opts.overwrite_existing {
+            let resumable_here = dest.with_extension("dcpart").exists();
+            if !resumable_here {
+                dest = crate::model::conflict_free_dest(&dest);
+                if let Some(name) = dest
+                    .file_name()
+                    .map(|s| s.to_string_lossy().to_string())
+                {
+                    mutex_guard(&shared.resolved_name).replace(name);
+                }
+            }
+        } else if opts.overwrite_existing && dest.exists() {
+            let _ = tokio::fs::remove_file(&dest).await;
+        }
+        let limiter = std::sync::Arc::new(
+            RateLimiter::new(opts.speed_limit_bps).with_global(opts.global_limit.clone()),
+        );
+        return crate::ftp::download_ftp(&url, &dest, &opts, shared, limiter).await;
+    }
     if is_playlist_url(&url) {
         if url.to_ascii_lowercase().split(['?', '#']).next().unwrap_or("").ends_with(".mpd")
             || url.contains(".mpd")
@@ -2097,14 +2672,77 @@ pub async fn download(
         tokio::fs::create_dir_all(parent).await?;
     }
 
-    let (mut total_opt, mut supports_range, ctype, disp) = probe(&client, &opts, &url).await;
+    // Direct media delivery hosts (NOT watch/reel pages): when the total is
+    // already known (browser-measured size or a previous resume), verify
+    // liveness + range support with ONE cheap Range probe instead of the
+    // full HEAD + Range probe. On expiring signed links every extra request
+    // burns freshness — but zero verification is worse: a dead/expired URL
+    // would burn ~100 futile chunks that each return zero bytes
+    // (`got 0 of …`). A 206 keeps the seeded total and uses chunked ranges;
+    // anything else falls through to the plain probe path below.
+    let direct_delivery = {
+        let low = url.to_ascii_lowercase();
+        low.contains("fbcdn")
+            || low.contains("scontent")
+            || low.contains("lookaside.")
+            || low.contains("fbsbx.com")
+            || low.contains("cdninstagram.com")
+    };
+    let seeded_total = if shared.has_total.load(Ordering::SeqCst) {
+        Some(shared.total.load(Ordering::SeqCst))
+    } else {
+        None
+    };
+    let mut range_verified: Option<Option<u64>> = None; // Some(x) = probe ran
+    if direct_delivery && seeded_total.is_some() {
+        match probe_range_once(&client, &opts, &url, seeded_total).await {
+            Ok(verified) => range_verified = Some(verified),
+            Err(e) => return Err(e), // expired/refused: fail fast, loudly
+        }
+    }
+    let (mut total_opt, mut supports_range, ctype, disp) = match range_verified {
+        Some(verified) => (verified.or(seeded_total), verified.is_some(), None, None),
+        None => probe(&client, &opts, &url).await,
+    };
+    // Pre-seeded totals imply resume support until proven otherwise; the
+    // first response corrects this (single_stream updates it live).
     shared
         .resumable
         .store(supports_range, Ordering::SeqCst);
+    // Documented name priority (P1): server Content-Disposition >
+    // resolved media title (page path below) > this probe's disposition >
+    // URL fallback (queue/extension name). Here: honor the disposition…
+    let probe_is_html = ctype
+        .as_deref()
+        .map(|c| c.contains("text/html"))
+        .unwrap_or(false);
     if opts.allow_rename {
         if let Some(n) = disp {
             dest.set_file_name(&n);
             mutex_guard(&shared.resolved_name).replace(n);
+        } else if !probe_is_html {
+            // …or at least fix the extension from the MIME type when the
+            // URL yielded no usable name (`download_123.bin` or bare
+            // `song` + video/mp4 → `song.mp4`).
+            if let Some(cur) = dest.file_name().map(|s| s.to_string_lossy().to_string()) {
+                let fixed = if crate::model::is_fallback_filename(&cur) {
+                    ctype
+                        .as_deref()
+                        .and_then(crate::model::ext_for_mime)
+                        .map(|ext| cur.trim_end_matches(".bin").to_string() + ext)
+                } else if !cur.contains('.') {
+                    ctype
+                        .as_deref()
+                        .and_then(crate::model::ext_for_mime)
+                        .map(|ext| cur.clone() + ext)
+                } else {
+                    None
+                };
+                if let Some(fixed) = fixed {
+                    dest.set_file_name(&fixed);
+                    mutex_guard(&shared.resolved_name).replace(fixed);
+                }
+            }
         }
     }
     let is_html = ctype
@@ -2117,17 +2755,80 @@ pub async fn download(
     if is_html || is_yt {
         let page_url = url.clone();
         match resolve_media(&client, &opts, &url, &shared).await {
-            Some((media_url, title)) => {
-                url = media_url;
+            Some(hit) => {
+                url = hit.url;
                 // media servers expect the page as referer
                 if opts.referer.trim().is_empty() {
-                    opts.referer = page_url;
+                    opts.referer = page_url.clone();
                 }
-                if !title.trim().is_empty() {
-                    let name = sanitize_filename(&title);
+                if !hit.title.trim().is_empty() {
+                    let name = sanitize_filename(&hit.title);
                     if opts.allow_rename {
                         dest.set_file_name(&name);
                         mutex_guard(&shared.resolved_name).replace(name);
+                    }
+                }
+                // Adaptive video+audio pair (1080p+ menu choice): merge via
+                // ffmpeg on completion instead of a small progressive file.
+                // Drop our dest claim first: download_adaptive takes its own.
+                if let Some(pair) = hit.pair_url.filter(|p| p.starts_with("http")) {
+                    if std::env::var("DOWNLOAD_CRAFT_DEBUG").is_ok() {
+                        eprintln!("[dbg] pair video={}", url);
+                        eprintln!("[dbg] pair audio={}", pair);
+                    }
+                    drop(_job);
+                    // YouTube adaptive legs can die mid-file at ~20%:
+                    // SABR-gated qualities serve only a ~2 MB preview outside
+                    // the browser, and stream URLs expire/session-lock fast
+                    // (403). Retry once with a fresh resolve — downgrading to
+                    // 720p progressive for gated qualities — instead of
+                    // failing at 19-20% and telling the user to click again.
+                    match download_adaptive(
+                        url.clone(),
+                        Some(pair.clone()),
+                        dest.clone(),
+                        connections,
+                        opts.clone(),
+                        shared.clone(),
+                    )
+                    .await
+                    {
+                        Ok(()) => return Ok(()),
+                        Err(e) => {
+                            let msg = format!("{e:#}");
+                            let sabr = msg.contains("serves only the first");
+                            let refused = msg.contains("refused this link (403)")
+                                || msg.contains("expired");
+                            if !(sabr || refused) {
+                                return Err(e);
+                            }
+                            let mut opts2 = opts.clone();
+                            if sabr {
+                                opts2.quality_pref = "720p".to_string();
+                            }
+                            match resolve_media(&client, &opts2, &page_url, &shared).await {
+                                Some(hit2) => {
+                                    return download_adaptive(
+                                        hit2.url,
+                                        hit2.pair_url.filter(|p| p.starts_with("http")),
+                                        dest,
+                                        connections,
+                                        opts2,
+                                        shared,
+                                    )
+                                    .await
+                                    .map_err(|e2| {
+                                        let m2 = format!("{e2:#}");
+                                        if sabr && (m2.contains("serves only the first") || m2.contains("refused this link (403)")) {
+                                            anyhow!("{m2} (tried 720p fallback automatically — if this persists, open the video in your browser and pick a 720p or below quality row)")
+                                        } else {
+                                            e2
+                                        }
+                                    });
+                                }
+                                None => return Err(e),
+                            }
+                        }
                     }
                 }
                 let (t2, r2, ctype2, d2) = probe(&client, &opts, &url).await;
@@ -2191,19 +2892,35 @@ pub async fn download(
     }
 
     let conns = connections.clamp(1, 16);
+    // Facebook/Instagram CDNs throttle parallel Range requests (idle-socket
+    // drops, short segments, 403/416 on later ranges). Start those hosts on
+    // a single sequential stream instead of burning retries on N-way Ranges.
+    // (P2: `effective_conns` shrinks further via halving on cut storms.)
+    let fragile_cdn = is_fragile_cdn(&url);
+    let mut effective_conns = if fragile_cdn { 1 } else { conns };
 
     // One shared bucket so N segments together honor the global cap.
     let limiter = std::sync::Arc::new(
         RateLimiter::new(opts.speed_limit_bps).with_global(opts.global_limit.clone()),
     );
-    // Transfer attempts (max 2). When a googlevideo link 403s on the first
-    // attempt and we know the watch page (referer), the stream URL was
-    // almost surely stale/session-locked: resolve ONE fresh link via the
-    // player API and retry once instead of failing outright.
+    // Transfer attempts (max 3 legs): fresh-link retry for refused
+    // googlevideo URLs, then single-connection fallback for hosts that
+    // throttle or botch parallel Range requests (FB/IG CDN class).
     let mut retried_fresh = false;
+    let mut fell_back_single = fragile_cdn;
+    let mut last_segmented = false;
     loop {
+        // P-speed: size googlevideo splits to the strict ~2 MiB window so
+        // parallel ranges 206 instead of 403ing into the fallback.
+        let mut seg_parts = effective_conns;
+        if is_googlevideo_url(&url) {
+            if let Some(t) = total_opt {
+                seg_parts = google_parts(t, effective_conns);
+            }
+        }
         let use_segmented =
-            supports_range && matches!(total_opt, Some(t) if t >= 1024 * 1024) && conns > 1;
+            supports_range && matches!(total_opt, Some(t) if t >= 1024 * 1024) && seg_parts > 1 && !fell_back_single;
+        last_segmented = use_segmented;
         let r = if use_segmented {
             segmented(
                 &client,
@@ -2211,7 +2928,23 @@ pub async fn download(
                 &url,
                 &dest,
                 total_opt.unwrap(),
-                conns,
+                seg_parts,
+                shared.clone(),
+                limiter.clone(),
+            )
+            .await
+        } else if (fragile_cdn || is_googlevideo_url(&url)) && supports_range && matches!(total_opt, Some(t) if t > 0) {
+            // Small bounded ranges only (see chunked_stream): throttling
+            // signed CDNs cut big streams, and strict googlevideo edges
+            // 403 open-ended, HEAD, and >~2 MiB ranges outright (verified
+            // live) while serving identical 1 MiB windows with 206.
+            // (Unverified/ignored ranges go single-stream below.)
+            chunked_stream(
+                &client,
+                &opts,
+                &url,
+                &dest,
+                total_opt.unwrap(),
                 shared.clone(),
                 limiter.clone(),
             )
@@ -2229,10 +2962,13 @@ pub async fn download(
             {
                 retried_fresh = true;
                 match resolve_media(&client, &opts, &opts.referer, &shared).await {
-                    Some((fresh, _)) if fresh != url && is_googlevideo_url(&fresh) => {
+                    Some(hit) if hit.url != url && is_googlevideo_url(&hit.url) => {
                         // Drop partials of the refused stream: resuming them
                         // against a different URL would corrupt the file.
+                        // (The resume sidecar is dropped too; the new URL
+                        // rebinds it on first write.)
                         let _ = tokio::fs::remove_file(dest.with_extension("dcpart")).await;
+                        let _ = tokio::fs::remove_file(dest.with_extension("dcmeta")).await;
                         for i in 0..16 {
                             let _ = tokio::fs::remove_file(
                                 dest.with_extension(format!("dcpart{i}")),
@@ -2240,7 +2976,7 @@ pub async fn download(
                             .await;
                         }
                         shared.downloaded.store(0, Ordering::SeqCst);
-                        url = fresh;
+                        url = hit.url;
                         let (t3, r3, _, _) = probe(&client, &opts, &url).await;
                         total_opt = t3;
                         supports_range = r3;
@@ -2257,6 +2993,47 @@ pub async fn download(
                         return Err(anyhow!(
                             "{e:#} (a fresh link was tried and also refused — replay the video in your browser and pick a new quality row)"
                         ));
+                    }
+                }
+            }
+            Err(e)
+                if !fell_back_single
+                    && last_segmented
+                    && (is_final_http_error(&e)
+                        || segmented_throttled(&e.to_string())) =>
+            {
+                // Parallel Ranges defeated (see seg_fallback): the resume
+                // binding drops stale part sets on every re-split, and the
+                // progress bar holds its max meanwhile.
+                let chunked_ok = (fragile_cdn || is_googlevideo_url(&url))
+                    && supports_range
+                    && matches!(total_opt, Some(t) if t > 0);
+                match seg_fallback(is_final_http_error(&e), effective_conns, chunked_ok) {
+                    SegFallback::Halve(h) => {
+                        effective_conns = h;
+                        continue;
+                    }
+                    SegFallback::Chunked => {
+                        fell_back_single = true;
+                        for i in 0..16 {
+                            let _ = tokio::fs::remove_file(
+                                dest.with_extension(format!("dcpart{i}")),
+                            )
+                            .await;
+                        }
+                        continue;
+                    }
+                    SegFallback::Single => {
+                        fell_back_single = true;
+                        for i in 0..16 {
+                            let _ = tokio::fs::remove_file(
+                                dest.with_extension(format!("dcpart{i}")),
+                            )
+                            .await;
+                        }
+                        supports_range = false;
+                        shared.resumable.store(false, Ordering::SeqCst);
+                        continue;
                     }
                 }
             }
@@ -2337,6 +3114,87 @@ pub async fn ffmpeg_mux(
     Ok(())
 }
 
+/// One adaptive leg (P-speed): segmented parallel first when the server
+/// honors ranges (sized to the strict window on googlevideo), halving on
+/// throttled splits, then sequential chunked 1 MiB windows on
+/// cut-happy/throttling hosts, then a plain stream. `label` ("video" /
+/// "audio") names the leg in errors, since two concurrent transfers would
+/// otherwise hide which one refused.
+#[allow(clippy::too_many_arguments)]
+async fn adaptive_leg(
+    client: &reqwest::Client,
+    opts: &EngineOpts,
+    url: &str,
+    leg_dest: &PathBuf,
+    total: Option<u64>,
+    range: bool,
+    conns: usize,
+    sub: Arc<SharedState>,
+    limiter: std::sync::Arc<RateLimiter>,
+    label: &str,
+) -> Result<()> {
+    let strict = is_fragile_cdn(url) || is_googlevideo_url(url);
+    let can_chunk = strict && matches!(total, Some(t) if t > 0);
+    let mut parts = conns.clamp(1, 16);
+    if is_googlevideo_url(url) {
+        if let Some(t) = total {
+            parts = google_parts(t, parts);
+        }
+    }
+    let can_segment = range && matches!(total, Some(t) if t >= 1024 * 1024) && parts > 1;
+    if can_segment {
+        // Legs start at zero (fresh work dir), so the counter holds only
+        // this attempt's bytes — safe to retry the split downward.
+        let mut n = parts;
+        loop {
+            match segmented(client, opts, url, leg_dest, total.unwrap(), n, sub.clone(), limiter.clone()).await
+            {
+                Ok(()) => return Ok(()),
+                Err(e) => {
+                    if !is_final_http_error(&e) {
+                        if let Some(h) = halve_conns(n) {
+                            n = h;
+                            continue;
+                        }
+                    }
+                    if can_chunk {
+                        // Stale parts belong to the failed split; the
+                        // chunked round rebinds its own offset, and the
+                        // counter restarts with it (never double-counts).
+                        for i in 0..16 {
+                            let _ = tokio::fs::remove_file(
+                                leg_dest.with_extension(format!("dcpart{i}")),
+                            )
+                            .await;
+                        }
+                        sub.downloaded.store(0, Ordering::SeqCst);
+                        return chunked_stream(
+                            client,
+                            opts,
+                            url,
+                            leg_dest,
+                            total.unwrap(),
+                            sub,
+                            limiter,
+                        )
+                        .await
+                        .map_err(|e| anyhow!("{label} leg: {e:#}"));
+                    }
+                    return Err(anyhow!("{label} leg: {e:#}"));
+                }
+            }
+        }
+    }
+    if can_chunk {
+        return chunked_stream(client, opts, url, leg_dest, total.unwrap(), sub, limiter)
+            .await
+            .map_err(|e| anyhow!("{label} leg: {e:#}"));
+    }
+    single_stream(client, opts, url, leg_dest, sub, limiter)
+        .await
+        .map_err(|e| anyhow!("{label} leg: {e:#}"))
+}
+
 /// Download an adaptive pair (video-only + audio) concurrently, then mux to
 /// one file. Container follows the codecs: MP4/M4A pairs stay `.mp4`,
 /// anything WebM/Opus becomes `.mkv` (same convention download managers use).
@@ -2349,9 +3207,21 @@ pub async fn download_adaptive(
     opts: EngineOpts,
     shared: Arc<SharedState>,
 ) -> Result<()> {
+    let video_url = normalize_media_url(&video_url);
+    let audio_url = audio_url.map(|u| normalize_media_url(&u));
     let _job = claim_dest_job(&dest).ok_or_else(|| {
         anyhow!("this destination is already downloading elsewhere — wait for it or remove the duplicate queue entry")
     })?;
+    // Merging needs ffmpeg: fail BEFORE any bytes move, not after two
+    // quarter-gigabyte legs finish. Progressive (single-file) qualities
+    // never reach this path, so this only gates real merges.
+    if audio_url.as_deref().map(|u| u.starts_with("http")).unwrap_or(false)
+        && ffmpeg_path().is_none()
+    {
+        return Err(anyhow!(
+            "this quality needs merging (video-only + audio) but ffmpeg was not found — install it (`winget install ffmpeg`), restart the app so it lands on PATH, then resume; 720p and below download as single files without it"
+        ));
+    }
     let client = opts.build_client()?;
     if let Some(parent) = dest.parent() {
         tokio::fs::create_dir_all(parent).await?;
@@ -2428,9 +3298,6 @@ pub async fn download_adaptive(
     let sa = Arc::new(SharedState::new());
     let v_done = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let a_done = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let pick = |total: Option<u64>, range: bool| -> bool {
-        range && matches!(total, Some(t) if t >= 1024 * 1024) && conns > 1
-    };
     let has_audio = audio_url.is_some();
     let fut_v = {
         let client = client.clone();
@@ -2440,11 +3307,10 @@ pub async fn download_adaptive(
         let done_flag = v_done.clone();
         let vd = v_dest.clone();
         async move {
-            let r = if pick(v_total, v_range) {
-                segmented(&client, &opts, &video_url, &vd, v_total.unwrap(), conns, sub, limiter).await
-            } else {
-                single_stream(&client, &opts, &video_url, &vd, sub, limiter).await
-            };
+            let r = adaptive_leg(
+                &client, &opts, &video_url, &vd, v_total, v_range, conns, sub, limiter, "video",
+            )
+            .await;
             done_flag.store(true, Ordering::SeqCst);
             r
         }
@@ -2460,11 +3326,7 @@ pub async fn download_adaptive(
         async move {
             let r = match au {
                 Some(a) => {
-                    if pick(a_total, a_range) {
-                        segmented(&client, &opts, &a, &ad, a_total.unwrap(), conns, sub, limiter).await
-                    } else {
-                        single_stream(&client, &opts, &a, &ad, sub, limiter).await
-                    }
+                    adaptive_leg(&client, &opts, &a, &ad, a_total, a_range, conns, sub, limiter, "audio").await
                 }
                 None => Ok(()),
             };
@@ -2488,13 +3350,18 @@ pub async fn download_adaptive(
     };
     let (rv, ra, _) = tokio::join!(fut_v, fut_a, agg);
     // Leg failures must also drop the work dir (unique per job, but litter
-    // accumulates across retries otherwise).
+    // accumulates across retries otherwise). The aggregated byte counter is
+    // reset too: those leg bytes were deleted with the work dir, so keeping
+    // them would persist phantom progress (bar jumps backwards on retry,
+    // e.g. 31% -> 20%).
     if let Err(e) = rv {
         let _ = tokio::fs::remove_dir_all(&work).await;
+        shared.downloaded.store(0, Ordering::SeqCst);
         return Err(e);
     }
     if let Err(e) = ra {
         let _ = tokio::fs::remove_dir_all(&work).await;
+        shared.downloaded.store(0, Ordering::SeqCst);
         return Err(e);
     }
     // Mux (or plain move when audio-less). The unique work dir is removed on
@@ -2507,6 +3374,9 @@ pub async fn download_adaptive(
             .map_err(|e| anyhow!(io_message(&e)))
     };
     let _ = tokio::fs::remove_dir_all(&work).await;
+    if finish.is_err() {
+        shared.downloaded.store(0, Ordering::SeqCst);
+    }
     finish?;
     let final_len = tokio::fs::metadata(&dest).await.map(|m| m.len()).unwrap_or(0);
     shared.total.store(final_len, Ordering::SeqCst);
@@ -2535,6 +3405,9 @@ struct DashRep {
     start_number: u64,
     /// Segment duration in seconds (duration ÷ timescale), when templated.
     seg_dur_secs: Option<f64>,
+    /// Exact segment count from a uniform SegmentTimeline (P3), preferred
+    /// over duration math when present.
+    timeline_count: Option<usize>,
 }
 
 fn xml_attr(tag: &str, name: &str) -> Option<String> {
@@ -2624,6 +3497,98 @@ fn dash_seg_count(mpd_duration: Option<f64>, seg_dur: f64) -> Option<usize> {
     }
 }
 
+/// Count segments from a `SegmentTimeline` element's `<S>` entries (P3).
+/// Only uniform timelines are countable: every entry must share one
+/// duration `d` and be contiguous (explicit `t` must match the running
+/// time). `r` repeats extend the count; `r="-1"` (repeat to period end)
+/// needs a known period duration. `timescale` converts timeline units to
+/// seconds. Returns:
+/// - `Ok(None)` — no timeline present (caller falls back to
+///   duration/timescale math).
+/// - `Ok(Some(n))` — exact segment count (capped like `dash_seg_count`).
+/// - `Err` — gaps, varying durations, or unbounded repeats: kept loud
+///   instead of assembling garbage out of order.
+fn timeline_count(block: &str, timescale: f64, period_dur_secs: Option<f64>) -> Result<Option<usize>> {
+    // Collect `<S …>` tags only (`<S `, `<S/>`, `<S>` — never
+    // `<SegmentTemplate…` / `<SegmentTimeline…` / `<Supplemental…`).
+    let mut tags: Vec<&str> = Vec::new();
+    let mut search = 0usize;
+    while let Some(p) = block[search..].find("<S") {
+        let abs = search + p;
+        let after = block[abs + 2..].chars().next();
+        match after {
+            Some(' ') | Some('/') | Some('>') => {
+                let end = block[abs..].find('>').map(|e| abs + e).unwrap_or(block.len());
+                tags.push(&block[abs..end.min(block.len())]);
+                search = abs + 2;
+            }
+            _ => search = abs + 2,
+        }
+    }
+    if tags.is_empty() {
+        return Ok(None);
+    }
+    let mut unit_d: Option<u64> = None;
+    let mut pos: Option<u64> = None; // running time in timeline units
+    let mut total: usize = 0;
+    for tag in &tags {
+        let d: u64 = xml_attr(tag, "d")
+            .and_then(|v| v.parse().ok())
+            .filter(|d| *d > 0)
+            .ok_or_else(|| {
+                anyhow!("DASH SegmentTimeline entry without a positive duration is not supported")
+            })?;
+        if let Some(u) = unit_d {
+            if u != d {
+                return Err(anyhow!(
+                    "this DASH manifest uses a varying-duration SegmentTimeline — not supported yet. Use the browser extension qualities (MP4) when the site offers them"
+                ));
+            }
+        } else {
+            unit_d = Some(d);
+        }
+        if let Some(t) = xml_attr(tag, "t").and_then(|v| v.parse::<u64>().ok()) {
+            if let Some(p) = pos {
+                if t != p {
+                    return Err(anyhow!(
+                        "this DASH manifest has gaps in its SegmentTimeline — not supported yet"
+                    ));
+                }
+            }
+            pos = Some(t);
+        }
+        let r_raw = xml_attr(tag, "r").unwrap_or_else(|| "0".to_string());
+        let r: i64 = r_raw.parse().unwrap_or(0);
+        let reps: u64 = if r < 0 {
+            // Repeat to period end (DASH-IF `r="-1"`).
+            let period = period_dur_secs.ok_or_else(|| {
+                anyhow!("this DASH manifest repeats segments to an unknown period end — not supported yet")
+            })?;
+            let ts = if timescale > 0.0 { timescale } else { 1.0 };
+            let seg_secs = d as f64 / ts;
+            if seg_secs <= 0.0 {
+                return Err(anyhow!("DASH SegmentTimeline entry without a positive duration is not supported"));
+            }
+            let elapsed = pos.unwrap_or(0) as f64 / ts;
+            let n = ((period - elapsed) / seg_secs).ceil().max(1.0) as u64;
+            pos = None; // nothing verifiable follows an open repeat
+            n
+        } else {
+            let n = (r as u64).saturating_add(1);
+            pos = Some(pos.unwrap_or(0).saturating_add(d.saturating_mul(n)));
+            n
+        };
+        total = total.saturating_add(reps as usize);
+        if total > 2000 {
+            return Ok(None); // oversize/live-ish: caller reports it cleanly
+        }
+    }
+    if total == 0 {
+        return Ok(None);
+    }
+    Ok(Some(total))
+}
+
 fn dash_expand(tpl: &str, number: u64, rep_id: &str, bw: u64) -> String {
     // $Number$, $Number%0Nd$, $RepresentationID$, $Bandwidth$.
     // Byte-walk would corrupt multibyte template text, so iterate chars.
@@ -2669,9 +3634,18 @@ fn dash_expand(tpl: &str, number: u64, rep_id: &str, bw: u64) -> String {
 
 /// Parse an MPD manifest into (video, audio) representation lists.
 /// Handles AdaptationSet mimeType + Representation bandwidth/width/height +
-/// BaseURL and SegmentTemplate (number-based). SegmentTimeline and dynamic
+/// BaseURL and SegmentTemplate (number-based). Uniform SegmentTimelines are
+/// counted exactly (`timeline_count`); varying/gapped timelines and dynamic
 /// (live) manifests are rejected by the caller.
 fn parse_mpd(xml: &str) -> Result<(Vec<DashRep>, Vec<DashRep>)> {
+    // Period duration for open-ended (`r="-1"`) timelines.
+    let mpd_dur = xml
+        .find("<MPD")
+        .and_then(|p| {
+            let q = xml[p..].find('>').map(|x| x + p).unwrap_or(xml.len());
+            xml_attr(&xml[p..q.min(xml.len())], "mediaPresentationDuration")
+        })
+        .and_then(|d| parse_pt_duration(&d));
     let mut videos = Vec::new();
     let mut audios = Vec::new();
     let mut rest = xml;
@@ -2687,6 +3661,7 @@ fn parse_mpd(xml: &str) -> Result<(Vec<DashRep>, Vec<DashRep>)> {
         let set_tpl_init;
         let set_start;
         let set_dur;
+        let set_timescale: f64;
         if let Some(st) = block.find("<SegmentTemplate") {
             let st_end = block[st..].find('>').map(|x| x + st).unwrap_or(block.len());
             let st_tag_full = &block[st..st_end.min(block.len())];
@@ -2706,13 +3681,43 @@ fn parse_mpd(xml: &str) -> Result<(Vec<DashRep>, Vec<DashRep>)> {
                 .and_then(|v| v.parse::<u64>().ok())
                 .unwrap_or(1);
             set_dur = tpl_secs(st_tag_full);
+            set_timescale = xml_attr(st_tag_full, "timescale")
+                .and_then(|v| v.parse::<f64>().ok())
+                .filter(|t| *t > 0.0)
+                .unwrap_or(1.0);
         } else {
             set_tpl_media = None;
             set_tpl_init = None;
             set_start = 1;
             set_dur = None;
+            set_timescale = 1.0;
         }
-        let has_timeline = block.contains("<SegmentTimeline");
+        // Set-level timeline scan, excluding Representation sub-blocks
+        // (their own timelines are evaluated per-rep below).
+        let mut set_scan = String::with_capacity(block.len());
+        {
+            let mut pos = 0usize;
+            let mut rsearch = 0usize;
+            while let Some(r) = block[rsearch..].find("<Representation") {
+                let rs = rsearch + r;
+                let r_body = block[rs..].find('>').map(|x| x + rs + 1).unwrap_or(block.len());
+                let r_end = block[r_body..]
+                    .find("</Representation>")
+                    .map(|x| x + r_body + "</Representation>".len())
+                    .unwrap_or(block.len());
+                set_scan.push_str(&block[pos..rs.min(block.len())]);
+                pos = r_end.min(block.len());
+                rsearch = pos;
+            }
+            set_scan.push_str(&block[pos..]);
+        }
+        // A malformed timeline is a loud error, not a silent miscount —
+        // but only when a timeline actually exists here.
+        let set_tl = if set_scan.contains("<SegmentTimeline") {
+            timeline_count(&set_scan, set_timescale, mpd_dur)?
+        } else {
+            None
+        };
         let mut rrest = block;
         while let Some(r) = rrest.find("<Representation") {
             let r_body = rrest[r..].find('>').map(|x| x + r + 1).unwrap_or(rrest.len());
@@ -2728,6 +3733,18 @@ fn parse_mpd(xml: &str) -> Result<(Vec<DashRep>, Vec<DashRep>)> {
                 .and_then(|t| xml_attr(t, "startNumber"))
                 .and_then(|v| v.parse::<u64>().ok())
                 .unwrap_or(set_start);
+            let rep_timescale = rep_tpl_tag
+                .as_ref()
+                .and_then(|t| xml_attr(t, "timescale"))
+                .and_then(|v| v.parse::<f64>().ok())
+                .filter(|t| *t > 0.0)
+                .unwrap_or(set_timescale);
+            // Rep-level timeline wins; otherwise the set-level one applies.
+            let rep_tl = if rblock.contains("<SegmentTimeline") {
+                timeline_count(rblock, rep_timescale, mpd_dur)?
+            } else {
+                None
+            };
             let rep = DashRep {
                 id: xml_attr(rtag, "id").unwrap_or_default(),
                 bandwidth: xml_attr(rtag, "bandwidth").and_then(|v| v.parse().ok()).unwrap_or(0),
@@ -2749,16 +3766,8 @@ fn parse_mpd(xml: &str) -> Result<(Vec<DashRep>, Vec<DashRep>)> {
                     .as_ref()
                     .and_then(|t| tpl_secs(t))
                     .or(set_dur),
+                timeline_count: rep_tl.or(set_tl),
             };
-            if has_timeline {
-                // Timelines need per-entry math we don't do yet — but a
-                // timeline WITH a fixed duration template is still countable
-                // below only if every entry is uniform, which we can't verify:
-                // reject loudly instead of assembling garbage.
-                return Err(anyhow!(
-                    "this DASH manifest uses SegmentTimeline — not supported yet. Use the browser extension qualities (MP4) when the site offers them"
-                ));
-            }
             if rep.mime.starts_with("video/") {
                 videos.push(rep);
             } else if rep.mime.starts_with("audio/") {
@@ -2777,8 +3786,64 @@ fn parse_mpd(xml: &str) -> Result<(Vec<DashRep>, Vec<DashRep>)> {
     Ok((videos, audios))
 }
 
+/// One DASH blob fetch with retries (init or media segment). Standalone so
+/// media segments can be fetched from spawned tasks (P2 parallelism).
+async fn dash_fetch_blob(
+    client: &reqwest::Client,
+    opts: &EngineOpts,
+    url: String,
+    shared: &Arc<SharedState>,
+    max_retries: u32,
+) -> Result<Vec<u8>> {
+    let mut attempt = 0u32;
+    loop {
+        attempt += 1;
+        wait_if_paused(shared).await?;
+        if shared.cancelled.load(Ordering::SeqCst) {
+            return Err(anyhow!("cancelled"));
+        }
+        match opts.get(client, &url).send().await {
+            Ok(resp) => match resp.error_for_status() {
+                Ok(r) => {
+                    let expect = r.content_length();
+                    let body = r.bytes().await.map_err(|e| anyhow!("segment network: {e}"))?;
+                    // Same clean-but-short guard as HLS segments.
+                    if let Some(n) = expect {
+                        if body.len() as u64 != n {
+                            if attempt >= max_retries {
+                                return Err(anyhow!(
+                                    "segment short: got {} of {n} bytes", body.len()
+                                ));
+                            }
+                            tokio::time::sleep(std::time::Duration::from_secs(1 << attempt.min(4))).await;
+                            continue;
+                        }
+                    }
+                    return Ok(body.to_vec());
+                }
+                Err(e) => {
+                    let m = http_status_err(&url, e);
+                    if is_final_http_error(&m) || attempt >= max_retries {
+                        return Err(m);
+                    }
+                }
+            },
+            Err(e) => {
+                if attempt >= max_retries {
+                    return Err(anyhow!("segment fetch: {e}"));
+                }
+            }
+        }
+        tokio::time::sleep(std::time::Duration::from_secs(1 << attempt.min(4))).await;
+    }
+}
+
 /// Download one DASH representation to a file: init segment + N media
-/// segments concatenated (fragmented MP4 chains this way for VOD).
+/// segments concatenated (fragmented MP4 chains this way for VOD). Media
+/// segments fetch in bounded parallel (P2, like HLS) into indexed part
+/// files and concatenate in order; the init segment stays sequential
+/// (headers must lead the stream).
+#[allow(clippy::too_many_arguments)]
 async fn dash_rep_download(
     client: &reqwest::Client,
     opts: &EngineOpts,
@@ -2789,6 +3854,7 @@ async fn dash_rep_download(
     dest: &PathBuf,
     shared: &Arc<SharedState>,
     limiter: &std::sync::Arc<RateLimiter>,
+    parallel: usize,
 ) -> Result<()> {
     let max_retries = opts.max_retries.max(1);
     let mut out = tokio::fs::OpenOptions::new()
@@ -2797,49 +3863,6 @@ async fn dash_rep_download(
         .truncate(true)
         .open(dest)
         .await?;
-    let mut fetch_blob = |url: String| async move {
-        let mut attempt = 0u32;
-        loop {
-            attempt += 1;
-            wait_if_paused(shared).await?;
-            if shared.cancelled.load(Ordering::SeqCst) {
-                return Err(anyhow!("cancelled"));
-            }
-            match opts.get(client, &url).send().await {
-                Ok(resp) => match resp.error_for_status() {
-                    Ok(r) => {
-                        let expect = r.content_length();
-                        let body = r.bytes().await.map_err(|e| anyhow!("segment network: {e}"))?;
-                        // Same clean-but-short guard as HLS segments.
-                        if let Some(n) = expect {
-                            if body.len() as u64 != n {
-                                if attempt >= max_retries {
-                                    return Err(anyhow!(
-                                        "segment short: got {} of {n} bytes", body.len()
-                                    ));
-                                }
-                                tokio::time::sleep(std::time::Duration::from_secs(1 << attempt.min(4))).await;
-                                continue;
-                            }
-                        }
-                        return Ok(body.to_vec());
-                    }
-                    Err(e) => {
-                        let m = http_status_err(&url, e);
-                        if is_final_http_error(&m) || attempt >= max_retries {
-                            return Err(m);
-                        }
-                    }
-                },
-                Err(e) => {
-                    if attempt >= max_retries {
-                        return Err(anyhow!("segment fetch: {e}"));
-                    }
-                }
-            }
-            tokio::time::sleep(std::time::Duration::from_secs(1 << attempt.min(4))).await;
-        }
-    };
     use tokio::io::AsyncWriteExt;
     if rep.seg_media.is_some() {
         // Templated representation: initialization segment (track headers)
@@ -2850,7 +3873,7 @@ async fn dash_rep_download(
             } else {
                 hls_abs(mpd_url, &init_tpl)
             };
-            let blob = fetch_blob(u).await?;
+            let blob = dash_fetch_blob(client, opts, u, shared, max_retries).await?;
             out.write_all(&blob).await.map_err(|e| anyhow!(io_message(&e)))?;
             shared.downloaded.fetch_add(blob.len() as u64, Ordering::SeqCst);
             limiter.consume(blob.len() as u64).await;
@@ -2860,19 +3883,67 @@ async fn dash_rep_download(
         let n = count.ok_or_else(|| {
             anyhow!("DASH live/dynamic manifests without a known segment count are not supported")
         })?;
+        // Bounded parallel fetch (P2): each segment lands in its indexed
+        // part file; concatenation below stays strictly ordered.
+        let slots = parallel.clamp(2, 8);
+        let sem = std::sync::Arc::new(tokio::sync::Semaphore::new(slots));
+        let mut handles = Vec::with_capacity(n);
         for i in 0..n {
             let num = rep.start_number.saturating_add(i as u64);
             let seg = dash_expand(&media_tpl, num, rep_id, rep.bandwidth);
             let u = if seg.starts_with("http") { seg } else { hls_abs(mpd_url, &seg) };
-            let blob = fetch_blob(u).await?;
-            out.write_all(&blob).await.map_err(|e| anyhow!(io_message(&e)))?;
-            shared.downloaded.fetch_add(blob.len() as u64, Ordering::SeqCst);
-            limiter.consume(blob.len() as u64).await;
+            let part = dest.with_extension(format!("dashpart{i}"));
+            let client = client.clone();
+            let opts = opts.clone();
+            let shared = shared.clone();
+            let limiter = limiter.clone();
+            let sem = sem.clone();
+            handles.push(tokio::spawn(async move {
+                let _permit = sem.acquire_owned().await.map_err(|e| anyhow!("semaphore: {e}"))?;
+                if shared.cancelled.load(Ordering::SeqCst) {
+                    return Err(anyhow!("cancelled"));
+                }
+                let blob = dash_fetch_blob(&client, &opts, u, &shared, max_retries).await?;
+                tokio::fs::write(&part, &blob).await.map_err(|e| anyhow!(io_message(&e)))?;
+                shared.downloaded.fetch_add(blob.len() as u64, Ordering::SeqCst);
+                limiter.consume(blob.len() as u64).await;
+                Ok::<(), anyhow::Error>(())
+            }));
+        }
+        let mut first_err: Option<anyhow::Error> = None;
+        for h in handles {
+            match h.await {
+                Ok(Ok(())) => {}
+                Ok(Err(e)) => {
+                    if first_err.is_none() {
+                        first_err = Some(e);
+                    }
+                }
+                Err(e) => {
+                    if first_err.is_none() {
+                        first_err = Some(anyhow!("segment task: {e}"));
+                    }
+                }
+            }
+        }
+        if let Some(e) = first_err {
+            for i in 0..n {
+                let _ = tokio::fs::remove_file(dest.with_extension(format!("dashpart{i}"))).await;
+            }
+            return Err(e);
+        }
+        for i in 0..n {
+            let part = dest.with_extension(format!("dashpart{i}"));
+            let mut f = tokio::fs::File::open(&part).await.map_err(|_| {
+                anyhow!("segment {i} missing after download — retry the download")
+            })?;
+            tokio::io::copy(&mut f, &mut out).await?;
+            let _ = tokio::fs::remove_file(&part).await;
         }
     } else if let Some(b) = rep.base_url.clone() {
         // Single-file representation.
         let u = if b.starts_with("http") { b } else { hls_abs(mpd_url, &b) };
-        let blob = fetch_blob(u).await?;
+        let blob = dash_fetch_blob(client, opts, u, shared, max_retries).await?;
         out.write_all(&blob).await.map_err(|e| anyhow!(io_message(&e)))?;
         shared.downloaded.fetch_add(blob.len() as u64, Ordering::SeqCst);
         limiter.consume(blob.len() as u64).await;
@@ -2893,7 +3964,8 @@ pub async fn download_dash(
     opts: EngineOpts,
     shared: Arc<SharedState>,
 ) -> Result<()> {
-    let _ = connections;
+    // Segment fetch parallelism (P2): bounded like HLS legs.
+    let parallel = connections.clamp(2, 8);
     let client = opts.build_client()?;
     if let Some(parent) = dest.parent() {
         tokio::fs::create_dir_all(parent).await?;
@@ -2972,14 +4044,18 @@ pub async fn download_dash(
     let limiter = std::sync::Arc::new(
         RateLimiter::new(opts.speed_limit_bps).with_global(opts.global_limit.clone()),
     );
-    let count_v = v.seg_dur_secs.and_then(|d| dash_seg_count(mpd_dur, d));
+    let count_v = v
+        .timeline_count
+        .or_else(|| v.seg_dur_secs.and_then(|d| dash_seg_count(mpd_dur, d)));
     let rep_id_v = if v.id.is_empty() { v.bandwidth.to_string() } else { v.id.clone() };
     let res: Result<()> = async {
-        dash_rep_download(&client, &opts, manifest_url, &v, &rep_id_v, count_v, &v_dest, &shared, &limiter).await?;
+        dash_rep_download(&client, &opts, manifest_url, &v, &rep_id_v, count_v, &v_dest, &shared, &limiter, parallel).await?;
         if let Some(rep) = a {
-            let count_a = rep.seg_dur_secs.and_then(|d| dash_seg_count(mpd_dur, d));
+            let count_a = rep
+                .timeline_count
+                .or_else(|| rep.seg_dur_secs.and_then(|d| dash_seg_count(mpd_dur, d)));
             let rep_id_a = if rep.id.is_empty() { rep.bandwidth.to_string() } else { rep.id.clone() };
-            dash_rep_download(&client, &opts, manifest_url, &rep, &rep_id_a, count_a, &a_dest, &shared, &limiter).await?;
+            dash_rep_download(&client, &opts, manifest_url, &rep, &rep_id_a, count_a, &a_dest, &shared, &limiter, parallel).await?;
             ffmpeg_mux(&v_dest, Some(&a_dest), &dest).await
         } else {
             // Video-only manifest: deliver the assembled track as-is.
@@ -3003,6 +4079,98 @@ pub async fn download_dash(
     Ok(())
 }
 
+/// Strict googlevideo-style edges 403 ranges above ~2 MiB while serving
+/// small bounded ranges with 206 (verified live against the strict
+/// fixture and googlevideo SABR edges).
+const STRICT_PART_MAX: u64 = 2 * 1024 * 1024;
+
+/// Segmented split size for googlevideo URLs (P-speed): no more parts than
+/// needed to keep ranges near the strict ~2 MiB window — fewer, fuller
+/// ranges beat a storm of micro-ranges. Never exceeds what was asked
+/// (a single connection stays single); larger files still split fully
+/// and rely on the chunked fallback below when an edge balks.
+fn google_parts(total: u64, conns: usize) -> usize {
+    let c = conns.clamp(1, 16);
+    if c <= 1 || total < 1024 * 1024 {
+        return c;
+    }
+    let fit = ((total + STRICT_PART_MAX - 1) / STRICT_PART_MAX).clamp(2, 16) as usize;
+    fit.min(c)
+}
+
+/// Classify a retryable attempt error for the end-of-download summary
+/// (cuts vs stalls vs restarts), so the log tells the user what the
+/// server actually kept doing instead of just the last error.
+fn classify_attempt(msg: &str) -> &'static str {
+    if msg.contains("stalled (no data") {
+        "stalled"
+    } else if msg.contains("bytes") {
+        "cut"
+    } else {
+        "other"
+    }
+}
+
+/// Next split when parallel ranges get throttled (P2): halve 16→8→4→2,
+/// then give up splitting (None) and collapse to one sequential stream.
+/// Halving (not abandoning) survives hosts that tolerate a few ranges but
+/// cut under a many-way storm.
+fn halve_conns(conns: usize) -> Option<usize> {
+    if conns > 2 {
+        Some((conns / 2).max(2))
+    } else {
+        None
+    }
+}
+
+/// Throttling signatures on a segmented failure that halving can survive:
+/// range rejections, cut-short parts, and rate limits (429). Hard refusals
+/// (401/403/410) are NOT included — parallelism didn't cause those.
+fn segmented_throttled(msg: &str) -> bool {
+    msg.contains("416")
+        || msg.contains("segment short")
+        || msg.contains("Range")
+        || msg.contains("429")
+}
+
+/// Next step after a segmented failure (P-speed): halve the split while
+/// throttling may just be a too-wide storm, else one chunked round on
+/// cut-happy hosts (1 MiB windows 206 where big ranges 403), else the
+/// plain single stream. Pure decision table, unit-tested below.
+enum SegFallback {
+    Halve(usize),
+    Chunked,
+    Single,
+}
+
+fn seg_fallback(is_final: bool, conns: usize, chunked_ok: bool) -> SegFallback {
+    if !is_final {
+        if let Some(h) = halve_conns(conns) {
+            return SegFallback::Halve(h);
+        }
+    }
+    if chunked_ok {
+        SegFallback::Chunked
+    } else {
+        SegFallback::Single
+    }
+}
+
+/// Append an attempt summary to a terminal transfer error, e.g.
+/// `connection ended early (…) [34 tries: 30 cut, 0 stalled, 4 restarted]`.
+/// Visible in full in Queues → Log; the row label shows the head of it.
+fn with_attempt_summary(
+    e: anyhow::Error,
+    attempt: u32,
+    cuts: u32,
+    stalls: u32,
+    restarts: u32,
+) -> anyhow::Error {
+    anyhow::anyhow!(
+        "{e:#} [{attempt} tries: {cuts} cut, {stalls} stalled, {restarts} restarted]"
+    )
+}
+
 async fn single_stream(
     client: &reqwest::Client,
     opts: &EngineOpts,
@@ -3011,23 +4179,100 @@ async fn single_stream(
     shared: Arc<SharedState>,
     limiter: std::sync::Arc<RateLimiter>,
 ) -> Result<()> {
-    // Retry the whole stream (resuming from the .dcpart file when the
-    // server honors ranges), mirroring the per-segment retry policy.
+    // Retry the whole stream, resuming from the .dcpart file when the
+    // server honors ranges. Throttled CDNs (FB/IG class) cut the socket
+    // repeatedly MID-file: attempts that still moved bytes must NOT consume
+    // the retry budget, or a big file dies after N cuts (the old bug — every
+    // cut burned one retry even with 10 MB of progress). Only consecutive
+    // zero-progress attempts fail the download, with an absolute cap so a
+    // 1-byte trickle can't loop forever. Mirrors download_range's policy.
     let max_retries = opts.max_retries.max(1);
-    let mut attempt = 0;
+    let mut stalled = 0u32;
+    let mut attempt = 0u32;
+    // Attempt telemetry for the final summary (see with_attempt_summary).
+    let mut cuts = 0u32;
+    let mut stalls = 0u32;
+    let mut restarts = 0u32;
+    // A 416 (offset rejected — total shrank or server forgot the file) is
+    // only worth one clean restart; a second 416 means the URL itself is bad.
+    let mut restarted_416 = false;
     loop {
         attempt += 1;
+        let len_before = tokio::fs::metadata(dest.with_extension("dcpart"))
+            .await
+            .map(|m| m.len())
+            .unwrap_or(0);
         match single_stream_once(client, opts, url, dest, &shared, &limiter).await {
             Ok(()) => return Ok(()),
             Err(e) => {
                 if shared.cancelled.load(Ordering::SeqCst)
                     || e.to_string() == "cancelled"
-                    || is_final_http_error(&e)
-                    || attempt >= max_retries
                 {
                     return Err(e);
                 }
-                tokio::time::sleep(std::time::Duration::from_secs(1 << attempt.min(4))).await;
+                // Refusals (403/401/410) AFTER partial progress on a signed
+                // link almost always mean expiry (fresh captures work, resume
+                // doesn't). Say so plainly instead of a generic refusal —
+                // the fix is a fresh capture, not another resume.
+                if is_final_http_error(&e) && len_before > 0 && is_fragile_cdn(url) {
+                    let got = crate::model::format_bytes(len_before);
+                    return Err(final_err(format!(
+                        "link expired after {got} — replay the reel and click the download button again for a fresh link, then resume"
+                    )));
+                }
+                // A refusal on FIRST touch can be edge throttling noise (the
+                // same URL 206s on immediate retry — verified live), so spend
+                // retry budget on it instead of failing instantly. A truly
+                // dead link fails every attempt and still reports the refusal
+                // with its type intact for the fallback routing above.
+                if is_final_http_error(&e) {
+                    stalled = stalled.saturating_add(1);
+                    if stalled >= max_retries || attempt >= max_retries * 20 {
+                        return Err(e);
+                    }
+                    tokio::time::sleep(std::time::Duration::from_secs(1 << stalled.min(4))).await;
+                    continue;
+                }
+                let msg = e.to_string();
+                match classify_attempt(&msg) {
+                    "cut" => cuts += 1,
+                    "stalled" => stalls += 1,
+                    _ => {}
+                }
+                if msg.contains("416") && len_before > 0 && !restarted_416 {
+                    // Server rejected our resume offset: drop the prefix and
+                    // restart from zero once (never resume a 416 twice).
+                    restarted_416 = true;
+                    restarts += 1;
+                    let _ = tokio::fs::remove_file(dest.with_extension("dcpart")).await;
+                    shared.downloaded.store(0, Ordering::SeqCst);
+                    if let Ok(mut g) = shared.part_done.lock() {
+                        if let Some(slot) = g.first_mut() {
+                            *slot = 0;
+                        }
+                    }
+                    stalled = 0;
+                    continue;
+                }
+                // Attempts append, so file growth == progress. A SHRUNK file
+                // means the server ignored our Range (200) and we truncated:
+                // count it as a restart, not silent progress.
+                let len_after = tokio::fs::metadata(dest.with_extension("dcpart"))
+                    .await
+                    .map(|m| m.len())
+                    .unwrap_or(0);
+                if len_after > len_before {
+                    stalled = 0;
+                } else {
+                    if len_after < len_before {
+                        restarts += 1;
+                    }
+                    stalled = stalled.saturating_add(1);
+                }
+                if stalled >= max_retries || attempt >= max_retries * 20 {
+                    return Err(with_attempt_summary(e, attempt, cuts, stalls, restarts));
+                }
+                tokio::time::sleep(std::time::Duration::from_secs(1 << stalled.min(4))).await;
             }
         }
     }
@@ -3041,17 +4286,36 @@ async fn single_stream_once(
     shared: &Arc<SharedState>,
     limiter: &std::sync::Arc<RateLimiter>,
 ) -> Result<()> {
-    // Resume support: continue from existing .part file if present.
+    // Resume support: continue from the existing .dcpart file, but ONLY
+    // when it is bound to this exact URL+total (see ResumeMeta). A stale
+    // prefix from another URL is discarded, never resumed into this file.
     let tmp = dest.with_extension("dcpart");
-    let mut start_at: u64 = 0;
-    if tmp.exists() {
-        start_at = tokio::fs::metadata(&tmp).await.map(|m| m.len()).unwrap_or(0);
-    }
+    let known_total = if shared.has_total.load(Ordering::SeqCst) {
+        Some(shared.total.load(Ordering::SeqCst))
+    } else {
+        None
+    };
+    let mut start_at: u64 = resume_offset(dest, "dcpart", url, known_total, 1);
 
     // Always request a range (even from 0): some media servers truncate
     // plain 200 responses but serve full content for range requests.
+    // Bounded when the total is known: strict edges (googlevideo SABR
+    // serving, `gir=yes`) 403 open-ended full-file ranges outright while
+    // serving the identical bounded window with 206 (verified live).
     let mut req = opts.get(client, url);
-    req = req.header(reqwest::header::RANGE, format!("bytes={start_at}-"));
+    req = if shared.has_total.load(Ordering::SeqCst) {
+        let total = shared.total.load(Ordering::SeqCst);
+        if total > start_at {
+            req.header(
+                reqwest::header::RANGE,
+                format!("bytes={start_at}-{}", total - 1),
+            )
+        } else {
+            req.header(reqwest::header::RANGE, format!("bytes={start_at}-"))
+        }
+    } else {
+        req.header(reqwest::header::RANGE, format!("bytes={start_at}-"))
+    };
     let resp = match req.send().await?.error_for_status() {
         Ok(r) => r,
         Err(e) => {
@@ -3088,6 +4352,15 @@ async fn single_stream_once(
         start_at = 0;
         shared.downloaded.store(0, Ordering::SeqCst);
     }
+    // Ground the resume flag in this response (the pre-download probe may
+    // have been skipped for expiring CDN links): only a 206 proves ranges.
+    // A 200 to a bytes=0- request means ranges are ignored; a 200 after a
+    // nonzero offset restart means the same after truncation above.
+    if is_partial {
+        shared.resumable.store(true, Ordering::SeqCst);
+    } else if start_at > 0 || resp.status() == reqwest::StatusCode::OK {
+        shared.resumable.store(false, Ordering::SeqCst);
+    }
     // Adopt server-advertised total when we didn't have one.
     if !shared.has_total.load(Ordering::SeqCst) {
         if let Some(len) = resp.content_length() {
@@ -3122,8 +4395,22 @@ async fn single_stream_once(
 
     let per_conn_limit = opts.speed_limit_bps; // single connection gets full budget
     let _ = per_conn_limit;
+    // Stall guard: a hung socket (no bytes at all for the timeout window)
+    // must fail the attempt so the retry loop resumes — otherwise a
+    // throttled CDN drip-freeze hangs the download forever at 0 B/s.
+    // Clamped 15–120 s so slow-but-moving trickles are never killed.
+    let stall_timeout = (opts.timeout_secs.max(15)).min(120);
     let mut stream = resp.bytes_stream();
-    while let Some(chunk) = stream.next().await {
+    loop {
+        let next = tokio::time::timeout(
+            std::time::Duration::from_secs(stall_timeout),
+            stream.next(),
+        )
+        .await
+        .map_err(|_| {
+            anyhow!("stalled (no data for {stall_timeout}s) — resuming")
+        })?;
+        let Some(chunk) = next else { break };
         wait_if_paused(&shared).await?;
         let bytes = chunk.map_err(|e| anyhow!("network: {e}"))?;
         file.write_all(&bytes)
@@ -3139,11 +4426,25 @@ async fn single_stream_once(
     }
     file.flush().await.map_err(|e| anyhow!(io_message(&e)))?;
     drop(file);
-    // Unknown totals (chunked / lengthless responses) can end cleanly yet
-    // short after a dropped socket: re-probe once, and if the server now
-    // reports MORE than we received, fail so the retry loop resumes instead
-    // of finalizing a truncated file as "Completed".
-    if !shared.has_total.load(Ordering::SeqCst) {
+    // A clean-but-early socket close yields a short stream with NO error —
+    // the classic Facebook/IG CDN failure ("connection ended early" in the
+    // UI). When the total is known, verify the landed bytes and fail so the
+    // retry loop resumes from the .dcpart offset instead of finalizing a
+    // truncated file as success (which the app would then report as a
+    // generic failure with no resume happening).
+    if shared.has_total.load(Ordering::SeqCst) {
+        let want = shared.total.load(Ordering::SeqCst);
+        let got = tokio::fs::metadata(&tmp).await.map(|m| m.len()).unwrap_or(0);
+        if want > 0 && got < want {
+            return Err(anyhow!(
+                "connection ended early (got {got} of {want} bytes) — resuming"
+            ));
+        }
+        // Unknown totals (chunked / lengthless responses) can end cleanly yet
+        // short after a dropped socket: re-probe once, and if the server now
+        // reports MORE than we received, fail so the retry loop resumes instead
+        // of finalizing a truncated file as "Completed".
+    } else {
         let got = tokio::fs::metadata(&tmp).await.map(|m| m.len()).unwrap_or(0);
         let (t, _, _, _) = probe(client, opts, url).await;
         if let Some(total) = t {
@@ -3162,6 +4463,302 @@ async fn single_stream_once(
     Ok(())
 }
 
+/// Sequential chunked download for throttling signed CDNs (FB/IG reels).
+///
+/// Failure mode it fixes: some CDN edges cap *bytes per connection*
+/// (~1 MB observed on fbcdn — every stream dies at the same offset). A
+/// single long stream can then NEVER finish: each resume restarts (or
+/// truncates on a 200) and dies at the same ~1 MB mark, burning all 100
+/// attempts at a frozen offset. Small bounded ranges (1 MiB) each complete
+/// under the cap, and any cut only loses the in-flight chunk — the file
+/// offset on disk is the resume point, so progress is strictly additive.
+///
+/// Requires a known total (browser-measured size or a prior probe);
+/// callers fall back to `single_stream` when it is unknown.
+const FRAGILE_CHUNK: u64 = 1024 * 1024;
+
+#[allow(clippy::too_many_arguments)]
+async fn chunked_stream(
+    client: &reqwest::Client,
+    opts: &EngineOpts,
+    url: &str,
+    dest: &PathBuf,
+    mut total: u64,
+    shared: Arc<SharedState>,
+    limiter: std::sync::Arc<RateLimiter>,
+) -> Result<()> {
+    let tmp = dest.with_extension("dcpart");
+    let max_retries = opts.max_retries.max(1);
+    let stall_timeout = (opts.timeout_secs.max(15)).min(120);
+    // Bind resume state first: a prefix from another URL is discarded here,
+    // so every chunk below appends bytes of THIS file only (see ResumeMeta).
+    resume_offset(dest, "dcpart", url, Some(total), 1);
+    // One restart-from-zero per download (stale offset / shrunken file).
+    let mut restarted = false;
+    let mut stalled = 0u32;
+    let mut attempt = 0u32;
+    // Attempt telemetry for the final summary (see with_attempt_summary).
+    let mut cuts = 0u32;
+    let mut stalls = 0u32;
+    let mut restarts = 0u32;
+    // Consecutive refusals on a live offset: strict edges throttle bursts
+    // with 403s that clear after a breather (verified live: the same range
+    // 206s again). Back off hard a few times before declaring expiry —
+    // instant expiry misdiagnosed throttling and killed good links.
+    let mut refusals = 0u32;
+    // Single part view for the dialogs (no lock held across awaits).
+    let have_now = tokio::fs::metadata(&tmp).await.map(|m| m.len()).unwrap_or(0);
+    {
+        let mut totals = mutex_guard(&shared.part_total);
+        let mut dones = mutex_guard(&shared.part_done);
+        totals.clear();
+        dones.clear();
+        totals.push((0, total));
+        dones.push(have_now);
+    }
+    loop {
+        attempt += 1;
+        let offset = tokio::fs::metadata(&tmp).await.map(|m| m.len()).unwrap_or(0);
+        if total > 0 && offset >= total {
+            break;
+        }
+        if shared.cancelled.load(Ordering::SeqCst) {
+            return Err(anyhow!("cancelled"));
+        }
+        wait_if_paused(&shared).await?;
+        let end = if total > 0 {
+            (offset.saturating_add(FRAGILE_CHUNK).saturating_sub(1)).min(total.saturating_sub(1))
+        } else {
+            offset.saturating_add(FRAGILE_CHUNK).saturating_sub(1)
+        };
+        let want = end.saturating_sub(offset).saturating_add(1);
+        let len_before = offset;
+        match chunked_once(client, opts, url, &tmp, offset, end, want, stall_timeout, &shared, &limiter).await {
+            Ok(wrote) => {
+                stalled = 0;
+                refusals = 0;
+                if total > 0 && offset.saturating_add(wrote) >= total {
+                    break;
+                }
+                if wrote == 0 {
+                    stalled = stalled.saturating_add(1);
+                }
+            }
+            Err(e) => {
+                if shared.cancelled.load(Ordering::SeqCst) || e.to_string() == "cancelled" {
+                    return Err(e);
+                }
+                if is_final_http_error(&e) {
+                    // Refusal on a live offset: throttle burst OR expiry.
+                    // Throttle clears after a breather; expiry never does —
+                    // so absorb a couple refusals with backoffs first and
+                    // only call it expired when it persists (kept short so a
+                    // gated YouTube quality fails fast instead of sitting at
+                    // 20% with 0 B/s for minutes).
+                    if len_before > 0 {
+                        if refusals < 2 {
+                            refusals += 1;
+                            let wait = (2u64 << refusals.min(4)).min(30);
+                            tokio::time::sleep(std::time::Duration::from_secs(wait)).await;
+                            continue;
+                        }
+                        // SABR-gated streams (`gir=yes`) serve only a ~2 MB
+                        // preview to plain ranged GETs outside a logged-in
+                        // browser session (verified live) — that reads exactly
+                        // like expiry ("progress then persistent refusal"),
+                        // but re-capturing cannot help. Say so plainly.
+                        if url.contains("gir=yes") {
+                            let got = crate::model::format_bytes(len_before);
+                            return Err(final_err(format!(
+                                "YouTube serves only the first ~2 MB of this quality outside the browser (got {got}) — pick 720p or below for a complete direct file"
+                            )));
+                        }
+                        let got = crate::model::format_bytes(len_before);
+                        return Err(final_err(format!(
+                            "link expired after {got} ({refusals} refusals) — replay the reel and click the download button again for a fresh link, then resume"
+                        )));
+                    }
+                    // First-touch refusal: retry within budget (edge throttle
+                    // noise 206s on immediate retry — verified live).
+                    stalled = stalled.saturating_add(1);
+                    if stalled >= max_retries || attempt >= max_retries * 30 {
+                        return Err(e);
+                    }
+                    tokio::time::sleep(std::time::Duration::from_secs(1 << stalled.min(4))).await;
+                    continue;
+                }
+                let msg = e.to_string();
+                match classify_attempt(&msg) {
+                    "cut" => cuts += 1,
+                    "stalled" => stalls += 1,
+                    _ => {}
+                }
+                if msg.contains("416") && !restarted {
+                    // Offset rejected (file shrank server-side?): refresh the
+                    // total once and restart from zero instead of wedging.
+                    restarted = true;
+                    restarts += 1;
+                    let _ = tokio::fs::remove_file(&tmp).await;
+                    shared.downloaded.store(0, Ordering::SeqCst);
+                    if let Ok(mut g) = shared.part_done.lock() {
+                        if let Some(slot) = g.first_mut() {
+                            *slot = 0;
+                        }
+                    }
+                    if let (t, _, _, _) = probe(client, opts, url).await {
+                        if let Some(t) = t {
+                            total = t;
+                            shared.total.store(t, Ordering::SeqCst);
+                            shared.has_total.store(true, Ordering::SeqCst);
+                            // Rebind resume state to the refreshed total.
+                            write_resume_meta(dest, url, Some(t), 1);
+                        }
+                    }
+                    stalled = 0;
+                    continue;
+                }
+                let len_after = tokio::fs::metadata(&tmp).await.map(|m| m.len()).unwrap_or(0);
+                if len_after > len_before {
+                    stalled = 0;
+                } else {
+                    if len_after < len_before {
+                        restarts += 1;
+                    }
+                    stalled = stalled.saturating_add(1);
+                }
+                if stalled >= max_retries || attempt >= max_retries * 30 {
+                    return Err(with_attempt_summary(e, attempt, cuts, stalls, restarts));
+                }
+                tokio::time::sleep(std::time::Duration::from_secs(1 << stalled.min(4))).await;
+            }
+        }
+    }
+    shared.downloaded.store(
+        tokio::fs::metadata(&tmp).await.map(|m| m.len()).unwrap_or(0),
+        Ordering::SeqCst,
+    );
+    let got = tokio::fs::metadata(&tmp).await.map(|m| m.len()).unwrap_or(0);
+    if total > 0 && got < total {
+        return Err(anyhow!(
+            "connection ended early (got {got} of {total} bytes) — resuming"
+        ));
+    }
+    tokio::fs::rename(&tmp, dest)
+        .await
+        .map_err(|e| anyhow!(io_message(&e)))?;
+    Ok(())
+}
+
+/// One chunk of [`chunked_stream`]: GET `bytes=offset-end`, append exactly
+/// that window to `tmp`. Returns bytes appended. A 200 (Range ignored) is
+/// sliced down to our window by discarding the prefix — works as far as the
+/// connection survives; a short stream is a retryable error, never silent.
+#[allow(clippy::too_many_arguments)]
+async fn chunked_once(
+    client: &reqwest::Client,
+    opts: &EngineOpts,
+    url: &str,
+    tmp: &PathBuf,
+    offset: u64,
+    end: u64,
+    want: u64,
+    stall_timeout: u64,
+    shared: &Arc<SharedState>,
+    limiter: &std::sync::Arc<RateLimiter>,
+) -> Result<u64> {
+    let resp = opts
+        .get(client, url)
+        .header(reqwest::header::RANGE, format!("bytes={offset}-{end}"))
+        .send()
+        .await?;
+    let resp = resp
+        .error_for_status()
+        .map_err(|e| http_status_err(url, e))?;
+    if std::env::var("DOWNLOAD_CRAFT_DEBUG").is_ok() {
+        eprintln!(
+            "[dbg] chunk range={offset}-{end} status={} len={:?}",
+            resp.status(),
+            resp.content_length(),
+        );
+    }
+    let is_partial = resp.status() == reqwest::StatusCode::PARTIAL_CONTENT;
+    if !is_partial {
+        shared.resumable.store(false, Ordering::SeqCst);
+    } else {
+        shared.resumable.store(true, Ordering::SeqCst);
+    }
+    // Kept for the short error below: a zero-byte range with a 200/empty
+    // body vs a cut 206 mean very different things (see probe_range_once).
+    let resp_status = resp.status();
+    let resp_len = resp.content_length();
+    let mut file = tokio::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(tmp)
+        .await?;
+    // Bytes to skip when slicing a 200 response down to our window.
+    let mut to_skip = if is_partial { 0 } else { offset };
+    let mut to_take = want;
+    let mut wrote = 0u64;
+    let mut stream = resp.bytes_stream();
+    loop {
+        if to_take == 0 {
+            break;
+        }
+        let next = tokio::time::timeout(
+            std::time::Duration::from_secs(stall_timeout),
+            stream.next(),
+        )
+        .await
+        .map_err(|_| anyhow!("stalled (no data for {stall_timeout}s) — resuming"))?;
+        let Some(chunk) = next else { break };
+        wait_if_paused(shared).await?;
+        let bytes = chunk.map_err(|e| anyhow!("network: {e}"))?;
+        let mut data = &bytes[..];
+        if to_skip > 0 {
+            let cut = (to_skip as usize).min(data.len());
+            data = &data[cut..];
+            to_skip -= cut as u64;
+            if data.is_empty() {
+                continue;
+            }
+        }
+        let take = (to_take as usize).min(data.len());
+        data = &data[..take];
+        if data.is_empty() {
+            break;
+        }
+        file.write_all(data)
+            .await
+            .map_err(|e| anyhow!(io_message(&e)))?;
+        wrote += data.len() as u64;
+        to_take -= data.len() as u64;
+        shared.downloaded.fetch_add(data.len() as u64, Ordering::SeqCst);
+        if let Ok(mut g) = shared.part_done.lock() {
+            if let Some(slot) = g.first_mut() {
+                *slot = slot.saturating_add(data.len() as u64);
+            }
+        }
+        limiter.consume(data.len() as u64).await;
+    }
+    file.flush().await.map_err(|e| anyhow!(io_message(&e)))?;
+    drop(file);
+    if wrote != want {
+        // Zero-byte ranges name the cause: an empty/ignored range (200, no
+        // body) means resume is impossible on this URL; a cut 206 means
+        // throttling (resume works). The Queues log shows the full text.
+        if wrote == 0 {
+            return Err(anyhow!(
+                "empty range {offset}-{end} (status {resp_status}, len {resp_len:?}) — resuming"
+            ));
+        }
+        return Err(anyhow!(
+            "connection ended early (got {wrote} of {want} bytes in range {offset}-{end}) — resuming"
+        ));
+    }
+    Ok(wrote)
+}
+
 async fn segmented(
     client: &reqwest::Client,
     opts: &EngineOpts,
@@ -3174,6 +4771,12 @@ async fn segmented(
 ) -> Result<()> {
     // Fresh segmented download: reset counter (no cross-session resume for v1).
     shared.downloaded.store(0, Ordering::SeqCst);
+
+    // Bind the part set: stale dcpart{i} files from another URL/total/split
+    // are discarded here (ranges below derive from this exact split).
+    // NOTE: this drops cross-session resume for mismatched splits by design
+    // (P0); same-URL+total+conns still resumes via download_range seeding.
+    resume_offset(dest, "dcpart", url, Some(total), connections);
 
     let chunk = total / connections as u64;
 
@@ -3279,17 +4882,32 @@ async fn download_range(
     shared: Arc<SharedState>,
 ) -> Result<()> {
     let max_retries = opts.max_retries.max(1);
-    let mut attempt = 0;
-    loop {
-        attempt += 1;
-        // each attempt restarts this part from scratch: roll back the
-        // previous attempt's contribution to the global counter first.
-        if let Ok(mut g) = shared.part_done.lock() {
-            if let Some(slot) = g.get_mut(part_idx) {
-                sub_saturating(&shared.downloaded, *slot);
-                *slot = 0;
+    // Attempts that made ANY progress don't count toward the retry budget
+    // (throttled CDNs drip-feed: each 1 MB trickle resets the stall count).
+    // Only consecutive zero-progress attempts fail the part, with an
+    // absolute cap so a 1-byte trickle can't loop forever.
+    let mut stalled = 0u32;
+    let mut attempt = 0u32;
+    // Seed the slot from any previous partial file (FB-style throttled
+    // servers get resumed, never restarted).
+    let range_len = end.saturating_sub(start).saturating_add(1);
+    let mut have = tokio::fs::metadata(part).await.map(|m| m.len()).unwrap_or(0);
+    if have > range_len {
+        // Stale garbage from another URL/shape: drop it, start clean.
+        let _ = tokio::fs::remove_file(part).await;
+        have = 0;
+    }
+    if let Ok(mut g) = shared.part_done.lock() {
+        if let Some(slot) = g.get_mut(part_idx) {
+            if *slot < have {
+                shared.downloaded.fetch_add(have - *slot, Ordering::SeqCst);
+                *slot = have;
             }
         }
+    }
+    loop {
+        attempt += 1;
+        let len_before = tokio::fs::metadata(part).await.map(|m| m.len()).unwrap_or(0);
         let res = download_range_once(
             client,
             opts,
@@ -3308,13 +4926,20 @@ async fn download_range(
                 if shared.cancelled.load(Ordering::SeqCst) {
                     return Err(e);
                 }
-                if e.to_string() == "cancelled"
-                    || is_final_http_error(&e)
-                    || attempt >= max_retries
-                {
+                if e.to_string() == "cancelled" || is_final_http_error(&e) {
                     return Err(e);
                 }
-                tokio::time::sleep(std::time::Duration::from_secs(1 << attempt.min(4))).await;
+                // Attempts append, so file growth == progress.
+                let len_after = tokio::fs::metadata(part).await.map(|m| m.len()).unwrap_or(0);
+                if len_after > len_before {
+                    stalled = 0;
+                } else {
+                    stalled = stalled.saturating_add(1);
+                }
+                if stalled >= max_retries || attempt >= max_retries * 20 {
+                    return Err(e);
+                }
+                tokio::time::sleep(std::time::Duration::from_secs(1 << stalled.min(4))).await;
             }
         }
     }
@@ -3332,29 +4957,77 @@ async fn download_range_once(
     part_idx: usize,
     shared: &Arc<SharedState>,
 ) -> Result<()> {
+    let range_len = end.saturating_sub(start).saturating_add(1);
+    // Resume offset: previous attempts (or an earlier throttled run) may
+    // have left a prefix. Stale over-long files are dropped, not appended to.
+    let orig = tokio::fs::metadata(part).await.map(|m| m.len()).unwrap_or(0);
+    let have = if orig > range_len {
+        let _ = tokio::fs::remove_file(part).await;
+        0
+    } else {
+        orig
+    };
+    let from = start.saturating_add(have);
     let resp = opts
         .get(client, url)
-        .header(reqwest::header::RANGE, format!("bytes={}-{}", start, end))
+        .header(
+            reqwest::header::RANGE,
+            format!("bytes={from}-{end}"),
+        )
         .send()
         .await?
         .error_for_status()
         .map_err(|e| http_status_err(url, e))?;
 
-    let mut file = tokio::fs::File::create(part).await?;
+    // 206 continues our prefix (append). A 200 means the server ignored Range
+    // and sent the whole file: slice our window out of the stream instead of
+    // writing garbage (or failing outright).
+    let is_partial = resp.status() == reqwest::StatusCode::PARTIAL_CONTENT;
+    if !is_partial && have > 0 {
+        let _ = tokio::fs::remove_file(part).await;
+    }
+    let mut file = tokio::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(part)
+        .await?;
     let mut stream = resp.bytes_stream();
+    // Bytes to skip/take when slicing a 200 response down to our window.
+    let mut to_skip = if is_partial { 0 } else { start };
+    let mut to_take = range_len;
     while let Some(chunk) = stream.next().await {
         wait_if_paused(shared).await?;
         let bytes = chunk.map_err(|e| anyhow!("network: {e}"))?;
-        file.write_all(&bytes)
-            .await
-            .map_err(|e| anyhow!(io_message(&e)))?;
-        shared.downloaded.fetch_add(bytes.len() as u64, Ordering::SeqCst);
-        if let Ok(mut g) = shared.part_done.lock() {
-            if let Some(slot) = g.get_mut(part_idx) {
-                *slot = slot.saturating_add(bytes.len() as u64);
+        let mut data = &bytes[..];
+        if to_skip > 0 {
+            let cut = (to_skip as usize).min(data.len());
+            data = &data[cut..];
+            to_skip -= cut as u64;
+            if data.is_empty() {
+                continue;
             }
         }
-        limiter.consume(bytes.len() as u64).await;
+        if !is_partial {
+            let take = (to_take as usize).min(data.len());
+            data = &data[..take];
+            to_take -= take as u64;
+        }
+        if data.is_empty() {
+            break;
+        }
+        file.write_all(data)
+            .await
+            .map_err(|e| anyhow!(io_message(&e)))?;
+        shared.downloaded.fetch_add(data.len() as u64, Ordering::SeqCst);
+        if let Ok(mut g) = shared.part_done.lock() {
+            if let Some(slot) = g.get_mut(part_idx) {
+                *slot = slot.saturating_add(data.len() as u64);
+            }
+        }
+        limiter.consume(data.len() as u64).await;
+        if !is_partial && to_take == 0 {
+            break;
+        }
     }
     file.flush().await.map_err(|e| anyhow!(io_message(&e)))?;
     drop(file);
@@ -3387,6 +5060,127 @@ mod tests {
     }
 
     #[test]
+    fn resume_meta_binding() {
+        // Sidecar binds .dcpart bytes to the exact URL+total+split (P0):
+        // same URL resumes, different URL discards, legacy unbound
+        // partials resume once by length.
+        let dir = std::env::temp_dir().join(format!("dc_meta_{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let dest = dir.join("v.mp4");
+        let part = dest.with_extension("dcpart");
+        let url_a = "https://cdn.example/v.mp4?tok=a";
+        let url_b = "https://cdn.example/v.mp4?tok=b";
+
+        // Fresh: no partial, binds and returns 0.
+        assert_eq!(resume_offset(&dest, "dcpart", url_a, Some(1000), 1), 0);
+        assert!(resume_meta_path(&dest).exists());
+
+        // Same URL: prefix resumes.
+        std::fs::write(&part, vec![7u8; 400]).unwrap();
+        assert_eq!(resume_offset(&dest, "dcpart", url_a, Some(1000), 1), 400);
+
+        // Total learned later is adopted, still resumes.
+        assert_eq!(resume_offset(&dest, "dcpart", url_a, Some(1000), 1), 400);
+
+        // Different total for same URL: stale prefix discarded.
+        assert_eq!(resume_offset(&dest, "dcpart", url_a, Some(2000), 1), 0);
+        assert!(!part.exists());
+
+        // Different URL: stale prefix discarded (the FB slice case).
+        std::fs::write(&part, vec![7u8; 100]).unwrap();
+        write_resume_meta(&dest, url_a, Some(1000), 1);
+        assert_eq!(resume_offset(&dest, "dcpart", url_b, Some(1000), 1), 0);
+        assert!(!part.exists());
+
+        // Legacy partial without sidecar: resumes once, then binds.
+        std::fs::write(&part, vec![7u8; 50]).unwrap();
+        let _ = std::fs::remove_file(resume_meta_path(&dest));
+        assert_eq!(resume_offset(&dest, "dcpart", url_a, Some(1000), 1), 50);
+        assert!(read_resume_meta(&dest).is_some());
+
+        // Split change (1 -> 4 conns): segmented parts dropped.
+        let p0 = dest.with_extension("dcpart0");
+        std::fs::write(&p0, vec![7u8; 10]).unwrap();
+        assert_eq!(resume_offset(&dest, "dcpart", url_a, Some(1000), 4), 0);
+        assert!(!p0.exists());
+
+        // meta_matches unit rules.
+        let m = ResumeMeta { url: url_a.into(), total: Some(1000), conns: 1 };
+        assert!(meta_matches(&m, url_a, Some(1000), 1));
+        assert!(!meta_matches(&m, url_b, Some(1000), 1));
+        assert!(!meta_matches(&m, url_a, Some(999), 1));
+        assert!(!meta_matches(&m, url_a, Some(1000), 4));
+        assert!(meta_matches(&m, url_a, None, 1)); // unknown: wildcard
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn halve_schedule() {
+        // P2: 16→8→4→2, then give up splitting (single stream).
+        assert_eq!(halve_conns(16), Some(8));
+        assert_eq!(halve_conns(8), Some(4));
+        assert_eq!(halve_conns(4), Some(2));
+        assert_eq!(halve_conns(3), Some(2));
+        assert_eq!(halve_conns(2), None);
+        assert_eq!(halve_conns(1), None);
+        // Throttling signatures halve; hard refusals go straight single.
+        assert!(segmented_throttled("segment short: got 1 of 100 bytes — retrying the range"));
+        assert!(segmented_throttled("HTTP 416 Range Not Satisfiable"));
+        assert!(segmented_throttled("HTTP status client error (429 Too Many Requests)"));
+        assert!(segmented_throttled("Range Not Satisfiable"));
+        assert!(!segmented_throttled("network: connection reset"));
+    }
+
+    #[test]
+    fn seg_fallback_table() {
+        // P-speed decision table after a segmented failure.
+        let is = |f: SegFallback| match f {
+            SegFallback::Halve(h) => format!("halve:{h}"),
+            SegFallback::Chunked => "chunked".to_string(),
+            SegFallback::Single => "single".to_string(),
+        };
+        assert_eq!(is(seg_fallback(false, 16, true)), "halve:8");
+        assert_eq!(is(seg_fallback(false, 3, true)), "halve:2");
+        assert_eq!(is(seg_fallback(false, 2, true)), "chunked");
+        assert_eq!(is(seg_fallback(false, 2, false)), "single");
+        assert_eq!(is(seg_fallback(true, 8, true)), "chunked");
+        assert_eq!(is(seg_fallback(true, 8, false)), "single");
+        assert_eq!(is(seg_fallback(true, 1, false)), "single");
+    }
+
+    #[test]
+    fn google_split_sizing() {
+        // P-speed: fit ranges to the strict window, never exceed asked.
+        assert_eq!(google_parts(5 * 1024 * 1024, 8), 3);
+        assert_eq!(google_parts(28 * 1024 * 1024, 8), 8);
+        assert_eq!(google_parts(5 * 1024 * 1024, 2), 2);
+        assert_eq!(google_parts(5 * 1024 * 1024, 1), 1);
+        assert_eq!(google_parts(500 * 1024, 8), 8);
+        assert_eq!(google_parts(100 * 1024 * 1024, 16), 16);
+    }
+
+    #[test]
+    fn fb_slice_normalize() {
+        // Real failure: scontent slice URL (bytestart/byteend) can only
+        // return ~1.1 MB while the full file is ~9.4 MB.
+        let slice = "https://scontent-lga3-2.xx.fbcdn.net/o1/v/t2/f2/m366/A.mp4?oh=abc&oe=xyz&bytestart=967&byteend=1193530";
+        let full = normalize_media_url(slice);
+        assert!(!full.contains("bytestart"), "{full}");
+        assert!(!full.contains("byteend"), "{full}");
+        assert!(full.contains("oh=abc"), "{full}");
+        assert!(full.contains("oe=xyz"), "{full}");
+        assert!(is_fragile_cdn(slice));
+        assert!(is_fragile_cdn(&full));
+        // Non-social hosts untouched.
+        let other = "https://cdn.example/v.mp4?bytestart=1&byteend=2";
+        assert_eq!(normalize_media_url(other), other);
+        // No slice params: identity.
+        let plain = "https://scontent.fdac90-1.fna.fbcdn.net/v.mp4?oh=1";
+        assert_eq!(normalize_media_url(plain), plain);
+    }
+
+    #[test]
     fn dispositions() {
         let mut h = reqwest::header::HeaderMap::new();
         h.insert(
@@ -3401,6 +5195,24 @@ mod tests {
             ),
         );
         assert_eq!(disposition_filename(&h).as_deref(), Some("فارسی.mp3"));
+        // P1: semicolons inside quotes must not split the value.
+        h.insert(
+            reqwest::header::CONTENT_DISPOSITION,
+            reqwest::header::HeaderValue::from_static("attachment; filename=\"a;b.mp4\""),
+        );
+        assert_eq!(disposition_filename(&h).as_deref(), Some("a;b.mp4"));
+        // P1: parameter names are case-insensitive; quoted filename* works.
+        h.insert(
+            reqwest::header::CONTENT_DISPOSITION,
+            reqwest::header::HeaderValue::from_static("attachment; FileName*=UTF-8''clip%20hd.mp4"),
+        );
+        assert_eq!(disposition_filename(&h).as_deref(), Some("clip hd.mp4"));
+        // P1: filename* wins over filename; unsafe chars sanitized.
+        h.insert(
+            reqwest::header::CONTENT_DISPOSITION,
+            reqwest::header::HeaderValue::from_static("attachment; filename=\"a/b.mp4\"; filename*=UTF-8''c:d.mp4"),
+        );
+        assert_eq!(disposition_filename(&h).as_deref(), Some("c_d.mp4"));
         let empty = reqwest::header::HeaderMap::new();
         assert_eq!(disposition_filename(&empty), None);
     }
@@ -3551,14 +5363,38 @@ mod tests {
         assert_eq!(hls_attr(&attrs, "METHOD").as_deref(), Some("AES-128"));
         assert_eq!(hls_attr(&attrs, "uri").as_deref(), Some("https://k/x.key"));
         assert_eq!(hls_attr(&attrs, "iv").as_deref(), Some("0x1234"));
-        // Key policy: none/plain ok, SAMPLE-AES + rotation rejected.
-        assert!(hls_key_info("#EXTM3U\n#EXTINF:6,\ns.ts\n").unwrap().is_none());
+        // Key policy: none/plain ok; SAMPLE-AES rejected; rotation (P3)
+        // yields a per-segment schedule instead of an error.
+        let plain = hls_key_schedule("#EXTM3U\n#EXTINF:6,\ns.ts\n", "https://h/pl.m3u8").unwrap();
+        assert_eq!(plain.len(), 1);
+        assert!(plain[0].is_none());
         let aes = "#EXTM3U\n#EXT-X-KEY:METHOD=AES-128,URI=\"k\",IV=0xAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA\n#EXTINF:6,\ns.ts\n";
-        let (u, iv) = hls_key_info(aes).unwrap().expect("key");
-        assert_eq!(u, "k");
-        assert_eq!(iv.as_deref(), Some("0xAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"));
-        assert!(hls_key_info("#EXT-X-KEY:METHOD=SAMPLE-AES,URI=\"k\"").is_err());
-        assert!(hls_key_info("#EXT-X-KEY:METHOD=AES-128,URI=\"a\"\n#EXT-X-KEY:METHOD=AES-128,URI=\"b\"").is_err());
+        let sched = hls_key_schedule(aes, "https://h/pl.m3u8").unwrap();
+        assert_eq!(sched.len(), 1);
+        let slot = sched[0].clone().expect("key");
+        assert_eq!(slot.uri, "https://h/k");
+        assert_eq!(slot.iv_hex.as_deref(), Some("0xAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"));
+        // Key change mid-playlist: segments before/after differ (rotation).
+        let rot = "#EXTM3U\n#EXT-X-KEY:METHOD=AES-128,URI=\"a\"\n#EXTINF:6,\ns0.ts\n#EXT-X-KEY:METHOD=AES-128,URI=\"b\"\n#EXTINF:6,\ns1.ts\n#EXT-X-ENDLIST\n";
+        let rsched = hls_key_schedule(rot, "https://h/pl.m3u8").unwrap();
+        assert_eq!(rsched.len(), 2);
+        assert_eq!(rsched[0].as_ref().unwrap().uri, "https://h/a");
+        assert_eq!(rsched[1].as_ref().unwrap().uri, "https://h/b");
+        // METHOD=NONE clears back to plain.
+        let none = "#EXTM3U\n#EXT-X-KEY:METHOD=AES-128,URI=\"a\"\n#EXTINF:6,\ns0.ts\n#EXT-X-KEY:METHOD=NONE\n#EXTINF:6,\ns1.ts\n";
+        let nsched = hls_key_schedule(none, "https://h/pl.m3u8").unwrap();
+        assert!(nsched[0].is_some());
+        assert!(nsched[1].is_none());
+        assert!(hls_key_schedule("#EXT-X-KEY:METHOD=SAMPLE-AES,URI=\"k\"", "https://h/x").is_err());
+        assert!(hls_key_schedule("#EXT-X-KEY:METHOD=AES-128", "https://h/x").is_err());
+        // EXT-X-MAP init sections.
+        let map = "#EXTM3U\n#EXT-X-MAP:URI=\"init.mp4\"\n#EXTINF:6,\ns0.ts\n";
+        assert_eq!(
+            hls_map_init(map, "https://h/v/pl.m3u8").unwrap().as_deref(),
+            Some("https://h/v/init.mp4")
+        );
+        assert!(hls_map_init("#EXTM3U\n#EXTINF:6,\ns0.ts\n", "https://h/x").unwrap().is_none());
+        assert!(hls_map_init("#EXT-X-MAP:URI=\"i.mp4\",BYTERANGE=\"16@0\"", "https://h/x").is_err());
         // IV forms: explicit hex, else sequence-based.
         assert_eq!(parse_hex_iv("0x00000000000000000000000000000001"), Some(1u128.to_be_bytes()));
         assert_eq!(parse_hex_iv("short"), None);
@@ -3586,6 +5422,36 @@ mod tests {
         assert!(parse_mpd("<MPD></MPD>").is_err());
         let drm = mpd.replace("<Period>", "<Period><AdaptationSet><ContentProtection/></AdaptationSet>");
         let _ = drm;
+    }
+
+    #[test]
+    fn dash_timeline() {
+        // Uniform repeat timeline: exact count.
+        let tl = "<SegmentTimeline><S t=\"0\" d=\"6\" r=\"2\" /></SegmentTimeline>";
+        assert_eq!(timeline_count(tl, 1.0, None).unwrap(), Some(3));
+        // Multi-entry uniform + contiguous: exact count.
+        let tl2 = "<SegmentTimeline><S t=\"0\" d=\"6\" /><S t=\"6\" d=\"6\" r=\"1\" /></SegmentTimeline>";
+        assert_eq!(timeline_count(tl2, 1.0, None).unwrap(), Some(3));
+        // No timeline: None (duration math fallback).
+        assert_eq!(timeline_count("<SegmentTemplate duration=\"6\" />", 1.0, None).unwrap(), None);
+        // Gap: loud error, never a miscount.
+        let gap = "<SegmentTimeline><S t=\"0\" d=\"6\" /><S t=\"12\" d=\"6\" /></SegmentTimeline>";
+        assert!(timeline_count(gap, 1.0, None).is_err());
+        // Varying durations: loud error.
+        let vary = "<SegmentTimeline><S t=\"0\" d=\"6\" /><S t=\"6\" d=\"4\" /></SegmentTimeline>";
+        assert!(timeline_count(vary, 1.0, None).is_err());
+        // Open repeat with known period: 60 s / 6 s segments = 10.
+        let open = "<SegmentTimeline><S t=\"0\" d=\"6\" r=\"-1\" /></SegmentTimeline>";
+        assert_eq!(timeline_count(open, 1.0, Some(60.0)).unwrap(), Some(10));
+        // Open repeat without period: loud error.
+        assert!(timeline_count(open, 1.0, None).is_err());
+        // Oversize timeline: None (caller reports live/oversize cleanly).
+        let big = "<SegmentTimeline><S t=\"0\" d=\"1\" r=\"5000\" /></SegmentTimeline>";
+        assert_eq!(timeline_count(big, 1.0, None).unwrap(), None);
+        // End-to-end: rep carries the timeline count over duration math.
+        let mpd = r#"<?xml version="1.0"?><MPD type="static"><Period><AdaptationSet mimeType="video/mp4"><SegmentTemplate timescale="1" startNumber="1" media="s-$Number$.m4s"/><SegmentTimeline><S t="0" d="6" r="2" /></SegmentTimeline><Representation id="v1" bandwidth="1000" width="640" height="360" codecs="avc1.64001e"></Representation></AdaptationSet></Period></MPD>"#;
+        let (vv, _) = parse_mpd(mpd).expect("timeline mpd");
+        assert_eq!(vv[0].timeline_count, Some(3));
     }
 
     #[test]
@@ -3678,6 +5544,7 @@ mod tests {
         mut s: tokio::net::TcpStream,
         body: std::sync::Arc<Vec<u8>>,
         flaky_hits: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        fb_hits: std::sync::Arc<std::sync::atomic::AtomicUsize>,
     ) {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
         let mut raw = Vec::new();
@@ -3734,6 +5601,14 @@ mod tests {
                 "application/vnd.apple.mpegurl",
                 "#EXTM3U\n#EXT-X-TARGETDURATION:6\n#EXT-X-MEDIA-SEQUENCE:0\n#EXT-X-KEY:METHOD=AES-128,URI=\"key\"\n#EXTINF:6.0,\ns0.ts\n#EXTINF:6.0,\ns1.ts\n#EXTINF:6.0,\ns2.ts\n#EXT-X-ENDLIST\n".to_string(),
             )),
+            "/hls-rot/pl.m3u8" => Some((
+                "application/vnd.apple.mpegurl",
+                "#EXTM3U\n#EXT-X-TARGETDURATION:6\n#EXT-X-MEDIA-SEQUENCE:0\n#EXT-X-KEY:METHOD=AES-128,URI=\"k1\"\n#EXTINF:6.0,\ns0.ts\n#EXTINF:6.0,\ns1.ts\n#EXT-X-KEY:METHOD=AES-128,URI=\"k2\",IV=0xAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA\n#EXTINF:6.0,\ns2.ts\n#EXT-X-ENDLIST\n".to_string(),
+            )),
+            "/hls-map/pl.m3u8" => Some((
+                "application/vnd.apple.mpegurl",
+                "#EXTM3U\n#EXT-X-TARGETDURATION:6\n#EXT-X-MEDIA-SEQUENCE:0\n#EXT-X-MAP:URI=\"init.mp4\"\n#EXTINF:6.0,\ns0.ts\n#EXTINF:6.0,\ns1.ts\n#EXT-X-ENDLIST\n".to_string(),
+            )),
             "/dash/vonly.mpd" => Some((
                 "application/dash+xml",
                 "<?xml version=\"1.0\"?><MPD mediaPresentationDuration=\"PT18S\" type=\"static\"><Period><AdaptationSet mimeType=\"video/mp4\"><Representation id=\"v1\" bandwidth=\"1000000\" width=\"640\" height=\"360\" codecs=\"avc1.64001e\"><BaseURL>v.mp4</BaseURL></Representation></AdaptationSet></Period></MPD>".to_string(),
@@ -3741,6 +5616,14 @@ mod tests {
             "/dash/both.mpd" => Some((
                 "application/dash+xml",
                 "<?xml version=\"1.0\"?><MPD mediaPresentationDuration=\"PT18S\" type=\"static\"><Period><AdaptationSet mimeType=\"video/mp4\"><Representation id=\"v1\" bandwidth=\"1000000\" width=\"640\" height=\"360\" codecs=\"avc1.64001e\"><BaseURL>v.mp4</BaseURL></Representation></AdaptationSet><AdaptationSet mimeType=\"audio/mp4\"><Representation id=\"a1\" bandwidth=\"128000\" codecs=\"mp4a.40.2\"><BaseURL>a.m4a</BaseURL></Representation></AdaptationSet></Period></MPD>".to_string(),
+            )),
+            "/dash/tpl.mpd" => Some((
+                "application/dash+xml",
+                "<?xml version=\"1.0\"?><MPD mediaPresentationDuration=\"PT18S\" type=\"static\"><Period><AdaptationSet mimeType=\"video/mp4\"><SegmentTemplate timescale=\"1\" duration=\"6\" startNumber=\"1\" media=\"seg-$Number$.m4s\" initialization=\"init.mp4\"/><Representation id=\"v1\" bandwidth=\"1000000\" width=\"640\" height=\"360\" codecs=\"avc1.64001e\"></Representation></AdaptationSet></Period></MPD>".to_string(),
+            )),
+            "/dash/tl.mpd" => Some((
+                "application/dash+xml",
+                "<?xml version=\"1.0\"?><MPD type=\"static\"><Period><AdaptationSet mimeType=\"video/mp4\"><SegmentTemplate timescale=\"1\" startNumber=\"1\" media=\"seg-$Number$.m4s\" initialization=\"init.mp4\"/><SegmentTimeline><S t=\"0\" d=\"6\" r=\"2\" /></SegmentTimeline><Representation id=\"v1\" bandwidth=\"1000000\" width=\"640\" height=\"360\" codecs=\"avc1.64001e\"></Representation></AdaptationSet></Period></MPD>".to_string(),
             )),
             _ => None,
         };
@@ -3756,8 +5639,114 @@ mod tests {
             let _ = s.flush().await;
             return;
         }
+        // Facebook-CDN simulations (clean-but-early closes, like fbcdn):
+        // /fbcut honors Range but cuts every connection after 64 KiB while
+        // advertising the full window (headers promise, body stops).
+        // /fbempty answers ranges with an empty 200 (`got 0 of …`).
+        // /fbexpire serves twice, then 403s (signed-URL expiry mid-file).
+        // /fb200cut ignores Range (full 200) but cuts every body at 64 KiB.
+        const FB_CUT: usize = 64 * 1024;
+        let fb_path = path.trim_start_matches('/');
+        let fb_mode = ["fbcut", "fbempty", "fbexpire", "fb200cut"]
+            .iter()
+            .find(|m| fb_path == **m)
+            .copied();
+        // Strict googlevideo-style edge: HEAD, open-ended, and >2 MiB
+        // ranges 403 (verified live); small bounded ranges serve 206.
+        if fb_path == "strict" {
+            const STRICT_MAX: u64 = 2 * 1024 * 1024;
+            let bad = match range {
+                None => true, // plain/HEAD without Range
+                Some((s, e)) => e == u64::MAX || e.saturating_sub(s).saturating_add(1) > STRICT_MAX,
+            };
+            if bad {
+                let r = "HTTP/1.1 403 Forbidden\r\nContent-Type: text/plain\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+                let _ = s.write_all(r.as_bytes()).await;
+                let _ = s.flush().await;
+                return;
+            }
+            let len = body.len() as u64;
+            let (start, end) = range.unwrap();
+            let end = end.min(len.saturating_sub(1));
+            if start >= len {
+                let r = format!("HTTP/1.1 416 Range Not Satisfiable\r\nContent-Range: bytes */{len}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+                let _ = s.write_all(r.as_bytes()).await;
+                let _ = s.flush().await;
+                return;
+            }
+            let payload = &body[start as usize..=end as usize];
+            let r = format!("HTTP/1.1 206 Partial Content\r\nContent-Type: application/octet-stream\r\nAccept-Ranges: bytes\r\nContent-Range: bytes {start}-{end}/{len}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", payload.len());
+            let _ = s.write_all(r.as_bytes()).await;
+            if !is_head {
+                let _ = s.write_all(payload).await;
+            }
+            let _ = s.flush().await;
+            return;
+        }
+        if let Some(mode) = fb_mode {
+            let n = fb_hits.fetch_add(1, Ordering::SeqCst);
+            if mode == "fbexpire" && n >= 2 {
+                let r = "HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+                let _ = s.write_all(r.as_bytes()).await;
+                let _ = s.flush().await;
+                return;
+            }
+            if mode == "fbempty" {
+                let r = "HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+                let _ = s.write_all(r.as_bytes()).await;
+                let _ = s.flush().await;
+                return;
+            }
+            let len = body.len() as u64;
+            if mode == "fb200cut" {
+                // Range ignored: whole body promised, cut early.
+                let cut = (FB_CUT as u64).min(len);
+                let r = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\nContent-Length: {len}\r\nConnection: close\r\n\r\n"
+                );
+                let _ = s.write_all(r.as_bytes()).await;
+                let _ = s.write_all(&body[..cut as usize]).await;
+                let _ = s.flush().await;
+                return;
+            }
+            // fbcut / fbexpire-early: honor the range, then cut the body.
+            let (start, end) = range.unwrap_or((0, len.saturating_sub(1)));
+            let end = end.min(len.saturating_sub(1));
+            if start >= len {
+                let r = format!(
+                    "HTTP/1.1 416 Range Not Satisfiable\r\nContent-Range: bytes */{len}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                );
+                let _ = s.write_all(r.as_bytes()).await;
+                let _ = s.flush().await;
+                return;
+            }
+            let window = &body[start as usize..=end as usize];
+            let cut = window.len().min(FB_CUT);
+            let r = format!(
+                "HTTP/1.1 206 Partial Content\r\nContent-Type: application/octet-stream\r\nAccept-Ranges: bytes\r\nContent-Range: bytes {start}-{end}/{len}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                window.len()
+            );
+            let _ = s.write_all(r.as_bytes()).await;
+            if !is_head {
+                let _ = s.write_all(&window[..cut]).await;
+            }
+            let _ = s.flush().await;
+            return;
+        }
         if path == "/hls-enc/key" {
             let key = [0x0Bu8; 16];
+            let resp = "HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\nContent-Length: 16\r\nConnection: close\r\n\r\n";
+            let _ = s.write_all(resp.as_bytes()).await;
+            if !is_head {
+                let _ = s.write_all(&key).await;
+            }
+            let _ = s.flush().await;
+            return;
+        }
+        // Rotating keys (P3): k1 serves segments 0-1 (sequence IVs), k2
+        // serves segment 2 (explicit IV in the playlist).
+        if path == "/hls-rot/k1" || path == "/hls-rot/k2" {
+            let key = if path.ends_with("k1") { [0x0Au8; 16] } else { [0x0Bu8; 16] };
             let resp = "HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\nContent-Length: 16\r\nConnection: close\r\n\r\n";
             let _ = s.write_all(resp.as_bytes()).await;
             if !is_head {
@@ -3788,11 +5777,54 @@ mod tests {
                     return Some(aes_cbc_encrypt_test(plain, &[0x0Bu8; 16], &(n as u128).to_be_bytes()));
                 }
             }
+            // Rotating-key segments (P3): s0/s1 under k1 (sequence IVs),
+            // s2 under k2 (the playlist's explicit IV).
+            if let Some(n) = path
+                .strip_prefix("/hls-rot/s")
+                .and_then(|s| s.strip_suffix(".ts"))
+                .and_then(|s| s.parse::<usize>().ok())
+            {
+                if n < 3 {
+                    let plain = &body[n * third..(n + 1) * third];
+                    if n < 2 {
+                        return Some(aes_cbc_encrypt_test(plain, &[0x0Au8; 16], &(n as u128).to_be_bytes()));
+                    }
+                    return Some(aes_cbc_encrypt_test(plain, &[0x0Bu8; 16], &[0xAAu8; 16]));
+                }
+            }
+            // EXT-X-MAP playlist (P3): plaintext segments + fixed init.
+            if let Some(n) = path
+                .strip_prefix("/hls-map/s")
+                .and_then(|s| s.strip_suffix(".ts"))
+                .and_then(|s| s.parse::<usize>().ok())
+            {
+                if n < 2 {
+                    return Some(body[n * third..(n + 1) * third].to_vec());
+                }
+            }
+            if path == "/hls-map/init.mp4" {
+                return Some(b"HLSMAPINIT".to_vec());
+            }
             if path == "/dash/v.mp4" {
                 return Some(body[..body.len() / 2].to_vec());
             }
             if path == "/dash/a.m4a" {
                 return Some(body[body.len() / 2..].to_vec());
+            }
+            // Templated DASH segments: thirds prove ordered assembly, and a
+            // fixed init marker proves headers lead the stream.
+            if let Some(n) = path
+                .strip_prefix("/dash/seg-")
+                .and_then(|s| s.strip_suffix(".m4s"))
+                .and_then(|s| s.parse::<usize>().ok())
+            {
+                if (1..=3).contains(&n) {
+                    let i = n - 1;
+                    return Some(body[i * third..(i + 1) * third].to_vec());
+                }
+            }
+            if path == "/dash/init.mp4" {
+                return Some(b"DASHINIT".to_vec());
             }
             None
         })();
@@ -3861,12 +5893,347 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn facebook_cdn_matrix() {
+        // Simulates the fbcdn failure modes from the field: mid-range cuts,
+        // empty ranges, mid-file expiry, and range-ignoring servers — over
+        // real sockets, asserting the engine finishes, fails fast, or fails
+        // honestly (never a truncated file masquerading as success).
+        use std::sync::atomic::AtomicUsize;
+        const LEN: usize = 300 * 1024; // < 1 MiB chunk: resume aggregation
+        let body: Vec<u8> = (0..LEN).map(|i| (i % 251) as u8).collect();
+        let want = body.clone();
+        let body = std::sync::Arc::new(body);
+        let flaky_hits = std::sync::Arc::new(AtomicUsize::new(0));
+        let fb_hits = std::sync::Arc::new(AtomicUsize::new(0));
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind fb fixture");
+        let addr = listener.local_addr().expect("fb fixture addr");
+        let fb_h = fb_hits.clone();
+        let srv = tokio::spawn(async move {
+            loop {
+                match listener.accept().await {
+                    Ok((s, _)) => {
+                        let b = body.clone();
+                        let f = flaky_hits.clone();
+                        let h = fb_h.clone();
+                        tokio::spawn(async move { serve_conn(s, b, f, h).await });
+                    }
+                    Err(_) => break,
+                }
+            }
+        });
+        let base = format!("http://{addr}");
+        let dir =
+            std::env::temp_dir().join(format!("dc_fb_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let opts = || EngineOpts {
+            user_agent: "idm-test/1".to_string(),
+            timeout_secs: 5,
+            max_retries: 2, // keep the suite fast; policy is what matters
+            ..Default::default()
+        };
+        let client = opts().build_client().unwrap();
+
+        // 1. Range probe semantics: 206 → total, 200 → none, 403 → dead.
+        assert_eq!(
+            probe_range_once(&client, &opts(), &format!("{base}/fbcut"), Some(LEN as u64)).await.ok(),
+            Some(Some(LEN as u64))
+        );
+        assert_eq!(
+            probe_range_once(&client, &opts(), &format!("{base}/fb200cut"), Some(LEN as u64)).await.ok(),
+            Some(None)
+        );
+        assert!(
+            probe_range_once(&client, &opts(), &format!("{base}/forbidden"), Some(LEN as u64))
+                .await
+                .is_err()
+        );
+
+        // 2. Cutter honors ranges but cuts every connection at 64 KiB:
+        // chunked sequential ranges must still assemble the exact file.
+        let dest = dir.join("fbcut.bin");
+        let shared = Arc::new(SharedState::new());
+        shared.total.store(LEN as u64, Ordering::SeqCst);
+        shared.has_total.store(true, Ordering::SeqCst);
+        chunked_stream(
+            &client,
+            &opts(),
+            &format!("{base}/fbcut"),
+            &dest,
+            LEN as u64,
+            shared.clone(),
+            std::sync::Arc::new(RateLimiter::new(0)),
+        )
+        .await
+        .expect("chunked survives cuts");
+        assert_eq!(std::fs::read(&dest).unwrap(), want);
+        assert_eq!(shared.downloaded.load(Ordering::SeqCst), LEN as u64);
+
+        // 3. Resume into chunked: stale prefix is continued, not rewritten.
+        let dest = dir.join("fbresume.bin");
+        std::fs::write(dest.with_extension("dcpart"), &want[..100 * 1024]).unwrap();
+        let shared = Arc::new(SharedState::new());
+        shared.total.store(LEN as u64, Ordering::SeqCst);
+        shared.has_total.store(true, Ordering::SeqCst);
+        chunked_stream(
+            &client,
+            &opts(),
+            &format!("{base}/fbcut"),
+            &dest,
+            LEN as u64,
+            shared.clone(),
+            std::sync::Arc::new(RateLimiter::new(0)),
+        )
+        .await
+        .expect("chunked resume");
+        assert_eq!(std::fs::read(&dest).unwrap(), want);
+
+        // 4. Empty ranges fail loudly with cause — never a phantom file.
+        let dest = dir.join("fbempty.bin");
+        let shared = Arc::new(SharedState::new());
+        shared.total.store(LEN as u64, Ordering::SeqCst);
+        shared.has_total.store(true, Ordering::SeqCst);
+        let err = chunked_stream(
+            &client,
+            &opts(),
+            &format!("{base}/fbempty"),
+            &dest,
+            LEN as u64,
+            shared.clone(),
+            std::sync::Arc::new(RateLimiter::new(0)),
+        )
+        .await
+        .expect_err("empty ranges must fail");
+        assert!(
+            format!("{err:#}").contains("empty range"),
+            "must name the cause, got: {err:#}"
+        );
+        assert!(!dest.exists(), "no truncated file may be finalized");
+
+        // 5. Mid-file expiry: progress then 403 → "expired", not generic.
+        // (Reset the fixture counter: earlier scenarios already spent it.)
+        fb_hits.store(0, Ordering::SeqCst);
+        let dest = dir.join("fbexpire.bin");
+        let shared = Arc::new(SharedState::new());
+        shared.total.store(LEN as u64, Ordering::SeqCst);
+        shared.has_total.store(true, Ordering::SeqCst);
+        let err = chunked_stream(
+            &client,
+            &opts(),
+            &format!("{base}/fbexpire"),
+            &dest,
+            LEN as u64,
+            shared.clone(),
+            std::sync::Arc::new(RateLimiter::new(0)),
+        )
+        .await
+        .expect_err("expiry must fail");
+        assert!(
+            format!("{err:#}").contains("expired"),
+            "must say expired, got: {err:#}"
+        );
+
+        // 6. Range-ignoring cutter: honest failure, no truncated success.
+        let dest = dir.join("fb200cut.bin");
+        let shared = Arc::new(SharedState::new());
+        shared.total.store(LEN as u64, Ordering::SeqCst);
+        shared.has_total.store(true, Ordering::SeqCst);
+        let err = chunked_stream(
+            &client,
+            &opts(),
+            &format!("{base}/fb200cut"),
+            &dest,
+            LEN as u64,
+            shared.clone(),
+            std::sync::Arc::new(RateLimiter::new(0)),
+        )
+        .await
+        .expect_err("range-hostile cutter must fail");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("tries:"),
+            "must carry the attempt summary, got: {msg}"
+        );
+        assert!(!dest.exists(), "no truncated file may be finalized");
+
+        // 7. End-to-end single stream through the cutter (unknown-total path).
+        let dest = dir.join("fbsingle.bin");
+        download(
+            format!("{base}/fbcut"),
+            dest.clone(),
+            1,
+            opts(),
+            Arc::new(SharedState::new()),
+        )
+        .await
+        .expect("single survives cuts");
+        assert_eq!(std::fs::read(&dest).unwrap(), want);
+
+        let _ = std::fs::remove_dir_all(&dir);
+        srv.abort();
+    }
+
+    #[tokio::test]
+    async fn strict_edge_matrix() {
+        // googlevideo SABR-style edge (verified live): HEAD, open-ended,
+        // and >2 MiB ranges 403; small bounded ranges serve 206. Chunked
+        // sequential ranges must complete; big single ranges must fail
+        // loudly (this is why strict hosts route to chunked_stream).
+        use std::sync::atomic::AtomicUsize;
+        const LEN: usize = 5 * 1024 * 1024; // forces multiple 1 MiB chunks
+        let body: Vec<u8> = (0..LEN).map(|i| (i % 251) as u8).collect();
+        let want = body.clone();
+        let body = std::sync::Arc::new(body);
+        let flaky_hits = std::sync::Arc::new(AtomicUsize::new(0));
+        let fb_hits = std::sync::Arc::new(AtomicUsize::new(0));
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind strict fixture");
+        let addr = listener.local_addr().expect("strict fixture addr");
+        let fb_h = fb_hits.clone();
+        let srv = tokio::spawn(async move {
+            loop {
+                match listener.accept().await {
+                    Ok((s, _)) => {
+                        let b = body.clone();
+                        let f = flaky_hits.clone();
+                        let h = fb_h.clone();
+                        tokio::spawn(async move { serve_conn(s, b, f, h).await });
+                    }
+                    Err(_) => break,
+                }
+            }
+        });
+        let base = format!("http://{addr}");
+        let dir =
+            std::env::temp_dir().join(format!("dc_strict_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let opts = || EngineOpts {
+            user_agent: "idm-test/1".to_string(),
+            timeout_secs: 5,
+            max_retries: 2,
+            ..Default::default()
+        };
+        let client = opts().build_client().unwrap();
+
+        // 1. Small-range probe verifies liveness + total.
+        assert_eq!(
+            probe_range_once(&client, &opts(), &format!("{base}/strict"), Some(LEN as u64)).await.ok(),
+            Some(Some(LEN as u64))
+        );
+
+        // 2. Chunked 1 MiB ranges complete byte-exact through the strict edge.
+        let dest = dir.join("strict.bin");
+        let shared = Arc::new(SharedState::new());
+        shared.total.store(LEN as u64, Ordering::SeqCst);
+        shared.has_total.store(true, Ordering::SeqCst);
+        chunked_stream(
+            &client,
+            &opts(),
+            &format!("{base}/strict"),
+            &dest,
+            LEN as u64,
+            shared.clone(),
+            std::sync::Arc::new(RateLimiter::new(0)),
+        )
+        .await
+        .expect("chunked survives strict edge");
+        assert_eq!(std::fs::read(&dest).unwrap(), want);
+
+        // 3. A 5 MiB single bounded range 403s immediately (final refusal —
+        // by design it keeps its type for fallback routing, no summary).
+        let dest = dir.join("strict-single.bin");
+        let shared = Arc::new(SharedState::new());
+        shared.total.store(LEN as u64, Ordering::SeqCst);
+        shared.has_total.store(true, Ordering::SeqCst);
+        let err = single_stream(
+            &client,
+            &opts(),
+            &format!("{base}/strict"),
+            &dest,
+            shared.clone(),
+            std::sync::Arc::new(RateLimiter::new(0)),
+        )
+        .await
+        .expect_err("5 MiB single range must 403");
+        assert!(
+            format!("{err:#}").contains("403"),
+            "must name the refusal, got: {err:#}"
+        );
+        assert!(!dest.exists(), "no truncated file may be finalized");
+
+        let _ = std::fs::remove_dir_all(&dir);
+        srv.abort();
+    }
+
+    #[test]
+    fn quality_selection() {
+        assert_eq!(chrome_major("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0 Safari/537.36"), Some(126));
+        assert_eq!(chrome_major("download_craft/0.7.0"), None);
+        assert_eq!(chrome_major(""), None);
+        assert_eq!(quality_cap("1080p"), Some(1080));
+        assert_eq!(quality_cap("1080p60"), Some(1080));
+        assert_eq!(quality_cap("720p"), Some(720));
+        assert_eq!(quality_cap(" 480p "), Some(480));
+        assert_eq!(quality_cap(""), None);
+        assert_eq!(quality_cap("HD"), None);
+        assert_eq!(quality_cap("100p"), None);
+        assert_eq!(quality_cap("5000p"), None);
+        // No cap: higher always wins.
+        assert!(better_stream(&None, 360, None));
+        assert!(better_stream(&Some((360, String::new())), 720, None));
+        assert!(!better_stream(&Some((720, String::new())), 360, None));
+        // Cap 720: highest at/below wins; above-cap fallback goes closest.
+        assert!(better_stream(&Some((1080, String::new())), 720, Some(720)));
+        assert!(better_stream(&Some((360, String::new())), 720, Some(720)));
+        assert!(!better_stream(&Some((720, String::new())), 1080, Some(720)));
+        assert!(better_stream(&Some((1440, String::new())), 1080, Some(720)));
+        assert!(!better_stream(&Some((1080, String::new())), 1440, Some(720)));
+    }
+
+    #[test]
+    fn adaptive_pair_selection() {
+        let fmts = serde_json::json!([
+            {"url": "https://x/v360", "mimeType": "video/mp4", "width": 640, "height": 360},
+            {"url": "https://x/v720", "mimeType": "video/mp4", "width": 1280, "height": 720},
+            {"url": "https://x/v1080", "mimeType": "video/mp4", "width": 1920, "height": 1080},
+            {"url": "https://x/a-low", "mimeType": "audio/mp4", "bitrate": 64000},
+            {"url": "https://x/a-high", "mimeType": "audio/mp4", "bitrate": 128000},
+            {"mimeType": "video/mp4", "width": 1920, "height": 1080},
+        ]);
+        let arr = fmts.as_array().unwrap();
+        // No cap: best video + best audio.
+        let (s, v, a) = pick_adaptive_pair(arr, None).unwrap();
+        assert_eq!((s, v.as_str(), a.as_str()), (1080, "https://x/v1080", "https://x/a-high"));
+        // Cap 720: exact fit wins, audio still best.
+        let (s, v, a) = pick_adaptive_pair(arr, Some(720)).unwrap();
+        assert_eq!((s, v.as_str(), a.as_str()), (720, "https://x/v720", "https://x/a-high"));
+        // Cap 480: highest at/below wins (360 here).
+        let (s, v, _) = pick_adaptive_pair(arr, Some(480)).unwrap();
+        assert_eq!((s, v.as_str()), (360, "https://x/v360"));
+        // No direct video at all: no pair (ciphered-only needs deciphering).
+        let novid = serde_json::json!([
+            {"url": "https://x/a", "mimeType": "audio/mp4", "bitrate": 64000},
+        ]);
+        assert!(pick_adaptive_pair(novid.as_array().unwrap(), None).is_none());
+        // No audio at all: no pair (nothing to merge with).
+        let noaud = serde_json::json!([
+            {"url": "https://x/v", "mimeType": "video/mp4", "width": 640, "height": 360},
+        ]);
+        assert!(pick_adaptive_pair(noaud.as_array().unwrap(), None).is_none());
+    }
+
+    #[tokio::test]
     async fn local_http_matrix() {
         use std::sync::atomic::AtomicUsize;
         const LEN: usize = 3 * 1024 * 1024; // >= 1 MiB forces segmented path
         let body: Vec<u8> = (0..LEN).map(|i| (i % 251) as u8).collect();
         let body = std::sync::Arc::new(body);
         let flaky_hits = std::sync::Arc::new(AtomicUsize::new(0));
+        let fb_hits = std::sync::Arc::new(AtomicUsize::new(0));
 
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
@@ -3878,7 +6245,8 @@ mod tests {
                     Ok((s, _)) => {
                         let b = body.clone();
                         let f = flaky_hits.clone();
-                        tokio::spawn(async move { serve_conn(s, b, f).await });
+                        let h = fb_hits.clone();
+                        tokio::spawn(async move { serve_conn(s, b, f, h).await });
                     }
                     Err(_) => break,
                 }
@@ -3888,6 +6256,16 @@ mod tests {
         let dir =
             std::env::temp_dir().join(format!("dc_matrix_{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
+
+        // 0. Error pages never poison totals: a 403 carrying
+        // `Content-Length: 0` must probe as unknown (not total 0), or every
+        // downstream check treats the file as already complete/empty.
+        let pclient = matrix_opts().build_client().unwrap();
+        let (t, r, _, _) = probe(&pclient, &matrix_opts(), &format!("{base}/forbidden")).await;
+        assert_eq!((t, r), (None, false));
+        let (t, r, _, _) = probe(&pclient, &matrix_opts(), &format!("{base}/file")).await;
+        assert_eq!(t, Some(LEN as u64));
+        assert!(r);
 
         // 1. Segmented multi-connection download, byte-exact.
         let dest = dir.join("seg.bin");
@@ -4005,6 +6383,35 @@ mod tests {
         .expect("hls aes");
         assert_eq!(std::fs::read(&dest).unwrap(), want);
 
+        // 8b. HLS key rotation (P3): s0/s1 under k1, s2 under k2+IV.
+        let dest = dir.join("hlsrot.bin");
+        download(
+            format!("{base}/hls-rot/pl.m3u8"),
+            dest.clone(),
+            6,
+            matrix_opts(),
+            Arc::new(SharedState::new()),
+        )
+        .await
+        .expect("hls rotation");
+        assert_eq!(std::fs::read(&dest).unwrap(), want);
+
+        // 8c. HLS EXT-X-MAP (P3): init section leads the assembled file.
+        let dest = dir.join("hlsmap.bin");
+        download(
+            format!("{base}/hls-map/pl.m3u8"),
+            dest.clone(),
+            6,
+            matrix_opts(),
+            Arc::new(SharedState::new()),
+        )
+        .await
+        .expect("hls map");
+        let third = want.len() / 3;
+        let mut want_map = b"HLSMAPINIT".to_vec();
+        want_map.extend_from_slice(&want[..2 * third]);
+        assert_eq!(std::fs::read(&dest).unwrap(), want_map);
+
         // 9. DASH video-only manifest → assembled track delivered.
         let dest = dir.join("dashv.bin");
         download(
@@ -4017,6 +6424,36 @@ mod tests {
         .await
         .expect("dash video-only");
         assert_eq!(std::fs::read(&dest).unwrap(), want[..want.len() / 2]);
+
+        // 9b. DASH SegmentTemplate (init + 3 media segments): parallel
+        // fetch with strictly ordered assembly (init must lead).
+        let dest = dir.join("dashtpl.bin");
+        download(
+            format!("{base}/dash/tpl.mpd"),
+            dest.clone(),
+            6,
+            matrix_opts(),
+            Arc::new(SharedState::new()),
+        )
+        .await
+        .expect("dash template");
+        let mut want_tpl = b"DASHINIT".to_vec();
+        want_tpl.extend_from_slice(&want);
+        assert_eq!(std::fs::read(&dest).unwrap(), want_tpl);
+
+        // 9c. DASH SegmentTimeline (`r="2"` → 3 segments, no MPD duration):
+        // count comes from the timeline, assembly identical to 9b.
+        let dest = dir.join("dashtl.bin");
+        download(
+            format!("{base}/dash/tl.mpd"),
+            dest.clone(),
+            6,
+            matrix_opts(),
+            Arc::new(SharedState::new()),
+        )
+        .await
+        .expect("dash timeline");
+        assert_eq!(std::fs::read(&dest).unwrap(), want_tpl);
 
         // 10. DASH video+audio without ffmpeg → loud guidance, not garbage.
         let dest = dir.join("dashboth.bin");

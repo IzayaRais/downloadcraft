@@ -17,6 +17,14 @@ use crate::model::{
 };
 use std::sync::mpsc::Receiver;
 
+/// Seconds → "3:26" badge for browser-known media durations.
+fn format_dur(secs: u64) -> String {
+    if secs == 0 || secs >= 86400 {
+        return String::new();
+    }
+    format!("{}:{:02}", secs / 60, secs % 60)
+}
+
 fn queue_path() -> Option<std::path::PathBuf> {
     config_dir().map(|p| p.join("queue.json"))
 }
@@ -184,6 +192,12 @@ struct ConfirmApp {
     cookie: String,
     pair_url: String,
     pair_mime: String,
+    /// Page/media MIME from the extension (first hint for naming when the
+    /// URL carries no usable name and no probe has run yet).
+    page_mime: String,
+    /// Media duration in seconds from the extension (best-effort badge).
+    duration_secs: u64,
+    quality_pref: String,
     connections: usize,
     user_agent: String,
     proxy_url: String,
@@ -197,6 +211,7 @@ struct ConfirmApp {
     centered: bool,
     show_adv: bool,
     done: bool,
+    exited: bool,
     notice: String,
     already_queued: bool,
 }
@@ -247,6 +262,13 @@ impl ConfirmApp {
         self.probe_size = None;
         let url = self.url.clone();
         let referer = self.referer.clone();
+        // Quality choice feeds the page resolve so the dialog measures the
+        // chosen stream's size, not just the page's (IDM shows size upfront).
+        let quality_pref = self.quality_pref.trim().to_string();
+        // Bare URL guess to correct with the MIME type when the server
+        // sends no disposition (P1: `download_123.bin` + video/mp4).
+        let guess_name = self.filename.clone();
+        let page_mime = self.page_mime.clone();
         let opts = EngineOpts {
             user_agent: if self.user_agent.trim().is_empty() {
                 format!("download_craft/{}", env!("CARGO_PKG_VERSION"))
@@ -256,6 +278,7 @@ impl ConfirmApp {
             timeout_secs: self.timeout_secs,
             proxy_url: self.proxy_url.clone(),
             referer,
+            quality_pref,
             ..Default::default()
         };
         rt.spawn(async move {
@@ -272,17 +295,40 @@ impl ConfirmApp {
                     if total.is_none() && is_page {
                         let shared =
                             std::sync::Arc::new(engine::SharedState::new());
-                        if let Some((media_url, title)) =
+                        if let Some(hit) =
                             engine::resolve_media(&client, &opts, &url, &shared).await
                         {
                             let (t2, _, _, _) =
-                                engine::probe(&client, &opts, &media_url).await;
+                                engine::probe(&client, &opts, &hit.url).await;
                             if total.is_none() {
                                 total = t2;
                             }
-                            if disp.is_none() && !title.trim().is_empty() {
-                                disp = Some(engine::sanitize_filename(&title));
+                            if let Some(pair) = hit.pair_url.filter(|p| p.starts_with("http")) {
+                                let (ta, _, _, _) =
+                                    engine::probe(&client, &opts, &pair).await;
+                                if let (Some(a), Some(b)) = (total, ta) {
+                                    total = Some(a.saturating_add(b));
+                                } else {
+                                    total = total.or(ta);
+                                }
                             }
+                            if disp.is_none() && !hit.title.trim().is_empty() {
+                                disp = Some(engine::sanitize_filename(&hit.title));
+                            }
+                        }
+                    }
+                    if disp.is_none()
+                        && crate::model::is_fallback_filename(&guess_name)
+                    {
+                        // No disposition and no media title: at least fix the
+                        // extension — probed MIME first, extension hint when
+                        // the probe itself was refused off-session.
+                        let ext = ctype
+                            .as_deref()
+                            .and_then(crate::model::ext_for_mime)
+                            .or_else(|| crate::model::ext_for_mime(&page_mime));
+                        if let Some(ext) = ext {
+                            disp = Some(guess_name.trim_end_matches(".bin").to_string() + ext);
                         }
                     }
                     (total, disp)
@@ -309,10 +355,16 @@ impl ConfirmApp {
         item.referer = self.referer.clone();
         item.cookie = self.cookie.clone();
         item.description = self.description.trim().to_string();
+        // Browser-measured size (extension HEAD/Range in the real session):
+        // keep it so the engine and progress UI know the total even when a
+        // server-side re-probe would 403 off-session.
+        item.total_bytes = self.probe_size.filter(|s| *s > 0);
         if self.pair_url.starts_with("http") {
             item.pair_url = self.pair_url.clone();
             item.pair_mime = self.pair_mime.clone();
         }
+        item.quality_pref = self.quality_pref.trim().to_string();
+        item.duration_secs = self.duration_secs;
         let id = match crate::model::append_to_queue(&mut item) {
             Some(id) => id,
             None => {
@@ -369,6 +421,8 @@ pub fn run() -> eframe::Result<()> {
         "--size",
         "--pair-url",
         "--pair-mime",
+        "--quality",
+        "--dur",
     ];
     let args: Vec<String> = std::env::args().collect();
     let mut map: std::collections::HashMap<&str, String> = std::collections::HashMap::new();
@@ -389,17 +443,26 @@ pub fn run() -> eframe::Result<()> {
         eprintln!("--confirm-download needs --url <http(s)://...>");
         std::process::exit(2);
     }
+    let page_mime = get("--mime").filter(|s| !s.trim().is_empty()).unwrap_or_default();
     let filename = get("--filename")
         .filter(|f| !f.trim().is_empty())
-        .unwrap_or_else(|| filename_from_url(&url));
+        .unwrap_or_else(|| {
+            crate::model::filename_from_url_with_mime(&url, Some(page_mime.as_str()))
+        });
     let referer = get("--referer").unwrap_or_default();
     let cookie = get("--cookie").unwrap_or_default();
     let pair_url = get("--pair-url").filter(|s| s.starts_with("http")).unwrap_or_default();
     let pair_mime = get("--pair-mime").unwrap_or_default();
+    let quality_pref = get("--quality").filter(|s| !s.trim().is_empty()).unwrap_or_default();
     // Browser-measured size (menu HEAD/Range): trust it, skip probing.
     let known_size: Option<u64> = get("--size")
         .and_then(|s| s.parse::<u64>().ok())
         .filter(|s| *s > 0);
+    // Browser-known media duration in seconds (best-effort badge).
+    let duration_secs: u64 = get("--dur")
+        .and_then(|s| s.parse::<u64>().ok())
+        .filter(|s| *s > 0 && *s < 86400)
+        .unwrap_or(0);
 
     // Claim the inbox entry first so the main window won't prompt too.
     claim_inbox(url.trim());
@@ -425,6 +488,9 @@ pub fn run() -> eframe::Result<()> {
         cookie,
         pair_url,
         pair_mime,
+        page_mime,
+        duration_secs,
+        quality_pref,
         connections: prefs.connections,
         user_agent: prefs.user_agent,
         proxy_url: prefs.proxy_url,
@@ -438,6 +504,7 @@ pub fn run() -> eframe::Result<()> {
         centered: false,
         show_adv: false,
         done: false,
+        exited: false,
         notice: String::new(),
         already_queued,
     };
@@ -475,9 +542,18 @@ pub fn run() -> eframe::Result<()> {
 }
 
 impl eframe::App for ConfirmApp {
+    /// Same bulletproofing as the progress window: Close can no-op, so back
+    /// it with a delayed exit once the dialog is done.
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         if self.done {
             ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+            if !self.exited {
+                self.exited = true;
+                std::thread::spawn(|| {
+                    std::thread::sleep(std::time::Duration::from_millis(400));
+                    std::process::exit(0);
+                });
+            }
             return;
         }
         // Center once on the primary monitor (Windows otherwise cascades).
@@ -500,8 +576,11 @@ impl eframe::App for ConfirmApp {
                 self.probe_size = sz;
                 if let Some(n) = nm {
                     // Prefer the server/video title when our name is a bare
-                    // URL guess.
-                    if self.filename == filename_from_url(&self.url) {
+                    // URL guess (or a last-resort fallback whose timestamp
+                    // drifted since dialog open).
+                    if self.filename == filename_from_url(&self.url)
+                        || crate::model::is_fallback_filename(&self.filename)
+                    {
                         self.filename = crate::model::apply_rename_template(
                             &self.rename_template,
                             &n,
@@ -562,6 +641,14 @@ impl eframe::App for ConfirmApp {
                         if self.probing {
                             ui.spinner();
                         } else if let Some(sz) = self.probe_size.filter(|s| *s > 0) {
+                            if self.duration_secs > 0 {
+                                ui.label(
+                                    egui::RichText::new(format_dur(self.duration_secs))
+                                        .size(14.0)
+                                        .strong(),
+                                );
+                                ui.label(egui::RichText::new("•").size(14.0).weak());
+                            }
                             ui.label(egui::RichText::new(format_bytes(sz)).size(14.0).strong());
                             ui.colored_label(
                                 egui::Color32::from_rgb(80, 200, 120),
@@ -615,6 +702,9 @@ impl eframe::App for ConfirmApp {
             if self.pair_url.starts_with("http") {
                 ui.weak("video-only + audio — merged to one file on completion (needs ffmpeg)");
             }
+            if !self.quality_pref.trim().is_empty() {
+                ui.weak(format!("Quality: {} (app resolves this stream itself)", self.quality_pref.trim()));
+            }
             if self.show_adv {
                 egui::Frame::new()
                     .corner_radius(crate::app::RADIUS)
@@ -666,10 +756,10 @@ impl eframe::App for ConfirmApp {
             ui.add_space(6.0);
             // Action row: Add | Download (accent) ... Cancel.
             ui.horizontal(|ui| {
-                if ui.add_sized([120.0, 42.0], egui::Button::new("Add")).clicked() {
+                if ui.add_sized([140.0, 42.0], egui::Button::new("Download Later")).clicked() {
                     self.commit(false);
                 }
-                let dl = egui::Button::new(egui::RichText::new("Download").strong().color(egui::Color32::WHITE))
+                let dl = egui::Button::new(egui::RichText::new("Start Download").strong().color(egui::Color32::WHITE))
                     .fill(egui::Color32::from_rgb(88, 101, 242));
                 if ui.add_sized([150.0, 42.0], dl).clicked() {
                     self.commit(true);

@@ -180,16 +180,45 @@ impl ProgressApp {
         self.item = items.into_iter().find(|d| d.id == self.id);
         self.snap = read_snap(self.id);
         // Queue file lags live counters: prefer the snapshot while active.
+        // Keep displayed progress monotonic across retry legs (see app).
         if self.snap.live {
             if let Some(it) = self.item.as_mut() {
-                it.downloaded_bytes = self.snap.downloaded;
-                if self.snap.total.is_some() {
-                    it.total_bytes = self.snap.total;
+                let new_total = self.snap.total;
+                if new_total != it.total_bytes {
+                    it.total_bytes = new_total;
+                    it.downloaded_bytes = self.snap.downloaded;
+                } else {
+                    it.downloaded_bytes =
+                        it.downloaded_bytes.max(self.snap.downloaded);
                 }
                 it.speed_bps = self.snap.speed;
             }
         }
         self.last_poll = Instant::now();
+    }
+
+    /// Close bulletproofing: viewport Close is async and has been observed
+    /// to no-op; back it with a delayed process exit (harmless if the
+    /// window already closed).
+    fn close_soon(ctx: &egui::Context) {
+        ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+        std::thread::spawn(|| {
+            std::thread::sleep(std::time::Duration::from_millis(400));
+            std::process::exit(0);
+        });
+    }
+
+    /// Single-line middle-truncated filename (`AQPu4kS…-fq.mp4`); full name
+    /// rides along as hover text at the call site.
+    fn short_name(name: &str) -> String {
+        const MAX: usize = 44;
+        let chars: Vec<char> = name.chars().collect();
+        if chars.len() <= MAX {
+            return name.to_string();
+        }
+        let head: String = chars[..20].iter().collect();
+        let tail: String = chars[chars.len() - 20..].iter().collect();
+        format!("{head}…{tail}")
     }
 }
 
@@ -227,8 +256,8 @@ pub fn run() -> eframe::Result<()> {
 
     let mut viewport = egui::ViewportBuilder::default()
         .with_title(title)
-        .with_inner_size([470.0, 560.0])
-        .with_min_inner_size([420.0, 420.0])
+        .with_inner_size([420.0, 320.0])
+        .with_min_inner_size([400.0, 300.0])
         .with_always_on_top()
         .with_resizable(true);
     if let Ok(icon) = eframe::icon_data::from_png_bytes(include_bytes!("../assets/icon.png")) {
@@ -255,7 +284,7 @@ impl eframe::App for ProgressApp {
             self.centered = true;
             let mon = ctx.input(|i| i.viewport().monitor_size);
             if let Some(m) = mon {
-                let (w, h) = (470.0, 560.0);
+                let (w, h) = (420.0, 320.0);
                 if m.x > w && m.y > h {
                     ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(
                         egui::Pos2::new((m.x - w) / 2.0, (m.y - h) / 2.0),
@@ -269,25 +298,76 @@ impl eframe::App for ProgressApp {
         ctx.request_repaint_after(Duration::from_millis(500));
 
         let green = egui::Color32::from_rgb(80, 200, 120);
-        egui::CentralPanel::default().show(ctx, |ui| {
-            let Some(item) = self.item.clone() else {
+        let Some(item) = self.item.clone() else {
+            egui::CentralPanel::default().show(ctx, |ui| {
                 ui.heading(format!("Download #{}", self.id));
                 ui.label("No longer in the queue.");
                 if ui.button("Close").clicked() {
-                    ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                    Self::close_soon(ctx);
                 }
-                return;
-            };
-            let downloading = self.snap.live
-                && matches!(
-                    item.status,
-                    crate::model::Status::Downloading | crate::model::Status::Queued
-                );
-            let paused = matches!(item.status, crate::model::Status::Paused);
-            let done = matches!(item.status, crate::model::Status::Completed);
-            let failed = matches!(item.status, crate::model::Status::Failed(_));
+            });
+            return;
+        };
+        let downloading = self.snap.live
+            && matches!(
+                item.status,
+                crate::model::Status::Downloading | crate::model::Status::Queued
+            );
+        let paused = matches!(item.status, crate::model::Status::Paused);
+        let done = matches!(item.status, crate::model::Status::Completed);
+        let failed = matches!(item.status, crate::model::Status::Failed(_));
 
-            ui.heading(item.filename.clone());
+        // Pinned action row: reserved by the OS layout pass, so the buttons
+        // can never be scrolled or clipped out of the window.
+        egui::TopBottomPanel::bottom("progress_actions").show(ctx, |ui| {
+            ui.add_space(4.0);
+            ui.horizontal(|ui| {
+                if done {
+                    if ui.add_sized([110.0, 32.0], egui::Button::new("Open file")).clicked() {
+                        open_path(&item.dest_path());
+                    }
+                    if ui.add_sized([110.0, 32.0], egui::Button::new("Open folder")).clicked() {
+                        if let Some(dir) = item.dest_path().parent() {
+                            open_path(dir);
+                        }
+                    }
+                } else if !failed {
+                    let label = if paused {
+                        "Resume".to_string()
+                    } else {
+                        format!("{} Pause", crate::app::MI_PAUSE)
+                    };
+                    if ui.add_sized([110.0, 32.0], egui::Button::new(label)).clicked() {
+                        send_cmd(self.id, if paused { "resume" } else { "pause" });
+                    }
+                    if ui.add_sized([110.0, 32.0], egui::Button::new("Cancel")).clicked() {
+                        send_cmd(self.id, "cancel");
+                    }
+                }
+                ui.with_layout(
+                    egui::Layout::right_to_left(egui::Align::Center),
+                    |ui| {
+                        if ui.add_sized([110.0, 32.0], egui::Button::new("Close")).clicked() {
+                            // Finished/failed: closes immediately. Active:
+                            // hides this window only — the download keeps
+                            // running in the main app (never cancelled here).
+                            Self::close_soon(ctx);
+                        }
+                    },
+                );
+            });
+            if failed {
+                ui.colored_label(
+                    egui::Color32::from_rgb(255, 150, 120),
+                    item.status.label(),
+                );
+            }
+            ui.add_space(2.0);
+        });
+
+        egui::CentralPanel::default().show(ctx, |ui| {
+            ui.heading(Self::short_name(&item.filename))
+                .on_hover_text(item.filename.clone());
             // Tab bar: Info | Speed | On Completion.
             ui.horizontal(|ui| {
                 for (i, name) in [(0u8, "Info"), (1, "Speed"), (2, "On Completion")] {
@@ -306,6 +386,9 @@ impl eframe::App for ProgressApp {
                 }
             });
             ui.separator();
+            // Scrollable content with a pinned action row below: short
+            // windows scroll instead of clipping buttons off-screen.
+            egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
             if self.tab == 1 {
                 // ---- Speed tab: live global cap (main app applies via the
                 // shared atomic, no restart). Thread count is fixed at start:
@@ -427,8 +510,8 @@ impl eframe::App for ProgressApp {
                     .show_percentage(),
             );
 
-            // Compact segment view: mini bars + one unified chunk map
-            // (replaces the bulky per-part text table).
+            // Clean segment progress: a single unified chunk map. No per-part
+            // text percentages underneath (the bar itself is sufficient).
             if !self.snap.parts.is_empty() {
                 ui.add_space(4.0);
                 let n = self.snap.parts.len();
@@ -461,82 +544,9 @@ impl eframe::App for ProgressApp {
                         p.rect_filled(fill, 3.0, egui::Color32::from_rgb(96, 165, 250));
                     }
                 }
-                // Mini bars (up to 16), two per row with part numbers.
-                ui.add_space(4.0);
-                let mut idx = 0;
-                while idx < n.min(16) {
-                    ui.horizontal(|ui| {
-                        for k in 0..2 {
-                            let i = idx + k;
-                            if i >= n.min(16) {
-                                break;
-                            }
-                            let (s, e, d) = self.snap.parts[i];
-                            let len = e.saturating_sub(s) + 1;
-                            let f = if len > 0 {
-                                (d as f32 / len as f32).clamp(0.0, 1.0)
-                            } else {
-                                0.0
-                            };
-                            ui.label(format!("#{} ", i + 1));
-                            ui.add(
-                                egui::ProgressBar::new(f)
-                                    .desired_width(150.0)
-                                    .desired_height(8.0)
-                                    .corner_radius(4)
-                                    .show_percentage(),
-                            );
-                            ui.add_space(8.0);
-                        }
-                    });
-                    idx += 2;
-                }
-                if n > 16 {
-                    ui.weak(format!("…and {} more parts", n - 16));
-                }
             }
             } // end Info tab
-
-            ui.add_space(8.0);
-            ui.horizontal(|ui| {
-                if done {
-                    if ui.add_sized([110.0, 38.0], egui::Button::new("Open file")).clicked() {
-                        open_path(&item.dest_path());
-                    }
-                    if ui.add_sized([110.0, 38.0], egui::Button::new("Open folder")).clicked() {
-                        if let Some(dir) = item.dest_path().parent() {
-                            open_path(dir);
-                        }
-                    }
-                } else if !failed {
-                    let label = if paused {
-                        "Resume".to_string()
-                    } else {
-                        format!("{} Pause", crate::app::MI_PAUSE)
-                    };
-                    if ui.add_sized([110.0, 38.0], egui::Button::new(label)).clicked() {
-                        send_cmd(self.id, if paused { "resume" } else { "pause" });
-                    }
-                    if ui.add_sized([110.0, 38.0], egui::Button::new("Cancel")).clicked() {
-                        send_cmd(self.id, "cancel");
-                    }
-                }
-                ui.with_layout(
-                    egui::Layout::right_to_left(egui::Align::Center),
-                    |ui| {
-                        if ui.add_sized([110.0, 38.0], egui::Button::new("Close")).clicked() {
-                            // Hides this window only — the download keeps running.
-                            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
-                        }
-                    },
-                );
-            });
-            if failed {
-                ui.colored_label(
-                    egui::Color32::from_rgb(255, 150, 120),
-                    item.status.label(),
-                );
-            }
+            }); // end scrollable content
         });
     }
 }

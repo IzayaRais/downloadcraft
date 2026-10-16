@@ -63,6 +63,15 @@ function renderVideos(box, videos, pageUrl) {
   (videos || []).forEach((v) => {
     const wrap = document.createElement("div");
     wrap.className = "item";
+    if (v.thumb && /^https?:\/\//i.test(v.thumb)) {
+      const im = document.createElement("img");
+      im.src = v.thumb;
+      im.loading = "lazy";
+      im.alt = "";
+      im.style.cssText = "display:block;max-width:320px;max-height:180px;width:100%;object-fit:cover;border-radius:8px;margin-bottom:6px;";
+      im.onerror = () => { im.style.display = "none"; };
+      wrap.appendChild(im);
+    }
     const t = document.createElement("div");
     t.style.fontWeight = "600";
     t.style.marginBottom = "4px";
@@ -96,13 +105,19 @@ function renderVideos(box, videos, pageUrl) {
       const btn = document.createElement("button");
       btn.style.marginRight = "4px";
       btn.style.marginBottom = "4px";
-      const base = `${st.label} · ${dispOf(st)}${st.kind === "v" ? " (no audio)" : st.kind === "a" ? " (audio)" : ""}`;
+      const durTxt = (typeof DCRank !== "undefined" ? DCRank.fmtDur(st._dur) : "");
+      const base = `${st.label} · ${dispOf(st)}${st.kind === "v" ? " (no audio)" : st.kind === "a" ? " (audio)" : ""}${st.ciphered ? " (via app)" : ""}${durTxt ? ` · ${durTxt}` : ""}`;
       btn.textContent = base;
-      const pair = (st.kind === "v" && bestA && bestA.url !== st.url)
+      btn.title = st.ciphered ? "The app deciphers this quality itself" : "";
+      const pair = (st.kind === "v" && bestA && bestA.url && bestA.url !== st.url)
         ? { url: bestA.url, mime: bestA.mime }
         : null;
       btn.onclick = () => {
-        chrome.runtime.sendMessage({ type: "download", url: st.url, filename: fname, pageUrl, size: st._size || null, pairUrl: (pair && pair.url) || null, pairMime: (pair && pair.mime) || null }, (res) => {
+        // Ciphered rows have no direct URL: send the page + quality hint.
+        const msg = st.ciphered
+          ? { type: "download", url: pageUrl, filename: fname, pageUrl, quality: st.label, size: st._size || null, dur: st._dur || null, pairUrl: (pair && pair.url) || null, pairMime: (pair && pair.mime) || null }
+          : { type: "download", url: st.url, filename: fname, pageUrl, size: st._size || null, dur: st._dur || null, pairUrl: (pair && pair.url) || null, pairMime: (pair && pair.mime) || null };
+        chrome.runtime.sendMessage(msg, (res) => {
           $("status").textContent = res && res.ok ? "Sent ✓ — confirm in Download Craft" : "App not reachable.";
         });
       };
@@ -123,6 +138,35 @@ function renderVideos(box, videos, pageUrl) {
     (v.streams || []).forEach((st) => qbtn(st, tagged(st)));
     (v.videoOnly || []).forEach((st) => qbtn(st, tagged(st)));
     (v.audio || []).forEach((st) => qbtn(st, tagged(st)));
+    // Generic ladder with page-JSON sizes (videos whose page hides every
+    // URL still offer every quality, like the in-page menu).
+    try {
+      const haveQ = new Set([...(v.streams || []), ...(v.videoOnly || [])].map((s) => s.label));
+      const order = ["2160p", "2160p60", "1440p", "1440p60", "1080p", "1080p60", "720p", "720p60", "480p", "360p", "240p", "144p"];
+      const ladder = order.filter((q) => !haveQ.has(q) && ((v.sizes || {})[q] || Object.keys(v.sizes || {}).some((k) => k.startsWith(q))));
+      if (ladder.length && (v.streams || []).length + (v.videoOnly || []).length < 6) {
+        ladder.forEach((q) => {
+          const exact = (v.sizes[q] && v.sizes[q].size) || 0;
+          const pre = Object.keys(v.sizes || {}).find((k) => k.startsWith(q));
+          const sz = exact || ((pre && v.sizes[pre].size) || 0);
+          const dz = ((v.sizes[q] && v.sizes[q].dur) || 0)
+            || ((pre && v.sizes[pre].dur) || 0);
+          const dzTxt = (typeof DCRank !== "undefined" ? DCRank.fmtDur(dz) : "");
+          const btn = document.createElement("button");
+          btn.style.marginRight = "4px";
+          btn.style.marginBottom = "4px";
+          btn.textContent = `${q} · mp4 (via app)${sz > 0 ? ` (${fmtSize(sz)})` : ""}${dzTxt ? ` · ${dzTxt}` : ""}`;
+          btn.title = "The app resolves this quality itself";
+          btn.onclick = () => {
+            const url = v.pageUrl || pageUrl;
+            chrome.runtime.sendMessage({ type: "download", url, filename: base, pageUrl: url, quality: q, size: sz || null, dur: dz || null }, (res) => {
+              $("status").textContent = res && res.ok ? "Sent ✓ — confirm in Download Craft" : "App not reachable.";
+            });
+          };
+          wrap.appendChild(btn);
+        });
+      }
+    } catch (e) { /* ladder is best-effort */ }
     box.appendChild(wrap);
     // Presence pre-check (same as the in-page menu).
     try {
@@ -140,9 +184,13 @@ function renderVideos(box, videos, pageUrl) {
         });
       }
     } catch (e) { /* ignore */ }
-    // IDM-style sizes (best-effort; googlevideo may 403 HEAD off-session).
+    // IDM-style sizes: page-JSON sizes (_size) print instantly; only
+    // measure the rest (googlevideo may 403 HEAD off-session).
+    for (const j of sizeJobs) {
+      if (j.st._size > 0 && j.btn.isConnected) j.btn.textContent = `${j.base} (${fmtSize(j.st._size)})`;
+    }
     try {
-      const urls = sizeJobs.map((j) => j.st.url).filter(Boolean).slice(0, 12);
+      const urls = sizeJobs.filter((j) => !(j.st._size > 0)).map((j) => j.st.url).filter(Boolean).slice(0, 12);
       if (urls.length) {
         chrome.runtime.sendMessage({ type: "getSizes", urls, referer: pageUrl }, (res) => {
           if (chrome.runtime.lastError) return;
@@ -159,29 +207,88 @@ function renderVideos(box, videos, pageUrl) {
   });
 }
 
-function renderLinks(list, links, net, pageUrl) {
+function renderLinks(list, links, net, pageUrl, pageTitle) {
   const have = new Set((links || []).map((l) => l.url));
-  (net || []).filter((n) => !have.has(n.url)).forEach((n) => {
+  const fnameFor = () => {
+    const s = String(pageTitle || "").replace(/[<>:"/\\|?*]/g, "_").trim().slice(0, 80);
+    const base = s || "video";
+    return base.endsWith(".mp4") ? base : base + ".mp4";
+  };
+  const R = (typeof DCRank !== "undefined") ? DCRank : null;
+  // P4: collapse same-file duplicates, demote playlist children to the
+  // end, biggest first — ad slivers and part files stop crowding the list.
+  const hasPlaylist = (net || []).some((n) => n && (
+    R ? R.kindOf(n) === "playlist" : /m3u8|mpd|mpegurl|dash/i.test(String(n.url || ""))
+  ));
+  const seenCanon = new Set();
+  const netItems = (net || [])
+    .filter((n) => n && /^https?:\/\//i.test(n.url || "") && !have.has(n.url))
+    .filter((n) => {
+      const k = R ? R.canonicalUrl(n.url) : String(n.url).split("#")[0];
+      if (seenCanon.has(k)) return false;
+      seenCanon.add(k);
+      return true;
+    })
+    .map((n) => ({ ...n, _score: R ? R.scoreMedia(n, { hasPlaylist }) : 0 }))
+    .sort((a, b) => b._score - a._score);
+  const sizeJobs = [];
+  // IDM-style sizes on network rows (measured in-tab, best-effort).
+  try {
+    const urls = netItems.map((n) => n.url).filter(Boolean).slice(0, 12);
+    if (urls.length) {
+      chrome.runtime.sendMessage({ type: "getSizes", urls, referer: pageUrl }, (res) => {
+        if (chrome.runtime.lastError) return;
+        const sizes = (res && res.sizes) || {};
+        for (const it of sizeJobs) {
+          const n = sizes[it.st.url] || 0;
+          const s = fmtSize(n);
+          if (n > 0) it.st._size = n;
+          if (s && it.btn.isConnected) it.btn.textContent = `${it.base} (${s})`;
+        }
+      });
+    }
+  } catch (e) { /* ignore */ }
+  netItems.forEach((n) => {
     const div = document.createElement("div");
     div.className = "item";
+    if (n.thumb && /^https?:\/\//i.test(n.thumb)) {
+      const im = document.createElement("img");
+      im.src = n.thumb;
+      im.loading = "lazy";
+      im.alt = "";
+      im.style.cssText = "display:block;max-width:320px;max-height:180px;width:100%;object-fit:cover;border-radius:8px;margin-bottom:6px;";
+      im.onerror = () => { im.style.display = "none"; };
+      div.appendChild(im);
+    }
     const a = document.createElement("a");
-    a.href = n.url; a.textContent = `Stream (${n.mime || "media"})`; a.target = "_blank";
+    a.href = n.url; a.textContent = `Stream (${n.mime || "media"})${n.tabs > 1 ? ` ×${n.tabs} tabs` : ""}`; a.target = "_blank";
     const btn = document.createElement("button");
-    btn.textContent = /m3u8|mpd|mpegurl|dash/i.test(n.url)
-      ? "Send stream (needs app resolve)"
-      : "Download stream";
+    const isStream = /m3u8|mpd|mpegurl|dash/i.test(n.url);
+    const isPart = R ? R.kindOf(n) === "segment" : /(\.ts|\.m4s|\.cmfv|\.cmfa)(\?|#|$)/i.test(String(n.url).split("?")[0]);
+    const base = isStream ? "Send stream (needs app resolve)" : isPart ? "Download part (segment)" : "Download stream";
+    btn.textContent = n.size > 0 ? `${base} (${fmtSize(n.size)})` : base;
     btn.onclick = () => {
-      chrome.runtime.sendMessage({ type: "download", url: n.url, pageUrl: pageUrl || undefined }, (res) => {
+      chrome.runtime.sendMessage({ type: "download", url: n.url, filename: isStream ? undefined : fnameFor(), pageUrl: pageUrl || undefined }, (res) => {
         $("status").textContent = res && res.ok ? "Sent ✓" : "App not reachable.";
       });
     };
     div.append(a, document.createElement("br"), btn);
     list.append(div);
+    sizeJobs.push({ btn, st: { url: n.url }, base });
   });
   (links || []).forEach((l) => {
     if (!/^https?:\/\//i.test(l.url)) return; // defense-in-depth: never offer odd schemes
     const div = document.createElement("div");
     div.className = "item";
+    if (l.thumb && /^https?:\/\//i.test(l.thumb)) {
+      const im = document.createElement("img");
+      im.src = l.thumb;
+      im.loading = "lazy";
+      im.alt = "";
+      im.style.cssText = "display:block;max-width:320px;max-height:180px;width:100%;object-fit:cover;border-radius:8px;margin-bottom:6px;";
+      im.onerror = () => { im.style.display = "none"; };
+      div.appendChild(im);
+    }
     const a = document.createElement("a");
     a.href = l.url; a.textContent = l.text || l.url; a.target = "_blank";
     const btn = document.createElement("button");
@@ -217,7 +324,7 @@ async function activeTab() {
       const peek = await chrome.tabs.sendMessage(tab.id, { type: "peekState" });
       if (peek && (peek.videos || peek.links || peek.net)) {
         renderVideos(box, peek.videos, peek.page || tabUrl);
-        renderLinks(list, peek.links, peek.net, peek.page || tabUrl);
+        renderLinks(list, peek.links, peek.net, peek.page || tabUrl, peek.title || "");
         return;
       }
     } catch (e) {

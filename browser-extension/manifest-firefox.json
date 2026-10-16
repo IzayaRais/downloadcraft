@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "Send to Download Craft",
-  "version": "0.5.2",
+  "version": "0.8.0",
   "description": "Automatically sends downloads to your Download Craft download manager.",
   "permissions": [
     "nativeMessaging",
@@ -27,6 +27,7 @@
         "https://*/*"
       ],
       "js": [
+        "rank.js",
         "content.js"
       ],
       "all_frames": true

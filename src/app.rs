@@ -254,20 +254,6 @@ fn win_lim_key(i: usize) -> &'static str {
     }
 }
 
-/// Section card used inside the Settings modal.
-fn section_card(ui: &mut egui::Ui, title: &str, body: impl FnOnce(&mut egui::Ui)) {
-    egui::Frame::new()
-        .fill(SURFACE)
-        .stroke(egui::Stroke::new(1.0_f32, CARD_BD))
-        .corner_radius(RADIUS)
-        .inner_margin(egui::Margin::same(10))
-        .show(ui, |ui| {
-            ui.label(egui::RichText::new(title).strong().size(13.0));
-            ui.add_space(4.0);
-            body(ui);
-        });
-}
-
 /// Full-width sidebar navigation row: icon + label left, count badge
 /// right, accent bar + highlight when selected. Manual-input version:
 /// reserves space, paints (hover from caller), returns the hit rect.
@@ -453,6 +439,7 @@ enum ButtonId {
     WinAdd,
     WinDel(usize),
     UpdCheck,
+    UpdDownload,
 }
 
 /// Checkbox identity for manual routing.
@@ -478,6 +465,8 @@ enum SliderId {
     DefConns,
     QMax,
     DetConns,
+    DetRetries,
+    DetTimeout,
 }
 
 /// Active manual slider drag.
@@ -786,6 +775,7 @@ fn tool_button(
     icon: &str,
     label: &str,
     enabled: bool,
+    tip: &str,
 ) -> egui::Rect {
     let (rect, _) = ui.allocate_exact_size(egui::vec2(88.0, TOOL_H), egui::Sense::hover());
     if enabled && man.hover(&rect) {
@@ -808,6 +798,18 @@ fn tool_button(
         egui::FontId::proportional(12.0),
         c,
     );
+    if enabled && !tip.is_empty() && man.hover(&rect) {
+        egui::Tooltip::always_open(
+            ui.ctx().clone(),
+            ui.layer_id(),
+            ui.id().with(("toolbar_tip", label)),
+            egui::PopupAnchor::Pointer,
+        )
+        .gap(12.0)
+        .show(|ui| {
+            ui.label(tip);
+        });
+    }
     rect
 }
 
@@ -951,9 +953,6 @@ enum ToolId {
 #[derive(Clone)]
 enum HitKind {
     Tool(ToolId),
-    TitleBtn(u8), // 0 min, 1 max/restore, 2 close
-    TitleDrag,
-    Resize(u8), // 0 west, 1 east, 2 south
     MenuBtn(u8), // 0 File, 1 Tasks, 2 Tools, 3 View, 4 Help
     MenuItem(u8), // action code (1..14, 20..22, 30..33)
     SideRow(String),
@@ -972,9 +971,9 @@ enum HitKind {
     DetParts,   // details Part-Info collapse toggle
 }
 
-/// Active manual divider drag: None, window-edge (dir set), or table column.
+/// Active manual divider drag: table column resize (window edges are the
+/// OS's job now that the app uses native decorations).
 enum ResizeCap {
-    Edge(egui::ResizeDirection),
     Col {
         col: SortCol,
         start_x: f32,
@@ -1007,7 +1006,6 @@ pub struct CraftApp {
     sort_col: SortCol,
     sort_asc: bool,
     show_add: bool,
-    show_settings: bool,
     show_queues: bool,
     show_about: bool,
     add_url: String,
@@ -1023,7 +1021,9 @@ pub struct CraftApp {
     clipboard_toast: Option<String>,
     browser_msg: String,
     pending_browser_install: Option<String>,
-    settings_page: String,
+    /// mtime of ui.json at our last load/save — a newer stamp means the
+    /// standalone Settings window wrote, so we reload (no restart needed).
+    last_ui_mtime: std::cell::Cell<Option<std::time::SystemTime>>,
     last_inbox_check: Instant,
     last_prog_write: Instant,
     /// Every queue id ever seen this session (seeded from disk at load).
@@ -1078,8 +1078,13 @@ pub struct CraftApp {
     update_check_on: bool,
     update_status: String,
     update_busy: bool,
-    update_rx: Option<std::sync::mpsc::Receiver<String>>,
+    update_rx: Option<std::sync::mpsc::Receiver<(String, Option<String>)>>,
+    /// Portable-update asset URL from the last check (P5), if any.
+    update_asset: Option<String>,
     update_auto_done: bool,
+    // ---- P5: per-download speed history (EWMA input + Details graph) ----
+    // Last ≤60 half-second samples per download id, pruned with tasks.
+    speed_hist: std::collections::HashMap<u64, std::collections::VecDeque<f64>>,
     // TEMPORARY input diagnostics (removed after the hover investigation):
     // ring buffer of recent pointer/selection/action states, flushed to
     // input.log so pointer delivery can be verified without watching.
@@ -1104,6 +1109,10 @@ pub struct CraftApp {
     add_cookie: String,
     add_user: String,
     add_pass: String,
+    /// Preferred quality from the extension menu (used by the size probe so
+    /// the Add dialog can show the chosen stream's size, and honored by the
+    /// engine at download time).
+    add_quality: String,
     // Details-dialog checksum staging (validated live; see Details tab).
     det_sum: String,
     det_for: Option<u64>,
@@ -1130,7 +1139,6 @@ impl CraftApp {
             sort_col: SortCol::Date,
             sort_asc: false,
             show_add: false,
-            show_settings: false,
             show_queues: false,
             show_about: false,
             add_url: String::new(),
@@ -1146,7 +1154,7 @@ impl CraftApp {
             clipboard_toast: None,
             browser_msg: String::new(),
             pending_browser_install: None,
-            settings_page: "Appearance".to_string(),
+            last_ui_mtime: std::cell::Cell::new(None),
             last_inbox_check: Instant::now(),
             last_prog_write: Instant::now(),
             known_ids: std::collections::HashSet::new(),
@@ -1206,7 +1214,9 @@ impl CraftApp {
             update_status: String::new(),
             update_busy: false,
             update_rx: None,
+            update_asset: None,
             update_auto_done: false,
+            speed_hist: std::collections::HashMap::new(),
             diag_lines: Vec::new(),
             diag_last: Instant::now(),
             diag_acts: 0,
@@ -1225,6 +1235,7 @@ impl CraftApp {
             add_cookie: String::new(),
             add_user: String::new(),
             add_pass: String::new(),
+            add_quality: String::new(),
             det_sum: String::new(),
             det_for: None,
             det_parts_open: true,
@@ -1232,6 +1243,10 @@ impl CraftApp {
         };
         app.load_queue();
         app.load_ui_state();
+        app.last_ui_mtime.set(
+            Self::ui_state_path()
+                .and_then(|p| std::fs::metadata(&p).and_then(|m| m.modified()).ok()),
+        );
         // Zero-config browser integration: the native host always points
         // at this binary (silent unless something needed fixing).
         for b in ["chrome", "edge", "brave", "opera", "vivaldi", "firefox"] {
@@ -1378,6 +1393,39 @@ impl CraftApp {
         crate::model::config_dir().map(|p| p.join("ui.json"))
     }
 
+    /// Launch the standalone Settings window (separate OS process).
+    fn open_settings_window() {
+        let Ok(exe) = std::env::current_exe() else {
+            return;
+        };
+        let mut cmd = std::process::Command::new(exe);
+        cmd.arg("--settings");
+        #[cfg(windows)]
+        {
+            use std::os::windows::process::CommandExt;
+            cmd.creation_flags(0x00000008);
+        }
+        let _ = cmd.spawn();
+    }
+
+    /// Reload ui.json when the standalone Settings window rewrote it.
+    /// Skipped while the Add dialog is open (never clobber typing).
+    fn watch_ui_state(&mut self) {
+        let Some(path) = Self::ui_state_path() else {
+            return;
+        };
+        let Ok(mtime) = std::fs::metadata(&path).and_then(|m| m.modified()) else {
+            return;
+        };
+        let changed = self.last_ui_mtime.get().map(|t| mtime > t).unwrap_or(false);
+        self.last_ui_mtime.set(Some(mtime));
+        if changed && !self.show_add {
+            self.load_ui_state();
+            self.refresh_speed_limit();
+            self.push_log("Settings reloaded from disk.");
+        }
+    }
+
     fn save_ui_state(&self) {
         if let Some(path) = Self::ui_state_path() {
             if let Some(parent) = path.parent() {
@@ -1413,6 +1461,11 @@ impl CraftApp {
             });
             if let Ok(json) = serde_json::to_string_pretty(&v) {
                 Self::atomic_write(&path, json.as_bytes());
+                if let Ok(mtime) =
+                    std::fs::metadata(&path).and_then(|m| m.modified())
+                {
+                    self.last_ui_mtime.set(Some(mtime));
+                }
             }
         }
     }
@@ -1608,6 +1661,7 @@ impl CraftApp {
                 self.add_url.clear();
                 self.add_file.clear();
                 self.add_checksum.clear();
+                self.add_quality.clear();
                 self.show_add = true;
             }
             2 => {
@@ -1642,7 +1696,7 @@ impl CraftApp {
                 }
             }
             8 => self.show_queues = true,
-            9 => self.show_settings = true,
+            9 => Self::open_settings_window(),
             10 => self.show_about = true,
             11 => self.import_list(),
             12 => self.export_list(),
@@ -1864,6 +1918,7 @@ impl CraftApp {
             user_agent: ua,
             timeout_secs: self.timeout_secs,
             proxy_url: self.proxy_url.clone(),
+            quality_pref: self.add_quality.trim().to_string(),
             ..Default::default()
         };
         self.rt.spawn(async move {
@@ -1883,16 +1938,26 @@ impl CraftApp {
                     if total.is_none() && is_page {
                         let shared =
                             std::sync::Arc::new(crate::engine::SharedState::new());
-                        if let Some((media_url, title)) =
-                            crate::engine::resolve_media(&client, &opts, &url, &shared).await
+                        if let Some(hit) = crate::engine::resolve_media(&client, &opts, &url, &shared).await
                         {
                             let (t2, _, _, _) =
-                                crate::engine::probe(&client, &opts, &media_url).await;
+                                crate::engine::probe(&client, &opts, &hit.url).await;
                             if total.is_none() {
                                 total = t2;
                             }
-                            if disp.is_none() && !title.trim().is_empty() {
-                                disp = Some(crate::engine::sanitize_filename(&title));
+                            // Pair audio adds to the finished size when the
+                            // menu choice merges (IDM shows the merged total).
+                            if let Some(pair) = hit.pair_url.filter(|p| p.starts_with("http")) {
+                                let (ta, _, _, _) =
+                                    crate::engine::probe(&client, &opts, &pair).await;
+                                if let (Some(a), Some(b)) = (total, ta) {
+                                    total = Some(a.saturating_add(b));
+                                } else {
+                                    total = total.or(ta);
+                                }
+                            }
+                            if disp.is_none() && !hit.title.trim().is_empty() {
+                                disp = Some(crate::engine::sanitize_filename(&hit.title));
                             }
                         }
                     }
@@ -1939,7 +2004,9 @@ impl CraftApp {
         });
     }
 
-    /// Queue all grabber results (deduped against the queue).
+    /// Queue all grabber results through the same dedupe + dest-clash
+    /// refresh path as every other capture (P4): re-grabs refresh stale
+    /// links instead of colliding, and the queue starts when running.
     fn queue_grab_results(&mut self) {
         if self.grab_results.is_empty() {
             self.grab_notice = "Grab a page first.".to_string();
@@ -1948,22 +2015,14 @@ impl CraftApp {
         let mut n = 0;
         let results = std::mem::take(&mut self.grab_results);
         for l in results {
-            if self.downloads.iter().any(|d| d.url == l.url) {
-                continue;
-            }
             let fname = crate::model::apply_rename_template(&self.rename_template, &l.name, &l.url);
-            let id = self.alloc_id();
-            let dir = self.save_dir_for(&fname);
-            self.downloads.push(DownloadItem::new(
-                id,
-                l.url,
-                fname,
-                dir,
-                self.connections_default,
-            ));
-            n += 1;
+            if self.queue_url(l.url, Some(fname), false, None) {
+                n += 1;
+            }
         }
-        self.save_queue();
+        if self.queue_running {
+            self.fill_next();
+        }
         self.push_log(format!("Grabber queued {n} link(s)."));
         self.grab_notice.clear();
     }
@@ -2002,7 +2061,7 @@ impl CraftApp {
         }
     }
 
-    /// One-shot opt-in update check against GitHub releases (P3.4).
+    /// One-shot opt-in update check against GitHub releases (P3.4, P5 asset).
     fn start_update_check(&mut self) {
         if self.update_busy {
             return;
@@ -2011,32 +2070,85 @@ impl CraftApp {
         self.update_rx = Some(rx);
         self.update_busy = true;
         self.update_status.clear();
+        self.update_asset = None;
         self.rt.spawn(async move {
             let _ = tx.send(update_check_async().await);
         });
     }
 
-    /// Queue one URL programmatically (used by inbox + import).
-    fn queue_url(&mut self, url: String, filename: Option<String>, autostart: bool) {        if !is_download_url(&url) || self.downloads.iter().any(|d| d.url == url) {
+    /// Queue the portable update asset as a normal download (P5).
+    /// Never self-replaces: the .zip lands in Downloads and the log +
+    /// notification tell the user where to unzip it.
+    fn download_update_asset(&mut self) {
+        let Some(url) = self.update_asset.clone() else {
+            self.push_log("No update asset known — check for updates first.");
             return;
+        };
+        let fname = url
+            .split(['?', '#'])
+            .next()
+            .unwrap_or(&url)
+            .rsplit('/')
+            .next()
+            .filter(|s| !s.is_empty())
+            .map(|s| s.to_string())
+            .unwrap_or_else(|| "download_craft_update.zip".to_string());
+        if self.queue_url(url, Some(fname.clone()), true, None) {
+            self.push_log(format!("Downloading update: {fname}"));
+            notify("Download Craft — update", &format!("Downloading {fname}"));
+        } else {
+            self.push_log("Update already queued.");
+        }
+    }
+
+    /// Queue one URL programmatically (used by inbox + import).
+    /// Returns true when the URL was newly queued or an existing same-file
+    /// entry was refreshed (P4 grab-all counts on this).
+    fn queue_url(&mut self, url: String, filename: Option<String>, autostart: bool, size: Option<u64>) -> bool {        if !is_download_url(&url) || self.downloads.iter().any(|d| d.url == url) {
+            return false;
         }
         let fname = filename
             .filter(|f| !f.trim().is_empty())
             .unwrap_or_else(|| filename_from_url(&url));
         let fname = crate::model::apply_rename_template(&self.rename_template, &fname, &url);
-        let id = self.alloc_id();
         let dir = self.save_dir_for(&fname);
-        self.downloads.push(DownloadItem::new(
+        let dest = std::path::Path::new(&dir).join(&fname);
+        // Same file, fresh URL (re-capture): refresh in place instead of a
+        // colliding duplicate (two tasks on one dest fail loudly and can
+        // corrupt resume state across different URLs).
+        if let Some(pos) = crate::model::find_dest_clash(&self.downloads, &dest) {
+            let id = self.downloads[pos].id;
+            if self.downloads[pos].url != url {
+                self.downloads[pos].url = url;
+                self.downloads[pos].downloaded_bytes = 0;
+                crate::model::drop_resume_state(&dest);
+            }
+            self.downloads[pos].total_bytes = size.filter(|s| *s > 0);
+            self.downloads[pos].speed_bps = 0.0;
+            self.downloads[pos].status = Status::Queued;
+            self.push_log(format!("Refreshed link: {fname}"));
+            if autostart {
+                self.start(id);
+            }
+            self.save_queue();
+            return true;
+        }
+        let id = self.alloc_id();
+        let mut item = DownloadItem::new(
             id,
             url,
             fname,
             dir,
             self.connections_default,
-        ));
+        );
+        // Browser-measured size survives queueing (see confirm::commit).
+        item.total_bytes = size.filter(|s| *s > 0);
+        self.downloads.push(item);
         if autostart {
             self.start(id);
         }
         self.save_queue();
+        true
     }
 
     fn import_list(&mut self) {
@@ -2053,7 +2165,7 @@ impl CraftApp {
         for line in data.lines() {
             let t = line.trim().trim_matches(|c| c == '"' || c == '\'');
             if is_download_url(t) && !self.downloads.iter().any(|d| d.url == t) {
-                self.queue_url(t.to_string(), None, false);
+                self.queue_url(t.to_string(), None, false, None);
                 n += 1;
             }
         }
@@ -2231,8 +2343,8 @@ impl CraftApp {
         let conns = item.connections;
         let opts = EngineOpts {
             speed_limit_bps: self.speed_limit_kbps * 1024,
-            timeout_secs: self.timeout_secs,
-            max_retries: self.max_retries,
+            timeout_secs: item.eff_timeout(self.timeout_secs),
+            max_retries: item.eff_retries(self.max_retries),
             user_agent: if self.user_agent.trim().is_empty() {
                 format!("download_craft/{}", env!("CARGO_PKG_VERSION"))
             } else {
@@ -2246,6 +2358,7 @@ impl CraftApp {
             allow_rename: true,
             expected_sha256: item.checksum_sha256.clone(),
             overwrite_existing: item.overwrite_existing,
+            quality_pref: item.quality_pref.clone(),
             global_limit: Some(self.speed_limit_live.clone()),
         };
         let shared2 = shared.clone();
@@ -2375,11 +2488,6 @@ impl CraftApp {
         self.downloads.iter().filter(|d| d.selected).map(|d| d.id).collect()
     }
 
-    /// Short debug label of the current manual hover (status readout).
-    fn man_hover_label(&self) -> String {
-        self.man_hover_dbg.clone()
-    }
-
     fn start_queue(&mut self) {
         self.queue_running = true;
         // Resume paused ones directly, but never above the concurrent limit:
@@ -2420,6 +2528,7 @@ impl CraftApp {
 
     fn poll_tasks(&mut self) {
         let mut finished = Vec::new();
+        let mut retry_notes = Vec::new();
         for (id, task) in self.tasks.iter_mut() {
             let dl = task.shared.downloaded.load(Ordering::SeqCst);
             let resumable = task.shared.resumable.load(Ordering::SeqCst);
@@ -2433,23 +2542,69 @@ impl CraftApp {
                 }
             }
             if let Some(d) = self.downloads.iter_mut().find(|d| d.id == *id) {
-                d.downloaded_bytes = dl;
-                d.resumable = resumable;
-                if task.shared.has_total.load(Ordering::SeqCst) {
-                    d.total_bytes = Some(task.shared.total.load(Ordering::SeqCst));
+                // Displayed progress is strictly monotonic: engine counters
+                // reset on retry/fallback legs (segment drop → resume from a
+                // lower offset), but the bar must never jump backwards
+                // (e.g. 35% -> 20% -> 31%). A changed total means a new leg —
+                // adopt both fresh values; otherwise keep the max.
+                let new_total = if task.shared.has_total.load(Ordering::SeqCst) {
+                    Some(task.shared.total.load(Ordering::SeqCst))
+                } else {
+                    None
+                };
+                if new_total != d.total_bytes {
+                    // Fresh link / quality fallback: the old bytes belong to
+                    // deleted work files, so restart the bar instead of
+                    // showing phantom progress — and say so in the log.
+                    if d.downloaded_bytes > 0 && dl < d.downloaded_bytes {
+                        retry_notes.push(format!(
+                            "Retrying {} with a fresh link — restarting progress.",
+                            d.filename
+                        ));
+                    }
+                    d.total_bytes = new_total;
+                    d.downloaded_bytes = dl;
+                } else {
+                    d.downloaded_bytes = d.downloaded_bytes.max(dl);
                 }
+                // Clamp to [0, total] so a stale counter can never exceed 100%.
+                if let Some(t) = d.total_bytes {
+                    if d.downloaded_bytes > t {
+                        d.downloaded_bytes = t;
+                    }
+                }
+                d.resumable = resumable;
                 let el = task.last_sample.elapsed().as_secs_f64();
                 if el >= 0.5 {
-                    let delta = dl.saturating_sub(task.last_bytes) as f64;
-                    d.speed_bps = if el > 0.0 { delta / el } else { 0.0 };
+                    // Speed from the MONOTONIC displayed value (never the raw
+                    // engine counter): a leg reset would otherwise show a
+                    // negative spike followed by an inflated catch-up burst.
+                    // P5: EWMA smoothing (α=0.4) so the readout and ETA stop
+                    // flickering on bursty CDNs; raw samples feed the graph.
+                    let delta = d.downloaded_bytes.saturating_sub(task.last_bytes) as f64;
+                    let raw = if el > 0.0 { delta / el } else { 0.0 };
+                    d.speed_bps = if d.speed_bps <= 0.0 {
+                        raw
+                    } else {
+                        0.4 * raw + 0.6 * d.speed_bps
+                    };
+                    let hist = self.speed_hist.entry(*id).or_default();
+                    hist.push_back(raw);
+                    while hist.len() > 60 {
+                        hist.pop_front();
+                    }
                     task.last_sample = Instant::now();
-                    task.last_bytes = dl;
+                    task.last_bytes = d.downloaded_bytes;
                 }
             }
             if task.handle.is_finished() {
                 finished.push(*id);
             }
         }
+        for note in retry_notes {
+            self.push_log(note);
+        }
+        let mut repair_restart: Vec<u64> = Vec::new();
         for id in finished {
             if let Some(task) = self.tasks.remove(&id) {
                 let cancelled = task.shared.cancelled.load(Ordering::SeqCst);
@@ -2459,6 +2614,8 @@ impl CraftApp {
                 let total = task.shared.total.load(Ordering::SeqCst);
                 let mut msg: Option<String> = None;
                 let mut finished_info: Option<(String, std::path::PathBuf)> = None;
+                // Set when the checksum repair below re-queues this id.
+                let mut repaired_here = false;
                 if let Some(d) = self.downloads.iter_mut().find(|d| d.id == id) {
                     d.downloaded_bytes = dl;
                     d.resumable = was_resumable;
@@ -2497,21 +2654,63 @@ impl CraftApp {
                             .unwrap_or_default()
                             .filter(|s| !s.trim().is_empty())
                             .unwrap_or_else(|| {
-                                "connection ended early — resume to retry".to_string()
+                                // Include landed vs expected bytes so a cut
+                                // connection (e.g. throttled FB CDN) tells the
+                                // user exactly where resume continues from.
+                                match d.total_bytes {
+                                    Some(t) if t > 0 => format!(
+                                        "connection ended early (got {} of {}) — resume to retry",
+                                        crate::model::format_bytes(dl),
+                                        crate::model::format_bytes(t)
+                                    ),
+                                    _ => "connection ended early — resume to retry".to_string(),
+                                }
                             });
-                        d.status = Status::Failed(reason.clone());
-                        msg = Some(format!("Failed #{id}: {reason}"));
+                        // P5 checksum auto-repair: one automatic from-scratch
+                        // redownload per checksum. A mismatch means the bytes
+                        // on disk are wrong, so resume state is dropped and
+                        // progress restarts; a second mismatch fails loudly
+                        // instead of looping forever.
+                        let mut repaired = false;
+                        if reason.contains("checksum mismatch")
+                            && !d.checksum_sha256.trim().is_empty()
+                            && !d.checksum_repaired
+                        {
+                            d.checksum_repaired = true;
+                            let dp = d.dest_path();
+                            crate::model::drop_resume_state(&dp);
+                            d.downloaded_bytes = 0;
+                            d.total_bytes = None;
+                            d.speed_bps = 0.0;
+                            d.status = Status::Queued;
+                            msg = Some(format!(
+                                "Checksum mismatch on {} — re-downloading once to repair.",
+                                d.filename
+                            ));
+                            repaired = true;
+                        }
+                        if !repaired {
+                            d.status = Status::Failed(reason.clone());
+                            msg = Some(format!("Failed #{id}: {reason}"));
+                        }
                         // Never keep a phantom size: a failed transfer with no
                         // bytes (e.g. a walled video page) must not display
                         // the probe's bogus total.
                         if dl == 0 {
                             d.total_bytes = None;
                         }
-                        notify(
-                            "Download Craft — download failed",
-                            &format!("#{id}: {reason}"),
-                        );
+                        if !repaired {
+                            notify(
+                                "Download Craft — download failed",
+                                &format!("#{id}: {reason}"),
+                            );
+                        } else {
+                            repaired_here = true;
+                        }
                     }
+                }
+                if repaired_here {
+                    repair_restart.push(id);
                 }
                 if let Some((name, path)) = finished_info {
                     self.on_download_finished(&name, &path);
@@ -2521,6 +2720,19 @@ impl CraftApp {
                 }
                 self.save_queue();
             }
+        }
+        // Checksum repairs restart immediately (the job was already running;
+        // this is an internal retry, not a queue jump).
+        for id in repair_restart {
+            if !self.tasks.contains_key(&id) {
+                self.start(id);
+            }
+        }
+        // P5: drop speed history for rows that no longer exist.
+        if self.speed_hist.len() > self.downloads.len() + 4 {
+            let live: std::collections::HashSet<u64> =
+                self.downloads.iter().map(|d| d.id).collect();
+            self.speed_hist.retain(|id, _| live.contains(id));
         }
         self.fill_next();
         self.maybe_finish_action();
@@ -2653,7 +2865,7 @@ impl CraftApp {
                 .unwrap_or(i64::MAX)
         };
         let mut keep: Vec<crate::native_host::InboxItem> = Vec::new();
-        let mut next: Option<(String, Option<String>, String, String)> = None;
+        let mut next: Option<(String, Option<String>, String, String, Option<u64>, Option<String>)> = None;
         for i in items.into_iter() {
             if next.is_none()
                 && is_download_url(&i.url)
@@ -2668,6 +2880,8 @@ impl CraftApp {
                         .or_else(|| i.page_url.clone())
                         .unwrap_or_default(),
                     i.cookie.clone().unwrap_or_default(),
+                    i.size,
+                    i.quality.clone(),
                 ));
             } else if is_download_url(&i.url)
                 && !self.downloads.iter().any(|d| d.url == i.url)
@@ -2690,7 +2904,7 @@ impl CraftApp {
                 Self::atomic_write(&path, json.as_bytes());
             }
         };
-        let Some((url, filename, referer, cookie)) = next else {
+        let Some((url, filename, referer, cookie, size, quality)) = next else {
             // Nothing actionable now: keep young entries, drop the file only
             // when fully drained.
             write_keep(&keep);
@@ -2708,7 +2922,16 @@ impl CraftApp {
         self.add_referer = referer;
         self.add_cookie = cookie;
         self.add_checksum.clear();
-        self.probe_done_for.clear(); // force a fresh size/name probe
+        self.add_quality = quality.filter(|s| !s.trim().is_empty()).unwrap_or_default();
+        // Browser-measured size rides along: show it without a server-side
+        // re-probe (which can 403 off-session on expiring CDN links).
+        match size.filter(|s| *s > 0) {
+            Some(s) => {
+                self.probe_size = Some(s);
+                self.probe_done_for = url.clone();
+            }
+            None => self.probe_done_for.clear(), // force a fresh size/name probe
+        }
         self.show_add = true;
         self.push_log("Browser extension sent a download — confirm in Add download.");
         true
@@ -2732,6 +2955,23 @@ impl CraftApp {
                 .iter()
                 .any(|d| d.id == it.id || d.url == it.url)
             {
+                continue;
+            }
+            // Foreign entry for a file we already track (fresh capture):
+            // refresh the local entry instead of a colliding duplicate.
+            if let Some(pos) =
+                crate::model::find_dest_clash(&self.downloads, &it.dest_path())
+            {
+                let local = &mut self.downloads[pos];
+                if local.url != it.url {
+                    local.url = std::mem::take(&mut it.url);
+                    local.downloaded_bytes = 0;
+                    let dp = local.dest_path();
+                    crate::model::drop_resume_state(&dp);
+                }
+                local.total_bytes = it.total_bytes;
+                local.speed_bps = 0.0;
+                local.status = Status::Queued;
                 continue;
             }
             if it.status.is_active() {
@@ -2841,9 +3081,9 @@ fn open_path(path: &std::path::Path, reveal: bool) {
 /// Write the native-messaging manifest + launcher and register it (HKCU, no admin).
 /// Zero-config: the unpacked extension carries a pinned key, so its ID is
 /// always this value — nothing to paste.
-const EXTENSION_ID: &str = "pgdhmfgefjnfijmlheboncdmfhcnoikk";
+pub(crate) const EXTENSION_ID: &str = "pgdhmfgefjnfijmlheboncdmfhcnoikk";
 
-fn install_native_host(browser: &str) -> Result<String, String> {
+pub(crate) fn install_native_host(browser: &str) -> Result<String, String> {
     let base = crate::model::config_dir()
         .map(|p| p.join("native-host"))
         .ok_or_else(|| "no config dir".to_string())?;
@@ -2968,10 +3208,11 @@ fn ensure_native_host(browser: &str) -> Result<bool, String> {
     Ok(true)
 }
 
-/// Opt-in update check (P3.4): compare the running version against the
-/// latest GitHub release tag. Network failures become a status string —
+/// Opt-in update check (P3.4, extended P5): compare the running version
+/// against the latest GitHub release tag, and locate the portable Windows
+/// asset when one is newer. Network failures become a status string —
 /// never a popup, never an auto-download.
-async fn update_check_async() -> String {
+async fn update_check_async() -> (String, Option<String>) {
     let current = env!("CARGO_PKG_VERSION");
     let client = match reqwest::Client::builder()
         .user_agent(format!("download_craft/{current}"))
@@ -2979,7 +3220,7 @@ async fn update_check_async() -> String {
         .build()
     {
         Ok(c) => c,
-        Err(e) => return format!("Update check failed: {e:#}"),
+        Err(e) => return (format!("Update check failed: {e:#}"), None),
     };
     let resp = client
         .get("https://api.github.com/repos/hungry-detective/downloadcraft/releases/latest")
@@ -2988,27 +3229,30 @@ async fn update_check_async() -> String {
         .await;
     let resp = match resp {
         Ok(r) => r,
-        Err(e) => return format!("Update check failed (network): {e:#}"),
+        Err(e) => return (format!("Update check failed (network): {e:#}"), None),
     };
     if !resp.status().is_success() {
-        return format!("Update check failed: HTTP {}", resp.status());
+        return (format!("Update check failed: HTTP {}", resp.status()), None);
     }
     let v: serde_json::Value = match resp.json().await {
         Ok(v) => v,
-        Err(e) => return format!("Update check failed (parse): {e:#}"),
+        Err(e) => return (format!("Update check failed (parse): {e:#}"), None),
     };
     let tag = v.get("tag_name").and_then(|t| t.as_str()).unwrap_or("");
     if tag.is_empty() {
-        return "Update check failed: no releases found.".to_string();
+        return ("Update check failed: no releases found.".to_string(), None);
     }
     if crate::model::is_newer_version(current, tag) {
         let url = v
             .get("html_url")
             .and_then(|u| u.as_str())
             .unwrap_or("https://github.com/hungry-detective/downloadcraft/releases");
-        format!("Update available: {tag} (you have v{current}) — {url}")
+        (
+            format!("Update available: {tag} (you have v{current}) — {url}"),
+            crate::model::pick_windows_asset(&v),
+        )
     } else {
-        format!("Up to date (v{current}).")
+        (format!("Up to date (v{current})."), None)
     }
 }
 
@@ -3080,44 +3324,11 @@ impl eframe::App for CraftApp {
         self.poll_tasks();
         self.poll_verify_jobs();
         self.write_progress_snapshot();
-        // TEMPORARY input diagnostics (removed after the hover investigation).
-        if self.diag_last.elapsed().as_secs() >= 1 {
-            self.diag_last = Instant::now();
-            let ptr = ctx
-                .pointer_hover_pos()
-                .map(|p| format!("{},{}", p.x as i32, p.y as i32))
-                .unwrap_or_else(|| "-".into());
-            let hov = self.man_hover_dbg.clone();
-            self.diag_lines.push(format!(
-                "t={} ptr={} hover={} sel={:?} acts={} stdh={} stdc={} press={} rel={} downL={} downR={} keys={} text={} lastkey={} manhits={} fires={}",
-                chrono::Local::now().format("%H:%M:%S"),
-                ptr,
-                hov,
-                self.selected_ids(),
-                self.diag_acts,
-                self.diag_std_hover,
-                self.diag_std_click,
-                ctx.input(|i| i.pointer.any_pressed()),
-                ctx.input(|i| i.pointer.any_released()),
-                ctx.input(|i| i.pointer.button_down(egui::PointerButton::Primary)),
-                ctx.input(|i| i.pointer.button_down(egui::PointerButton::Secondary)),
-                self.man.key_count,
-                self.man.text_count,
-                self.man.last_key,
-                self.diag_hits_n,
-                self.man.fires,
-            ));
-            while self.diag_lines.len() > 150 {
-                self.diag_lines.remove(0);
-            }
-            if let Some(dir) = crate::model::config_dir() {
-                let _ = std::fs::write(dir.join("input.log"), self.diag_lines.join("\n"));
-            }
-        }
         self.check_scheduler();
         if self.last_inbox_check.elapsed().as_secs() >= 2 {
             self.last_inbox_check = Instant::now();
             crate::model::touch_heartbeat();
+            self.watch_ui_state();
             self.merge_queue_from_disk();
             self.check_wake();
             self.check_cmd();
@@ -3132,9 +3343,10 @@ impl eframe::App for CraftApp {
                 while let Ok(m) = rx.try_recv() {
                     got = Some(m);
                 }
-                if let Some(m) = got {
+                if let Some((m, asset)) = got {
                     self.update_busy = false;
                     self.update_status = m.clone();
+                    self.update_asset = asset;
                     if m.starts_with("Update available") {
                         self.push_log(m);
                     }
@@ -3147,9 +3359,9 @@ impl eframe::App for CraftApp {
                 ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
             }
         }
-        // TEMPORARY experiment: continuous repaint instead of the 500 ms
-        // throttle, to rule out frame-starvation breaking hit-testing.
-        ctx.request_repaint();
+        // Repaint a few times per second for live progress/speed; pointer
+        // input repaints immediately on its own.
+        ctx.request_repaint_after(std::time::Duration::from_millis(250));
 
         // theme (re-applied when the user switches it)
         if self.theme_applied != self.theme {
@@ -3196,164 +3408,9 @@ impl eframe::App for CraftApp {
             ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
         }
 
-        // ================= custom titlebar (OS chrome off so it matches the app) =================
-        let maximized = ctx.input(|i| i.viewport().maximized.unwrap_or(false));
-        egui::TopBottomPanel::top("titlebar")
-            .frame(egui::Frame::new().fill(BG).inner_margin(egui::Margin::ZERO))
-            .show(ctx, |ui| {
-                ui.set_min_height(34.0);
-                ui.horizontal_centered(|ui| {
-                    ui.spacing_mut().item_spacing.x = 8.0;
-                    // mini app icon
-                    let (ir, _) = ui.allocate_exact_size(egui::vec2(20.0, 20.0), egui::Sense::hover());
-                    let p = ui.painter();
-                    p.rect_filled(ir, 5.0, PRIMARY);
-                    p.circle_filled(ir.center() + egui::vec2(-2.0, -2.0), 8.0, SECONDARY);
-                    p.text(
-                        ir.center(),
-                        egui::Align2::CENTER_CENTER,
-                        MI_DOWNLOAD.to_string(),
-                        egui::FontId::proportional(10.0),
-                        egui::Color32::WHITE,
-                    );
-                    ui.label(egui::RichText::new("Download Craft").size(13.0));
-                    // draggable space (manual: press starts OS drag,
-                    // double-click toggles maximize)
-                    let btn_w = 46.0 * 3.0;
-                    let drag_w = (ui.available_width() - btn_w).max(0.0);
-                    let (dr, _) =
-                        ui.allocate_exact_size(egui::vec2(drag_w, 34.0), egui::Sense::hover());
-                    self.hits.push((HitKind::TitleDrag, dr));
-                    // window buttons (painter glyphs, zero gap so nothing clips)
-                    ui.spacing_mut().item_spacing.x = 0.0;
-                    let man_ref = &self.man;
-                    let btn = |ui: &mut egui::Ui, kind: u8| {
-                        let (rect, _) = ui.allocate_exact_size(
-                            egui::vec2(46.0, 34.0),
-                            egui::Sense::hover(),
-                        );
-                        let hover = man_ref.hover(&rect);
-                        let p = ui.painter();
-                            if hover {
-                                p.rect_filled(
-                                    rect,
-                                    0.0,
-                                    if kind == 2 {
-                                        egui::Color32::from_rgb(0xC4, 0x2B, 0x1C)
-                                    } else {
-                                        SURFACE_LT
-                                    },
-                                );
-                            }
-                            let g =
-                                if kind == 2 || hover { egui::Color32::WHITE } else { DIM };
-                            let ctr = rect.center();
-                        match kind {
-                            0 => {
-                                p.line_segment(
-                                    [ctr + egui::vec2(-5.0, 0.0), ctr + egui::vec2(5.0, 0.0)],
-                                    egui::Stroke::new(1.4_f32, g),
-                                );
-                            }
-                            1 if maximized => {
-                                p.rect_stroke(
-                                    egui::Rect::from_center_size(
-                                        ctr + egui::vec2(-1.5, 1.5),
-                                        egui::vec2(8.0, 8.0),
-                                    ),
-                                    0.0,
-                                    egui::Stroke::new(1.2_f32, g),
-                                    egui::StrokeKind::Inside,
-                                );
-                                p.rect_stroke(
-                                    egui::Rect::from_center_size(
-                                        ctr + egui::vec2(1.5, -1.5),
-                                        egui::vec2(8.0, 8.0),
-                                    ),
-                                    0.0,
-                                    egui::Stroke::new(1.2_f32, g),
-                                    egui::StrokeKind::Inside,
-                                );
-                            }
-                            1 => {
-                                p.rect_stroke(
-                                    egui::Rect::from_center_size(ctr, egui::vec2(10.0, 10.0)),
-                                    0.0,
-                                    egui::Stroke::new(1.2_f32, g),
-                                    egui::StrokeKind::Inside,
-                                );
-                            }
-                            _ => {
-                                p.line_segment(
-                                    [ctr + egui::vec2(-4.5, -4.5), ctr + egui::vec2(4.5, 4.5)],
-                                    egui::Stroke::new(1.4_f32, g),
-                                );
-                                p.line_segment(
-                                    [ctr + egui::vec2(-4.5, 4.5), ctr + egui::vec2(4.5, -4.5)],
-                                    egui::Stroke::new(1.4_f32, g),
-                                );
-                            }
-                        }
-                        rect
-                    };
-                    for kind in 0..3u8 {
-                        let r = btn(ui, kind);
-                        self.hits.push((HitKind::TitleBtn(kind), r));
-                    }
-                });
-            });
-
-        // ================= manual resize edges (borderless window) =================
-        if !maximized {
-            let win = ctx.screen_rect();
-            let edge = 6.0;
-            let strips: [(egui::Id, egui::Rect, egui::ResizeDirection, egui::CursorIcon); 3] = [
-                (
-                    egui::Id::new("rz_w"),
-                    egui::Rect::from_min_max(
-                        egui::pos2(win.min.x, win.min.y + 34.0),
-                        egui::pos2(win.min.x + edge, win.max.y - edge),
-                    ),
-                    egui::ResizeDirection::West,
-                    egui::CursorIcon::ResizeHorizontal,
-                ),
-                (
-                    egui::Id::new("rz_e"),
-                    egui::Rect::from_min_max(
-                        egui::pos2(win.max.x - edge, win.min.y + 34.0),
-                        egui::pos2(win.max.x, win.max.y - edge),
-                    ),
-                    egui::ResizeDirection::East,
-                    egui::CursorIcon::ResizeHorizontal,
-                ),
-                (
-                    egui::Id::new("rz_s"),
-                    egui::Rect::from_min_max(
-                        egui::pos2(win.min.x, win.max.y - edge),
-                        egui::pos2(win.max.x, win.max.y),
-                    ),
-                    egui::ResizeDirection::South,
-                    egui::CursorIcon::ResizeVertical,
-                ),
-            ];
-            for (_id, rect, dir, _cursor) in strips {
-                // During resize/minimize the OS can transiently report a
-                // shrunken screen rect; clamp and skip empties.
-                let size = rect.size().max(egui::vec2(0.0, 0.0));
-                if size.x <= 0.0 || size.y <= 0.0 {
-                    continue;
-                }
-                let rect = egui::Rect::from_min_size(rect.min, size);
-                // Manual hit record (no Area/interact needed); the
-                // cursor + BeginResize happen in process_hits.
-                let code = match dir {
-                    egui::ResizeDirection::West => 0,
-                    egui::ResizeDirection::East => 1,
-                    _ => 2,
-                };
-                self.hits.push((HitKind::Resize(code), rect));
-            }
-        }
+        // Native OS window chrome (title bar, min/max/close, drag, resize,
+        // snap, taskbar) — a custom-painted titlebar can never match it and
+        // is the fastest way to look unprofessional.
 
         // ================= menu bar + search =================
         // Flat desktop menu bar: manual text buttons (no backgrounds),
@@ -3572,10 +3629,6 @@ impl eframe::App for CraftApp {
                     ui.add_space(10.0);
                     mi(ui, MI_MENU, 15.0, DIM);
                     ui.label(egui::RichText::new(format!("{active}")).color(DIM));
-                    // TEMPORARY input diagnostics: manual hover id shows
-                    // whether manual routing (bypassing hit-test) sees you.
-                    let ptr = ctx.pointer_hover_pos().map(|p| format!("{},{}", p.x as i32, p.y as i32)).unwrap_or_else(|| "-".to_string());
-                    ui.label(egui::RichText::new(format!("ptr={ptr} man={}", self.man_hover_label())).color(DIM).small());
                 });
             });
         });
@@ -3598,20 +3651,20 @@ impl eframe::App for CraftApp {
                     ui.add_space(10.0);
                     let busy = !self.tasks.is_empty();
                     let tools = [
-                        (ToolId::StartQueue, MI_PLAY, "Start Queue", true),
-                        (ToolId::StopQueue, MI_STOP, "Stop Queue", busy),
-                        (ToolId::StopAll, MI_STOP, "Stop All", busy),
+                        (ToolId::StartQueue, MI_PLAY, "Start Queue", true, "Start queued downloads"),
+                        (ToolId::StopQueue, MI_STOP, "Stop Queue", busy, "Stop starting new downloads (active ones finish)"),
+                        (ToolId::StopAll, MI_PAUSE, "Pause All", busy, "Pause every active download now"),
                     ];
-                    for (id, icon, label, enabled) in tools {
-                        let r = tool_button(ui, &self.man, icon, label, enabled);
+                    for (id, icon, label, enabled, tip) in tools {
+                        let r = tool_button(ui, &self.man, icon, label, enabled, tip);
                         self.hits.push((HitKind::Tool(id), r));
                     }
                     ui.add_space(10.0);
-                    let r = tool_button(ui, &self.man, MI_QUEUE, "Open Queues", true);
+                    let r = tool_button(ui, &self.man, MI_QUEUE, "Open Queues", true, "Queue status, scheduler and log");
                     self.hits.push((HitKind::Tool(ToolId::Queues), r));
-                    let r = tool_button(ui, &self.man, MI_CLOUD_DL, "Site Grabber", true);
+                    let r = tool_button(ui, &self.man, MI_CLOUD_DL, "Site Grabber", true, "Collect file links from a web page");
                     self.hits.push((HitKind::Tool(ToolId::Grabber), r));
-                    let r = tool_button(ui, &self.man, MI_SETTINGS, "Settings", true);
+                    let r = tool_button(ui, &self.man, MI_SETTINGS, "Settings", true, "Open Settings in its own window");
                     self.hits.push((HitKind::Tool(ToolId::Settings), r));
                 });
                 ui.add_space(8.0);
@@ -3648,7 +3701,7 @@ impl eframe::App for CraftApp {
                                     |ui| {
                                         let r = mbutton(ui, &self.man, "×", 34.0, 30.0, false);
                                         self.hits.push((HitKind::Btn(ButtonId::TDismiss), r));
-                                        let r = mbutton(ui, &self.man, "Add", 70.0, 30.0, false);
+                                        let r = mbutton(ui, &self.man, "Add URL", 90.0, 30.0, false);
                                         self.hits.push((HitKind::Btn(ButtonId::TAdd), r));
                                     },
                                 );
@@ -3955,7 +4008,6 @@ impl eframe::App for CraftApp {
 
         // ================= modal backdrop (dim only — never intercepts clicks) =================
         if self.show_add
-            || self.show_settings
             || self.show_queues
             || self.show_grabber
             || self.show_about
@@ -4025,6 +4077,7 @@ impl eframe::App for CraftApp {
                 .default_width(add_w)
                 .min_width(add_w.min(320.0))
                 .max_width(add_w)
+                .max_height((ctx.screen_rect().height() * 0.86).clamp(300.0, 900.0))
                 .frame(modal_frame())
                 .show(ctx, |ui| {
                     ui.spacing_mut().item_spacing.y = 10.0;
@@ -4112,9 +4165,9 @@ impl eframe::App for CraftApp {
                     // Row 4: actions (manual buttons; commit runs in
                     // process_hits via ButtonId).
                     ui.horizontal(|ui| {
-                        let r = mbutton(ui, &self.man, "Add", 110.0, 36.0, false);
+                        let r = mbutton(ui, &self.man, "Download Later", 130.0, 36.0, false);
                         self.hits.push((HitKind::Btn(ButtonId::AddAdd), r));
-                        let r = mbutton(ui, &self.man, "Download", 130.0, 36.0, true);
+                        let r = mbutton(ui, &self.man, "Start Download", 140.0, 36.0, true);
                         self.hits.push((HitKind::Btn(ButtonId::AddDownload), r));
                         ui.with_layout(
                             egui::Layout::right_to_left(egui::Align::Center),
@@ -4170,6 +4223,7 @@ impl eframe::App for CraftApp {
                 .default_width(grab_w)
                 .min_width(grab_w.min(320.0))
                 .max_width(grab_w)
+                .max_height((ctx.screen_rect().height() * 0.86).clamp(300.0, 900.0))
                 .frame(modal_frame())
                 .show(ctx, |ui| {
                     ui.spacing_mut().item_spacing.y = 10.0;
@@ -4211,9 +4265,9 @@ impl eframe::App for CraftApp {
                         });
                     }
                     ui.horizontal(|ui| {
-                        let r = mbutton(ui, &self.man, "Grab", 110.0, 36.0, false);
+                        let r = mbutton(ui, &self.man, "Find Links", 110.0, 36.0, false);
                         self.hits.push((HitKind::Btn(ButtonId::GrabStart), r));
-                        let r = mbutton(ui, &self.man, "Queue all", 130.0, 36.0, true);
+                        let r = mbutton(ui, &self.man, "Queue All", 130.0, 36.0, true);
                         self.hits.push((HitKind::Btn(ButtonId::GrabQueue), r));
                         ui.with_layout(
                             egui::Layout::right_to_left(egui::Align::Center),
@@ -4225,336 +4279,6 @@ impl eframe::App for CraftApp {
                     });
                 });
             self.show_grabber = open && self.show_grabber;
-        }
-
-        if self.show_settings {
-            let mut open = true;
-            let bmsg = self.browser_msg.clone();
-            let set_w = modal_width(ctx, 700.0);
-            egui::Window::new("Settings")
-                .id(egui::Id::new("settings_modal"))
-                .order(egui::Order::Foreground)
-                .open(&mut open)
-                .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
-                .pivot(egui::Align2::CENTER_CENTER)
-                .collapsible(false)
-                .resizable(false)
-                .default_width(set_w)
-                .min_width(set_w.min(320.0))
-                .max_width(set_w)
-                .frame(modal_frame())
-                .show(ctx, |ui| {
-                // Two-pane settings: rail on the left, page content scrolling.
-                ui.horizontal(|ui| {
-                ui.vertical(|ui| {
-                    ui.set_width(180.0);
-                    ui.spacing_mut().item_spacing.y = 2.0;
-                    ui.add_space(4.0);
-                    const PANES: &[(&str, &str)] = &[
-                        ("Appearance", MI_PALETTE),
-                        ("Download Engine", MI_DOWNLOAD),
-                        ("Categories & Rules", MI_FOLDER),
-                        ("Browser Integration", MI_PUBLIC),
-                        ("Updates", MI_UPDATE),
-                    ];
-                    for (name, icon) in PANES {
-                        let r = side_nav_row(
-                            ui,
-                            &self.man,
-                            self.settings_page == *name,
-                            icon,
-                            name,
-                            None,
-                            false,
-                        );
-                        self.hits.push((HitKind::SideRow(format!("set:{name}")), r));
-                    }
-                });
-                ui.separator();
-                egui::ScrollArea::vertical().max_height(440.0).show(ui, |ui| {
-                ui.spacing_mut().item_spacing.y = 8.0;
-                // Appearance pane: theme + what the theme changes.
-                if self.settings_page == "Appearance" {
-                section_card(ui, "Appearance", |ui| {
-                ui.label("Theme (applies instantly):");
-                ui.horizontal(|ui| {
-                    for (label, id, key) in [
-                        ("Dark", ButtonId::ThemeDark, "dark"),
-                        ("Black", ButtonId::ThemeBlack, "black"),
-                        ("Light", ButtonId::ThemeLight, "light"),
-                    ] {
-                        let sel = self.theme == key;
-                        let r = mbutton(ui, &self.man, &format!("{}{label}", if sel { "✓ " } else { "" }), 100.0, 32.0, sel);
-                        self.hits.push((HitKind::Btn(id), r));
-                    }
-                });
-                ui.small("Fonts, radius, and accent stay identical — only the palette changes.");
-                });
-                }
-                if self.settings_page == "Download Engine" {
-                section_card(ui, "Downloads", |ui| {
-                ui.horizontal(|ui| {
-                    ui.label("Save folder:");
-                    let r = mtext(ui, "set_dir", &mut self.add_dir, "", 220.0, false);
-                    self.hits.push((HitKind::Field("set_dir"), r));
-                    let r = micon(ui, &self.man, MI_FOLDER_OPEN);
-                    self.hits.push((HitKind::Btn(ButtonId::SFolder), r));
-                });
-                let r = mcheck(
-                    ui,
-                    &self.man,
-                    "Sort into category subfolders",
-                    self.category_folders,
-                );
-                self.hits.push((HitKind::Check(CheckId::CatFold), r));
-                ui.label(
-                    egui::RichText::new(format!(
-                        "Default connections: {}",
-                        self.connections_default
-                    ))
-                    .color(DIM),
-                );
-                let r = mslider(
-                    ui,
-                    &self.man,
-                    "",
-                    1.0,
-                    16.0,
-                    self.slider_get(SliderId::DefConns),
-                    false,
-                );
-                self.hits.push((
-                    HitKind::Slider(SliderId::DefConns, 1.0, 16.0, false),
-                    r,
-                ));
-                ui.horizontal(|ui| {
-                    ui.label("Speed limit:");
-                    let r = mcheck(ui, &self.man, "unlimited", self.speed_limit_kbps == 0);
-                    self.hits.push((HitKind::Check(CheckId::Unlimited), r));
-                });
-                if self.speed_limit_kbps != 0 {
-                    ui.label(
-                        egui::RichText::new(format!(
-                            "{} KB/s cap",
-                            self.speed_limit_kbps
-                        ))
-                        .color(DIM),
-                    );
-                    let r = mslider(
-                        ui,
-                        &self.man,
-                        "",
-                        50.0,
-                        20000.0,
-                        self.slider_get(SliderId::LimitKB),
-                        true,
-                    );
-                    self.hits.push((
-                        HitKind::Slider(SliderId::LimitKB, 50.0, 20000.0, true),
-                        r,
-                    ));
-                }
-                });
-                section_card(ui, "Network", |ui| {
-                ui.horizontal(|ui| {
-                    ui.label("User-Agent:");
-                    let r = mtext(ui, "set_ua", &mut self.user_agent, "", 260.0, false);
-                    self.hits.push((HitKind::Field("set_ua"), r));
-                });
-                ui.horizontal(|ui| {
-                    ui.label("Proxy:");
-                    let r = mtext(ui, "set_proxy", &mut self.proxy_url, "http://127.0.0.1:8080 (empty = none)", 260.0, false);
-                    self.hits.push((HitKind::Field("set_proxy"), r));
-                });
-                ui.label(
-                    egui::RichText::new(format!("Timeout: {} s", self.timeout_secs)).color(DIM),
-                );
-                let r = mslider(
-                    ui,
-                    &self.man,
-                    "",
-                    5.0,
-                    600.0,
-                    self.slider_get(SliderId::Timeout),
-                    false,
-                );
-                self.hits.push((
-                    HitKind::Slider(SliderId::Timeout, 5.0, 600.0, false),
-                    r,
-                ));
-                ui.label(
-                    egui::RichText::new(format!("Retries: {}", self.max_retries)).color(DIM),
-                );
-                let r = mslider(
-                    ui,
-                    &self.man,
-                    "",
-                    1.0,
-                    20.0,
-                    self.slider_get(SliderId::Retries),
-                    false,
-                );
-                self.hits.push((
-                    HitKind::Slider(SliderId::Retries, 1.0, 20.0, false),
-                    r,
-                ));
-                });
-                section_card(ui, "On completion", |ui| {
-                ui.horizontal(|ui| {
-                    ui.label("Antivirus:");
-                    let r = mtext(ui, "set_av", &mut self.antivirus_cmd, "{file} = path", 260.0, false);
-                    self.hits.push((HitKind::Field("set_av"), r));
-                });
-                let r = mcheck(
-                    ui,
-                    &self.man,
-                    "Minimize to system tray instead of quitting",
-                    self.close_to_tray,
-                );
-                self.hits.push((HitKind::Check(CheckId::Tray), r));
-                ui.small("The tray icon appears after ticking this (check the overflow area).");
-                });
-                } // end Download Engine pane
-                if self.settings_page == "Categories & Rules" {
-                section_card(ui, "Folders & names", |ui| {
-                ui.horizontal(|ui| {
-                    ui.label("Rename template:");
-                    let r = mtext(ui, "set_tpl", &mut self.rename_template, "{name}{ext}", 220.0, false);
-                    self.hits.push((HitKind::Field("set_tpl"), r));
-                });
-                ui.small(format!(
-                    "Preview: {}  (tokens: {{name}} {{ext}} {{date}} {{host}})",
-                    crate::model::apply_rename_template(
-                        &self.rename_template,
-                        "My Video.mp4",
-                        "https://cdn.example/v"
-                    )
-                ));
-                ui.small("Type → folder rules (first match wins, max 8):");
-                for (i, rule) in self.folder_rules.iter_mut().enumerate().take(8) {
-                    ui.horizontal(|ui| {
-                        let r = mtext(ui, rule_ext_key(i), &mut rule.exts, "mp4,mkv", 130.0, false);
-                        self.hits.push((HitKind::Field(rule_ext_key(i)), r));
-                        ui.label("→");
-                        let r = mtext(ui, rule_dir_key(i), &mut rule.folder, "Video", 130.0, false);
-                        self.hits.push((HitKind::Field(rule_dir_key(i)), r));
-                        let r = mbutton(ui, &self.man, "▲", 34.0, 30.0, false);
-                        self.hits.push((HitKind::Btn(ButtonId::RuleUp(i)), r));
-                        let r2 = mbutton(ui, &self.man, "▼", 34.0, 30.0, false);
-                        self.hits.push((HitKind::Btn(ButtonId::RuleDown(i)), r2));
-                        let r3 = mbutton(ui, &self.man, "×", 34.0, 30.0, false);
-                        self.hits.push((HitKind::Btn(ButtonId::RuleDel(i)), r3));
-                    });
-                }
-                ui.horizontal(|ui| {
-                    let r = mbutton(ui, &self.man, "Add rule", 110.0, 32.0, false);
-                    self.hits.push((HitKind::Btn(ButtonId::RuleAdd), r));
-                    let r = mbutton(ui, &self.man, "Reset defaults", 130.0, 32.0, false);
-                    self.hits.push((HitKind::Btn(ButtonId::RuleReset), r));
-                });
-                });
-                } // end Categories & Rules pane
-                if self.settings_page == "Download Engine" {
-                section_card(ui, "Speed windows", |ui| {
-                ui.horizontal(|ui| {
-                    let r = mcheck(ui, &self.man, "Enable speed windows", self.speed_windows_on);
-                    self.hits.push((HitKind::Check(CheckId::WinOn), r));
-                });
-                ui.small("While a window is active its cap overrides the global limit (0 = full speed):");
-                for i in 0..self.speed_windows.len().min(6) {
-                    let (s, e, l) = {
-                        let w = &self.speed_windows[i];
-                        (w.start.clone(), w.end.clone(), w.limit_kbps.to_string())
-                    };
-                    ui.horizontal(|ui| {
-                        let mut s = s;
-                        let r = mtext(ui, win_start_key(i), &mut s, "02:00", 70.0, false);
-                        self.hits.push((HitKind::Field(win_start_key(i)), r));
-                        self.speed_windows[i].start = s;
-                        ui.label("–");
-                        let mut e = e;
-                        let r = mtext(ui, win_end_key(i), &mut e, "06:00", 70.0, false);
-                        self.hits.push((HitKind::Field(win_end_key(i)), r));
-                        self.speed_windows[i].end = e;
-                        let mut l = l;
-                        let r = mtext(ui, win_lim_key(i), &mut l, "KB/s", 90.0, false);
-                        self.hits.push((HitKind::Field(win_lim_key(i)), r));
-                        if let Ok(n) = l.trim().parse::<u64>() {
-                            self.speed_windows[i].limit_kbps = n;
-                        }
-                        ui.label("KB/s");
-                        let r = mbutton(ui, &self.man, "×", 34.0, 30.0, false);
-                        self.hits.push((HitKind::Btn(ButtonId::WinDel(i)), r));
-                    });
-                }
-                ui.horizontal(|ui| {
-                    let r = mbutton(ui, &self.man, "Add window", 120.0, 32.0, false);
-                    self.hits.push((HitKind::Btn(ButtonId::WinAdd), r));
-                    ui.small(self.speed_window_status());
-                });
-                });
-                } // end Download Engine pane (Speed windows)
-                if self.settings_page == "Updates" {
-                section_card(ui, "Updates", |ui| {
-                ui.horizontal(|ui| {
-                    let r = mcheck(ui, &self.man, "Check for updates on launch", self.update_check_on);
-                    self.hits.push((HitKind::Check(CheckId::UpdOn), r));
-                    let r = mbutton(ui, &self.man, "Check now", 110.0, 32.0, false);
-                    self.hits.push((HitKind::Btn(ButtonId::UpdCheck), r));
-                });
-                if self.update_busy {
-                    ui.horizontal(|ui| {
-                        ui.spinner();
-                        ui.small("Checking…");
-                    });
-                } else if !self.update_status.is_empty() {
-                    ui.small(&self.update_status);
-                }
-                });
-                } // end Updates pane
-                if self.settings_page == "Browser Integration" {
-                section_card(ui, "Browser integration", |ui| {
-                ui.small("Load browser-extension/ unpacked once — its ID is pinned, no pasting needed.");
-                ui.small("One-time setup: host auto-repairs on every launch (like IDM) — no need to click Install each time; buttons below are manual repair only.");
-                ui.small(format!("Extension ID: {EXTENSION_ID}"));// auto host status lives in the log (see Queues/Log on repair)
-                ui.horizontal(|ui| {
-                    let r = mbutton(ui, &self.man, "Install Chrome", 110.0, 32.0, false);
-                    self.hits.push((HitKind::Btn(ButtonId::SChrome), r));
-                    let r = mbutton(ui, &self.man, "Install Edge", 110.0, 32.0, false);
-                    self.hits.push((HitKind::Btn(ButtonId::SEdge), r));
-                    let r = mbutton(ui, &self.man, "Install Firefox", 110.0, 32.0, false);
-                    self.hits.push((HitKind::Btn(ButtonId::SFirefox), r));
-                });
-                ui.horizontal(|ui| {
-                    let r = mbutton(ui, &self.man, "Install Brave", 110.0, 32.0, false);
-                    self.hits.push((HitKind::Btn(ButtonId::SBrave), r));
-                    let r = mbutton(ui, &self.man, "Install Opera", 110.0, 32.0, false);
-                    self.hits.push((HitKind::Btn(ButtonId::SOpera), r));
-                    ui.small("Brave/Opera/Vivaldi share the Chrome extension (developer mode → Load unpacked).");
-                });
-                if !bmsg.is_empty() {
-                    ui.small(&bmsg);
-                }
-                });
-                } // end Browser Integration pane
-                ui.add_space(4.0);
-                ui.horizontal(|ui| {
-                    ui.with_layout(
-                        egui::Layout::right_to_left(egui::Align::Center),
-                        |ui| {
-                            let r = mbutton(ui, &self.man, "Close", 110.0, 36.0, false);
-                            self.hits.push((HitKind::Btn(ButtonId::SClose), r));
-                        },
-                    );
-                });
-                }); // end content scroll
-                }); // end horizontal (rail + content)
-            });
-            let was_open = self.show_settings;
-            self.show_settings = open;
-            if was_open && !open {
-                self.save_ui_state();
-            }
         }
 
         if self.show_queues {
@@ -4575,13 +4299,14 @@ impl eframe::App for CraftApp {
                 .default_width(q_w)
                 .min_width(q_w.min(320.0))
                 .max_width(q_w)
+                .max_height((ctx.screen_rect().height() * 0.86).clamp(300.0, 900.0))
                 .frame(modal_frame())
                 .show(ctx, |ui| {
                 ui.label(format!("{n_items} item(s) in queue, {n_active} active."));
                 ui.horizontal(|ui| {
-                    let r = mbutton(ui, &self.man, "▶ Start Queue", 130.0, 32.0, false);
+                    let r = mbutton(ui, &self.man, "Start Queue", 130.0, 32.0, false);
                     self.hits.push((HitKind::Btn(ButtonId::QStart), r));
-                    let r = mbutton(ui, &self.man, "▢ Stop Queue", 130.0, 32.0, false);
+                    let r = mbutton(ui, &self.man, "Stop Queue", 130.0, 32.0, false);
                     self.hits.push((HitKind::Btn(ButtonId::QStop), r));
                 });
                 ui.label(
@@ -4660,7 +4385,7 @@ impl eframe::App for CraftApp {
                     ui.small("Waiting for scheduled time…");
                 } else {
                     ui.small("Scheduler already fired this session.");
-                    let r = mbutton(ui, &self.man, "Reset scheduler", 140.0, 30.0, false);
+                    let r = mbutton(ui, &self.man, "Reset Scheduler", 140.0, 30.0, false);
                     self.hits.push((HitKind::Btn(ButtonId::QSchedReset), r));
                 }
                 ui.separator();
@@ -4736,6 +4461,7 @@ impl eframe::App for CraftApp {
                         .default_width(det_w)
                         .min_width(det_w.min(320.0))
                         .max_width(det_w)
+                        .max_height((ctx.screen_rect().height() * 0.86).clamp(300.0, 900.0))
                         .frame(modal_frame())
                         .show(ctx, |ui| {
                             ui.horizontal(|ui| {
@@ -4840,12 +4566,59 @@ impl eframe::App for CraftApp {
                                     SECONDARY,
                                 );
                                 ui.add_space(8.0);
+                                // P5 speed history: raw half-second samples as
+                                // a mini area chart (EWMA readout above it).
+                                let hist: Vec<f64> = self
+                                    .speed_hist
+                                    .get(&did)
+                                    .map(|h| h.iter().copied().collect())
+                                    .unwrap_or_default();
+                                if hist.len() > 1 {
+                                    let peak = hist.iter().copied().fold(0.0_f64, f64::max).max(1.0);
+                                    ui.label(
+                                        egui::RichText::new(format!(
+                                            "Speed history (peak {}):",
+                                            format_speed(peak)
+                                        ))
+                                        .color(DIM),
+                                    );
+                                    let (grect, _) = ui.allocate_exact_size(
+                                        egui::vec2(ui.available_width(), 40.0),
+                                        egui::Sense::hover(),
+                                    );
+                                    let gp = ui.painter();
+                                    gp.rect_filled(grect, 4.0, SURFACE);
+                                    let n = hist.len();
+                                    let pts: Vec<egui::Pos2> = hist
+                                        .iter()
+                                        .enumerate()
+                                        .map(|(i, v)| {
+                                            let x = grect.min.x
+                                                + grect.width() * (i as f32 / (n.max(2) - 1) as f32);
+                                            let y = grect.max.y
+                                                - 3.0
+                                                - (grect.height() - 6.0)
+                                                    * (*v as f32 / peak as f32).clamp(0.0, 1.0);
+                                            egui::pos2(x, y)
+                                        })
+                                        .collect();
+                                    let mut poly = pts.clone();
+                                    poly.push(egui::pos2(grect.max.x, grect.max.y - 1.0));
+                                    poly.push(egui::pos2(grect.min.x, grect.max.y - 1.0));
+                                    gp.add(egui::Shape::convex_polygon(
+                                        poly,
+                                        egui::Color32::from_rgba_unmultiplied(124, 92, 252, 40),
+                                        egui::Stroke::new(0.0, egui::Color32::TRANSPARENT),
+                                    ));
+                                    gp.add(egui::Shape::line(pts, egui::Stroke::new(1.5, PRIMARY)));
+                                    ui.add_space(8.0);
+                                }
                                 ui.horizontal(|ui| {
                                     if active {
                                         let r = mbutton(
                                             ui,
                                             &self.man,
-                                            if paused { "▶  Resume" } else { "⏸  Pause" },
+                                            if paused { "Resume" } else { "Pause" },
                                             110.0,
                                             32.0,
                                             false,
@@ -4861,8 +4634,8 @@ impl eframe::App for CraftApp {
                                     );
                                 });
                                 ui.add_space(4.0);
-                                // Part Info (manual collapse toggle).
-                                let r = mbutton(ui, &self.man, if self.det_parts_open { "▾ Part Info" } else { "▸ Part Info" }, 140.0, 28.0, false);
+                                // Part details (manual collapse toggle).
+                                let r = mbutton(ui, &self.man, if self.det_parts_open { "Hide Part Details" } else { "Show Part Details" }, 150.0, 28.0, false);
                                 self.hits.push((HitKind::DetParts, r));
                                 if self.det_parts_open {
                                     if ranges.is_empty() {
@@ -4901,7 +4674,9 @@ impl eframe::App for CraftApp {
                                                 x += seg_w;
                                             }
                                         }
-                                        // per-part table
+                                        // per-part table (scrolls past ~8 rows so
+                                        // the dialog never outgrows the screen)
+                                        egui::ScrollArea::vertical().max_height(190.0).show(ui, |ui| {
                                         egui::Grid::new("parts")
                                             .num_columns(4)
                                             .spacing([16.0, 4.0])
@@ -4933,6 +4708,7 @@ impl eframe::App for CraftApp {
                                                     ui.end_row();
                                                 }
                                             });
+                                        });
                                     }
                                 }
                             } else {
@@ -4965,6 +4741,58 @@ impl eframe::App for CraftApp {
                                     HitKind::Slider(SliderId::DetConns, 1.0, 16.0, false),
                                     r,
                                 ));
+                                // P5 per-download overrides (0 = global).
+                                ui.label(
+                                    egui::RichText::new(format!(
+                                        "Retries: {}",
+                                        item.max_retries
+                                            .map(|n| n.to_string())
+                                            .unwrap_or_else(|| format!(
+                                                "global ({})",
+                                                self.max_retries
+                                            ))
+                                    ))
+                                    .color(DIM),
+                                );
+                                let r = mslider(
+                                    ui,
+                                    &self.man,
+                                    "",
+                                    0.0,
+                                    20.0,
+                                    self.slider_get(SliderId::DetRetries),
+                                    false,
+                                );
+                                self.hits.push((
+                                    HitKind::Slider(SliderId::DetRetries, 0.0, 20.0, false),
+                                    r,
+                                ));
+                                ui.label(
+                                    egui::RichText::new(format!(
+                                        "Timeout: {}",
+                                        item.timeout_secs
+                                            .map(|n| format!("{n}s"))
+                                            .unwrap_or_else(|| format!(
+                                                "global ({}s)",
+                                                self.timeout_secs
+                                            ))
+                                    ))
+                                    .color(DIM),
+                                );
+                                let r = mslider(
+                                    ui,
+                                    &self.man,
+                                    "",
+                                    0.0,
+                                    600.0,
+                                    self.slider_get(SliderId::DetTimeout),
+                                    false,
+                                );
+                                self.hits.push((
+                                    HitKind::Slider(SliderId::DetTimeout, 0.0, 600.0, false),
+                                    r,
+                                ));
+                                ui.small("Retries/timeout apply on restart (0 = global).");
                                 ui.label("Referer:");
                                 if let Some(d) =
                                     self.downloads.iter_mut().find(|d| d.id == did)
@@ -5043,6 +4871,7 @@ impl eframe::App for CraftApp {
                 .default_width(ab_w)
                 .min_width(ab_w.min(320.0))
                 .max_width(ab_w)
+                .max_height((ctx.screen_rect().height() * 0.86).clamp(280.0, 900.0))
                 .frame(modal_frame())
                 .show(ctx, |ui| {
                 ui.heading("Download Craft");
@@ -5052,6 +4881,31 @@ impl eframe::App for CraftApp {
                 ui.separator();
                 ui.small("Interface design inspired by modern download managers.");
                 ui.small("Icons: Material Icons font (Apache-2.0, © Google). See NOTICE.md.");
+                // P5 portable updater: check is opt-in, the asset downloads
+                // as a normal queued file (never a silent self-replace —
+                // Windows locks the running exe).
+                ui.separator();
+                ui.horizontal(|ui| {
+                    let r = mbutton(
+                        ui,
+                        &self.man,
+                        if self.update_busy { "Checking…" } else { "Check for updates" },
+                        150.0,
+                        32.0,
+                        false,
+                    );
+                    self.hits.push((HitKind::Btn(ButtonId::UpdCheck), r));
+                    if self.update_asset.is_some() && !self.update_busy {
+                        let r = mbutton(ui, &self.man, "Download update", 150.0, 32.0, true);
+                        self.hits.push((HitKind::Btn(ButtonId::UpdDownload), r));
+                    }
+                });
+                if !self.update_status.trim().is_empty() {
+                    ui.small(self.update_status.clone());
+                }
+                if self.update_asset.is_some() {
+                    ui.small("Portable .zip lands in your downloads — unzip over the app folder to upgrade.");
+                }
                 ui.add_space(6.0);
                 ui.horizontal(|ui| {
                     ui.with_layout(
@@ -5140,6 +4994,17 @@ impl CraftApp {
                 .and_then(|did| self.downloads.iter().find(|d| d.id == did))
                 .map(|d| d.connections as f64)
                 .unwrap_or(8.0),
+            // 0 = follow the global setting (P5 per-download overrides).
+            SliderId::DetRetries => self
+                .details_id
+                .and_then(|did| self.downloads.iter().find(|d| d.id == did))
+                .map(|d| d.max_retries.unwrap_or(0) as f64)
+                .unwrap_or(0.0),
+            SliderId::DetTimeout => self
+                .details_id
+                .and_then(|did| self.downloads.iter().find(|d| d.id == did))
+                .map(|d| d.timeout_secs.unwrap_or(0) as f64)
+                .unwrap_or(0.0),
         }
     }
 
@@ -5158,6 +5023,24 @@ impl CraftApp {
                 if let Some(did) = self.details_id {
                     if let Some(d) = self.downloads.iter_mut().find(|d| d.id == did) {
                         d.connections = (v as usize).clamp(1, 16);
+                    }
+                }
+            }
+            SliderId::DetRetries => {
+                if let Some(did) = self.details_id {
+                    if let Some(d) = self.downloads.iter_mut().find(|d| d.id == did) {
+                        let n = v.round() as u32;
+                        d.max_retries = if n == 0 { None } else { Some(n.clamp(1, 20)) };
+                        self.save_queue();
+                    }
+                }
+            }
+            SliderId::DetTimeout => {
+                if let Some(did) = self.details_id {
+                    if let Some(d) = self.downloads.iter_mut().find(|d| d.id == did) {
+                        let n = (v.round() as u64) / 5 * 5; // 5 s steps
+                        d.timeout_secs = if n == 0 { None } else { Some(n.clamp(5, 600)) };
+                        self.save_queue();
                     }
                 }
             }
@@ -5210,6 +5093,10 @@ impl CraftApp {
         item.password = self.add_pass.clone();
         item.checksum_sha256 = csum;
         item.overwrite_existing = self.add_overwrite;
+        item.quality_pref = self.add_quality.trim().to_string();
+        // Probed (or browser-measured) size survives queueing so the engine
+        // and progress UI know the total even if a re-probe would 403.
+        item.total_bytes = self.probe_size.filter(|s| *s > 0);
         if !self.add_overwrite {
             let dest = item.dest_path();
             if dest.exists() {
@@ -5227,6 +5114,7 @@ impl CraftApp {
         self.add_url.clear();
         self.add_file.clear();
         self.add_checksum.clear();
+        self.add_quality.clear();
         if download {
             self.queue_running = true;
             self.start(id);
@@ -5324,6 +5212,7 @@ impl CraftApp {
                 }
             }
             ButtonId::UpdCheck => self.start_update_check(),
+            ButtonId::UpdDownload => self.download_update_asset(),
             ButtonId::QStart => self.start_queue(),
             ButtonId::QStop => self.stop_queue(),
             ButtonId::QSchedReset => self.scheduler_started = false,
@@ -5343,12 +5232,13 @@ impl CraftApp {
             ButtonId::SBrave => self.pending_browser_install = Some("brave".to_string()),
             ButtonId::SOpera => self.pending_browser_install = Some("opera".to_string()),
             ButtonId::SClose => {
+                // Legacy in-app Settings close (Settings now lives in its own
+                // window; kept so the match stays exhaustive).
                 if self.add_dir.trim().is_empty() {
                     self.add_dir = dirs::download_dir()
                         .map(|p| p.to_string_lossy().to_string())
                         .unwrap_or_else(|| "C:\\Downloads".to_string());
                 }
-                self.show_settings = false;
                 self.save_ui_state();
             }
             ButtonId::ThemeDark => {
@@ -5383,6 +5273,7 @@ impl CraftApp {
                     self.add_url = url.clone();
                     self.add_file = filename_from_url(&url);
                     self.add_checksum.clear();
+                    self.add_quality.clear();
                     self.clipboard_toast = None;
                     self.add_focus_req = true;
                     self.show_add = true;
@@ -5480,13 +5371,6 @@ impl CraftApp {
         // Active divider drag continues here (movement, not clicks).
         if let Some(cap) = self.resize_cap.take() {
             match cap {
-                ResizeCap::Edge(dir) => {
-                    if self.man.down_left() {
-                        // OS owns the drag after BeginResize; keep capture
-                        // until release (no per-frame work needed).
-                        self.resize_cap = Some(ResizeCap::Edge(dir));
-                    }
-                }
                 ResizeCap::Col { col, start_x, start_w } => {
                     if self.man.down_left() {
                         if let Some(p) = self.man.pos() {
@@ -5500,11 +5384,8 @@ impl CraftApp {
                 }
             }
         }
-        let maximized = ctx.input(|i| i.viewport().maximized.unwrap_or(false));
-        // Modal dialogs (Phase 2: their controls are still standard widgets)
-        // block main-UI hits beneath them; titlebar + popups stay live.
+        // Modal dialogs block main-UI hits beneath them; popups stay live.
         let modal_open = self.show_add
-            || self.show_settings
             || self.show_queues
             || self.show_about
             || self.details_id.is_some();
@@ -5518,17 +5399,24 @@ impl CraftApp {
         // Snapshot hover for cursor icons (resize zones).
         let mut zone_cursor: Option<egui::CursorIcon> = None;
         for (kind, rect) in self.hits.clone().into_iter().rev() {
-            // Background clicks pass through modal dialogs (their own
-            // controls arrive in Phase 2); everything else is blocked.
-            let bg_kind = matches!(
+            // When a modal dialog is open, main-list hits beneath it are
+            // blocked — but the dialog's OWN controls must stay live.
+            // Otherwise every Close/Pause/slider inside Queues/Details/About
+            // is skipped and the buttons look dead. Block only the main
+            // window surface; allow popups and all dialog kinds.
+            let dialog_kind = matches!(
                 kind,
-                HitKind::TitleBtn(_)
-                    | HitKind::TitleDrag
-                    | HitKind::Resize(_)
-                    | HitKind::MenuItem(_)
+                HitKind::MenuItem(_)
                     | HitKind::CtxItem(_, _)
+                    | HitKind::Btn(_)
+                    | HitKind::Check(_)
+                    | HitKind::Slider(..)
+                    | HitKind::Field(_)
+                    | HitKind::ComboAnchor
+                    | HitKind::DetTab(_)
+                    | HitKind::DetParts
             );
-            if modal_open && !bg_kind {
+            if modal_open && !dialog_kind {
                 continue;
             }
             let hov = self.man.hover(&rect);
@@ -5543,12 +5431,9 @@ impl CraftApp {
                     HitKind::HdrCol(c) => format!("hdr:{}", c.key()),
                     HitKind::HdrCheck => "hdrcheck".to_string(),
                     HitKind::ResizeCol(c) => format!("rz:{}", c.key()),
-                    HitKind::TitleBtn(k) => format!("title:{k}"),
                     HitKind::MenuBtn(m) => format!("menu:{m}"),
                     HitKind::MenuItem(a) => format!("menuitem:{a}"),
                     HitKind::CtxItem(_, id) => format!("ctx:#{id}"),
-                    HitKind::TitleDrag => "titledrag".to_string(),
-                    HitKind::Resize(_) => "rzwin".to_string(),
                     HitKind::Btn(_) => "btn".to_string(),
                     HitKind::Check(_) => "check".to_string(),
                     HitKind::Slider(..) => "slider".to_string(),
@@ -5565,58 +5450,28 @@ impl CraftApp {
                 HitKind::Tool(t) => {
                     if clk {
                         self.diag_acts += 1;
+                        // Dimmed actions are inert (a disabled button must
+                        // never act, even if its rect is clicked).
+                        let idle = self.tasks.is_empty();
                         match t {
                             ToolId::AddUrl => {
                                 self.add_url.clear();
                                 self.add_file.clear();
                                 self.add_checksum.clear();
+                                self.add_quality.clear();
                                 self.show_add = true;
                             }
                             ToolId::StartQueue => self.start_queue(),
-                            ToolId::StopQueue => self.stop_queue(),
-                            ToolId::StopAll => self.stop_all(),
+                            ToolId::StopQueue if !idle => self.stop_queue(),
+                            ToolId::StopAll if !idle => self.stop_all(),
+                            ToolId::StopQueue | ToolId::StopAll => {}
                             ToolId::Queues => self.show_queues = true,
-                            ToolId::Settings => self.show_settings = true,
+                            ToolId::Settings => Self::open_settings_window(),
                             ToolId::Grabber => {
                                 self.grab_notice.clear();
                                 self.show_grabber = true;
                             }
                         }
-                    }
-                }
-                HitKind::TitleBtn(k) => {
-                    if clk {
-                        self.diag_acts += 1;
-                        match k {
-                            0 => ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(true)),
-                            1 => ctx.send_viewport_cmd(egui::ViewportCommand::Maximized(!maximized)),
-                            _ => ctx.send_viewport_cmd(egui::ViewportCommand::Close),
-                        }
-                    }
-                }
-                HitKind::TitleDrag => {
-                    if self.man.press_started_in(&rect) {
-                        ctx.send_viewport_cmd(egui::ViewportCommand::StartDrag);
-                    }
-                    if clk && self.man.take_double() {
-                        ctx.send_viewport_cmd(egui::ViewportCommand::Maximized(!maximized));
-                    }
-                }
-                HitKind::Resize(e) => {
-                    if hov {
-                        zone_cursor = Some(match e {
-                            2 => egui::CursorIcon::ResizeVertical,
-                            _ => egui::CursorIcon::ResizeHorizontal,
-                        });
-                    }
-                    if self.man.press_started_in(&rect) {
-                        let dir = match e {
-                            0 => egui::ResizeDirection::West,
-                            1 => egui::ResizeDirection::East,
-                            _ => egui::ResizeDirection::South,
-                        };
-                        self.resize_cap = Some(ResizeCap::Edge(dir));
-                        ctx.send_viewport_cmd(egui::ViewportCommand::BeginResize(dir));
                     }
                 }
                 HitKind::MenuBtn(m) => {
@@ -5641,9 +5496,6 @@ impl CraftApp {
                     if clk {
                         if key == "Queues" {
                             self.show_queues = true;
-                        } else if let Some(page) = key.strip_prefix("set:") {
-                            self.settings_page = page.to_string();
-                            self.show_settings = true;
                         } else {
                             self.filter = key.clone();
                         }

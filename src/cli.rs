@@ -61,6 +61,11 @@ pub enum Commands {
         /// Expected SHA-256 hex digest (verified after download)
         #[arg(long)]
         checksum: Option<String>,
+        /// Preferred YouTube quality (e.g. 720p, 1080p60): the engine
+        /// resolves the highest stream at or below it, merging video+audio
+        /// for adaptive-only qualities (needs ffmpeg for those)
+        #[arg(long)]
+        quality: Option<String>,
     },
     /// Remove an item from the queue (keeps the file)
     Remove {
@@ -148,12 +153,15 @@ fn global_opts() -> EngineOpts {
 fn opts_for(item: &DownloadItem, limit_bps: u64) -> EngineOpts {
     let mut o = global_opts();
     o.speed_limit_bps = limit_bps;
+    o.timeout_secs = item.eff_timeout(o.timeout_secs);
+    o.max_retries = item.eff_retries(o.max_retries);
     o.referer = item.referer.clone();
     o.cookie = item.cookie.clone();
     o.username = item.username.clone();
     o.password = item.password.clone();
     o.expected_sha256 = item.checksum_sha256.clone();
     o.overwrite_existing = item.overwrite_existing;
+    o.quality_pref = item.quality_pref.clone();
     o
 }
 
@@ -187,6 +195,24 @@ pub fn run(cli: Cli) -> anyhow::Result<()> {
                     .map(|p| p.to_string_lossy().to_string())
                     .unwrap_or_else(|| "C:\\Downloads".to_string())
             });
+            let dest = std::path::Path::new(&dir).join(&fname);
+            // Same file, fresh URL: refresh in place (see append_to_queue).
+            if let Some(pos) = crate::model::find_dest_clash(&items, &dest) {
+                let id = items[pos].id;
+                if items[pos].url != url {
+                    items[pos].url = url;
+                    items[pos].downloaded_bytes = 0;
+                    crate::model::drop_resume_state(&dest);
+                }
+                items[pos].speed_bps = 0.0;
+                items[pos].status = crate::model::Status::Queued;
+                save_queue(&items);
+                println!("refreshed #{id} {fname}");
+                if !no_start {
+                    run_id(id)?;
+                }
+                return Ok(());
+            }
             let id = items.iter().map(|d| d.id).max().unwrap_or(0) + 1;
             let mut item = DownloadItem::new(id, url, fname.clone(), dir, connections);
             item.checksum_sha256 = csum;
@@ -228,6 +254,7 @@ pub fn run(cli: Cli) -> anyhow::Result<()> {
             output,
             connections,
             checksum,
+            quality,
         } => {
             if !is_download_url(&url) {
                 anyhow::bail!("not an http(s) URL: {url}");
@@ -246,6 +273,7 @@ pub fn run(cli: Cli) -> anyhow::Result<()> {
             o.speed_limit_bps = 0;
             o.allow_rename = false;
             o.expected_sha256 = csum;
+            o.quality_pref = quality.filter(|s| !s.trim().is_empty()).unwrap_or_default();
             run_engine(url, dest, connections, o)?;
             Ok(())
         }

@@ -169,6 +169,28 @@ pub struct DownloadItem {
     /// Replace an existing destination file instead of auto-renaming.
     #[serde(default)]
     pub overwrite_existing: bool,
+    /// Preferred YouTube quality picked in the extension menu (e.g. "720p",
+    /// "1080p60"). Empty = best available. The engine picks the highest
+    /// stream at or below it (ciphered pages expose no direct URLs, so the
+    /// choice can only be honored server-side at resolve time).
+    #[serde(default)]
+    pub quality_pref: String,
+    /// Media duration in seconds from the extension (best-effort, P4).
+    /// Display/metadata only — never affects engine behavior.
+    #[serde(default)]
+    pub duration_secs: u64,
+    /// Per-download retry budget (P5). None = use the global setting.
+    /// Some(n) overrides it for this item only (clamped 1–20 at use).
+    #[serde(default)]
+    pub max_retries: Option<u32>,
+    /// Per-download stall timeout in seconds (P5). None = global.
+    #[serde(default)]
+    pub timeout_secs: Option<u64>,
+    /// Checksum-mismatch auto-repair latch (P5): set once the app spends
+    /// its single automatic from-scratch redownload after a mismatch, so
+    /// a persistently corrupt source fails loudly instead of looping.
+    #[serde(default)]
+    pub checksum_repaired: bool,
 }
 
 impl DownloadItem {
@@ -195,11 +217,26 @@ impl DownloadItem {
             pair_url: String::new(),
             pair_mime: String::new(),
             overwrite_existing: false,
+            quality_pref: String::new(),
+            duration_secs: 0,
+            max_retries: None,
+            timeout_secs: None,
+            checksum_repaired: false,
         }
     }
 
     pub fn dest_path(&self) -> std::path::PathBuf {
         std::path::Path::new(&self.save_dir).join(&self.filename)
+    }
+
+    /// Effective retry budget: per-download override or the global setting.
+    pub fn eff_retries(&self, global: u32) -> u32 {
+        self.max_retries.unwrap_or(global).clamp(1, 20).max(1)
+    }
+
+    /// Effective stall timeout: per-download override or the global setting.
+    pub fn eff_timeout(&self, global: u64) -> u64 {
+        self.timeout_secs.unwrap_or(global).clamp(5, 600).max(5)
     }
 
     pub fn progress(&self) -> f32 {
@@ -273,13 +310,15 @@ pub fn format_eta(item: &DownloadItem) -> String {
 }
 
 /// Last-resort filename from a URL. Placeholder segments that carry no
-/// real name (`videoplayback`, `watch`, `play`, API paths…) and raw
-/// hash-looking segments are skipped in favor of an earlier meaningful
-/// segment; otherwise a timestamped default.
+/// real name (`videoplayback`, `watch`, `play`, `reel`, API paths…),
+/// all-digit IDs (`/reel/113054…`), and raw hash-looking segments are
+/// skipped in favor of an earlier meaningful segment; otherwise a
+/// timestamped default.
 pub fn filename_from_url(raw: &str) -> String {
     const PLACEHOLDERS: &[&str] = &[
         "videoplayback", "watch", "play", "player", "download", "media",
         "api", "v", "video", "audio", "file", "get", "stream", "content",
+        "reel", "reels", "embed", "post", "posts", "share",
     ];
     if let Ok(u) = url::Url::parse(raw) {
         if let Some(segs) = u.path_segments() {
@@ -288,6 +327,10 @@ pub fn filename_from_url(raw: &str) -> String {
                 let clean = seg.split('?').next().unwrap_or(seg);
                 let low = clean.to_ascii_lowercase();
                 if clean.is_empty() || PLACEHOLDERS.contains(&low.as_str()) {
+                    continue;
+                }
+                // Numeric IDs (`/reel/113054…`, `/posts/123`) are not names.
+                if !clean.is_empty() && clean.bytes().all(|b| b.is_ascii_digit()) {
                     continue;
                 }
                 // Raw hash/blob ids (32+ hex chars, no extension) are not names.
@@ -302,6 +345,65 @@ pub fn filename_from_url(raw: &str) -> String {
         }
     }
     format!("download_{}.bin", chrono::Local::now().timestamp())
+}
+
+/// Extension for a `Content-Type` (with parameters tolerated): the correct
+/// suffix when the URL itself carries no usable name (P1). Unknown types
+/// yield None so callers keep the safe `.bin` default.
+pub fn ext_for_mime(mime: &str) -> Option<&'static str> {
+    let m = mime.split(';').next().unwrap_or("").trim().to_ascii_lowercase();
+    match m.as_str() {
+        "video/mp4" => Some(".mp4"),
+        "video/webm" => Some(".webm"),
+        "video/x-matroska" | "video/mkv" => Some(".mkv"),
+        "video/quicktime" => Some(".mov"),
+        "video/x-msvideo" => Some(".avi"),
+        "audio/mpeg" | "audio/mp3" => Some(".mp3"),
+        "audio/mp4" | "audio/m4a" | "audio/x-m4a" => Some(".m4a"),
+        "audio/webm" | "audio/opus" => Some(".webm"),
+        "audio/wav" | "audio/x-wav" => Some(".wav"),
+        "audio/flac" => Some(".flac"),
+        "audio/ogg" => Some(".ogg"),
+        "image/png" => Some(".png"),
+        "image/jpeg" => Some(".jpg"),
+        "image/gif" => Some(".gif"),
+        "image/webp" => Some(".webp"),
+        "image/svg+xml" => Some(".svg"),
+        "application/pdf" => Some(".pdf"),
+        "application/zip" => Some(".zip"),
+        "application/x-rar-compressed" | "application/vnd.rar" => Some(".rar"),
+        "application/x-7z-compressed" => Some(".7z"),
+        "application/gzip" | "application/x-gzip" => Some(".gz"),
+        "application/x-msdownload" | "application/octet-stream" => None,
+        _ => None,
+    }
+}
+
+/// True for `download_<ts>.bin` last-resort names (no real name survived).
+pub fn is_fallback_filename(name: &str) -> bool {
+    let n = name.trim();
+    n.starts_with("download_") && n.ends_with(".bin")
+}
+
+/// URL fallback name with the extension corrected from a known MIME type:
+/// `download_123.bin` + `video/mp4` → `download_123.mp4`, and extensionless
+/// `song` + `audio/mpeg` → `song.mp3`. Anything already suffixed is
+/// returned untouched.
+pub fn filename_from_url_with_mime(raw: &str, mime: Option<&str>) -> String {
+    let ext = mime.and_then(ext_for_mime);
+    let base = filename_from_url(raw);
+    if is_fallback_filename(&base) {
+        if let Some(ext) = ext {
+            return base.trim_end_matches(".bin").to_string() + ext;
+        }
+        return base;
+    }
+    if !base.contains('.') {
+        if let Some(ext) = ext {
+            return base + ext;
+        }
+    }
+    base
 }
 
 fn percent_decode(s: &str) -> String {
@@ -324,7 +426,14 @@ fn percent_decode(s: &str) -> String {
 
 pub fn is_download_url(s: &str) -> bool {
     let t = s.trim();
-    (t.starts_with("http://") || t.starts_with("https://")) && t.len() < 2048 && !t.contains(' ')
+    // `ftps://` passes the gate so the engine can refuse it loudly with
+    // guidance (instead of a generic "not a URL" message).
+    (t.starts_with("http://")
+        || t.starts_with("https://")
+        || t.starts_with("ftp://")
+        || t.starts_with("ftps://"))
+        && t.len() < 2048
+        && !t.contains(' ')
 }
 
 /// Public product name shown everywhere in the UI.
@@ -519,10 +628,37 @@ pub fn apply_rename_template(tpl: &str, filename: &str, url: &str) -> String {
     crate::engine::sanitize_filename(&out)
 }
 
+/// Position of a non-completed item writing the same destination file.
+/// A fresh capture of the same video (new signed URL, same filename) must
+/// refresh that entry instead of queueing a colliding duplicate: two tasks
+/// on one destination fail with "already downloading elsewhere", and stale
+/// part files from a different URL would corrupt resume.
+pub fn find_dest_clash(items: &[DownloadItem], dest: &std::path::Path) -> Option<usize> {
+    items.iter().position(|d| {
+        !matches!(d.status, Status::Completed) && d.dest_path() == dest
+    })
+}
+
+/// Drop resume state that belongs to a previous URL for `dest` (sidecar
+/// `.dcpart`/segment files + HLS maps). Called when an entry's URL is
+/// replaced: offsets from another (possibly sliced) URL must never be
+/// resumed into the new file.
+pub fn drop_resume_state(dest: &std::path::Path) {
+    let _ = std::fs::remove_file(dest.with_extension("dcpart"));
+    let _ = std::fs::remove_file(dest.with_extension("dcmeta"));
+    for i in 0..16 {
+        let _ = std::fs::remove_file(dest.with_extension(format!("dcpart{i}")));
+    }
+    let _ = std::fs::remove_file(dest.with_extension("hlsmap"));
+}
+
 /// Append an item to the shared queue file with a fresh id (used by the
 /// standalone dialogs). Holds the queue lock across read-assign-write so
 /// concurrent writers can no longer collide on ids. Returns the assigned
-/// id, or None when the URL is already queued.
+/// id, or None when the URL is already queued. A non-completed entry for
+/// the SAME destination file (fresh capture, new signed URL) is refreshed
+/// in place — new URL/meta, progress reset — and its id is returned, so a
+/// re-click never creates a colliding duplicate.
 pub fn append_to_queue(item: &mut DownloadItem) -> Option<u64> {
     let _guard = fs_lock("queue");
     let path = config_dir()?.join("queue.json");
@@ -532,6 +668,46 @@ pub fn append_to_queue(item: &mut DownloadItem) -> Option<u64> {
         .unwrap_or_default();
     if items.iter().any(|d| d.url == item.url) {
         return None;
+    }
+    if let Some(pos) = find_dest_clash(&items, &item.dest_path()) {
+        let id = items[pos].id;
+        let created = items[pos].created_at;
+        let fresh_url = item.url.clone();
+        let same_url = items[pos].url == fresh_url;
+        items[pos].url = fresh_url;
+        items[pos].filename = item.filename.clone();
+        items[pos].save_dir = item.save_dir.clone();
+        items[pos].referer = std::mem::take(&mut item.referer);
+        items[pos].cookie = std::mem::take(&mut item.cookie);
+        items[pos].username = std::mem::take(&mut item.username);
+        items[pos].password = std::mem::take(&mut item.password);
+        let checksum_changed = items[pos].checksum_sha256 != item.checksum_sha256;
+        items[pos].checksum_sha256 = std::mem::take(&mut item.checksum_sha256);
+        items[pos].pair_url = std::mem::take(&mut item.pair_url);
+        items[pos].pair_mime = std::mem::take(&mut item.pair_mime);
+        items[pos].quality_pref = std::mem::take(&mut item.quality_pref);
+        items[pos].duration_secs = item.duration_secs;
+        items[pos].max_retries = item.max_retries;
+        items[pos].timeout_secs = item.timeout_secs;
+        if checksum_changed {
+            // New checksum, new latch: the repair retry applies per digest.
+            items[pos].checksum_repaired = false;
+        }
+        items[pos].overwrite_existing = item.overwrite_existing;
+        items[pos].total_bytes = item.total_bytes;
+        if !same_url {
+            // Different bytes (or a slice of them): never resume old parts.
+            items[pos].downloaded_bytes = 0;
+            let dp = items[pos].dest_path();
+            drop_resume_state(&dp);
+        }
+        items[pos].speed_bps = 0.0;
+        items[pos].status = Status::Queued;
+        items[pos].created_at = created;
+        serde_json::to_string_pretty(&items)
+            .ok()
+            .and_then(|j| atomic_write(&path, j.as_bytes()).ok())?;
+        return Some(id);
     }
     let id = items.iter().map(|d| d.id).max().unwrap_or(0) + 1;
     item.id = id;
@@ -618,6 +794,40 @@ pub fn is_newer_version(current: &str, latest: &str) -> bool {
     false
 }
 
+/// Pick the portable Windows asset from a GitHub `releases/latest` payload
+/// (P5): a `.zip` whose name mentions windows (+64-bit when several).
+/// Pure helper, fixture-tested below.
+pub fn pick_windows_asset(v: &serde_json::Value) -> Option<String> {
+    let assets = v.get("assets")?.as_array()?;
+    let names: Vec<(&str, &str)> = assets
+        .iter()
+        .filter_map(|a| {
+            let name = a.get("name")?.as_str()?;
+            let url = a.get("browser_download_url")?.as_str()?;
+            Some((name, url))
+        })
+        .collect();
+    let is_zip = |n: &str| n.to_ascii_lowercase().ends_with(".zip");
+    let is_win = |n: &str| n.to_ascii_lowercase().contains("windows");
+    let is_64 = |n: &str| {
+        let l = n.to_ascii_lowercase();
+        l.contains("x86_64") || l.contains("x64")
+    };
+    // Portable build first, then any 64-bit windows zip, then any windows
+    // zip, then any zip at all.
+    let portable = names
+        .iter()
+        .find(|(n, _)| is_zip(n) && is_win(n) && n.to_ascii_lowercase().contains("portable"));
+    let win64 = names.iter().find(|(n, _)| is_zip(n) && is_win(n) && is_64(n));
+    let win = names.iter().find(|(n, _)| is_zip(n) && is_win(n));
+    let any = names.iter().find(|(n, _)| is_zip(n));
+    portable
+        .or(win64)
+        .or(win)
+        .or(any)
+        .map(|(_, u)| u.to_string())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -646,7 +856,8 @@ mod tests {
     #[test]
     fn url_checks() {
         assert!(is_download_url("https://example.com/f.zip"));
-        assert!(!is_download_url("ftp://example.com/f.zip"));
+        assert!(is_download_url("ftp://example.com/f.zip"));
+        assert!(is_download_url("ftps://example.com/f.zip"));
         assert!(!is_download_url("not a url"));
         assert_eq!(filename_from_url("https://h/x/my%20file.zip?a=b"), "my file.zip");
         assert_eq!(filename_from_url("https://h/x/%D9%81%D8%A7%D8%B1%D8%B3%DB%8C.mp3"), "فارسی.mp3");
@@ -654,6 +865,61 @@ mod tests {
         let fb = filename_from_url("https://h/watch?v=x");
         assert!(fb.starts_with("download_") && fb.ends_with(".bin"), "{fb}");
         assert_eq!(filename_from_url("https://h/v/abc123/videoplayback?x=1"), "abc123");
+        // numeric IDs and reel paths are not names either (P1)
+        let reel = filename_from_url("https://www.facebook.com/reel/1130540689426081");
+        assert!(reel.starts_with("download_"), "{reel}");
+        let posts = filename_from_url("https://www.facebook.com/posts/12345");
+        assert!(posts.starts_with("download_"), "{posts}");
+        // real file tails still win over placeholder parents
+        assert_eq!(
+            filename_from_url("https://scontent.xx.fbcdn.net/o1/v/t2/AQabc123.mp4?oh=1&oe=2"),
+            "AQabc123.mp4"
+        );
+    }
+
+    #[test]
+    fn mime_naming_matrix() {
+        // P1: extension-from-MIME only rescues last-resort names.
+        assert_eq!(ext_for_mime("video/mp4"), Some(".mp4"));
+        assert_eq!(ext_for_mime("video/mp4; charset=binary"), Some(".mp4"));
+        assert_eq!(ext_for_mime("VIDEO/WEBM"), Some(".webm"));
+        assert_eq!(ext_for_mime("audio/mp4"), Some(".m4a"));
+        assert_eq!(ext_for_mime("audio/mpeg"), Some(".mp3"));
+        assert_eq!(ext_for_mime("image/jpeg"), Some(".jpg"));
+        assert_eq!(ext_for_mime("application/pdf"), Some(".pdf"));
+        assert_eq!(ext_for_mime("application/octet-stream"), None);
+        assert_eq!(ext_for_mime("text/html"), None);
+        assert_eq!(ext_for_mime(""), None);
+        assert!(is_fallback_filename("download_123.bin"));
+        assert!(!is_fallback_filename("clip.mp4"));
+        // 10-URL acceptance: meaningful names untouched, fallbacks fixed.
+        assert_eq!(
+            filename_from_url_with_mime("https://cdn.example/a/my%20clip.mp4", Some("video/mp4")),
+            "my clip.mp4"
+        );
+        let song = filename_from_url_with_mime("https://cdn.example/a/song", Some("audio/mpeg"));
+        assert_eq!(song, "song.mp3");
+        assert_eq!(
+            filename_from_url_with_mime("https://h/x/file.unknown", Some("video/webm")),
+            "file.unknown"
+        );
+        let reel = filename_from_url_with_mime(
+            "https://www.facebook.com/reel/1130540689426081",
+            Some("video/mp4"),
+        );
+        assert!(reel.starts_with("download_") && reel.ends_with(".mp4"), "{reel}");
+        let ytid = filename_from_url_with_mime(
+            "https://youtu.be/aqz-KE-bpKQ",
+            Some("video/mp4"),
+        );
+        assert_eq!(ytid, "aqz-KE-bpKQ.mp4");
+        let disp = filename_from_url_with_mime("https://h/dl?id=7", Some("application/pdf"));
+        assert_eq!(disp, "dl.pdf");
+        // unknown mime: usable bare names stay, true fallbacks keep .bin
+        let keep = filename_from_url_with_mime("https://h/nameless", Some("text/html"));
+        assert_eq!(keep, "nameless");
+        let keep2 = filename_from_url_with_mime("https://h/nameless", None);
+        assert_eq!(keep2, "nameless");
     }
 
     #[test]
@@ -662,6 +928,47 @@ mod tests {
         assert_eq!(relative_time(&now), "just now");
         assert!(relative_time(&(now - chrono::Duration::hours(14))).contains("14 hours ago"));
         assert!(relative_time(&(now - chrono::Duration::days(2))).contains("2 days ago"));
+    }
+
+    #[test]
+    fn dest_clash_refresh() {
+        let dir = std::env::temp_dir().join("dc_clash_test");
+        let _ = std::fs::create_dir_all(&dir);
+        let dir_s = dir.to_string_lossy().to_string();
+        let mut a = DownloadItem::new(1, "https://h/v1.mp4".into(), "v.mp4".into(), dir_s.clone(), 4);
+        a.status = Status::Failed("old".into());
+        let items = vec![a];
+        let dest = std::path::Path::new(&dir_s).join("v.mp4");
+        assert_eq!(find_dest_clash(&items, &dest), Some(0));
+        let other = std::path::Path::new(&dir_s).join("other.mp4");
+        assert_eq!(find_dest_clash(&items, &other), None);
+        let mut done = DownloadItem::new(2, "https://h/v2.mp4".into(), "v.mp4".into(), dir_s, 4);
+        done.status = Status::Completed;
+        assert_eq!(find_dest_clash(&vec![done], &dest), None);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn p5_overrides_and_compat() {
+        // P5: per-download overrides fall back to globals, clamped.
+        let mut d = DownloadItem::new(1, "https://h/v.mp4".into(), "v.mp4".into(), "C:\\T".into(), 4);
+        assert_eq!(d.eff_retries(5), 5);
+        assert_eq!(d.eff_timeout(60), 60);
+        d.max_retries = Some(99);
+        d.timeout_secs = Some(1);
+        assert_eq!(d.eff_retries(5), 20);
+        assert_eq!(d.eff_timeout(60), 5);
+        d.max_retries = Some(0);
+        assert_eq!(d.eff_retries(5), 1);
+        // Old queue.json entries (no new keys) still parse with safe
+        // defaults: no override, no repair spent, no duration.
+        let old = r#"{"id":7,"url":"https://h/v.mp4","filename":"v.mp4","save_dir":"C:\\T","total_bytes":100,"downloaded_bytes":10,"status":"Queued","created_at":"2026-10-15T00:00:00+06:00","connections":8}"#;
+        let back: DownloadItem = serde_json::from_str(old).expect("old queue parses");
+        assert_eq!(back.max_retries, None);
+        assert_eq!(back.timeout_secs, None);
+        assert!(!back.checksum_repaired);
+        assert_eq!(back.duration_secs, 0);
+        assert_eq!(back.eff_retries(5), 5);
     }
 
     #[test]
@@ -712,5 +1019,31 @@ mod tests {
         assert!(!is_newer_version("0.6.0", "0.6.0"));
         assert!(is_newer_version("0.6", "0.6.1"));
         assert!(!is_newer_version("  v0.6.0 ", "0.6.0"));
+    }
+
+    #[test]
+    fn update_asset_pick() {
+        // P5: portable windows zip wins; then 64-bit; then any windows
+        // zip; then any zip; nothing zip-like gives None.
+        let v: serde_json::Value = serde_json::json!({
+            "tag_name": "v0.8.0",
+            "assets": [
+                {"name": "DownloadCraft-0.8.0-linux-x64.tar.gz", "browser_download_url": "https://h/l.tgz"},
+                {"name": "DownloadCraft-0.8.0-windows-x64.zip", "browser_download_url": "https://h/w64.zip"},
+                {"name": "DownloadCraft-0.8.0-windows-x64-portable.zip", "browser_download_url": "https://h/port.zip"},
+                {"name": "notes.txt", "browser_download_url": "https://h/n.txt"}
+            ]
+        });
+        assert_eq!(pick_windows_asset(&v).as_deref(), Some("https://h/port.zip"));
+        let v2: serde_json::Value = serde_json::json!({
+            "assets": [
+                {"name": "app-windows-x64.zip", "browser_download_url": "https://h/a.zip"},
+                {"name": "app-linux.zip", "browser_download_url": "https://h/b.zip"}
+            ]
+        });
+        assert_eq!(pick_windows_asset(&v2).as_deref(), Some("https://h/a.zip"));
+        let v3: serde_json::Value = serde_json::json!({"assets": []});
+        assert_eq!(pick_windows_asset(&v3), None);
+        assert_eq!(pick_windows_asset(&serde_json::json!({})), None);
     }
 }

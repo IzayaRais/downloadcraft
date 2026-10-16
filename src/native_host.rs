@@ -41,6 +41,13 @@ struct Incoming {
     /// (Only read on Incoming; stored nowhere.)
     #[serde(default)]
     pub urls: Option<Vec<String>>,
+    /// Preferred YouTube quality from the extension quality menu.
+    #[serde(default)]
+    pub quality: Option<String>,
+    /// Media duration in seconds (page player / JSON, best-effort).
+    /// Display-only: shown in the confirm dialog next to the size.
+    #[serde(default)]
+    pub dur: Option<u64>,
 }
 
 #[derive(Debug, Serialize)]
@@ -107,6 +114,13 @@ pub struct InboxItem {
     /// (Only read on Incoming; stored nowhere.)
     #[serde(default)]
     pub urls: Option<Vec<String>>,
+    /// Preferred YouTube quality from the extension quality menu.
+    #[serde(default)]
+    pub quality: Option<String>,
+    /// Media duration in seconds (page player / JSON, best-effort).
+    /// Display-only: shown in the confirm dialog next to the size.
+    #[serde(default)]
+    pub dur: Option<u64>,
 }
 
 pub fn inbox_path() -> Option<std::path::PathBuf> {
@@ -192,6 +206,8 @@ fn queue_download(msg: &Incoming) -> Result<bool, String> {
         pair_url: msg.pair_url.clone().filter(|s| s.starts_with("http")),
         pair_mime: msg.pair_mime.clone().filter(|s| !s.trim().is_empty()),
         urls: None,
+        quality: msg.quality.clone().filter(|s| !s.trim().is_empty()),
+        dur: msg.dur.filter(|s| *s > 0),
     };
     // Same URL re-captured: refresh metadata instead of ignoring it (the
     // filename/referer/cookie may be corrected this time).
@@ -239,6 +255,9 @@ fn spawn_confirm(msg: &Incoming) {
     if let Some(c) = msg.cookie.clone().filter(|s| !s.trim().is_empty()) {
         cmd.arg("--cookie").arg(c);
     }
+    if let Some(m) = msg.mime.clone().filter(|s| !s.trim().is_empty()) {
+        cmd.arg("--mime").arg(m);
+    }
     if let Some(s) = msg.size.filter(|s| *s > 0) {
         cmd.arg("--size").arg(s.to_string());
     }
@@ -247,6 +266,12 @@ fn spawn_confirm(msg: &Incoming) {
         if let Some(m) = msg.pair_mime.clone().filter(|s| !s.trim().is_empty()) {
             cmd.arg("--pair-mime").arg(m);
         }
+    }
+    if let Some(q) = msg.quality.clone().filter(|s| !s.trim().is_empty()) {
+        cmd.arg("--quality").arg(q);
+    }
+    if let Some(d) = msg.dur.filter(|s| *s > 0) {
+        cmd.arg("--dur").arg(d.to_string());
     }
     #[cfg(windows)]
     {

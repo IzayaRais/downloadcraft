@@ -7,12 +7,31 @@
   // Must match manifest version + background.js EXT_VER. The background
   // rejects messages from any other version with a "reload this tab"
   // error, so a stale script can never fail mysteriously.
-  const EXT_VER = "0.5.2";
+  const EXT_VER = "0.6.0";
   // Generation guard: when the worker re-injects this script (after an
   // update), older live instances must go quiet instead of fighting over
   // the button. The newest instance always wins.
   const GEN = (window.__dcGen = (window.__dcGen || 0) + 1);
   const alive = () => window.__dcGen === GEN;
+  // "Extension context invalidated" happens when Chrome reloads/updates the
+  // extension while this page is open: every chrome.* call in the OLD script
+  // then throws. Detect it once, shut down timers/observers (no spam), and
+  // tell the user the one-click fix (reload the tab).
+  let __dcDead = false;
+  const __dcTimers = [];
+  const __dcObservers = [];
+  function ctxInvalidated(e) {
+    const m = String((e && e.message) || e || "");
+    return /extension context invalidated/i.test(m);
+  }
+  function markDead() {
+    if (__dcDead) return;
+    __dcDead = true;
+    try { __dcTimers.forEach(clearInterval); } catch (e) {}
+    try { __dcTimers.forEach(clearTimeout); } catch (e) {}
+    try { __dcObservers.forEach((o) => { try { o.disconnect(); } catch (x) {} }); } catch (e) {}
+    toast("Download Craft was updated — reload this tab (Ctrl+R), then click again");
+  }
   const DL = /\.(zip|rar|7z|exe|msi|pdf|mp4|mkv|webm|mov|mp3|flac|wav|ogg|m4a|iso|tar|gz|dmg)$/i;
 
   function collectLinks() {
@@ -22,14 +41,23 @@
         .filter((l) => /^https?:\/\//i.test(l.url) && DL.test(l.url.split("?")[0]))
         .slice(0, 30);
       const media = [];
+      const posterOf = (el) => {
+        try {
+          const v = el && el.tagName && el.tagName.toLowerCase() === "video"
+            ? el
+            : (el && el.closest && el.closest("video")) || null;
+          const p = v && v.getAttribute && v.getAttribute("poster");
+          return /^https?:\/\//i.test(p || "") ? p : "";
+        } catch (e) { return ""; }
+      };
       document.querySelectorAll("video[src], audio[src]").forEach((el) => {
         if (/^https?:\/\//i.test(el.currentSrc || el.src)) {
-          media.push({ url: el.currentSrc || el.src, text: `Page media (${el.tagName.toLowerCase()})` });
+          media.push({ url: el.currentSrc || el.src, text: `Page media (${el.tagName.toLowerCase()})`, thumb: posterOf(el) });
         }
       });
       document.querySelectorAll("video source[src], audio source[src]").forEach((el) => {
         if (/^https?:\/\//i.test(el.src)) {
-          media.push({ url: el.src, text: "Page media (source)" });
+          media.push({ url: el.src, text: "Page media (source)", thumb: posterOf(el) });
         }
       });
       chrome.storage.local.set({
@@ -37,6 +65,7 @@
         downloadCraftPage: location.href,
       });
     } catch (e) {
+      if (ctxInvalidated(e)) { markDead(); return; }
       /* page CSP may block storage; popup manual URL still works */
     }
   }
@@ -126,6 +155,20 @@
     return (m.split("/")[1] || "mp4").slice(0, 5);
   }
 
+  function ytThumb(pr, id) {
+    try {
+      const thumbs = pr && pr.videoDetails && pr.videoDetails.thumbnail && pr.videoDetails.thumbnail.thumbnails;
+      if (Array.isArray(thumbs) && thumbs.length) {
+        const valid = thumbs.filter((t) => t && /^https?:\/\//i.test(t.url || ""));
+        if (valid.length) {
+          valid.sort((a, b) => (b.width || 0) - (a.width || 0));
+          return valid[0].url;
+        }
+      }
+    } catch (e) { /* ignore */ }
+    return id ? `https://i.ytimg.com/vi/${id}/hqdefault.jpg` : "";
+  }
+
   function ytStreams() {
     const id = ytVideoId();
     if (!id) return null;
@@ -134,7 +177,7 @@
     const pr = prs.find((p) => p && p.videoDetails && p.videoDetails.videoId === id) || null;
     const docTitle = document.title.replace(/ - YouTube$/, "");
     if (!pr || !pr.streamingData) {
-      return { videoId: id, title: docTitle || "youtube_video", streams: [], videoOnly: [], audio: [] };
+      return { videoId: id, title: docTitle || "youtube_video", thumb: ytThumb(pr, id), streams: [], videoOnly: [], audio: [] };
     }
     const title = (pr.videoDetails && pr.videoDetails.title) || docTitle || "youtube_video";
     // Stream URLs carry `expire=<unix>` and are session-locked: rows older
@@ -153,6 +196,21 @@
     };
     const direct = (arr) => (Array.isArray(arr) ? arr : [])
       .filter((f) => f && typeof f.url === "string" && f.url.startsWith("http") && fresh(f.url));
+    // Sizes straight from the page JSON (contentLength per format): exact,
+    // instant, no HEAD request — googlevideo HEADs 403 off-session, which is
+    // why rows historically showed no size. Duration likewise.
+    const sizeOf = (f) => {
+      try {
+        const n = parseInt(String(f.contentLength || "0").replace(/\D/g, ""), 10);
+        return n > 0 ? n : 0;
+      } catch (e) { return 0; }
+    };
+    const durOf = (f) => {
+      try {
+        const ms = parseInt(String(f.approxDurationMs || "0").replace(/\D/g, ""), 10);
+        return ms > 0 && ms < 86400000 * 3 ? Math.round(ms / 1000) : 0;
+      } catch (e) { return 0; }
+    };
     const qlabel = (f) => {
       // qualityLabel is "1080p" but often lacks fps; append it like IDM
       // ("1080p60") when the stream is high-frame-rate.
@@ -160,10 +218,26 @@
       if (/^\d+p$/.test(q) && (f.fps || 0) >= 50) return `${q}${f.fps}`;
       return q;
     };
+    // Ciphered entries carry signatureCipher instead of a direct URL (the
+    // page hides URLs until playback). Offered as "(via app)" rows: the
+    // click sends the page URL + quality hint and the desktop app deciphers
+    // that exact quality server-side — this is what fills the menu on
+    // VEVO/music videos that embed zero direct URLs.
+    const ciphered = (arr, wantVideo) => (Array.isArray(arr) ? arr : [])
+      .filter((f) => f && typeof f.signatureCipher === "string" && !f.url
+        && (wantVideo ? String(f.mimeType || "").startsWith("video/")
+                      : String(f.mimeType || "").startsWith("audio/")));
+    const cipherRows = (arr, wantVideo, kind) => ciphered(arr, wantVideo).map((f) => {
+      const mime = String(f.mimeType || "").split(";")[0];
+      return { url: null, label: qlabel(f), mime, disp: contOf(mime), kind, itag: f.itag || 0, ciphered: true, _size: sizeOf(f), _dur: durOf(f) };
+    });
     // Progressive = video+audio in one file (ready to play).
     const streams = direct(pr.streamingData.formats).map((f) => {
       const mime = String(f.mimeType || "").split(";")[0];
-      return { url: f.url, label: qlabel(f), mime, disp: contOf(mime), kind: "av", itag: f.itag || 0 };
+      return { url: f.url, label: qlabel(f), mime, disp: contOf(mime), kind: "av", itag: f.itag || 0, _size: sizeOf(f), _dur: durOf(f) };
+    });
+    cipherRows(pr.streamingData.formats, true, "av").forEach((s) => {
+      if (!streams.some((x) => x.label === s.label && x.disp === s.disp)) streams.push(s);
     });
     // Adaptive video-only incl. WebM VP9/AV1 — this is where 1080p+/4K live
     // (IDM's "2160p 4K / 1440p HD" rows). Honestly video-only: the app labels
@@ -173,7 +247,7 @@
       .filter((f) => String(f.mimeType || "").startsWith("video/"))
       .map((f) => {
         const mime = String(f.mimeType || "").split(";")[0];
-        return { url: f.url, label: qlabel(f), mime, disp: contOf(mime), kind: "v", itag: f.itag || 0 };
+        return { url: f.url, label: qlabel(f), mime, disp: contOf(mime), kind: "v", itag: f.itag || 0, _size: sizeOf(f), _dur: durOf(f) };
       })
       .filter((s) => {
         const k = `${s.label}|${s.disp}`;
@@ -182,6 +256,19 @@
         return true;
       })
       .slice(0, 16);
+    cipherRows(pr.streamingData.adaptiveFormats, true, "v").forEach((s) => {
+      if (!videoOnly.some((x) => x.label === s.label && x.disp === s.disp)) videoOnly.push(s);
+    });
+    // Size/duration map over EVERY video format (even ones with no URL at
+    // all): powers the generic ladder + popup rows with exact page-JSON
+    // sizes, no network measuring needed.
+    const sizes = {};
+    for (const f of [...(pr.streamingData.formats || []), ...(pr.streamingData.adaptiveFormats || [])]) {
+      if (!String(f.mimeType || "").startsWith("video/")) continue;
+      const q = qlabel(f);
+      const sz = sizeOf(f);
+      if (sz > 0 && !sizes[q]) sizes[q] = { size: sz, dur: durOf(f) };
+    }
     const audio = direct(pr.streamingData.adaptiveFormats)
       .filter((f) => String(f.mimeType || "").startsWith("audio/"))
       .map((f) => {
@@ -194,27 +281,41 @@
           kind: "a",
           itag: f.itag || 0,
           br: f.bitrate || 0,
+          _size: sizeOf(f),
+          _dur: durOf(f),
         };
       })
       .slice(0, 6);
-    return { videoId: id, title, streams, videoOnly, audio };
+    return { videoId: id, title, thumb: ytThumb(pr, id), streams, videoOnly, audio, sizes };
   }
 
-  function sendDownload(url, filename, mime, size, pair) {
+  function stripFbSlice(url) {
+    try {
+      const u = new URL(url);
+      if (!u.searchParams.has("bytestart") && !u.searchParams.has("byteend")) return url;
+      u.searchParams.delete("bytestart");
+      u.searchParams.delete("byteend");
+      return u.toString();
+    } catch (e) { return url; }
+  }
+
+  function sendDownload(url, filename, mime, size, pair, quality, dur) {
     // A tab running a stale script (extension reloaded without a tab
     // reload) has no extension APIs left — fail loudly, not mysteriously.
     try {
       if (!chrome || !chrome.runtime || !chrome.runtime.sendMessage) {
         throw new Error("page runs an older script — reload this tab (Ctrl+R), then click again");
       }
+      void chrome.runtime.id; // throws when the context was invalidated
     } catch (e) {
+      if (ctxInvalidated(e)) markDead();
       toast("Download Craft: " + (e && e.message ? e.message : e));
       return;
     }
     // blob: / mediasource streams cannot be fetched by the desktop app —
     // fall back to the page URL so the engine can resolve it server-side.
     // The extension keeps audio extensions for audio fallbacks.
-    let sendUrl = url;
+    let sendUrl = stripFbSlice(url);
     if (/^blob:/i.test(url)) {
       sendUrl = location.href;
       if (!filename) {
@@ -223,8 +324,9 @@
       }
     }
     try {
-      chrome.runtime.sendMessage({ type: "download", url: sendUrl, filename, ver: EXT_VER, pageUrl: location.href, referer: location.href, mime: mime || null, size: size || null, pairUrl: (pair && pair.url) || null, pairMime: (pair && pair.mime) || null }, (res) => {
+      chrome.runtime.sendMessage({ type: "download", url: sendUrl, filename, ver: EXT_VER, pageUrl: location.href, referer: location.href, mime: mime || null, size: size || null, pairUrl: (pair && pair.url) || null, pairMime: (pair && pair.mime) || null, quality: quality || null, dur: dur || null }, (res) => {
       if (chrome.runtime.lastError) {
+        if (ctxInvalidated(chrome.runtime.lastError)) markDead();
         toast("Download Craft: " + chrome.runtime.lastError.message);
         return;
       }
@@ -233,8 +335,126 @@
       }
       });
     } catch (e) {
+      if (ctxInvalidated(e)) markDead();
       toast("Download Craft: " + (e && e.message ? e.message : e));
     }
+  }
+
+  // ---------- Facebook reels support (IDM-style quality rows) ----------
+  // Facebook is an SPA: switching reels swaps /reel/<id> with no reload and
+  // the player holds a blob: URL, so the real file URL only exists in
+  // network traffic + embedded page JSON. IDM shows per-quality rows with
+  // title/duration/quality/size — this rebuilds the same from:
+  //   title    <- og:description / og:title (the reel caption)
+  //   HD/SD    <- playable_url_quality_hd / playable_url (/hd_src/sd_src,
+  //               browser_native_hd/sd_url) in the page JSON
+  //   live set <- background-sniffed fbcdn/mp4 traffic for this tab
+  //   duration <- duration_in_ms-style keys in the page JSON
+  function fbUnescape(s) {
+    try {
+      return String(s || "")
+        .replace(/\\\//g, "/")
+        .replace(/\\u([\da-fA-F]{4})/g, (_, h) => String.fromCharCode(parseInt(h, 16)))
+        .replace(/&amp;/g, "&");
+    } catch (e) { return String(s || ""); }
+  }
+  function fbMeta(prop) {
+    try {
+      const el = document.querySelector(`meta[property="${prop}"]`);
+      const c = el && el.getAttribute("content");
+      return c ? fbUnescape(c) : "";
+    } catch (e) { return ""; }
+  }
+  function fbJsonUrls(html) {
+    const out = {};
+    const grab = (key) => {
+      // "key":"https:\/\/..." or "key": "https://..."
+      const re = new RegExp(`"${key}"\\s*:\\s*"((?:\\\\.|[^"\\\\])*)"`);
+      const m = html.match(re);
+      const u = m && fbUnescape(m[1]);
+      return u && /^https?:\/\//i.test(u) ? u : "";
+    };
+    out.hd = grab("playable_url_quality_hd") || grab("browser_native_hd_url") || grab("hd_src");
+    out.sd = grab("playable_url") || grab("browser_native_sd_url") || grab("sd_src");
+    return out;
+  }
+  function fbJsonNum(html, keys) {
+    for (const k of keys) {
+      const m = html.match(new RegExp(`"${k}"\\s*:\\s*"?([\\d.]+)`));
+      if (m) {
+        const n = parseFloat(m[1]);
+        if (n > 0 && n < 10000000) return n;
+      }
+    }
+    return 0;
+  }
+  function fbInfo() {
+    let html = "";
+    try { html = document.documentElement.innerHTML.slice(0, 1500000); } catch (e) {}
+    const urls = fbJsonUrls(html);
+    // Duration: ms-style keys dominate FB JSON; fall back to plain seconds.
+    let durMs = fbJsonNum(html, ["playable_duration_in_ms", "duration_in_ms", "length_in_ms"]);
+    let durSec = durMs > 0 ? Math.round(durMs / 1000)
+      : Math.round(fbJsonNum(html, ["videoDuration", "video_length", "duration", "length_in_seconds"]) || 0);
+    if (!(durSec > 0 && durSec < 36000)) durSec = 0;
+    // Dimensions: meta first (current reel), JSON fallbacks.
+    let w = parseInt((document.querySelector('meta[property="og:video:width"]') || {}).content, 10) || 0;
+    let h = parseInt((document.querySelector('meta[property="og:video:height"]') || {}).content, 10) || 0;
+    if (!(w > 0)) w = Math.round(fbJsonNum(html, ["original_width", "video_width", "width"]) || 0);
+    if (!(h > 0)) h = Math.round(fbJsonNum(html, ["original_height", "video_height", "height"]) || 0);
+    // Title: caption first, then page title. Never "Facebook".
+    let title = fbMeta("og:description") || fbMeta("og:title") || "";
+    title = title.replace(/\s*\|\s*Facebook\s*$/i, "").replace(/\s+on Facebook.*$/i, "").trim();
+    if (!title || /^facebook$/i.test(title)) {
+      title = String(document.title || "").replace(/\s*\|\s*Facebook\s*$/i, "").trim() || "facebook_video";
+    }
+    if (/^facebook$/i.test(title)) title = "facebook_video";
+    return { hd: urls.hd, sd: urls.sd, durSec, w, h, title: title.slice(0, 100), thumb: fbMeta("og:image") };
+  }
+  function fbQuality(w, h, isHd) {
+    const q = Math.max(w || 0, h || 0);
+    if (q >= 1080) return "1080p HD";
+    if (q >= 720) return "720p HD";
+    if (q >= 480) return "480p";
+    if (q > 0) return `${q}p`;
+    return isHd ? "HD" : "SD";
+  }
+  function fbFilename(title) {
+    const s = String(title || "facebook_video").replace(/[<>:"/\\|?*\u0000-\u001f]/g, "_").trim();
+    const base = (s.replace(/\.+$/, "") || "facebook_video").slice(0, 80);
+    return base.endsWith(".mp4") ? base : base + ".mp4";
+  }
+  // Pick the best directly-downloadable candidate the background sniffer
+  // caught for this page: prefer real video/mp4 over playlists, biggest
+  // known size first. Facebook reels render as blob: players, so this is
+  // what makes the pill work without a page reload.
+  function bestSniffed(items) {
+    const list = (items || []).filter((m) => m && /^https?:\/\//i.test(m.url));
+    if (!list.length) return null;
+    const R = (typeof DCRank !== "undefined") ? DCRank : null;
+    // P4: when the tab already holds a playlist, loose segments are its
+    // children (the engine assembles them) — never pick a part. Without
+    // rank.js, fall back to the legacy inline score below.
+    const hasPlaylist = R
+      ? list.some((m) => R.kindOf(m) === "playlist")
+      : list.some((m) => /m3u8|mpd|mpegurl|dash/i.test(String(m.url || "")));
+    const pool = R
+      ? list.filter((m) => R.scoreMedia(m, { hasPlaylist }) >= 0)
+      : list.slice();
+    if (!pool.length) return null;
+    const score = (m) => {
+      if (R) return R.scoreMedia(m, { hasPlaylist });
+      const u = String(m.url || "");
+      const mime = String(m.mime || "").toLowerCase();
+      if (/m3u8|mpd|mpegurl|dash/i.test(u)) return -1; // engine can't take playlists directly
+      let s = 0;
+      if (mime.startsWith("video/")) s += 100;
+      if (/mp4/i.test(mime) || /\.mp4/i.test(u)) s += 50;
+      if (/fbcdn|lookaside|facebook|instagram|cdninstagram/i.test(u)) s += 20;
+      s += Math.min(30, Math.log10((m.size || 0) + 1) * 5);
+      return s;
+    };
+    return pool.slice().sort((a, b) => score(b) - score(a))[0];
   }
 
   // Small on-page error toast (failures are otherwise silent).
@@ -331,16 +551,40 @@
     return i === 0 ? `${n} ${u[i]}` : `${v.toFixed(v >= 100 ? 0 : 1)} ${u[i]}`;
   }
 
+  // Seconds → "3:26" for rows with page-JSON durations (shared rank.js
+  // helper when loaded, inline fallback otherwise).
+  function fmtDurSec(sec) {
+    if (typeof DCRank !== "undefined" && DCRank.fmtDur) return DCRank.fmtDur(sec);
+    const n = Math.round(Number(sec) || 0);
+    if (!(n > 0) || n >= 86400) return "";
+    return `${Math.floor(n / 60)}:${String(n % 60).padStart(2, "0")}`;
+  }
+
+  // In-page menu theming (dark + light like the "extension ui.png" mockup).
+  // Real implementation lives in rank.js (node-tested); these wrappers
+  // degrade to the historic dark look when rank.js failed to load.
+  const DCUI = (typeof DCRank !== "undefined" && DCRank.paintDcMenu) ? DCRank : null;
+  function dcThemeMode() { return DCUI ? DCUI.dcThemeMode() : "dark"; }
+  function dcTokens() {
+    if (DCUI) return DCUI.dcTokens();
+    return { mode: "dark", bg: "rgba(16,17,23,.92)", border: "1px solid rgba(255,255,255,.1)", radius: "12px", shadow: "0 8px 28px rgba(0,0,0,.5)", text: "#e6e6f0", dim: "rgba(230,230,240,.6)", itemBg: "transparent", itemBorder: "1px solid transparent", itemHover: "#35363e", toggleBorder: "rgba(255,255,255,.25)", toggle: "☀" };
+  }
+  function paintDcMenu(menu) { if (DCUI) DCUI.paintDcMenu(menu); }
+  function dcThemeToggle(menu) { return DCUI ? DCUI.dcThemeToggle(menu, document) : null; }
+
   function enrichSizes(pairs) {
     // pairs: [{btn, st, base}] — fill in "(12.4 MB)" once HEAD/Range answers.
+    // Rows carrying a page-JSON size (_size) already print it; never
+    // re-fetch those (googlevideo HEADs 403 and we'd just flicker).
     try {
-      const urls = pairs.map((p) => p.st.url).filter(Boolean).slice(0, 12);
+      const need = pairs.filter((p) => !(p.st._size > 0));
+      const urls = need.map((p) => p.st.url).filter(Boolean).slice(0, 12);
       if (!urls.length) return;
       chrome.runtime.sendMessage({ type: "getSizes", urls, referer: location.href }, (res) => {
         if (chrome.runtime.lastError) return;
         if (!alive()) return;
         const sizes = (res && res.sizes) || {};
-        for (const p of pairs) {
+        for (const p of need) {
           if (!p.btn.isConnected) continue;
           const n = sizes[p.st.url] || 0;
           const s = fmtSize(n);
@@ -416,6 +660,7 @@
         menu.querySelectorAll("[data-dc-sniff]").forEach((el) => el.remove());
         const h = document.createElement("div");
         h.setAttribute("data-dc-sniff", "1");
+        h.setAttribute("data-dc", "sec");
         h.textContent = "Detected playing streams";
         h.style.cssText = "padding:8px 8px 2px;font-size:11px;opacity:.6;text-transform:uppercase;letter-spacing:.06em;";
         menu.appendChild(h);
@@ -425,6 +670,7 @@
           const lab = sniffLabel(m);
           const base = lab.text;
           const b = document.createElement("button");
+          b.setAttribute("data-dc", "item");
           b.textContent = m.size > 0 ? `${base} (${fmtSize(m.size)})` : base;
           b.title = m.url.slice(0, 120);
           b.style.cssText = [
@@ -432,8 +678,8 @@
             "padding:7px 10px", "border-radius:6px", "border:1px solid transparent",
             "background:transparent", "color:#e6e6f0", "cursor:pointer", "font:13px system-ui,sans-serif",
           ].join(";");
-          b.onmouseenter = () => { b.style.background = "#35363e"; };
-          b.onmouseleave = () => { b.style.background = "transparent"; };
+          b.onmouseenter = () => { b.style.background = (menu._dcT || dcTokens()).itemHover; };
+          b.onmouseleave = () => { b.style.background = (menu._dcT || dcTokens()).itemBg; };
           b.onclick = (ev) => {
             ev.stopPropagation();
             menu.style.display = "none";
@@ -443,6 +689,7 @@
           pairs.push({ btn: b, st: { url: m.url }, base });
         });
         enrichSizes(pairs);
+        try { paintDcMenu(menu); } catch (e) { /* theme is best-effort */ }
       });
     } catch (e) { /* ignore */ }
   }
@@ -525,12 +772,26 @@
     const fname = safeFilename(info.title);
     menu.innerHTML = "";
     const head = document.createElement("div");
-    head.style.cssText = "padding:4px 8px 8px;font-weight:600;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;";
-    head.textContent = info.title;
-    head.title = info.title;
+    head.style.cssText = "display:flex;align-items:center;gap:8px;padding:4px 8px 8px;font-weight:600;";
+    if (info.thumb && /^https?:\/\//i.test(info.thumb)) {
+      const im = document.createElement("img");
+      im.src = info.thumb;
+      im.loading = "lazy";
+      im.style.cssText = "width:96px;height:54px;object-fit:cover;border-radius:6px;flex-shrink:0;";
+      im.onerror = () => { im.style.display = "none"; };
+      head.appendChild(im);
+    }
+    const ht = document.createElement("span");
+    ht.setAttribute("data-dc", "head");
+    ht.style.cssText = "white-space:nowrap;overflow:hidden;text-overflow:ellipsis;";
+    ht.textContent = info.title;
+    ht.title = info.title;
+    head.appendChild(ht);
+    { const __t = dcThemeToggle(menu); if (__t) head.appendChild(__t); }
     menu.appendChild(head);
     const mkItem = (label, tip, onClick) => {
       const b = document.createElement("button");
+      b.setAttribute("data-dc", "item");
       b.textContent = label;
       if (tip) b.title = tip;
       b.style.cssText = [
@@ -538,8 +799,8 @@
         "padding:7px 10px", "border-radius:6px", "border:1px solid transparent",
         "background:transparent", "color:#e6e6f0", "cursor:pointer", "font:13px system-ui,sans-serif",
       ].join(";");
-      b.onmouseenter = () => { b.style.background = "#35363e"; };
-      b.onmouseleave = () => { b.style.background = "transparent"; };
+      b.onmouseenter = () => { b.style.background = (menu._dcT || dcTokens()).itemHover; };
+      b.onmouseleave = () => { b.style.background = (menu._dcT || dcTokens()).itemBg; };
       b.onclick = (ev) => {
         ev.stopPropagation();
         menu.style.display = "none";
@@ -557,6 +818,7 @@
       // VEVO-type pages embed zero direct URLs: tell the user the fix is
       // playback (the sniffer then merges live stream rows below).
       const h = document.createElement("div");
+      h.setAttribute("data-dc", "hint");
       h.textContent = "No direct links yet — press play, then reopen this menu for fresh qualities.";
       h.style.cssText = "padding:8px;font-size:12px;opacity:.75;line-height:1.4;";
       menu.appendChild(h);
@@ -571,15 +833,39 @@
     const section = (head, list, nameFn) => {
       if (!list.length) return;
       const h = document.createElement("div");
+      h.setAttribute("data-dc", "sec");
       h.textContent = head;
       h.style.cssText = "padding:8px 8px 2px;font-size:11px;opacity:.6;text-transform:uppercase;letter-spacing:.06em;";
       menu.appendChild(h);
       list.forEach((st) => {
-        const base = `⬇ ${st.label} · ${st.disp || contOf(st.mime)}`;
+        // IDM-style row: "<title>, MP4 file, quality 1080p HD 60 fps".
+        const m = String(st.label || "").match(/^(\d+)p(\d+)?$/);
+        const hh = m ? parseInt(m[1], 10) : 0;
+        const fps = m && m[2] ? parseInt(m[2], 10) : 0;
+        const hd = hh >= 720 ? " HD" : "";
+        const fr = fps >= 50 ? ` ${fps} fps` : "";
+        const qtext = hh > 0 ? `${hh}p${hd}${fr}` : st.label;
+        const cont = (st.disp || contOf(st.mime) || "mp4").toUpperCase();
+        const via = st.ciphered ? " (via app)" : "";
+        const shortT = info.title.length > 42 ? info.title.slice(0, 42) + "…" : info.title;
+        // Page-JSON sizes print immediately (no network round-trip), and
+        // page-JSON durations ride along to the Add dialog.
+        const presize = st._size > 0 ? ` (${fmtSize(st._size)})` : "";
+        const predur = st._dur > 0 ? `, ${fmtDurSec(st._dur)}` : "";
+        const base = `⬇ ${shortT}, ${cont} file, quality ${qtext}${via}${presize}${predur}`;
         const b = mkItem(
           base,
-          st.url.slice(0, 120),
-          () => sendDownload(st.url, nameFn(st), st.mime, st._size || null, pairFor(st)),
+          st.ciphered ? "The app deciphers this quality itself" : (st.url || "").slice(0, 120),
+          // Ciphered rows have no direct URL at build time: the sniffer
+          // swaps in the player's fresh deciphered URL by itag once you
+          // press play (see appendSniffed) — prefer it when present, else
+          // send the page + quality hint for server-side resolve.
+          // st._size rides along so the Add dialog shows it upfront.
+          st.ciphered
+            ? () => (st.url
+              ? sendDownload(st.url, nameFn(st), st.mime, st._size || null, pairFor(st), null, st._dur || null)
+              : sendDownload(location.href, nameFn(st), st.mime, st._size || null, pairFor(st), st.label, st._dur || null))
+            : () => sendDownload(st.url, nameFn(st), st.mime, st._size || null, pairFor(st), null, st._dur || null),
         );
         sizePairs.push({ btn: b, st, base });
       });
@@ -593,6 +879,59 @@
     section("Video + audio", info.streams, () => fname);
     section("Video only (no audio)", info.videoOnly || [], (st) => tagged(fname, st));
     section("Audio only", info.audio || [], (st) => tagged(fname, st));
+    // Full ladder fallback: when the page exposes almost nothing directly
+    // (ciphered embeds, music videos), still offer every standard quality
+    // like IDM does — the engine resolves each to the closest stream at or
+    // below it, so a click always downloads something sensible. Sizes come
+    // from the page JSON map (contentLength per quality), no network needed.
+    {
+      const haveQ = new Set([
+        ...(info.streams || []).map((s) => s.label),
+        ...((info.videoOnly || []).map((s) => s.label)),
+      ]);
+      const sizeByQ = {};
+      const durByQ = {};
+      for (const s of [...(info.streams || []), ...(info.videoOnly || [])]) {
+        if (s && s.label && s._size > 0 && !sizeByQ[s.label]) sizeByQ[s.label] = s._size;
+        if (s && s.label && s._dur > 0 && !durByQ[s.label]) durByQ[s.label] = s._dur;
+      }
+      // Plus every page-JSON size (formats with no URL at all still count).
+      for (const [q, m] of Object.entries(info.sizes || {})) {
+        if (!sizeByQ[q] && m && m.size > 0) sizeByQ[q] = m.size;
+        if (!durByQ[q] && m && m.dur > 0) durByQ[q] = m.dur;
+      }
+      // Ladder asks plain "1080p" while the map may hold "1080p60".
+      const sizeForQ = (q) => {
+        if (sizeByQ[q]) return sizeByQ[q];
+        const k = Object.keys(sizeByQ).find((k) => k.startsWith(q));
+        return k ? sizeByQ[k] : 0;
+      };
+      const durForQ = (q) => {
+        if (durByQ[q]) return durByQ[q];
+        const k = Object.keys(durByQ).find((k) => k.startsWith(q));
+        return k ? durByQ[k] : 0;
+      };
+      const ladder = ["1080p", "720p", "480p", "360p", "240p", "144p"].filter((q) => !haveQ.has(q) && ![...haveQ].some((h) => String(h).startsWith(q)));
+      if (ladder.length && (info.streams || []).length + (info.videoOnly || []).length < 6) {
+        const h = document.createElement("div");
+        h.setAttribute("data-dc", "sec");
+        h.textContent = "More qualities (via app)";
+        h.style.cssText = "padding:8px 8px 2px;font-size:11px;opacity:.6;text-transform:uppercase;letter-spacing:.06em;";
+        menu.appendChild(h);
+        const shortT = info.title.length > 42 ? info.title.slice(0, 42) + "…" : info.title;
+        ladder.forEach((q) => {
+          const hh = parseInt(q, 10);
+          const sz = sizeForQ(q);
+          const dz = durForQ(q);
+          const base = `⬇ ${shortT}, MP4 file, quality ${q}${hh >= 720 ? " HD" : ""} (via app)${sz > 0 ? ` (${fmtSize(sz)})` : ""}${dz > 0 ? `, ${fmtDurSec(dz)}` : ""}`;
+          mkItem(base, "The app resolves this quality itself", () => {
+            sendDownload(location.href, fname, "video/mp4", sz || null, pairFor({ kind: "av" }), q, dz || null);
+          });
+          // Deliberately NOT in sizePairs: sizing a watch page would print
+          // the HTML byte count as a bogus "(2.1 MB)" on the row.
+        });
+      }
+    }
     enrichSizes(sizePairs);
     markQueuedRows(sizePairs);
     appendSniffed(menu, new Set([
@@ -602,7 +941,9 @@
     ]), sizePairs);
     btn.onclick = (ev) => {
       ev.stopPropagation();
-      menu.style.display = menu.style.display === "none" ? "block" : "none";
+      const show = menu.style.display === "none";
+      if (show) paintDcMenu(menu);
+      menu.style.display = show ? "block" : "none";
     };
     btn.onmouseenter = () => { btn.style.background = "rgba(40,41,55,.85)"; };
     btn.onmouseleave = () => { btn.style.background = "rgba(12,12,16,.68)"; };
@@ -615,6 +956,7 @@
       });
     }
     placeInPlayer(btn, menu);
+    paintDcMenu(menu);
   }
 
   function refreshYouTube() {
@@ -636,12 +978,13 @@
     // its player-API fallback — so the button always appears.
     // ytStreams() matches the CURRENT video id, so SPA autoplay can
     // never show the previous video's title/streams.
-    const info = ytStreams() || { videoId: id, title: document.title.replace(/ - YouTube$/, ""), streams: [], videoOnly: [], audio: [] };
+    const info = ytStreams() || { videoId: id, title: document.title.replace(/ - YouTube$/, ""), thumb: `https://i.ytimg.com/vi/${id}/hqdefault.jpg`, streams: [], videoOnly: [], audio: [] };
     try {
       chrome.storage.local.set({
         downloadCraftVideos: [{
-          videoId: info.videoId, title: info.title,
+          videoId: info.videoId, title: info.title, thumb: info.thumb || "",
           streams: info.streams, videoOnly: info.videoOnly || [], audio: info.audio || [],
+          sizes: info.sizes || {},
           pageUrl: location.href,
         }],
         downloadCraftPage: location.href,
@@ -705,28 +1048,45 @@
         ].join(";");
         pill.onclick = (ev) => {
           ev.stopPropagation(); ev.preventDefault();
+          // Facebook reels: open the IDM-style quality menu (title + HD/SD
+          // rows with sizes) instead of firing one mystery download — the
+          // player only holds a blob: URL and every reel needs no reload.
+          if (isFacebookPage()) {
+            handleFbPill(pill);
+            return;
+          }
           const direct = mediaUrlOf(v);
           if (direct) {
             const base = (document.title || "video").replace(/[<>:"/\\|?*\u0000-\u001f]/g, "_").slice(0, 80);
             const ext = /\.mp3|\.m4a|\.wav|\.ogg/i.test(direct) ? "" : ".mp4";
-            sendDownload(direct, base + ext, v.getAttribute && v.getAttribute("type"));
+            let vdur = null;
+            try {
+              const d = Math.round(v.duration);
+              if (Number.isFinite(d) && d > 0 && d < 86400) vdur = d;
+            } catch (e) { /* duration unknown */ }
+            sendDownload(direct, base + ext, v.getAttribute && v.getAttribute("type"), null, null, null, vdur);
           } else {
             // Ask background for sniffed media URLs for this tab first.
+            // (Facebook reels render as blob: players — the real fbcdn/mp4
+            // URL only exists in the sniffed network traffic.)
             try {
               chrome.runtime.sendMessage({ type: "getMedia", pageUrl: location.href }, (res) => {
                 if (chrome.runtime.lastError) {
+                  if (ctxInvalidated(chrome.runtime.lastError)) markDead();
                   sendDownload(location.href, undefined, null);
                   return;
                 }
                 const items = (res && res.items) || [];
-                if (items.length) {
-                  const best = items[items.length - 1];
-                  sendDownload(best.url, undefined, best.mime);
+                const best = bestSniffed(items);
+                if (best) {
+                  const base = (document.title || "video").replace(/[<>:"/\\|?*\u0000-\u001f]/g, "_").slice(0, 80);
+                  sendDownload(best.url, base + ".mp4", best.mime, best.size || null);
                 } else {
                   sendDownload(location.href, undefined, null);
                 }
               });
             } catch (e) {
+              if (ctxInvalidated(e)) markDead();
               sendDownload(location.href, undefined, null);
             }
           }
@@ -747,8 +1107,139 @@
     } catch (e) { /* ignore */ }
   }
 
-  // Merge background-sniffed network media into popup storage so qualities
-  // show even for blob: players.
+  function isFacebookPage() {
+    try {
+      const h = location.hostname.toLowerCase();
+      return h === "facebook.com" || h.endsWith(".facebook.com");
+    } catch (e) { return false; }
+  }
+
+  // Facebook quality menu (IDM-style): title header + HD/SD rows with
+  // duration and measured sizes, so every reel offers a choice instead of
+  // one mystery "Facebook.mp4".
+  function openFbMenu(pill, rows, title, thumb) {
+    try { document.querySelectorAll("#dc-fb-menu").forEach((m) => m.remove()); } catch (e) {}
+    const menu = document.createElement("div");
+    menu.id = "dc-fb-menu";
+    menu.style.cssText = [
+      "position:absolute", "top:40px", "right:8px", "z-index:2147483647",
+      "min-width:250px", "max-width:340px",
+      "background:rgba(16,17,23,.94)", "backdrop-filter:blur(12px)",
+      "border:1px solid rgba(255,255,255,.1)", "border-radius:12px",
+      "padding:6px", "box-shadow:0 8px 28px rgba(0,0,0,.5)",
+      "font:13px system-ui,sans-serif", "color:#e6e6f0",
+    ].join(";");
+    const head = document.createElement("div");
+    head.style.cssText = "display:flex;align-items:center;gap:8px;padding:4px 8px 8px;font-weight:600;";
+    const headThumb = thumb || ((rows && rows[0] && rows[0].thumb) || "");
+    if (headThumb && /^https?:\/\//i.test(headThumb)) {
+      const im = document.createElement("img");
+      im.src = headThumb;
+      im.loading = "lazy";
+      im.style.cssText = "width:96px;height:54px;object-fit:cover;border-radius:6px;flex-shrink:0;";
+      im.onerror = () => { im.style.display = "none"; };
+      head.appendChild(im);
+    }
+    const ht = document.createElement("span");
+    ht.setAttribute("data-dc", "head");
+    ht.style.cssText = "white-space:nowrap;overflow:hidden;text-overflow:ellipsis;";
+    ht.textContent = title;
+    ht.title = title;
+    head.appendChild(ht);
+    { const __t = dcThemeToggle(menu); if (__t) head.appendChild(__t); }
+    menu.appendChild(head);
+    const sizePairs = [];
+    rows.forEach((st) => {
+      const b = document.createElement("button");
+      b.setAttribute("data-dc", "item");
+      b.textContent = st.label;
+      b.title = (st.url || "").slice(0, 120);
+      b.style.cssText = [
+        "display:block", "width:100%", "text-align:left", "margin:2px 0",
+        "padding:7px 10px", "border-radius:6px", "border:1px solid transparent",
+        "background:transparent", "color:#e6e6f0", "cursor:pointer", "font:13px system-ui,sans-serif",
+      ].join(";");
+      b.onmouseenter = () => { b.style.background = (menu._dcT || dcTokens()).itemHover; };
+      b.onmouseleave = () => { b.style.background = (menu._dcT || dcTokens()).itemBg; };
+      b.onclick = (ev) => {
+        ev.stopPropagation();
+        menu.remove();
+        sendDownload(st.url, st.fname, "video/mp4", st._size || null, null, null, st.dur || null);
+      };
+      menu.appendChild(b);
+      sizePairs.push({ btn: b, st, base: st.label });
+    });
+    enrichSizes(sizePairs);
+    try {
+      (pill.parentElement || document.documentElement).appendChild(menu);
+    } catch (e) { /* ignore */ }
+    paintDcMenu(menu);
+    setTimeout(() => {
+      const closer = (ev) => {
+        if (menu.isConnected && !menu.contains(ev.target)) {
+          menu.remove();
+          document.removeEventListener("click", closer);
+        }
+      };
+      document.addEventListener("click", closer);
+    }, 0);
+  }
+
+  function fbMenuRows(info, items) {
+    // Dedupe page-JSON URLs against sniffed traffic, then rank HD first.
+    const seen = new Set();
+    const rows = [];
+    const fname = fbFilename(info.title);
+    const dur = info.durSec > 0 ? `, ${info.durSec} sec` : "";
+    const push = (url, quality) => {
+      if (!url || !/^https?:\/\//i.test(url) || seen.has(url)) return;
+      seen.add(url);
+      rows.push({ url, fname, label: `⬇ ${info.title.slice(0, 40)}, MP4 file${dur}, quality ${quality}`, _size: 0, dur: info.durSec || null, thumb: info.thumb || "" });
+    };
+    if (info.hd && info.hd !== info.sd) push(info.hd, fbQuality(info.w, info.h, true));
+    if (info.sd) push(info.sd, fbQuality(info.w, info.h, info.hd === info.sd));
+    // Anything else the player actually fetched (fresh session URLs).
+    // P4: when a playlist is on the tab, loose segments are its children
+    // (ad slivers included) — offer the playlist, never the parts.
+    const R = (typeof DCRank !== "undefined") ? DCRank : null;
+    const hasPlaylist = (items || []).some((m) => m && (
+      (R ? R.kindOf(m) === "playlist" : /m3u8|mpd|mpegurl|dash/i.test(String(m.url || "")))
+    ));
+    const isSeg = (u) => R ? R.kindOf({ url: u }) === "segment" : /(\.ts|\.m4s|\.cmfv|\.cmfa)(\?|#|$)/i.test(String(u).split("?")[0]);
+    const rest = (items || []).filter((m) => m && /^https?:\/\//i.test(m.url) && !seen.has(m.url)
+      && !/m3u8|mpd|mpegurl|dash/i.test(m.url)
+      && !(hasPlaylist && isSeg(m.url)));
+    rest.slice(0, 6).forEach((m) => {
+      seen.add(m.url);
+      rows.push({ url: m.url, fname, label: `⬇ ${info.title.slice(0, 40)}, MP4 file${dur}, quality ${fbQuality(0, 0, false)}`, _size: m.size || 0, thumb: m.thumb || info.thumb || "" });
+    });
+    return rows;
+  }
+
+  function handleFbPill(pill) {
+    const info = fbInfo();
+    try {
+      chrome.runtime.sendMessage({ type: "getMedia", pageUrl: location.href }, (res) => {
+        if (chrome.runtime.lastError) {
+          if (ctxInvalidated(chrome.runtime.lastError)) markDead();
+          sendDownload(location.href, fbFilename(info.title), null, null, null, null, info.durSec || null);
+          return;
+        }
+        const items = (res && res.items) || [];
+        const rows = fbMenuRows(info, items);
+        if (!rows.length) {
+          sendDownload(location.href, fbFilename(info.title), null, null, null, null, info.durSec || null);
+        } else if (rows.length === 1) {
+          sendDownload(rows[0].url, rows[0].fname, "video/mp4", rows[0]._size || null, null, null, rows[0].dur || info.durSec || null);
+        } else {
+          openFbMenu(pill, rows, info.title, info.thumb);
+        }
+      });
+    } catch (e) {
+      if (ctxInvalidated(e)) markDead();
+      sendDownload(location.href, fbFilename(info.title), null, null, null, null, info.durSec || null);
+    }
+  }
   function pullNetworkMedia() {
     try {
       chrome.runtime.sendMessage({ type: "getMedia", pageUrl: location.href }, (res) => {
@@ -759,9 +1250,15 @@
         try {
           chrome.storage.local.get(["downloadCraftLinks"], (cur) => {
             const have = new Set(((cur && cur.downloadCraftLinks) || []).map((l) => l.url));
+            let pageThumb = "";
+            try {
+              const pv = document.querySelector("video[poster]");
+              const pp = pv && pv.getAttribute("poster");
+              if (/^https?:\/\//i.test(pp || "")) pageThumb = pp;
+            } catch (e) { /* ignore */ }
             const add = items
               .filter((m) => !have.has(m.url))
-              .map((m) => ({ url: m.url, text: `Stream (${m.mime || "media"})` }));
+              .map((m) => ({ url: m.url, text: `Stream (${m.mime || "media"})`, thumb: m.thumb || pageThumb }));
             if (add.length) {
               chrome.storage.local.get(["downloadCraftLinks", "downloadCraftPage"], (c2) => {
                 const merged = [...(((c2 && c2.downloadCraftLinks) || [])), ...add].slice(0, 50);
@@ -804,18 +1301,41 @@
           links: cur.downloadCraftLinks || [],
           net,
           page: location.href,
+          title: document.title || "",
         });
       })();
       return true;
     });
   } catch (e) { /* messaging unavailable */ }
 
-  // Initial pass + SPA navigation (YouTube rarely reloads the page).
+  // Initial pass + SPA navigation (YouTube AND Facebook rarely reload).
+  // Facebook reels swap /reel/<id> via history API: no reload, same video
+  // element, new blob: src. Patch pushState/replaceState + popstate so the
+  // pill + sniffed candidates refresh instantly instead of on the 2 s poll.
   // The player response can arrive after the content script runs, so
   // retry a few times before giving up.
   collectLinks();
   ensureUniversalButtons();
   pullNetworkMedia();
+  function spaRefresh() {
+    if (__dcDead || !alive()) return;
+    try { collectLinks(); } catch (e) { if (ctxInvalidated(e)) return markDead(); }
+    try { ensureUniversalButtons(); } catch (e) { if (ctxInvalidated(e)) return markDead(); }
+    try { pullNetworkMedia(); } catch (e) { if (ctxInvalidated(e)) return markDead(); }
+    try { refreshYouTube(); } catch (e) { if (ctxInvalidated(e)) return markDead(); }
+  }
+  try {
+    const fireSpa = () => setTimeout(spaRefresh, 300);
+    if (!window.__dcHistPatched) {
+      window.__dcHistPatched = true;
+      const ps = history.pushState;
+      const rs = history.replaceState;
+      history.pushState = function () { try { ps.apply(this, arguments); } finally { fireSpa(); } };
+      history.replaceState = function () { try { rs.apply(this, arguments); } finally { fireSpa(); } };
+      window.addEventListener("popstate", fireSpa);
+      window.addEventListener("hashchange", fireSpa);
+    }
+  } catch (e) { /* history patch is best-effort */ }
   try {
     // Debounced + generation-gated: a superseded instance disconnects
     // instead of fighting the new one, and mutation storms (infinite
@@ -831,14 +1351,16 @@
       }, 400);
     });
     mo.observe(document.documentElement, { childList: true, subtree: true });
+    __dcObservers.push(mo);
   } catch (e) { /* observer optional */ }
-  setInterval(() => { if (alive()) pullNetworkMedia(); }, 8000);
+  __dcTimers.push(setInterval(() => { if (__dcDead || !alive()) return; try { pullNetworkMedia(); } catch (x) { if (ctxInvalidated(x)) markDead(); } }, 8000));
   if (!refreshYouTube()) {
     let tries = 0;
     const timer = setInterval(() => {
       tries++;
-      if (refreshYouTube() || tries >= 6) clearInterval(timer);
+      if (__dcDead || !alive() || refreshYouTube() || tries >= 6) clearInterval(timer);
     }, 2000);
+    __dcTimers.push(timer);
   }
   document.addEventListener("yt-navigate-finish", () => {
     if (!alive()) return; // superseded by a newer injected instance
@@ -849,13 +1371,21 @@
   let lastUrl = location.href;
   let lastTitle = document.title;
   const watcher = setInterval(() => {
-    if (!alive()) { clearInterval(watcher); return; } // superseded: stop
+    if (__dcDead || !alive()) { clearInterval(watcher); return; } // superseded: stop
     if (location.href !== lastUrl || document.title !== lastTitle) {
       lastUrl = location.href;
       lastTitle = document.title;
+      // Drop pills bound to the previous reel's <video> node so the new
+      // reel gets a fresh pill even when Facebook reuses the DOM node.
+      try {
+        document.querySelectorAll("video").forEach((v) => {
+          if (v.__dcBtn && !v.__dcBtn.isConnected) v.__dcBtn = null;
+        });
+      } catch (e) {}
       collectLinks();
       ensureUniversalButtons();
       refreshYouTube();
     }
-  }, 2000);
+  }, 1000);
+  __dcTimers.push(watcher);
 })();
