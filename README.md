@@ -1,6 +1,6 @@
 # Download Craft
 
-![Download Craft GUI](Screenshot.png)
+![Download Craft main window](Screenshot.png)
 
 A lightweight, offline-first download manager for Windows, written in pure
 Rust with an `egui` GUI. Multi-connection segmented HTTP(S) downloads,
@@ -9,6 +9,27 @@ shares the same queue.
 
 MIT licensed — free for open-source, closed-source, and commercial use.
 See `LICENSE`. Interface design inspired by modern download managers.
+
+## Screenshots
+
+Capture a link and start it — the app probes the URL for its name and size
+before the transfer begins:
+
+<p align="center">
+  <img src="docs/screenshot-download-file-info.png" alt="Download File Info: address, folder, size, filename" width="52%">
+</p>
+
+Watch it transfer — live speed, remaining time, and every parallel segment:
+
+<p align="center">
+  <img src="docs/screenshot-progress-window.png" alt="Progress window during a segmented transfer" width="42%">
+</p>
+
+And when it lands, open it, open its folder, or just close the dialog:
+
+<p align="center">
+  <img src="docs/screenshot-download-complete.png" alt="Download complete dialog with Open, Open with, Open folder" width="48%">
+</p>
 
 ## Features
 
@@ -20,9 +41,14 @@ See `LICENSE`. Interface design inspired by modern download managers.
   on-demand "Verify checksum" for finished files.
 - Queue with concurrency limit, scheduler, retry-all-failed, finish actions
   (nothing / shutdown / sleep / hibernate), import/export URL lists.
+- YouTube and other yt-dlp-supported sites: the app fetches and keeps its
+  own yt-dlp up to date, which is what makes 1080p+ and merged audio+video
+  work. Settings → YouTube shows the copy in use, its version, and the
+  JavaScript runtime; "Re-download" refreshes it.
 - Clipboard URL detection, desktop notifications, system tray, antivirus hook.
 - Status sidebar with live counts, search, sortable/resizable
-  columns, per-segment progress view, dark/black/light themes.
+  columns, per-segment progress view, and System / Dark / Light themes.
+- File names render in any script (Bangla, Arabic, CJK, …) instead of boxes.
 - CLI (`add/list/download/get/remove/redownload/clear/import/export/status`)
   and browser native-messaging host (Chrome/Edge/Firefox) sharing
   `%APPDATA%\download_craft\queue.json`.
