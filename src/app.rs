@@ -157,21 +157,14 @@ pub(crate) const MI_PUBLIC: &str = "\u{e80b}";
 pub(crate) const MI_UPDATE: &str = "\u{e923}";
 pub(crate) const MI_SPEED: &str = "\u{e9e4}";
 
-/// Material Icons (Apache-2.0, Google) as fallback font for UI glyphs.
+/// Material Icons (Apache-2.0, Google) as fallback font for UI glyphs, plus
+/// the named Segoe UI families the Add-download dialog asks for.
 /// Every window (main, confirm, progress, basket, mini) must call this —
 /// otherwise icon glyphs render as tofu boxes.
 pub fn setup_fonts(cc: &eframe::CreationContext<'_>) {
-    let mut fonts = egui::FontDefinitions::default();
-    fonts.font_data.insert(
-        "material".to_owned(),
-        std::sync::Arc::new(egui::FontData::from_static(include_bytes!(
-            "../assets/fonts/MaterialIcons-Regular.ttf"
-        ))),
-    );
-    if let Some(fam) = fonts.families.get_mut(&egui::FontFamily::Proportional) {
-        fam.push("material".to_owned());
-    }
-    cc.egui_ctx.set_fonts(fonts);
+    // `false`: the manager window keeps its own typography and only the named
+    // families ("segoe"/"popup-semibold") are added for the dialog.
+    crate::fonts::install(cc, false);
 }
 
 fn file_icon(cat: &str) -> &'static str {
@@ -213,6 +206,367 @@ fn modal_frame() -> egui::Frame {
 /// always fit, even on narrow windows.
 fn modal_width(ctx: &egui::Context, max_w: f32) -> f32 {
     (ctx.screen_rect().width() * 0.90).clamp(320.0, max_w)
+}
+
+// ================= Add-download dialog — concept tokens =================
+//
+// `popup_concepts.html` is the source of truth. Its card renders 562x253
+// border-box in Chrome, so every offset below is that layout in egui space:
+// origin = card top-left, card border included, top-to-bottom order
+// header (39) | URL | folder + size | filename | actions.
+const DM_W: f32 = 562.0;
+/// Card height with the advanced panel closed — the concept's exact size.
+const DM_H: f32 = 253.0;
+/// Advanced ("settings") panel height. The concept draws it collapsed, so this
+/// part is app design rendered in the concept's own tokens.
+const DM_PANEL_H: f32 = 224.0;
+
+const DM_CARD: egui::Color32 = egui::Color32::from_rgb(0x0f, 0x0f, 0x22);
+/// Card border *and* field fill (#1e293b in the concept).
+const DM_LINE: egui::Color32 = egui::Color32::from_rgb(0x1e, 0x29, 0x3b);
+const DM_BOX_BD: egui::Color32 = egui::Color32::from_rgb(0x33, 0x41, 0x55);
+const DM_TXT: egui::Color32 = egui::Color32::from_rgb(0xe2, 0xe8, 0xf0);
+const DM_DIM: egui::Color32 = egui::Color32::from_rgb(0x94, 0xa3, 0xb8);
+const DM_ACC: egui::Color32 = egui::Color32::from_rgb(0x3b, 0x82, 0xf6);
+const DM_ACC2: egui::Color32 = egui::Color32::from_rgb(0x8b, 0x5c, 0xf6);
+const DM_OK: egui::Color32 = egui::Color32::from_rgb(0x22, 0xc5, 0x5e);
+const DM_HOVER: egui::Color32 = egui::Color32::from_rgb(0x1c, 0x24, 0x36);
+const DM_HOVER2: egui::Color32 = egui::Color32::from_rgb(0x27, 0x33, 0x4a);
+const DM_RAD: f32 = 6.0;
+/// Field box height including its 1px stroke (the concept's 36px + 2px).
+const DM_BOX_H: f32 = 38.0;
+
+// Content gutters inside the card's 1px border (concept padding 16 / 14 / 10).
+const DM_X: f32 = 17.0;
+const DM_W_IN: f32 = 528.0;
+const DM_ROW1: f32 = 54.0;
+const DM_ROW2: f32 = 102.0;
+const DM_ROW3: f32 = 150.0;
+const DM_ACT: f32 = 202.0;
+const DM_PATH_W: f32 = 364.0;
+const DM_SIZE_W: f32 = 156.0;
+const DM_FILE_W: f32 = 436.0;
+
+/// Design box: #1e293b fill, 1px #334155 border, 6px radius.
+fn dm_box(p: &egui::Painter, r: egui::Rect) {
+    p.rect(
+        r,
+        DM_RAD,
+        DM_LINE,
+        egui::Stroke::new(1.0, DM_BOX_BD),
+        egui::StrokeKind::Inside,
+    );
+}
+
+/// One concept row: painted box plus a frameless editor inside it (the concept
+/// draws its values dim, but a real input reads better in the design's own
+/// content colour; unknown text stays `DM_DIM` as the hint). `text_r` bounds
+/// the editor so in-box icon buttons keep their room. Returns the box rect.
+fn dm_field(
+    ui: &mut egui::Ui,
+    key: &str,
+    rect: egui::Rect,
+    text_r: f32,
+    buf: &mut String,
+    hint: &str,
+    password: bool,
+) -> egui::Rect {
+    dm_box(ui.painter(), rect);
+    let inner = egui::Rect::from_min_max(
+        egui::pos2(rect.min.x + 13.0, rect.min.y + 1.0),
+        egui::pos2(text_r.max(rect.min.x + 40.0), rect.max.y - 1.0),
+    );
+    let line = egui::Rect::from_center_size(inner.center(), egui::vec2(inner.width(), 18.0));
+    let te = egui::TextEdit::singleline(buf)
+        .id(egui::Id::new(key))
+        .hint_text(hint)
+        .password(password)
+        .frame(false)
+        .margin(egui::Margin::ZERO)
+        .font(crate::fonts::reg(11.0))
+        .desired_width(line.width());
+    ui.scope(|ui| {
+        let v = ui.visuals_mut();
+        v.override_text_color = Some(DM_TXT);
+        v.weak_text_color = Some(DM_DIM);
+        v.selection.bg_fill = egui::Color32::from_rgba_premultiplied(59, 130, 246, 90);
+        ui.put(line, te);
+    });
+    rect
+}
+
+/// Concept mark: outlined accent circle with a blue download arrow (18px).
+fn dm_mark(p: &egui::Painter, r: egui::Rect) {
+    let s = r.width() / 24.0;
+    let m = |x: f32, y: f32| egui::pos2(r.min.x + x * s, r.min.y + y * s);
+    let st = egui::Stroke::new(2.0 * s, DM_ACC);
+    p.circle_stroke(m(12.0, 12.0), 9.0 * s, st);
+    p.line_segment([m(12.0, 8.0), m(12.0, 15.0)], st);
+    p.line_segment([m(8.5, 11.5), m(12.0, 15.0)], st);
+    p.line_segment([m(12.0, 15.0), m(15.5, 11.5)], st);
+}
+
+/// The concept's own stroke icons, traced from its inline SVG (24x24 viewBox).
+#[derive(Clone, Copy)]
+enum DmIcon {
+    Minimize,
+    Maximize,
+    Close,
+    Clipboard,
+    Folder,
+    Chevron,
+    Grid,
+    Check,
+    Refresh,
+    Settings,
+}
+
+/// Polyline arc, degrees, screen space (0 = right, 90 = down).
+fn dm_arc(p: &egui::Painter, c: egui::Pos2, r: f32, a0: f32, a1: f32, st: egui::Stroke) {
+    let n = 14;
+    let pts: Vec<egui::Pos2> = (0..=n)
+        .map(|i| {
+            let a = (a0 + (a1 - a0) * i as f32 / n as f32).to_radians();
+            egui::pos2(c.x + r * a.cos(), c.y + r * a.sin())
+        })
+        .collect();
+    p.add(egui::Shape::line(pts, st));
+}
+
+/// Paint `icon` inside `r`; `w` is the concept's stroke width in viewBox units.
+fn dm_icon(p: &egui::Painter, r: egui::Rect, icon: DmIcon, color: egui::Color32, w: f32) {
+    let s = r.width().min(r.height()) / 24.0;
+    let m = |x: f32, y: f32| egui::pos2(r.min.x + x * s, r.min.y + y * s);
+    let st = egui::Stroke::new((w * s).max(1.0), color);
+    let line = |a: (f32, f32), b: (f32, f32)| {
+        p.line_segment([m(a.0, a.1), m(b.0, b.1)], st);
+    };
+    match icon {
+        DmIcon::Minimize => line((5.0, 12.0), (19.0, 12.0)),
+        DmIcon::Maximize => {
+            p.rect_stroke(
+                egui::Rect::from_min_size(m(5.0, 5.0), egui::vec2(14.0 * s, 14.0 * s)),
+                egui::CornerRadius::same(1),
+                st,
+                egui::StrokeKind::Inside,
+            );
+        }
+        DmIcon::Close => {
+            line((6.0, 6.0), (18.0, 18.0));
+            line((18.0, 6.0), (6.0, 18.0));
+        }
+        DmIcon::Clipboard => {
+            p.rect_stroke(
+                egui::Rect::from_min_size(m(8.0, 8.0), egui::vec2(12.0 * s, 12.0 * s)),
+                egui::CornerRadius::same(2),
+                st,
+                egui::StrokeKind::Inside,
+            );
+            line((4.0, 16.0), (4.0, 4.0));
+            line((4.0, 4.0), (16.0, 4.0));
+        }
+        DmIcon::Folder => {
+            p.add(egui::Shape::line(
+                vec![
+                    m(3.0, 7.0),
+                    m(6.0, 3.0),
+                    m(18.0, 3.0),
+                    m(21.0, 7.0),
+                    m(21.0, 20.0),
+                    m(3.0, 20.0),
+                    m(3.0, 7.0),
+                ],
+                st,
+            ));
+            line((3.0, 7.0), (21.0, 7.0));
+        }
+        DmIcon::Chevron => {
+            line((6.0, 9.0), (12.0, 15.0));
+            line((12.0, 15.0), (18.0, 9.0));
+        }
+        DmIcon::Grid => {
+            // The concept draws these at 30% opacity.
+            let g = egui::Color32::from_rgba_unmultiplied(color.r(), color.g(), color.b(), 77);
+            for (x, y) in [(3.0, 3.0), (14.0, 3.0), (3.0, 14.0), (14.0, 14.0)] {
+                p.rect_filled(
+                    egui::Rect::from_min_size(m(x, y), egui::vec2(7.0 * s, 7.0 * s)),
+                    1.0,
+                    g,
+                );
+            }
+        }
+        DmIcon::Check => {
+            line((5.0, 13.0), (9.0, 17.0));
+            line((9.0, 17.0), (19.0, 7.0));
+        }
+        DmIcon::Refresh => {
+            // Two arcs of one circle plus the concept's corner brackets.
+            dm_arc(p, r.center(), 8.0 * s, -12.0, -152.0, st);
+            dm_arc(p, r.center(), 8.0 * s, 168.0, 28.0, st);
+            line((4.0, 4.0), (4.0, 10.0));
+            line((4.0, 10.0), (10.0, 10.0));
+            line((20.0, 20.0), (20.0, 14.0));
+            line((20.0, 14.0), (14.0, 14.0));
+        }
+        DmIcon::Settings => {
+            p.circle_stroke(m(12.0, 12.0), 3.5 * s, st);
+            for (x, y) in [
+                (12.0, 2.0),
+                (12.0, 22.0),
+                (2.0, 12.0),
+                (20.0, 12.0),
+                (4.9, 4.9),
+                (17.7, 17.7),
+                (4.9, 19.1),
+                (17.7, 6.3),
+            ] {
+                line((x, y), (x + (12.0 - x) * 0.28, y + (12.0 - y) * 0.28));
+            }
+        }
+    }
+}
+
+/// Concept icon button: hover wash plus glyph. Input stays on the manual hit
+/// table, so this only paints.
+fn dm_icon_btn(
+    p: &egui::Painter,
+    man: &ManState,
+    rect: egui::Rect,
+    icon: DmIcon,
+    size: f32,
+    w: f32,
+    color: egui::Color32,
+) {
+    if man.hover(&rect) {
+        p.rect_filled(rect, DM_RAD, DM_HOVER2);
+    }
+    dm_icon(
+        p,
+        egui::Rect::from_center_size(rect.center(), egui::Vec2::splat(size)),
+        icon,
+        color,
+        w,
+    );
+}
+
+/// Outline button (concept "Add" / "Cancel").
+fn dm_btn_flat(p: &egui::Painter, man: &ManState, r: egui::Rect, label: &str) {
+    let hov = man.hover(&r);
+    if hov {
+        p.rect_filled(r, DM_RAD, DM_HOVER);
+    }
+    p.rect_stroke(
+        r,
+        DM_RAD,
+        egui::Stroke::new(1.0, DM_BOX_BD),
+        egui::StrokeKind::Inside,
+    );
+    p.text(
+        r.center(),
+        egui::Align2::CENTER_CENTER,
+        label.to_string(),
+        crate::fonts::reg(12.0),
+        if hov { DM_TXT } else { DM_DIM },
+    );
+}
+
+/// Fill a rounded rect with the concept's 135 degree accent gradient. egui has
+/// no gradient paint, so build a fan mesh over the rounded outline: every
+/// vertex is tinted by (x + y), and linear interpolation across the triangles
+/// reproduces the diagonal exactly.
+fn dm_gradient(
+    p: &egui::Painter,
+    r: egui::Rect,
+    rad: f32,
+    a: egui::Color32,
+    b: egui::Color32,
+) {
+    let mix = |t: f32| {
+        egui::Color32::from_rgb(
+            (a.r() as f32 + (b.r() as f32 - a.r() as f32) * t).round() as u8,
+            (a.g() as f32 + (b.g() as f32 - a.g() as f32) * t).round() as u8,
+            (a.b() as f32 + (b.b() as f32 - a.b() as f32) * t).round() as u8,
+        )
+    };
+    let span = (r.width() + r.height()).max(1.0);
+    let tint = |q: egui::Pos2| {
+        mix((((q.x - r.min.x) + (q.y - r.min.y)) / span).clamp(0.0, 1.0))
+    };
+    let mut pts: Vec<egui::Pos2> = Vec::new();
+    for (cx, cy, a0, a1) in [
+        (r.right() - rad, r.top() + rad, -90.0f32, 0.0f32),
+        (r.right() - rad, r.bottom() - rad, 0.0, 90.0),
+        (r.left() + rad, r.bottom() - rad, 90.0, 180.0),
+        (r.left() + rad, r.top() + rad, 180.0, 270.0),
+    ] {
+        for i in 0..=6 {
+            let ang = (a0 + (a1 - a0) * i as f32 / 6.0).to_radians();
+            pts.push(egui::pos2(cx + rad * ang.cos(), cy + rad * ang.sin()));
+        }
+    }
+    let mut mesh = egui::Mesh::default();
+    let c = r.center();
+    let ci = mesh.vertices.len() as u32;
+    mesh.vertices.push(egui::epaint::Vertex {
+        pos: c,
+        uv: egui::epaint::WHITE_UV,
+        color: tint(c),
+    });
+    for q in &pts {
+        mesh.vertices.push(egui::epaint::Vertex {
+            pos: *q,
+            uv: egui::epaint::WHITE_UV,
+            color: tint(*q),
+        });
+    }
+    let first = ci + 1;
+    for i in 0..pts.len() as u32 {
+        mesh.add_triangle(ci, first + i, first + (i + 1) % pts.len() as u32);
+    }
+    p.add(egui::Shape::mesh(mesh));
+}
+
+/// Manual slider painted in the concept's tokens. Geometry comes from
+/// `slider_track`, so the manual drag handling stays exact.
+fn dm_slider(p: &egui::Painter, man: &ManState, rect: egui::Rect, frac: f32) {
+    let (tx0, tw) = slider_track(&rect);
+    let ty = rect.center().y;
+    let track = egui::Rect::from_min_size(egui::pos2(tx0, ty - 2.0), egui::vec2(tw, 4.0));
+    p.rect_filled(track, 2.0, DM_BOX_BD);
+    p.rect_filled(
+        egui::Rect::from_min_size(track.min, egui::vec2(tw * frac, 4.0)),
+        2.0,
+        DM_ACC,
+    );
+    let kx = tx0 + tw * frac;
+    if man.hover(&rect) {
+        p.circle_filled(
+            egui::pos2(kx, ty),
+            9.0,
+            egui::Color32::from_rgba_unmultiplied(59, 130, 246, 50),
+        );
+    }
+    p.circle_filled(egui::pos2(kx, ty), 6.0, DM_ACC);
+}
+
+/// Recent-folders menu geometry, derived from the caret button so the render
+/// and the outside-click test can never disagree. (The caret sits 308px right
+/// of the path box's left edge: 364 - 28 - 28.)
+fn dm_menu_rect(caret: egui::Rect, rows: usize) -> egui::Rect {
+    egui::Rect::from_min_size(
+        egui::pos2(caret.min.x - 308.0, caret.max.y + 6.0),
+        egui::vec2(320.0, rows as f32 * 24.0 + 12.0),
+    )
+}
+
+/// Left-elided path for the recent-folders menu.
+fn elide_left(s: &str, max: usize) -> String {
+    let n = s.chars().count();
+    if n <= max {
+        s.to_string()
+    } else {
+        format!("…{}", s.chars().skip(n - max + 1).collect::<String>())
+    }
 }
 
 /// Static field keys for the capped dynamic rows (rules ≤8, windows ≤6).
@@ -1119,6 +1473,10 @@ pub struct CraftApp {
     det_parts_open: bool,
     // Autofocus request for the Add dialog URL field.
     add_focus_req: bool,
+    // Recent-folders menu (the path field's caret): open flag + caret rect, so
+    // the outside-click test and the render agree.
+    add_recent_open: bool,
+    add_caret: Option<egui::Rect>,
 }
 
 impl CraftApp {
@@ -1240,6 +1598,8 @@ impl CraftApp {
             det_for: None,
             det_parts_open: true,
             add_focus_req: false,
+            add_recent_open: false,
+            add_caret: None,
         };
         app.load_queue();
         app.load_ui_state();
@@ -2104,8 +2464,38 @@ impl CraftApp {
     /// Queue one URL programmatically (used by inbox + import).
     /// Returns true when the URL was newly queued or an existing same-file
     /// entry was refreshed (P4 grab-all counts on this).
-    fn queue_url(&mut self, url: String, filename: Option<String>, autostart: bool, size: Option<u64>) -> bool {        if !is_download_url(&url) || self.downloads.iter().any(|d| d.url == url) {
+    fn queue_url(&mut self, url: String, filename: Option<String>, autostart: bool, size: Option<u64>) -> bool {
+        if !is_download_url(&url) {
             return false;
+        }
+        // Same URL already tracked. A live row is left alone; a dead row
+        // (failed, or finished with its file gone) is refreshed so a
+        // re-capture is never silently dropped.
+        if let Some(pos) = self.downloads.iter().position(|d| d.url == url) {
+            let dead = match &self.downloads[pos].status {
+                Status::Failed(_) => true,
+                Status::Completed => !self.downloads[pos].dest_path().exists(),
+                _ => false,
+            };
+            if !dead {
+                return false;
+            }
+            let id = self.downloads[pos].id;
+            let fname = self.downloads[pos].filename.clone();
+            if let Some(s) = size.filter(|s| *s > 0) {
+                self.downloads[pos].total_bytes = Some(s);
+            }
+            self.downloads[pos].downloaded_bytes = 0;
+            self.downloads[pos].speed_bps = 0.0;
+            self.downloads[pos].status = Status::Queued;
+            let dp = self.downloads[pos].dest_path();
+            crate::model::drop_resume_state(&dp);
+            self.push_log(format!("Re-queued: {fname}"));
+            if autostart {
+                self.start(id);
+            }
+            self.save_queue();
+            return true;
         }
         let fname = filename
             .filter(|f| !f.trim().is_empty())
@@ -2623,8 +3013,20 @@ impl CraftApp {
                         d.total_bytes = Some(total);
                     }
                     d.speed_bps = 0.0;
+                    // Bytes the engine *fetched* are not proof the file landed:
+                    // a re-fetched/overlapping segment can push the counter to
+                    // the total while the assembled file is still short, and a
+                    // failed/renamed write leaves nothing behind. "Finished"
+                    // must mean the bytes are actually on disk.
+                    // Merged (video+audio) deliveries are exempt: muxing
+                    // rewrites the container, so sizes are not comparable.
+                    let landed = std::fs::metadata(d.dest_path())
+                        .map(|m| m.len())
+                        .unwrap_or(0);
+                    let adaptive = d.pair_url.starts_with("http");
                     let complete = match d.total_bytes {
-                        Some(t) => t > 0 && dl >= t,
+                        Some(t) if adaptive => t > 0 && dl >= t,
+                        Some(t) => t > 0 && dl >= t && landed >= t,
                         // unknown size: only a clean end WITH bytes counts
                         None => !cancelled && dl > 0,
                     };
@@ -2658,6 +3060,11 @@ impl CraftApp {
                                 // connection (e.g. throttled FB CDN) tells the
                                 // user exactly where resume continues from.
                                 match d.total_bytes {
+                                    Some(t) if t > 0 && dl >= t => format!(
+                                        "transfer reported {} but only {} is on disk — resume to retry",
+                                        crate::model::format_bytes(dl),
+                                        crate::model::format_bytes(landed)
+                                    ),
                                     Some(t) if t > 0 => format!(
                                         "connection ended early (got {} of {}) — resume to retry",
                                         crate::model::format_bytes(dl),
@@ -4031,6 +4438,16 @@ impl eframe::App for CraftApp {
                 self.add_focus_req = false;
                 focus_field(ctx, "add_url");
             }
+            // Esc backs out of the menu first, then the dialog (a modal this
+            // tall can otherwise be hard to dismiss).
+            if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+                if self.add_recent_open {
+                    self.add_recent_open = false;
+                } else {
+                    self.show_add = false;
+                    self.add_focus_req = false;
+                }
+            }
             // auto-probe once per URL
             if !self.add_url.trim().is_empty()
                 && self.add_url.trim() != self.probe_done_for
@@ -4065,118 +4482,313 @@ impl eframe::App for CraftApp {
             let mut open = self.show_add;
             // In-canvas centered modal (a separate OS window proved unstable
             // here, so the dialog lives in the main canvas like before).
-            let add_w = modal_width(ctx, 540.0);
+            // The concept is a fixed-size dialog; only the advanced panel makes
+            // it taller (the concept draws that collapsed).
+            let adv_h = if self.add_adv { DM_PANEL_H + 14.0 } else { 0.0 };
+            let card_h = (DM_H + adv_h).min((ctx.screen_rect().height() * 0.94).max(300.0));
             egui::Window::new("Add download")
                 .id(egui::Id::new("add_download_modal"))
                 .order(egui::Order::Foreground)
                 .open(&mut open)
+                .title_bar(false)
                 .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
                 .pivot(egui::Align2::CENTER_CENTER)
                 .collapsible(false)
                 .resizable(false)
-                .default_width(add_w)
-                .min_width(add_w.min(320.0))
-                .max_width(add_w)
-                .max_height((ctx.screen_rect().height() * 0.86).clamp(300.0, 900.0))
-                .frame(modal_frame())
+                .fixed_size(egui::vec2(DM_W, card_h))
+                .frame(egui::Frame::new())
                 .show(ctx, |ui| {
-                    ui.spacing_mut().item_spacing.y = 10.0;
-                    // Row 1: URL + paste button
-                    ui.horizontal(|ui| {
-                        let r = mtext(ui, "add_url", &mut self.add_url, "https://...", f32::INFINITY, false);
-                        self.hits.push((HitKind::Field("add_url"), r));
-                        let r = micon(ui, &self.man, MI_PASTE);
-                        self.hits.push((HitKind::Btn(ButtonId::AddPaste), r));
-                    });
-                    // Row 2: folder + picker | size badge + refresh + gear
-                    ui.horizontal(|ui| {
-                        ui.spacing_mut().item_spacing.x = 6.0;
-                        let r = mtext(ui, "add_dir", &mut self.add_dir, "Save folder", 200.0, false);
-                        self.hits.push((HitKind::Field("add_dir"), r));
-                        let r = micon(ui, &self.man, MI_FOLDER_OPEN);
-                        self.hits.push((HitKind::Btn(ButtonId::AddFolder), r));
-                        ui.separator();
-                        if pbusy {
-                            ui.spinner();
-                        } else if let Some(sz) = psize.filter(|s| *s > 0) {
-                            ui.label(
-                                egui::RichText::new(format_bytes(sz)).size(12.0).strong(),
-                            );
-                            mi(ui, MI_CHECK, 14.0, SUCCESS);
-                        } else {
-                            ui.small("—");
+                    // Everything is painted from the card origin: the concept is
+                    // a pixel layout, not a flow layout.
+                    let card = ui.max_rect();
+                    let o = card.min;
+                    let p = ui.painter().clone();
+                    let at = |x: f32, y: f32, w: f32, h: f32| {
+                        egui::Rect::from_min_size(egui::pos2(o.x + x, o.y + y), egui::vec2(w, h))
+                    };
+                    // ---- card ----
+                    p.rect(
+                        card,
+                        8.0,
+                        DM_CARD,
+                        egui::Stroke::new(1.0, DM_LINE),
+                        egui::StrokeKind::Inside,
+                    );
+                    // ---- header: mark + title + window controls ----
+                    dm_mark(&p, at(15.0, 11.0, 18.0, 18.0));
+                    p.text(
+                        egui::pos2(o.x + 41.0, o.y + 20.0),
+                        egui::Align2::LEFT_CENTER,
+                        "Add download",
+                        crate::fonts::semi(13.0),
+                        DM_TXT,
+                    );
+                    p.line_segment(
+                        [
+                            egui::pos2(o.x + 1.0, o.y + 39.5),
+                            egui::pos2(o.x + DM_W - 1.0, o.y + 39.5),
+                        ],
+                        egui::Stroke::new(1.0, DM_LINE),
+                    );
+                    // The dialog lives in the main canvas, so minimise/restore
+                    // drive the real OS window and the X closes the dialog.
+                    for (cx, icon, ctl) in [
+                        (485.0f32, DmIcon::Minimize, 0u8),
+                        (513.0, DmIcon::Maximize, 1),
+                        (541.0, DmIcon::Close, 2),
+                    ] {
+                        let r = at(cx - 8.0, 12.0, 16.0, 16.0);
+                        dm_icon_btn(&p, &self.man, r, icon, 12.0, 2.0, DM_DIM);
+                        if self.man.clicked(&r) {
+                            match ctl {
+                                0 => ui
+                                    .ctx()
+                                    .send_viewport_cmd(egui::ViewportCommand::Minimized(true)),
+                                1 => {
+                                    let max = ui
+                                        .ctx()
+                                        .input(|i| i.viewport().maximized.unwrap_or(false));
+                                    ui.ctx()
+                                        .send_viewport_cmd(egui::ViewportCommand::Maximized(!max));
+                                }
+                                _ => {
+                                    self.show_add = false;
+                                    self.add_focus_req = false;
+                                    self.add_recent_open = false;
+                                }
+                            }
                         }
-                        let r = micon(ui, &self.man, MI_REFRESH);
-                        self.hits.push((HitKind::Btn(ButtonId::AddRefresh), r));
-                        let r = micon(ui, &self.man, MI_SETTINGS);
-                        self.hits.push((HitKind::Btn(ButtonId::AddAdv), r));
-                    });
-                    // Row 3: filename
-                    ui.horizontal(|ui| {
-                        let r = mtext(ui, "add_file", &mut self.add_file, "Filename", f32::INFINITY, false);
-                        self.hits.push((HitKind::Field("add_file"), r));
-                    });
-                    // Advanced (gear toggles content)
-                    if self.add_adv {
-                        egui::Frame::new()
-                            .fill(BG)
-                            .corner_radius(RADIUS)
-                            .inner_margin(egui::Margin::same(8))
-                            .show(ui, |ui| {
-                                let v = self.slider_get(SliderId::AddConns);
-                                ui.label(
-                                    egui::RichText::new(format!(
-                                        "Connections: {}",
-                                        self.add_conns
-                                    ))
-                                    .color(DIM),
-                                );
-                                let r = mslider(ui, &self.man, "", 1.0, 16.0, v, false);
-                                self.hits.push((
-                                    HitKind::Slider(SliderId::AddConns, 1.0, 16.0, false),
-                                    r,
-                                ));
-                                ui.label("Referer:");
-                                let r = mtext(ui, "add_ref", &mut self.add_referer, "", f32::INFINITY, false);
-                                self.hits.push((HitKind::Field("add_ref"), r));
-                                ui.label("Cookie:");
-                                let r = mtext(ui, "add_cookie", &mut self.add_cookie, "", f32::INFINITY, false);
-                                self.hits.push((HitKind::Field("add_cookie"), r));
-                                ui.horizontal(|ui| {
-                                    ui.label("User:");
-                                    let r = mtext(ui, "add_user", &mut self.add_user, "", 130.0, false);
-                                    self.hits.push((HitKind::Field("add_user"), r));
-                                    ui.label("Pass:");
-                                    let r = mtext(ui, "add_pass", &mut self.add_pass, "", 130.0, true);
-                                    self.hits.push((HitKind::Field("add_pass"), r));
-                                });
-                                ui.label("SHA-256 (optional):");
-                                let r = mtext(ui, "add_sum", &mut self.add_checksum, "64 hex chars", f32::INFINITY, false);
-                                self.hits.push((HitKind::Field("add_sum"), r));
-                                let r = mcheck(
-                                    ui,
-                                    &self.man,
-                                    "Overwrite file if it already exists",
-                                    self.add_overwrite,
-                                );
-                                self.hits.push((HitKind::Check(CheckId::AddOverwrite), r));
-                            });
                     }
-                    // Row 4: actions (manual buttons; commit runs in
-                    // process_hits via ButtonId).
-                    ui.horizontal(|ui| {
-                        let r = mbutton(ui, &self.man, "Download Later", 130.0, 36.0, false);
-                        self.hits.push((HitKind::Btn(ButtonId::AddAdd), r));
-                        let r = mbutton(ui, &self.man, "Start Download", 140.0, 36.0, true);
-                        self.hits.push((HitKind::Btn(ButtonId::AddDownload), r));
-                        ui.with_layout(
-                            egui::Layout::right_to_left(egui::Align::Center),
-                            |ui| {
-                                let r = mbutton(ui, &self.man, "Cancel", 110.0, 36.0, false);
-                                self.hits.push((HitKind::Btn(ButtonId::AddCancel), r));
-                            },
+                    // ---- row 1: URL + clipboard ----
+                    let url_box = at(DM_X, DM_ROW1, DM_W_IN, DM_BOX_H);
+                    let url_btn = egui::Rect::from_min_size(
+                        egui::pos2(url_box.max.x - 33.0, url_box.min.y + 5.0),
+                        egui::Vec2::splat(28.0),
+                    );
+                    dm_field(
+                        ui,
+                        "add_url",
+                        url_box,
+                        url_btn.min.x - 6.0,
+                        &mut self.add_url,
+                        "https://…",
+                        false,
+                    );
+                    self.hits.push((HitKind::Field("add_url"), url_box));
+                    dm_icon_btn(&p, &self.man, url_btn, DmIcon::Clipboard, 14.0, 1.5, DM_DIM);
+                    self.hits.push((HitKind::Btn(ButtonId::AddPaste), url_btn));
+                    // ---- row 2: save folder + carets | size chip ----
+                    let path_box = at(DM_X, DM_ROW2, DM_PATH_W, DM_BOX_H);
+                    let caret_btn = egui::Rect::from_min_size(
+                        egui::pos2(path_box.max.x - 33.0, path_box.min.y + 5.0),
+                        egui::Vec2::splat(28.0),
+                    );
+                    let folder_btn = egui::Rect::from_min_size(
+                        egui::pos2(caret_btn.min.x - 28.0, caret_btn.min.y),
+                        egui::Vec2::splat(28.0),
+                    );
+                    dm_field(
+                        ui,
+                        "add_dir",
+                        path_box,
+                        folder_btn.min.x - 6.0,
+                        &mut self.add_dir,
+                        "Save folder",
+                        false,
+                    );
+                    self.hits.push((HitKind::Field("add_dir"), path_box));
+                    dm_icon_btn(&p, &self.man, folder_btn, DmIcon::Folder, 14.0, 1.5, DM_DIM);
+                    self.hits.push((HitKind::Btn(ButtonId::AddFolder), folder_btn));
+                    dm_icon_btn(&p, &self.man, caret_btn, DmIcon::Chevron, 10.0, 2.0, DM_DIM);
+                    self.add_caret = Some(caret_btn);
+                    if self.man.clicked(&caret_btn) {
+                        self.add_recent_open = !self.add_recent_open;
+                    }
+                    // size chip: grid mark, size, and a tick once the probe is in
+                    let chip = at(DM_X + DM_PATH_W + 8.0, DM_ROW2, DM_SIZE_W, DM_BOX_H);
+                    dm_box(&p, chip);
+                    dm_icon(
+                        &p,
+                        egui::Rect::from_center_size(
+                            egui::pos2(chip.min.x + 21.0, chip.center().y),
+                            egui::Vec2::splat(16.0),
+                        ),
+                        DmIcon::Grid,
+                        DM_ACC,
+                        0.0,
+                    );
+                    let known = !pbusy && psize.filter(|s| *s > 0).is_some();
+                    let sz_txt: String = if pbusy {
+                        "…".to_string()
+                    } else {
+                        psize
+                            .filter(|s| *s > 0)
+                            .map(format_bytes)
+                            .unwrap_or_else(|| "—".to_string())
+                    };
+                    let g = p.layout_no_wrap(sz_txt, crate::fonts::reg(11.0), DM_TXT);
+                    let tw = g.size().x;
+                    let tx = chip.min.x + 37.0;
+                    p.galley(
+                        egui::pos2(tx, chip.center().y - g.size().y * 0.5),
+                        g,
+                        DM_TXT,
+                    );
+                    if known {
+                        dm_icon(
+                            &p,
+                            egui::Rect::from_min_size(
+                                egui::pos2(tx + tw + 8.0, chip.min.y + 13.0),
+                                egui::Vec2::splat(12.0),
+                            ),
+                            DmIcon::Check,
+                            DM_OK,
+                            2.5,
                         );
-                    });
+                    }
+                    // ---- row 3: filename + refresh + advanced ----
+                    let file_box = at(DM_X, DM_ROW3, DM_FILE_W, DM_BOX_H);
+                    let refr_btn = egui::Rect::from_min_size(
+                        egui::pos2(file_box.max.x + 8.0, file_box.min.y),
+                        egui::Vec2::splat(38.0),
+                    );
+                    let gear_btn = egui::Rect::from_min_size(
+                        egui::pos2(refr_btn.max.x + 8.0, refr_btn.min.y),
+                        egui::Vec2::splat(38.0),
+                    );
+                    dm_field(
+                        ui,
+                        "add_file",
+                        file_box,
+                        file_box.max.x - 13.0,
+                        &mut self.add_file,
+                        "Filename",
+                        false,
+                    );
+                    self.hits.push((HitKind::Field("add_file"), file_box));
+                    dm_icon_btn(&p, &self.man, refr_btn, DmIcon::Refresh, 14.0, 1.5, DM_DIM);
+                    self.hits.push((HitKind::Btn(ButtonId::AddRefresh), refr_btn));
+                    dm_icon_btn(&p, &self.man, gear_btn, DmIcon::Settings, 14.0, 1.5, DM_DIM);
+                    self.hits.push((HitKind::Btn(ButtonId::AddAdv), gear_btn));
+                    // ---- advanced panel (gear): same tokens, placeholders
+                    // instead of labels, per the concept's field style ----
+                    if self.add_adv {
+                        let panel = at(DM_X, DM_ACT, DM_W_IN, DM_PANEL_H);
+                        dm_box(&p, panel);
+                        let cx = panel.min.x + 13.0;
+                        let cw = panel.width() - 26.0;
+                        let mut cy = panel.min.y + 13.0;
+                        let row = egui::Rect::from_min_size(egui::pos2(cx, cy), egui::vec2(cw, 30.0));
+                        p.text(
+                            egui::pos2(row.min.x, row.center().y),
+                            egui::Align2::LEFT_CENTER,
+                            "Connections",
+                            crate::fonts::reg(11.0),
+                            DM_DIM,
+                        );
+                        let srect = egui::Rect::from_min_size(
+                            egui::pos2(row.min.x + 92.0, row.min.y + 5.0),
+                            egui::vec2(row.width() - 144.0, 20.0),
+                        );
+                        let frac =
+                            (((self.add_conns as f64) - 1.0) / 15.0).clamp(0.0, 1.0) as f32;
+                        dm_slider(&p, &self.man, srect, frac);
+                        self.hits.push((
+                            HitKind::Slider(SliderId::AddConns, 1.0, 16.0, false),
+                            srect,
+                        ));
+                        p.text(
+                            egui::pos2(row.max.x, row.center().y),
+                            egui::Align2::RIGHT_CENTER,
+                            format!("{}", self.add_conns),
+                            crate::fonts::reg(11.0),
+                            DM_TXT,
+                        );
+                        cy += 38.0;
+                        let half = (cw - 8.0) / 2.0;
+                        let r_ref = egui::Rect::from_min_size(egui::pos2(cx, cy), egui::vec2(half, DM_BOX_H));
+                        let r_cok = egui::Rect::from_min_size(
+                            egui::pos2(cx + half + 8.0, cy),
+                            egui::vec2(half, DM_BOX_H),
+                        );
+                        dm_field(ui, "add_ref", r_ref, r_ref.max.x - 13.0, &mut self.add_referer, "Referer (optional)", false);
+                        self.hits.push((HitKind::Field("add_ref"), r_ref));
+                        dm_field(ui, "add_cookie", r_cok, r_cok.max.x - 13.0, &mut self.add_cookie, "Cookie (optional)", false);
+                        self.hits.push((HitKind::Field("add_cookie"), r_cok));
+                        cy += DM_BOX_H + 8.0;
+                        let r_usr = egui::Rect::from_min_size(egui::pos2(cx, cy), egui::vec2(half, DM_BOX_H));
+                        let r_pwd = egui::Rect::from_min_size(
+                            egui::pos2(cx + half + 8.0, cy),
+                            egui::vec2(half, DM_BOX_H),
+                        );
+                        dm_field(ui, "add_user", r_usr, r_usr.max.x - 13.0, &mut self.add_user, "User (optional)", false);
+                        self.hits.push((HitKind::Field("add_user"), r_usr));
+                        dm_field(ui, "add_pass", r_pwd, r_pwd.max.x - 13.0, &mut self.add_pass, "Password", true);
+                        self.hits.push((HitKind::Field("add_pass"), r_pwd));
+                        cy += DM_BOX_H + 8.0;
+                        let r_sum = egui::Rect::from_min_size(egui::pos2(cx, cy), egui::vec2(cw, DM_BOX_H));
+                        dm_field(ui, "add_sum", r_sum, r_sum.max.x - 13.0, &mut self.add_checksum, "SHA-256 checksum (optional, 64 hex)", false);
+                        self.hits.push((HitKind::Field("add_sum"), r_sum));
+                        cy += DM_BOX_H + 8.0;
+                        let ow = egui::Rect::from_min_size(egui::pos2(cx, cy), egui::vec2(cw, 22.0));
+                        let cbx = egui::Rect::from_min_size(
+                            egui::pos2(ow.min.x, ow.center().y - 8.0),
+                            egui::Vec2::splat(16.0),
+                        );
+                        if self.add_overwrite {
+                            p.rect_filled(cbx, 4.0, DM_ACC);
+                            dm_icon(
+                                &p,
+                                egui::Rect::from_center_size(cbx.center(), egui::Vec2::splat(12.0)),
+                                DmIcon::Check,
+                                egui::Color32::WHITE,
+                                2.5,
+                            );
+                        } else {
+                            p.rect(
+                                cbx,
+                                4.0,
+                                DM_CARD,
+                                egui::Stroke::new(1.0, DM_BOX_BD),
+                                egui::StrokeKind::Inside,
+                            );
+                        }
+                        p.text(
+                            egui::pos2(cbx.max.x + 8.0, ow.center().y),
+                            egui::Align2::LEFT_CENTER,
+                            "Overwrite file if it already exists",
+                            crate::fonts::reg(11.0),
+                            DM_DIM,
+                        );
+                        self.hits.push((HitKind::Check(CheckId::AddOverwrite), ow));
+                    }
+                    // ---- actions (manual hit table, as before) ----
+                    let act_y = DM_ACT + adv_h;
+                    let add_btn = at(DM_X, act_y, 100.0, 36.0);
+                    dm_btn_flat(&p, &self.man, add_btn, "Add");
+                    self.hits.push((HitKind::Btn(ButtonId::AddAdd), add_btn));
+                    let dl_btn = egui::Rect::from_min_size(
+                        egui::pos2(add_btn.max.x + 8.0, add_btn.min.y),
+                        egui::vec2(140.0, 36.0),
+                    );
+                    dm_gradient(&p, dl_btn, DM_RAD, DM_ACC, DM_ACC2);
+                    if self.man.hover(&dl_btn) {
+                        p.rect_filled(dl_btn, DM_RAD, egui::Color32::from_white_alpha(22));
+                    }
+                    p.text(
+                        dl_btn.center(),
+                        egui::Align2::CENTER_CENTER,
+                        "Download",
+                        crate::fonts::semi(13.0),
+                        egui::Color32::WHITE,
+                    );
+                    self.hits.push((HitKind::Btn(ButtonId::AddDownload), dl_btn));
+                    let cancel_btn = egui::Rect::from_min_size(
+                        egui::pos2(o.x + DM_W - 17.0 - 100.0, add_btn.min.y),
+                        egui::vec2(100.0, 36.0),
+                    );
+                    dm_btn_flat(&p, &self.man, cancel_btn, "Cancel");
+                    self.hits.push((HitKind::Btn(ButtonId::AddCancel), cancel_btn));
                 });
             // The egui X button can't be relied on: keep the flag unless
             // our own Cancel/Add/Download closed it.
@@ -4186,6 +4798,69 @@ impl eframe::App for CraftApp {
                     .map(|p| p.to_string_lossy().to_string())
                     .unwrap_or_else(|| "C:\\Downloads".to_string());
             }
+            // ---- recent-folders menu (the path field's caret) ----
+            // A click outside the caret and outside the menu closes it. The
+            // caret rect is this frame's; the menu rect is derived, never
+            // stored, so the two can't drift apart.
+            if self.add_recent_open && ctx.input(|i| i.pointer.any_click()) {
+                let pos = ctx.input(|i| i.pointer.interact_pos());
+                let rows = self.add_recent_dirs().len();
+                let menu = self.add_caret.map(|c| dm_menu_rect(c, rows));
+                let inside = |r: Option<egui::Rect>| match (r, pos) {
+                    (Some(r), Some(q)) => r.contains(q),
+                    _ => false,
+                };
+                if !inside(self.add_caret) && !inside(menu) {
+                    self.add_recent_open = false;
+                }
+            }
+            if self.add_recent_open {
+                match self.add_caret {
+                    None => self.add_recent_open = false,
+                    Some(caret) => {
+                        let anchors = self.add_recent_dirs();
+                        let mut pick: Option<String> = None;
+                        egui::Area::new(egui::Id::new("add_recent_menu"))
+                            .order(egui::Order::Foreground)
+                            .fixed_pos(dm_menu_rect(caret, anchors.len()).min)
+                            .show(ctx, |ui| {
+                                egui::Frame::new()
+                                    .fill(DM_CARD)
+                                    .stroke(egui::Stroke::new(1.0, DM_LINE))
+                                    .corner_radius(DM_RAD)
+                                    .inner_margin(egui::Margin::same(6))
+                                    .show(ui, |ui| {
+                                        ui.spacing_mut().item_spacing.y = 0.0;
+                                        for d in &anchors {
+                                            let resp = ui
+                                                .add_sized(
+                                                    egui::vec2(308.0, 24.0),
+                                                    egui::Button::new(
+                                                        egui::RichText::new(elide_left(d, 46))
+                                                            .size(11.0)
+                                                            .color(DM_TXT),
+                                                    )
+                                                    .fill(egui::Color32::TRANSPARENT)
+                                                    .stroke(egui::Stroke::NONE),
+                                                )
+                                                .on_hover_text(d);
+                                            if resp.clicked() {
+                                                pick = Some(d.clone());
+                                            }
+                                        }
+                                    });
+                            });
+                        if let Some(d) = pick {
+                            self.add_dir = d;
+                            self.add_recent_open = false;
+                        }
+                    }
+                }
+            }
+        }
+        if !self.show_add {
+            self.add_recent_open = false;
+            self.add_caret = None;
         }
 
         // ================= site grabber (P3.1) =================
@@ -5061,14 +5736,25 @@ impl CraftApp {
             self.push_log("Add download: invalid SHA-256 (want 64 hex chars).");
             return;
         }
-        if self
+        // Same URL already tracked: a live row (queued/downloading/paused, or
+        // finished with its file present) blocks a duplicate, but a DEAD row —
+        // failed, or "Completed" with the file gone — is refreshed in place
+        // below so a stale entry never dead-ends the user.
+        let existing = self
             .downloads
             .iter()
-            .any(|d| d.url == self.add_url.trim())
-        {
-            self.show_add = true;
-            self.push_log("Add download: that URL is already queued.");
-            return;
+            .position(|d| d.url == self.add_url.trim());
+        if let Some(pos) = existing {
+            let dead = match &self.downloads[pos].status {
+                Status::Failed(_) => true,
+                Status::Completed => !self.downloads[pos].dest_path().exists(),
+                _ => false,
+            };
+            if !dead {
+                self.show_add = true;
+                self.push_log("Add download: that URL is already queued.");
+                return;
+            }
         }
         if self.add_file.trim().is_empty() {
             self.add_file = filename_from_url(&self.add_url);
@@ -5079,7 +5765,17 @@ impl CraftApp {
                 .unwrap_or_else(|| "C:\\Downloads".to_string());
         }
         let final_dir = self.save_dir_for(&self.add_file);
-        let id = self.alloc_id();
+        let id = match existing {
+            Some(pos) => {
+                // Refresh the dead row in place (same id): drop any stale
+                // resume state so a mixed-URL resume can't corrupt the file.
+                let id = self.downloads[pos].id;
+                let dp = self.downloads[pos].dest_path();
+                crate::model::drop_resume_state(&dp);
+                id
+            }
+            None => self.alloc_id(),
+        };
         let mut item = DownloadItem::new(
             id,
             self.add_url.trim().to_string(),
@@ -5106,8 +5802,16 @@ impl CraftApp {
                 ));
             }
         }
-        self.downloads.push(item);
-        self.push_log(format!("Queued #{id}"));
+        match existing {
+            Some(pos) => {
+                self.downloads[pos] = item;
+                self.push_log(format!("Re-queued #{id}"));
+            }
+            None => {
+                self.downloads.push(item);
+                self.push_log(format!("Queued #{id}"));
+            }
+        }
         self.save_queue();
         self.show_add = false;
         self.add_focus_req = false;
@@ -5120,6 +5824,34 @@ impl CraftApp {
             self.start(id);
             Self::spawn_progress(id);
         }
+    }
+
+    /// Candidate save folders for the path field's caret menu: the standard
+    /// user folders first, then whatever the dialog is currently pointed at.
+    fn add_recent_dirs(&self) -> Vec<String> {
+        let mut out: Vec<String> = Vec::new();
+        for d in [
+            dirs::download_dir(),
+            dirs::desktop_dir(),
+            dirs::document_dir(),
+            dirs::picture_dir(),
+            dirs::video_dir(),
+            dirs::audio_dir(),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            let s = d.to_string_lossy().to_string();
+            if !out.contains(&s) {
+                out.push(s);
+            }
+        }
+        for s in [self.add_dir.trim().to_string()] {
+            if !s.is_empty() && !out.contains(&s) {
+                out.push(s);
+            }
+        }
+        out
     }
 
     fn do_button(&mut self, b: ButtonId) {

@@ -25,24 +25,12 @@ fn format_dur(secs: u64) -> String {
     format!("{}:{:02}", secs / 60, secs % 60)
 }
 
-fn queue_path() -> Option<std::path::PathBuf> {
-    config_dir().map(|p| p.join("queue.json"))
-}
-
 fn wake_path() -> Option<std::path::PathBuf> {
     config_dir().map(|p| p.join("wake.json"))
 }
 
 fn ui_path() -> Option<std::path::PathBuf> {
     config_dir().map(|p| p.join("ui.json"))
-}
-
-fn read_queue() -> Vec<DownloadItem> {
-    let _guard = crate::model::fs_lock("queue");
-    queue_path()
-        .and_then(|p| std::fs::read_to_string(p).ok())
-        .and_then(|s| serde_json::from_str(&s).ok())
-        .unwrap_or_default()
 }
 
 /// Claim (remove) our URL from the native inbox so the main window does not
@@ -213,7 +201,12 @@ struct ConfirmApp {
     done: bool,
     exited: bool,
     notice: String,
-    already_queued: bool,
+    /// State for controls the concept does not show (dropdown + extras).
+    cat_open: bool,
+    win_h: f32,
+    adding_cat: bool,
+    new_cat: String,
+    custom_cats: Vec<String>,
 }
 
 const CATEGORIES: &[&str] = &[
@@ -225,6 +218,292 @@ const CATEGORIES: &[&str] = &[
     "Apps",
     "Other",
 ];
+
+// ---------- "Compact Blue" concept geometry ----------
+// `popup_concepts.html` draws the card as `width:500px` with 16px side
+// padding and a 1px border. CSS `box-sizing` is content-box, so the box that
+// actually appears on screen is 534 x 228 px. Everything below is expressed
+// in those exact pixels so the Rust dialog matches the mock 1:1.
+const CARD_W: f32 = 534.0;
+const CARD_H: f32 = 228.0;
+const PAD_X: f32 = 16.0;
+const PAD_Y: f32 = 12.0;
+const CONTENT_W: f32 = CARD_W - 2.0 - 2.0 * PAD_X; // 500
+const CARD_RAD: f32 = 10.0;
+const RAD: f32 = 5.0; // inputs and buttons
+const LBL_H: f32 = 11.0; // 9px label line box
+const LBL_GAP: f32 = 2.0;
+const ROW_GAP: f32 = 6.0;
+const FIELD_H: f32 = 21.0;
+const PATH_H: f32 = 19.0;
+const DESC_H: f32 = 24.0;
+const BTN_H: f32 = 24.0;
+
+const C_CARD: egui::Color32 = egui::Color32::from_rgb(0x0f, 0x0f, 0x22);
+const C_INPUT: egui::Color32 = egui::Color32::from_rgb(0x0a, 0x0a, 0x1a);
+const C_BORDER: egui::Color32 = egui::Color32::from_rgb(0x2a, 0x2a, 0x4a);
+const C_ACCENT: egui::Color32 = egui::Color32::from_rgb(0x3b, 0x82, 0xf6);
+const C_ACCENT_DK: egui::Color32 = egui::Color32::from_rgb(0x1d, 0x4e, 0xd8);
+const C_ACCENT_HI: egui::Color32 = egui::Color32::from_rgb(0x4a, 0x8f, 0xf8);
+const C_TXT: egui::Color32 = egui::Color32::from_rgb(0xe0, 0xe0, 0xf0);
+const C_LBL: egui::Color32 = egui::Color32::from_rgb(0x88, 0x88, 0xa8);
+const C_FTXT: egui::Color32 = egui::Color32::from_rgb(0xa0, 0xa0, 0xb8);
+const C_DIM: egui::Color32 = egui::Color32::from_rgb(0x60, 0x60, 0x80);
+const C_BTN_BD: egui::Color32 = egui::Color32::from_rgb(0x3a, 0x3a, 0x5a);
+const C_HOVER: egui::Color32 = egui::Color32::from_rgb(0x1a, 0x1a, 0x2f);
+
+// Material Icons glyphs for the concept's own chrome.
+const GL_CARET: &str = "\u{e5c5}"; // arrow_drop_down, the "▾"
+const GL_ADD: &str = "\u{e145}"; // add, the "+"
+const GL_CLOSE: &str = "\u{e5cd}"; // close, the "✕"
+
+const FONT_SEMI: &str = crate::fonts::FONT_SEMI;
+
+fn reg(size: f32) -> egui::FontId {
+    egui::FontId::new(size, egui::FontFamily::Proportional)
+}
+
+fn semi(size: f32) -> egui::FontId {
+    egui::FontId::new(size, egui::FontFamily::Name(FONT_SEMI.into()))
+}
+
+/// Loads Segoe UI — the family the concept asks for — plus a semibold cut for
+/// its 600-weight title and primary button. Missing system fonts fall back to
+/// the bundled defaults, so this is safe on any machine.
+fn setup_popup_fonts(cc: &eframe::CreationContext<'_>) {
+    // `true`: this whole window is the concept, so Segoe UI also becomes its
+    // default proportional face.
+    crate::fonts::install(cc, true);
+}
+
+/// The 20px gradient mark: rounded accent square + white download arrow,
+/// traced from the concept's inline SVG (24x24 viewBox scaled to 10px).
+fn app_mark(p: &egui::Painter, rect: egui::Rect) {
+    p.rect(rect, RAD, C_ACCENT, egui::Stroke::NONE, egui::StrokeKind::Inside);
+    let s = 10.0 / 24.0;
+    let o = rect.min.to_vec2() + egui::vec2(5.0, 5.0);
+    let m = |x: f32, y: f32| egui::pos2(o.x + x * s, o.y + y * s);
+    let stroke = egui::Stroke::new(3.0 * s, egui::Color32::WHITE);
+    p.line_segment([m(12.0, 4.0), m(12.0, 16.0)], stroke);
+    p.line_segment([m(6.0, 10.0), m(12.0, 16.0)], stroke);
+    p.line_segment([m(12.0, 16.0), m(18.0, 10.0)], stroke);
+}
+
+/// Rounded input box with a frameless single-line editor inside it.
+fn field(
+    ui: &mut egui::Ui,
+    rect: egui::Rect,
+    buf: &mut String,
+    hint: &str,
+) -> egui::Response {
+    ui.painter().rect(
+        rect,
+        RAD,
+        C_INPUT,
+        egui::Stroke::new(1.0_f32, C_BORDER),
+        egui::StrokeKind::Inside,
+    );
+    let inner = egui::Rect::from_min_max(
+        egui::pos2(rect.left() + 8.0, rect.top()),
+        egui::pos2(rect.right() - 8.0, rect.bottom()),
+    );
+    ui.scope_builder(
+        egui::UiBuilder::new()
+            .max_rect(inner)
+            .layout(egui::Layout::left_to_right(egui::Align::Center)),
+        |ui| {
+            ui.add(
+                egui::TextEdit::singleline(buf)
+                    .frame(false)
+                    .margin(egui::Margin::ZERO)
+                    .desired_width(inner.width())
+                    .text_color(C_FTXT)
+                    .font(reg(9.0))
+                    .hint_text(egui::RichText::new(hint).size(9.0).color(C_DIM)),
+            )
+        },
+    )
+    .inner
+}
+
+#[derive(Clone, Copy, PartialEq)]
+enum Btn {
+    Ghost,
+    Primary,
+}
+
+/// Concept button: equal-height pill, 10px label, accent fill for primary.
+fn button(
+    ui: &mut egui::Ui,
+    rect: egui::Rect,
+    label: &str,
+    kind: Btn,
+    salt: u64,
+) -> egui::Response {
+    let r = ui.interact(rect, egui::Id::new(("popup-btn", salt)), egui::Sense::click());
+    if r.hovered() {
+        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+    }
+    let (fill, stroke, txt, font) = match kind {
+        Btn::Primary => (
+            if r.is_pointer_button_down_on() {
+                C_ACCENT_DK
+            } else if r.hovered() {
+                C_ACCENT_HI
+            } else {
+                C_ACCENT
+            },
+            egui::Stroke::NONE,
+            egui::Color32::WHITE,
+            semi(10.0),
+        ),
+        Btn::Ghost => (
+            if r.hovered() {
+                C_HOVER
+            } else {
+                egui::Color32::TRANSPARENT
+            },
+            egui::Stroke::new(1.0_f32, C_BTN_BD),
+            C_FTXT,
+            reg(10.0),
+        ),
+    };
+    let p = ui.painter();
+    p.rect(rect, RAD, fill, stroke, egui::StrokeKind::Inside);
+    p.text(rect.center(), egui::Align2::CENTER_CENTER, label, font, txt);
+    r
+}
+
+/// The concept's 20px squares: filled accent ("+") or outlined dark ("...").
+fn square(
+    ui: &mut egui::Ui,
+    rect: egui::Rect,
+    glyph: &str,
+    filled: bool,
+    salt: u64,
+) -> egui::Response {
+    let r = ui.interact(rect, egui::Id::new(("popup-sq", salt)), egui::Sense::click());
+    if r.hovered() {
+        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+    }
+    let p = ui.painter();
+    if filled {
+        p.rect(
+            rect,
+            RAD,
+            if r.hovered() { C_ACCENT_HI } else { C_ACCENT },
+            egui::Stroke::NONE,
+            egui::StrokeKind::Inside,
+        );
+        p.text(
+            rect.center(),
+            egui::Align2::CENTER_CENTER,
+            glyph,
+            reg(12.0),
+            egui::Color32::WHITE,
+        );
+    } else {
+        p.rect(
+            rect,
+            RAD,
+            if r.hovered() { C_HOVER } else { C_INPUT },
+            egui::Stroke::new(1.0_f32, C_BORDER),
+            egui::StrokeKind::Inside,
+        );
+        p.text(
+            rect.center(),
+            egui::Align2::CENTER_CENTER,
+            glyph,
+            reg(10.0),
+            C_FTXT,
+        );
+    }
+    r
+}
+
+/// Concept dropdown: dark rounded box, 9px value, trailing caret, and a
+/// floating list anchored under the box.
+fn combo(
+    ui: &mut egui::Ui,
+    rect: egui::Rect,
+    id: &str,
+    current: &str,
+    options: &[String],
+    open: &mut bool,
+) -> Option<String> {
+    let resp = ui.interact(rect, egui::Id::new(("popup-combo", id)), egui::Sense::click());
+    if resp.hovered() {
+        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+    }
+    let p = ui.painter();
+    p.rect(
+        rect,
+        RAD,
+        C_INPUT,
+        egui::Stroke::new(1.0_f32, C_BORDER),
+        egui::StrokeKind::Inside,
+    );
+    p.text(
+        egui::pos2(rect.left() + 8.0, rect.center().y),
+        egui::Align2::LEFT_CENTER,
+        current,
+        reg(9.0),
+        C_FTXT,
+    );
+    p.text(
+        egui::pos2(rect.right() - 4.0, rect.center().y),
+        egui::Align2::RIGHT_CENTER,
+        GL_CARET,
+        reg(12.0),
+        C_DIM,
+    );
+    if resp.clicked() {
+        *open = !*open;
+    }
+    let mut picked = None;
+    egui::Popup::from_response(&resp)
+        .open_bool(&mut *open)
+        .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside)
+        .align(egui::RectAlign::BOTTOM_START)
+        .gap(2.0)
+        .frame(
+            egui::Frame::new()
+                .fill(C_CARD)
+                .stroke(egui::Stroke::new(1.0_f32, C_BORDER))
+                .corner_radius(RAD)
+                .inner_margin(egui::Margin::symmetric(3, 3)),
+        )
+        .show(|ui| {
+            egui::ScrollArea::vertical()
+                .max_height(140.0)
+                .show(ui, |ui| {
+                    ui.spacing_mut().item_spacing = egui::vec2(0.0, 1.0);
+                    let w = rect.width() - 10.0;
+                    for o in options {
+                        let (r, ir) =
+                            ui.allocate_exact_size(egui::vec2(w, 18.0), egui::Sense::click());
+                        if ir.hovered() {
+                            ui.painter().rect_filled(r, 3.0, C_HOVER);
+                            ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+                        }
+                        ui.painter().text(
+                            egui::pos2(r.left() + 6.0, r.center().y),
+                            egui::Align2::LEFT_CENTER,
+                            o,
+                            reg(9.0),
+                            if o.as_str() == current { C_ACCENT } else { C_FTXT },
+                        );
+                        if ir.clicked() {
+                            picked = Some(o.clone());
+                        }
+                    }
+                });
+        });
+    if picked.is_some() {
+        *open = false;
+    }
+    picked
+}
 
 impl ConfirmApp {
     fn effective_dir(&self) -> String {
@@ -247,6 +526,19 @@ impl ConfirmApp {
         } else {
             self.save_base.clone()
         }
+    }
+
+    /// Extra one-line facts the concept has no place for; shown under the
+    /// hidden extras panel only.
+    fn extra_notes(&self) -> Vec<String> {
+        let mut v = Vec::new();
+        if self.pair_url.starts_with("http") {
+            v.push("video-only + audio — merged on completion (needs ffmpeg)".to_string());
+        }
+        if !self.quality_pref.trim().is_empty() {
+            v.push(format!("Quality: {}", self.quality_pref.trim()));
+        }
+        v
     }
 
     fn start_probe(&mut self) {
@@ -366,43 +658,67 @@ impl ConfirmApp {
         item.quality_pref = self.quality_pref.trim().to_string();
         item.duration_secs = self.duration_secs;
         let id = match crate::model::append_to_queue(&mut item) {
-            Some(id) => id,
-            None => {
-                self.notice = "Already in queue.".to_string();
-                self.done = true;
+            crate::model::AppendResult::Added(id) => {
+                save_remember_category(self.remember_path);
+                id
+            }
+            crate::model::AppendResult::AlreadyQueued(id) => {
+                // Not an error. The URL is already in the list; if the user
+                // asked to start it we wake that row, so this is never a dead
+                // end. Stay open so the notice is actually read.
+                self.notice = if start {
+                    format!("Already in the queue (#{id}) — starting it.")
+                } else {
+                    format!("Already in the queue (#{id}).")
+                };
+                if start {
+                    self.wake_targets(&[id]);
+                }
+                return;
+            }
+            crate::model::AppendResult::Error(e) => {
+                // Never close on a failed write: closing with a stale message
+                // is exactly what made this look like "already in queue".
+                self.notice = format!("Could not update the queue: {e}");
                 return;
             }
         };
         save_remember_category(self.remember_path);
         if start {
-            // Tell the main app to start this id (consumed on next poll /
-            // at its startup when we launch it below).
-            if let Some(p) = wake_path() {
-                let _guard = crate::model::fs_lock("wake");
-                let mut ids: Vec<u64> = std::fs::read_to_string(&p)
-                    .ok()
-                    .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
-                    .and_then(|v| v.get("start").cloned())
-                    .and_then(|v| serde_json::from_value::<Vec<u64>>(v).ok())
-                    .unwrap_or_default();
-                if !ids.contains(&id) {
-                    ids.push(id);
-                }
-                if let Ok(json) =
-                    serde_json::to_string_pretty(&serde_json::json!({ "start": ids }))
-                {
-                    let _ = atomic_write(&p, json.as_bytes());
-                }
-            }
-            // tasklist + cold-start spawn can take seconds (debug builds
-            // especially) — never block the dialog on it; close at once.
-            std::thread::spawn(|| {
-                if !main_app_running() {
-                    launch_main_app();
-                }
-            });
+            self.wake_targets(&[id]);
         }
         self.done = true;
+    }
+
+    /// Ask the main app to start these ids (consumed on its next poll, or at
+    /// startup when we launch it below).
+    fn wake_targets(&self, targets: &[u64]) {
+        if let Some(p) = wake_path() {
+            let _guard = crate::model::fs_lock("wake");
+            let mut ids: Vec<u64> = std::fs::read_to_string(&p)
+                .ok()
+                .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
+                .and_then(|v| v.get("start").cloned())
+                .and_then(|v| serde_json::from_value::<Vec<u64>>(v).ok())
+                .unwrap_or_default();
+            for id in targets {
+                if !ids.contains(id) {
+                    ids.push(*id);
+                }
+            }
+            if let Ok(json) =
+                serde_json::to_string_pretty(&serde_json::json!({ "start": ids }))
+            {
+                let _ = atomic_write(&p, json.as_bytes());
+            }
+        }
+        // tasklist + cold-start spawn can take seconds (debug builds
+        // especially) — never block the dialog on it; close at once.
+        std::thread::spawn(|| {
+            if !main_app_running() {
+                launch_main_app();
+            }
+        });
     }
 }
 
@@ -469,7 +785,14 @@ pub fn run() -> eframe::Result<()> {
 
     let prefs = load_prefs();
     let category = category_of(&filename).to_string();
-    let already_queued = read_queue().iter().any(|d| d.url == url.trim());
+    // A row that is still usable (queued/downloading/paused, or finished with
+    // its file present) is reported up front. A dead row (failed, or finished
+    // with the file gone) is refreshed by the capture instead, so the buttons
+    // never dead-end on a stale "already in queue".
+    let initial_notice = match crate::model::queued_entry(url.trim()) {
+        Some((id, false)) => format!("Already in the queue (#{id})."),
+        _ => String::new(),
+    };
 
     let rt = std::sync::Arc::new(
         tokio::runtime::Builder::new_multi_thread()
@@ -505,8 +828,12 @@ pub fn run() -> eframe::Result<()> {
         show_adv: false,
         done: false,
         exited: false,
-        notice: String::new(),
-        already_queued,
+        notice: initial_notice,
+        cat_open: false,
+        win_h: 0.0,
+        adding_cat: false,
+        new_cat: String::new(),
+        custom_cats: Vec::new(),
     };
     // Prefill filename from server when the extension sent none useful.
     // A browser-known size skips probing entirely (server re-probes of
@@ -518,10 +845,11 @@ pub fn run() -> eframe::Result<()> {
 
     let mut viewport = egui::ViewportBuilder::default()
         .with_title("Add download")
-        .with_inner_size([620.0, 500.0])
-        .with_min_inner_size([560.0, 440.0])
-        .with_always_on_top()
-        .with_resizable(true);
+        .with_inner_size([CARD_W, CARD_H])
+        .with_resizable(false)
+        .with_decorations(false)
+        .with_transparent(true)
+        .with_always_on_top();
     if let Ok(icon) = eframe::icon_data::from_png_bytes(include_bytes!("../assets/icon.png")) {
         viewport = viewport.with_icon(std::sync::Arc::new(icon));
     }
@@ -532,9 +860,8 @@ pub fn run() -> eframe::Result<()> {
             ..Default::default()
         },
         Box::new(|cc| {
-            crate::app::setup_fonts(cc);
+            setup_popup_fonts(cc);
             cc.egui_ctx.set_visuals(crate::app::dark_visuals());
-            // ABDM-style: big rounded fields + pill buttons.
             crate::app::apply_widget_theme(&cc.egui_ctx);
             Ok(Box::new(app))
         }),
@@ -542,6 +869,12 @@ pub fn run() -> eframe::Result<()> {
 }
 
 impl eframe::App for ConfirmApp {
+    /// The window is transparent and frameless: the concept's rounded card is
+    /// painted by hand, so the surface behind it must stay clear.
+    fn clear_color(&self, _visuals: &egui::Visuals) -> [f32; 4] {
+        [0.0, 0.0, 0.0, 0.0]
+    }
+
     /// Same bulletproofing as the progress window: Close can no-op, so back
     /// it with a delayed exit once the dialog is done.
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
@@ -561,7 +894,7 @@ impl eframe::App for ConfirmApp {
             self.centered = true;
             let mon = ctx.input(|i| i.viewport().monitor_size);
             if let Some(m) = mon {
-                let (w, h) = (620.0, 500.0);
+                let (w, h) = (CARD_W, CARD_H);
                 if m.x > w && m.y > h {
                     ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(
                         egui::Pos2::new((m.x - w) / 2.0, (m.y - h) / 2.0),
@@ -594,185 +927,399 @@ impl eframe::App for ConfirmApp {
         if self.probing {
             ctx.request_repaint();
         }
-        egui::CentralPanel::default().show(ctx, |ui| {
-            ui.add_space(4.0);
-            if self.already_queued {
-                ui.label("This URL is already in the queue.");
-                ui.add_space(6.0);
-                if ui.button("Close").clicked() {
-                    self.done = true;
+        // Grow the window when the hidden extras are open, so the concept
+        // surface itself never changes size or position.
+        let notes = self.extra_notes();
+        let mut extra_h = if self.show_adv {
+            10.0 + 3.0 * (FIELD_H + ROW_GAP)
+        } else {
+            0.0
+        };
+        if self.adding_cat {
+            extra_h += FIELD_H + ROW_GAP;
+        }
+        if self.show_adv && !notes.is_empty() {
+            extra_h += 4.0 + 12.0 * notes.len() as f32;
+        }
+        if !self.notice.is_empty() {
+            extra_h += 16.0;
+        }
+        let want_h = CARD_H + extra_h;
+        if (self.win_h - want_h).abs() > 0.5 {
+            self.win_h = want_h;
+            ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(egui::vec2(CARD_W, want_h)));
+        }
+
+        let panel = egui::CentralPanel::default().frame(egui::Frame::NONE);
+        panel.show(ctx, |ui| {
+            // The concept card IS the window: 534x228, 1px #2a2a4a border,
+            // 10px radius, painted edge to edge.
+            let card = ui.max_rect();
+            let p = ui.painter().clone();
+            p.rect(
+                card,
+                CARD_RAD,
+                C_CARD,
+                egui::Stroke::new(1.0_f32, C_BORDER),
+                egui::StrokeKind::Inside,
+            );
+            // Content box: card minus the 1px border minus the 16/12 padding.
+            let left = card.left() + 1.0 + PAD_X;
+            let right = card.right() - 1.0 - PAD_X;
+            let mut y = card.top() + 1.0 + PAD_Y;
+
+            // --- header: mark + title + gear/close; drag anywhere to move ---
+            let hdr = egui::Rect::from_min_size(
+                egui::pos2(left, y),
+                egui::vec2(CONTENT_W - 46.0, 20.0),
+            );
+            if ui
+                .interact(
+                    hdr,
+                    egui::Id::new("popup-header"),
+                    egui::Sense::click_and_drag(),
+                )
+                .drag_started()
+            {
+                ctx.send_viewport_cmd(egui::ViewportCommand::StartDrag);
+            }
+            app_mark(
+                &p,
+                egui::Rect::from_min_size(egui::pos2(left, y), egui::vec2(20.0, 20.0)),
+            );
+            p.text(
+                egui::pos2(left + 26.0, y + 10.0),
+                egui::Align2::LEFT_CENTER,
+                "Download File Info",
+                semi(12.0),
+                C_TXT,
+            );
+            let close_r = egui::Rect::from_center_size(
+                egui::pos2(right - 5.5, y + 10.0),
+                egui::vec2(12.0, 12.0),
+            );
+            let gear_r = egui::Rect::from_center_size(
+                egui::pos2(right - 27.5, y + 10.0),
+                egui::vec2(12.0, 12.0),
+            );
+            let gear = ui.interact(gear_r, egui::Id::new("popup-gear"), egui::Sense::click());
+            let close = ui.interact(close_r, egui::Id::new("popup-close"), egui::Sense::click());
+            p.text(
+                gear_r.center(),
+                egui::Align2::CENTER_CENTER,
+                crate::app::MI_SETTINGS,
+                reg(11.0),
+                if gear.hovered() { C_FTXT } else { C_DIM },
+            );
+            p.text(
+                close_r.center(),
+                egui::Align2::CENTER_CENTER,
+                GL_CLOSE,
+                reg(11.0),
+                if close.hovered() { C_FTXT } else { C_DIM },
+            );
+            if gear.hovered() || close.hovered() {
+                ctx.set_cursor_icon(egui::CursorIcon::PointingHand);
+            }
+            if gear.clicked() {
+                self.show_adv = !self.show_adv;
+            }
+            if close.clicked() {
+                self.done = true;
+            }
+            y += 20.0 + 8.0;
+
+            // --- URL ---
+            p.text(
+                egui::pos2(left, y + LBL_H / 2.0),
+                egui::Align2::LEFT_CENTER,
+                "URL",
+                reg(9.0),
+                C_LBL,
+            );
+            let url_rect = egui::Rect::from_min_size(
+                egui::pos2(left, y + LBL_H + LBL_GAP),
+                egui::vec2(CONTENT_W, FIELD_H),
+            );
+            field(ui, url_rect, &mut self.url, "https://...");
+            y += LBL_H + LBL_GAP + FIELD_H + ROW_GAP;
+            // --- Category (flex 1) + Save As (flex 2) ---
+            let unit = (CONTENT_W - ROW_GAP) / 3.0;
+            let cat_w = unit;
+            let save_x = left + cat_w + ROW_GAP;
+            let save_w = unit * 2.0;
+            p.text(
+                egui::pos2(left, y + LBL_H / 2.0),
+                egui::Align2::LEFT_CENTER,
+                "Category",
+                reg(9.0),
+                C_LBL,
+            );
+            p.text(
+                egui::pos2(save_x, y + LBL_H / 2.0),
+                egui::Align2::LEFT_CENTER,
+                "Save As",
+                reg(9.0),
+                C_LBL,
+            );
+            let fy = y + LBL_H + LBL_GAP;
+            let dd_w = cat_w - 4.0 - 20.0;
+            let cat_rect =
+                egui::Rect::from_min_size(egui::pos2(left, fy), egui::vec2(dd_w, FIELD_H));
+            let plus_rect = egui::Rect::from_min_size(
+                egui::pos2(left + dd_w + 4.0, fy),
+                egui::vec2(20.0, 20.0),
+            );
+            let sd_w = save_w - 4.0 - 20.0;
+            let save_rect =
+                egui::Rect::from_min_size(egui::pos2(save_x, fy), egui::vec2(sd_w, FIELD_H));
+            let dots_rect = egui::Rect::from_min_size(
+                egui::pos2(save_x + sd_w + 4.0, fy),
+                egui::vec2(20.0, 20.0),
+            );
+            let mut cats: Vec<String> = CATEGORIES.iter().map(|c| c.to_string()).collect();
+            cats.extend(self.custom_cats.iter().cloned());
+            if let Some(pick) =
+                combo(ui, cat_rect, "cat", &self.category, &cats, &mut self.cat_open)
+            {
+                self.category = pick;
+            }
+            if square(ui, plus_rect, GL_ADD, true, 1).clicked() {
+                self.adding_cat = !self.adding_cat;
+            }
+            field(ui, save_rect, &mut self.filename, "filename");
+            if square(ui, dots_rect, "...", false, 2).clicked() {
+                let mut dlg = rfd::FileDialog::new();
+                if !self.save_base.trim().is_empty() {
+                    dlg = dlg.set_directory(&self.save_base);
                 }
-                return;
+                if let Some(dir) = dlg.pick_folder() {
+                    self.save_base = dir.to_string_lossy().to_string();
+                }
+            }
+            y += LBL_H + LBL_GAP + FIELD_H + ROW_GAP;
+
+            if self.adding_cat {
+                let w = CONTENT_W - 4.0 - 44.0;
+                let f = egui::Rect::from_min_size(egui::pos2(left, y), egui::vec2(w, FIELD_H));
+                field(ui, f, &mut self.new_cat, "New category name");
+                let b = egui::Rect::from_min_size(
+                    egui::pos2(left + w + 4.0, y),
+                    egui::vec2(44.0, FIELD_H),
+                );
+                let enter = ui.input(|i| i.key_pressed(egui::Key::Enter));
+                if button(ui, b, "Add", Btn::Primary, 3).clicked() || enter {
+                    let name = self.new_cat.trim().to_string();
+                    if !name.is_empty() {
+                        if !self.custom_cats.iter().any(|c| c.eq_ignore_ascii_case(&name)) {
+                            self.custom_cats.push(name.clone());
+                        }
+                        self.category = name;
+                        self.new_cat.clear();
+                        self.adding_cat = false;
+                    }
+                }
+                y += FIELD_H + ROW_GAP;
+            }
+            // --- remember + size + folder (one compact row) ---
+            let cy = y + PATH_H / 2.0;
+            let cb = ui.interact(
+                egui::Rect::from_center_size(egui::pos2(left + 5.0, cy), egui::vec2(18.0, 18.0)),
+                egui::Id::new("popup-remember"),
+                egui::Sense::click(),
+            );
+            if cb.hovered() {
+                ctx.set_cursor_icon(egui::CursorIcon::PointingHand);
+            }
+            let box_r =
+                egui::Rect::from_center_size(egui::pos2(left + 5.0, cy), egui::vec2(10.0, 10.0));
+            if self.remember_path {
+                p.rect(box_r, 2.0, C_ACCENT, egui::Stroke::NONE, egui::StrokeKind::Inside);
+                let stroke = egui::Stroke::new(1.3_f32, egui::Color32::WHITE);
+                let m = |x: f32, yy: f32| egui::pos2(box_r.left() + x, box_r.top() + yy);
+                p.line_segment([m(2.4, 5.2), m(4.3, 7.2)], stroke);
+                p.line_segment([m(4.3, 7.2), m(7.7, 3.0)], stroke);
+            } else {
+                p.rect(
+                    box_r,
+                    2.0,
+                    C_INPUT,
+                    egui::Stroke::new(1.0_f32, C_BORDER),
+                    egui::StrokeKind::Inside,
+                );
+            }
+            if cb.clicked() {
+                self.remember_path = !self.remember_path;
+            }
+            let lr = p.text(
+                egui::pos2(left + 14.0, cy),
+                egui::Align2::LEFT_CENTER,
+                "Remember this path",
+                reg(8.0),
+                C_LBL,
+            );
+            let mut sx = lr.right() + 8.0;
+            let known = self.probe_size.filter(|s| *s > 0);
+            let size_txt = if self.probing {
+                "…".to_string()
+            } else {
+                match known {
+                    Some(sz) if self.duration_secs > 0 => {
+                        format!("{} • {}", format_dur(self.duration_secs), format_bytes(sz))
+                    }
+                    Some(sz) => format_bytes(sz),
+                    None => "size unknown".to_string(),
+                }
+            };
+            let sr = p.text(
+                egui::pos2(sx, cy),
+                egui::Align2::LEFT_CENTER,
+                &size_txt,
+                reg(8.0),
+                if known.is_some() { C_ACCENT } else { C_DIM },
+            );
+            sx = sr.right() + 8.0;
+            let br = p.text(
+                egui::pos2(sx, cy),
+                egui::Align2::LEFT_CENTER,
+                "|",
+                reg(8.0),
+                C_DIM,
+            );
+            sx = br.right() + 8.0;
+            let path_rect = egui::Rect::from_min_size(
+                egui::pos2(sx, y),
+                egui::vec2((right - sx).max(60.0), PATH_H),
+            );
+            field(ui, path_rect, &mut self.save_base, "folder")
+                .on_hover_text(format!("→ {}", self.effective_dir()));
+            y += PATH_H + ROW_GAP;
+
+            // --- description ---
+            p.text(
+                egui::pos2(left, y + LBL_H / 2.0),
+                egui::Align2::LEFT_CENTER,
+                "Description",
+                reg(9.0),
+                C_LBL,
+            );
+            let desc_rect = egui::Rect::from_min_size(
+                egui::pos2(left, y + LBL_H + LBL_GAP),
+                egui::vec2(CONTENT_W, DESC_H),
+            );
+            field(ui, desc_rect, &mut self.description, "optional note");
+            y += LBL_H + LBL_GAP + DESC_H + 8.0;
+            // --- actions: Download Later | Start Download | Cancel ---
+            let bw = (CONTENT_W - 2.0 * ROW_GAP) / 3.0;
+            let later = button(
+                ui,
+                egui::Rect::from_min_size(egui::pos2(left, y), egui::vec2(bw, BTN_H)),
+                "Download Later",
+                Btn::Ghost,
+                4,
+            );
+            let start = button(
+                ui,
+                egui::Rect::from_min_size(
+                    egui::pos2(left + bw + ROW_GAP, y),
+                    egui::vec2(bw, BTN_H),
+                ),
+                "Start Download",
+                Btn::Primary,
+                5,
+            );
+            let cancel = button(
+                ui,
+                egui::Rect::from_min_size(
+                    egui::pos2(left + 2.0 * (bw + ROW_GAP), y),
+                    egui::vec2(bw, BTN_H),
+                ),
+                "Cancel",
+                Btn::Ghost,
+                6,
+            );
+            if later.clicked() {
+                self.commit(false);
+            }
+            if start.clicked() {
+                self.commit(true);
+            }
+            if cancel.clicked() {
+                self.done = true;
+            }
+            y += BTN_H;
+
+            // --- extras: the concept has no such rows, so they live in a
+            // panel that is closed by default and grows the window. ---
+            if self.show_adv {
+                y += 10.0;
+                let rows: [(&str, &mut String, &str); 2] = [
+                    ("Referer", &mut self.referer, "http://..."),
+                    ("Cookie", &mut self.cookie, "name=value; ..."),
+                ];
+                for (lbl, buf, hint) in rows {
+                    p.text(
+                        egui::pos2(left, y + FIELD_H / 2.0),
+                        egui::Align2::LEFT_CENTER,
+                        lbl,
+                        reg(9.0),
+                        C_LBL,
+                    );
+                    let f = egui::Rect::from_min_size(
+                        egui::pos2(left + 62.0, y),
+                        egui::vec2(CONTENT_W - 62.0, FIELD_H),
+                    );
+                    field(ui, f, buf, hint);
+                    y += FIELD_H + ROW_GAP;
+                }
+                let ccy = y + FIELD_H / 2.0;
+                p.text(
+                    egui::pos2(left, ccy),
+                    egui::Align2::LEFT_CENTER,
+                    "Connections",
+                    reg(9.0),
+                    C_LBL,
+                );
+                p.text(
+                    egui::pos2(left + 62.0, ccy),
+                    egui::Align2::LEFT_CENTER,
+                    self.connections.to_string(),
+                    reg(9.0),
+                    C_FTXT,
+                );
+                ui.put(
+                    egui::Rect::from_min_size(
+                        egui::pos2(left + 96.0, ccy - 8.0),
+                        egui::vec2(CONTENT_W - 96.0, 16.0),
+                    ),
+                    egui::Slider::new(&mut self.connections, 1..=16).show_value(false),
+                );
+                y += FIELD_H + ROW_GAP;
+                for n in &notes {
+                    p.text(
+                        egui::pos2(left, y),
+                        egui::Align2::LEFT_CENTER,
+                        n,
+                        reg(8.0),
+                        C_DIM,
+                    );
+                    y += 12.0;
+                }
             }
 
-            // Row 1: URL + copy.
-            ui.horizontal(|ui| {
-                ui.add_sized(
-                    [ui.available_width() - 52.0, 38.0],
-                    egui::TextEdit::singleline(&mut self.url).hint_text("https://..."),
-                );
-                if ui
-                    .add_sized([44.0, 38.0], egui::Button::new(crate::app::MI_COPY))
-                    .on_hover_text("Copy URL")
-                    .clicked()
-                {
-                    if let Ok(mut cb) = arboard::Clipboard::new() {
-                        let _ = cb.set_text(self.url.clone());
-                    }
-                }
-            });
-            // Row 2: category + remember + size badge (ABDM keeps size here).
-            ui.horizontal(|ui| {
-                egui::ComboBox::from_id_salt("cf_cat")
-                    .selected_text(&self.category)
-                    .width(130.0)
-                    .show_ui(ui, |ui| {
-                        for c in CATEGORIES {
-                            ui.selectable_value(&mut self.category, c.to_string(), *c);
-                        }
-                    });
-                ui.checkbox(
-                    &mut self.remember_path,
-                    format!("Remember for \"{}\"", self.category),
-                );
-                ui.with_layout(
-                    egui::Layout::right_to_left(egui::Align::Center),
-                    |ui| {
-                        if self.probing {
-                            ui.spinner();
-                        } else if let Some(sz) = self.probe_size.filter(|s| *s > 0) {
-                            if self.duration_secs > 0 {
-                                ui.label(
-                                    egui::RichText::new(format_dur(self.duration_secs))
-                                        .size(14.0)
-                                        .strong(),
-                                );
-                                ui.label(egui::RichText::new("•").size(14.0).weak());
-                            }
-                            ui.label(egui::RichText::new(format_bytes(sz)).size(14.0).strong());
-                            ui.colored_label(
-                                egui::Color32::from_rgb(80, 200, 120),
-                                egui::RichText::new(crate::app::MI_CHECK).size(14.0),
-                            );
-                        } else {
-                            ui.weak("size unknown");
-                        }
-                    },
-                );
-            });
-            // Row 3: save folder + browse.
-            ui.horizontal(|ui| {
-                ui.add_sized(
-                    [ui.available_width() - 52.0, 38.0],
-                    egui::TextEdit::singleline(&mut self.save_base),
-                );
-                if ui
-                    .add_sized([44.0, 38.0], egui::Button::new(crate::app::MI_FOLDER_OPEN))
-                    .on_hover_text("Browse folder")
-                    .clicked()
-                {
-                    if let Some(p) = rfd::FileDialog::new().pick_folder() {
-                        self.save_base = p.to_string_lossy().to_string();
-                    }
-                }
-            });
-            // Row 4: filename + re-probe + advanced gear.
-            ui.horizontal(|ui| {
-                ui.add_sized(
-                    [ui.available_width() - 104.0, 38.0],
-                    egui::TextEdit::singleline(&mut self.filename).hint_text("Filename"),
-                );
-                if ui
-                    .add_sized([44.0, 38.0], egui::Button::new(crate::app::MI_REFRESH))
-                    .on_hover_text("Re-check name and size")
-                    .clicked()
-                {
-                    self.probe_size = None;
-                    self.start_probe();
-                }
-                if ui
-                    .add_sized([44.0, 38.0], egui::Button::new(crate::app::MI_SETTINGS))
-                    .on_hover_text("Advanced")
-                    .clicked()
-                {
-                    self.show_adv = !self.show_adv;
-                }
-            });
-            ui.weak(format!("→ {}", self.effective_dir()));
-            if self.pair_url.starts_with("http") {
-                ui.weak("video-only + audio — merged to one file on completion (needs ffmpeg)");
-            }
-            if !self.quality_pref.trim().is_empty() {
-                ui.weak(format!("Quality: {} (app resolves this stream itself)", self.quality_pref.trim()));
-            }
-            if self.show_adv {
-                egui::Frame::new()
-                    .corner_radius(crate::app::RADIUS)
-                    .inner_margin(egui::Margin::same(8))
-                    .show(ui, |ui| {
-                        ui.horizontal(|ui| {
-                            ui.label("Referer");
-                            ui.add(
-                                egui::TextEdit::singleline(&mut self.referer)
-                                    .desired_width(f32::INFINITY),
-                            );
-                        });
-                        ui.horizontal(|ui| {
-                            ui.label("Cookie");
-                            ui.add(
-                                egui::TextEdit::singleline(&mut self.cookie)
-                                    .desired_width(f32::INFINITY),
-                            );
-                        });
-                        ui.horizontal(|ui| {
-                            ui.label("Description");
-                            ui.add(
-                                egui::TextEdit::singleline(&mut self.description)
-                                    .desired_width(f32::INFINITY)
-                                    .hint_text("optional note"),
-                            );
-                        });
-                        ui.horizontal(|ui| {
-                            ui.label(format!("Connections: {}", self.connections));
-                            ui.add(
-                                egui::Slider::new(&mut self.connections, 1..=16).show_value(false),
-                            );
-                        });
-                    });
-            } else {
-                // Description stays one line under, like IDM.
-                ui.horizontal(|ui| {
-                    ui.label("Description");
-                    ui.add(
-                        egui::TextEdit::singleline(&mut self.description)
-                            .desired_width(f32::INFINITY)
-                            .hint_text("optional note"),
-                    );
-                });
-            }
             if !self.notice.is_empty() {
-                ui.colored_label(egui::Color32::from_rgb(255, 150, 120), &self.notice);
-            }
-            ui.add_space(6.0);
-            // Action row: Add | Download (accent) ... Cancel.
-            ui.horizontal(|ui| {
-                if ui.add_sized([140.0, 42.0], egui::Button::new("Download Later")).clicked() {
-                    self.commit(false);
-                }
-                let dl = egui::Button::new(egui::RichText::new("Start Download").strong().color(egui::Color32::WHITE))
-                    .fill(egui::Color32::from_rgb(88, 101, 242));
-                if ui.add_sized([150.0, 42.0], dl).clicked() {
-                    self.commit(true);
-                }
-                ui.with_layout(
-                    egui::Layout::right_to_left(egui::Align::Center),
-                    |ui| {
-                        if ui.add_sized([120.0, 42.0], egui::Button::new("Cancel")).clicked() {
-                            self.done = true;
-                        }
-                    },
+                // Clamp: the notice carries I/O messages that can be long, and
+                // `p.text` does not wrap or clip inside the fixed card.
+                let shown: String = self.notice.chars().take(70).collect();
+                p.text(
+                    egui::pos2(left, y + 8.0),
+                    egui::Align2::LEFT_CENTER,
+                    &shown,
+                    reg(9.0),
+                    egui::Color32::from_rgb(255, 150, 120),
                 );
-            });
+            }
+            let _ = y;
         });
     }
 }

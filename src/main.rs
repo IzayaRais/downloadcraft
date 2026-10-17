@@ -9,6 +9,7 @@ mod basket;
 mod cli;
 mod confirm;
 mod engine;
+mod fonts;
 mod ftp;
 mod grabber;
 mod manual;

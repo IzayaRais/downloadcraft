@@ -652,22 +652,105 @@ pub fn drop_resume_state(dest: &std::path::Path) {
     let _ = std::fs::remove_file(dest.with_extension("hlsmap"));
 }
 
+/// Outcome of `append_to_queue`.
+#[derive(Debug, Clone, PartialEq)]
+pub enum AppendResult {
+    /// Entry added, or an existing dead entry refreshed in place — start it.
+    Added(u64),
+    /// The URL is already queued and still usable (id of the existing row).
+    AlreadyQueued(u64),
+    /// The queue file could not be read or written. Callers must NOT fall
+    /// back to "write a fresh file": that silently deletes every entry we
+    /// failed to parse. Surface the message instead.
+    Error(String),
+}
+
+/// Read the shared queue, tolerating a UTF-8 BOM (editors and PowerShell
+/// snapshots add one and `serde_json` rejects it). A file that exists but
+/// does not parse is an error — never an empty queue, or the next write
+/// would destroy it.
+pub fn read_queue_items(path: &std::path::Path) -> Result<Vec<DownloadItem>, String> {
+    let data = match std::fs::read_to_string(path) {
+        Ok(d) => d,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) => return Err(format!("cannot read {}: {e}", path.display())),
+    };
+    let data = data.trim_start_matches('\u{feff}');
+    if data.trim().is_empty() {
+        return Ok(Vec::new());
+    }
+    serde_json::from_str(data).map_err(|e| format!("{} is not valid JSON: {e}", path.display()))
+}
+
+fn write_queue(path: &std::path::Path, items: &[DownloadItem]) -> Result<(), String> {
+    let json = serde_json::to_string_pretty(items)
+        .map_err(|e| format!("cannot serialize the queue: {e}"))?;
+    atomic_write(path, json.as_bytes()).map_err(|e| format!("cannot write {}: {e}", path.display()))
+}
+
+/// Is this row effectively gone — a failure, or a "Completed" row whose file
+/// no longer exists? Such an entry must never block a fresh capture.
+fn entry_is_dead(d: &DownloadItem) -> bool {
+    match &d.status {
+        Status::Failed(_) => true,
+        Status::Completed => !d.dest_path().exists(),
+        _ => false,
+    }
+}
+
+/// Look up a queued URL. Returns `(id, dead)`; `dead` mirrors what
+/// `append_to_queue` would do with a fresh capture of the same URL.
+pub fn queued_entry(url: &str) -> Option<(u64, bool)> {
+    let path = config_dir()?.join("queue.json");
+    let items = read_queue_items(&path).ok()?;
+    let d = items.into_iter().find(|d| d.url == url)?;
+    Some((d.id, entry_is_dead(&d)))
+}
+
 /// Append an item to the shared queue file with a fresh id (used by the
 /// standalone dialogs). Holds the queue lock across read-assign-write so
-/// concurrent writers can no longer collide on ids. Returns the assigned
-/// id, or None when the URL is already queued. A non-completed entry for
-/// the SAME destination file (fresh capture, new signed URL) is refreshed
-/// in place — new URL/meta, progress reset — and its id is returned, so a
+/// concurrent writers can no longer collide on ids. A non-completed entry for
+/// the SAME destination file (fresh capture, new signed URL) is refreshed in
+/// place — new URL/meta, progress reset — and its id is returned, so a
 /// re-click never creates a colliding duplicate.
-pub fn append_to_queue(item: &mut DownloadItem) -> Option<u64> {
+pub fn append_to_queue(item: &mut DownloadItem) -> AppendResult {
     let _guard = fs_lock("queue");
-    let path = config_dir()?.join("queue.json");
-    let mut items: Vec<DownloadItem> = std::fs::read_to_string(&path)
-        .ok()
-        .and_then(|s| serde_json::from_str(&s).ok())
-        .unwrap_or_default();
-    if items.iter().any(|d| d.url == item.url) {
-        return None;
+    let path = match config_dir() {
+        Some(d) => d.join("queue.json"),
+        None => return AppendResult::Error("no config directory".to_string()),
+    };
+    append_to_queue_at(&path, item)
+}
+
+/// Path-injected core of `append_to_queue` (unit-tested without touching the
+/// real queue). Callers must hold the queue lock.
+fn append_to_queue_at(path: &std::path::Path, item: &mut DownloadItem) -> AppendResult {
+    let mut items = match read_queue_items(path) {
+        Ok(v) => v,
+        Err(e) => return AppendResult::Error(e),
+    };
+    if let Some(pos) = items.iter().position(|d| d.url == item.url) {
+        // Same URL again. Reuse the row unless it is dead (failed, or finished
+        // with the file gone) — then refresh it so "Start Download" always
+        // works instead of dead-ending on "already in queue".
+        if !entry_is_dead(&items[pos]) {
+            return AppendResult::AlreadyQueued(items[pos].id);
+        }
+        let id = items[pos].id;
+        let created = items[pos].created_at;
+        items[pos].downloaded_bytes = 0;
+        if item.total_bytes.is_some() {
+            items[pos].total_bytes = item.total_bytes;
+        }
+        items[pos].speed_bps = 0.0;
+        items[pos].status = Status::Queued;
+        items[pos].created_at = created;
+        let dp = items[pos].dest_path();
+        drop_resume_state(&dp);
+        return match write_queue(path, &items) {
+            Ok(()) => AppendResult::Added(id),
+            Err(e) => AppendResult::Error(e),
+        };
     }
     if let Some(pos) = find_dest_clash(&items, &item.dest_path()) {
         let id = items[pos].id;
@@ -704,19 +787,19 @@ pub fn append_to_queue(item: &mut DownloadItem) -> Option<u64> {
         items[pos].speed_bps = 0.0;
         items[pos].status = Status::Queued;
         items[pos].created_at = created;
-        serde_json::to_string_pretty(&items)
-            .ok()
-            .and_then(|j| atomic_write(&path, j.as_bytes()).ok())?;
-        return Some(id);
+        return match write_queue(path, &items) {
+            Ok(()) => AppendResult::Added(id),
+            Err(e) => AppendResult::Error(e),
+        };
     }
     let id = items.iter().map(|d| d.id).max().unwrap_or(0) + 1;
     item.id = id;
     item.status = Status::Queued;
     items.push(item.clone());
-    serde_json::to_string_pretty(&items)
-        .ok()
-        .and_then(|j| atomic_write(&path, j.as_bytes()).ok())?;
-    Some(id)
+    match write_queue(path, &items) {
+        Ok(()) => AppendResult::Added(id),
+        Err(e) => AppendResult::Error(e),
+    }
 }
 
 /// A daily speed window (P3.4): HH:MM–HH:MM at `limit_kbps` (0 = full speed).
@@ -842,6 +925,189 @@ mod tests {
         assert_eq!(category_of("a.exe"), "Apps");
         assert_eq!(category_of("a.xyz"), "Other");
         assert_eq!(category_of("noext"), "Other");
+    }
+
+    #[test]
+    fn queue_read_tolerates_bom_and_flags_corruption() {
+        let dir = std::env::temp_dir().join("dc_queue_read_test");
+        let _ = std::fs::create_dir_all(&dir);
+        let p = dir.join("queue.json");
+
+        // Missing file = empty queue, not an error.
+        let _ = std::fs::remove_file(&p);
+        assert_eq!(read_queue_items(&p).unwrap().len(), 0);
+
+        // A UTF-8 BOM (editors/PowerShell snapshots add one) must not make the
+        // queue look empty — treating it as empty is how a rewrite silently
+        // deletes every existing row.
+        let item = DownloadItem::new(
+            1,
+            "https://e.com/a.zip".into(),
+            "a.zip".into(),
+            dir.to_string_lossy().into(),
+            8,
+        );
+        let json = serde_json::to_string_pretty(&vec![item]).unwrap();
+        std::fs::write(&p, format!("\u{feff}{json}")).unwrap();
+        let items = read_queue_items(&p).unwrap();
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].url, "https://e.com/a.zip");
+
+        // Genuine corruption is an error, never an empty list: callers must
+        // refuse to write rather than wipe the queue.
+        std::fs::write(&p, "{ not json").unwrap();
+        assert!(read_queue_items(&p).is_err());
+
+        // A blank file is an empty queue.
+        std::fs::write(&p, "  \n").unwrap();
+        assert_eq!(read_queue_items(&p).unwrap().len(), 0);
+    }
+
+    #[test]
+    fn dead_entries_do_not_block_requeue() {
+        let dir = std::env::temp_dir().join("dc_dead_entry_test");
+        let _ = std::fs::create_dir_all(&dir);
+        let mut item = DownloadItem::new(
+            1,
+            "https://e.com/a.zip".into(),
+            "a.zip".into(),
+            dir.to_string_lossy().into(),
+            8,
+        );
+
+        // Finished with the file present = live (must not be re-downloaded).
+        item.status = Status::Completed;
+        std::fs::write(item.dest_path(), b"x").unwrap();
+        assert!(!entry_is_dead(&item));
+
+        // Finished with the file GONE = dead: a re-capture must be allowed.
+        std::fs::remove_file(item.dest_path()).unwrap();
+        assert!(entry_is_dead(&item));
+
+        // Failed is dead even when a partial file lingers.
+        std::fs::write(item.dest_path(), b"y").unwrap();
+        item.status = Status::Failed("early end".into());
+        assert!(entry_is_dead(&item));
+
+        // Live states are never dead.
+        for s in [Status::Queued, Status::Downloading, Status::Paused] {
+            item.status = s;
+            assert!(!entry_is_dead(&item));
+        }
+    }
+
+    #[test]
+    fn dead_row_is_refreshed_not_blocked() {
+        let dir = std::env::temp_dir().join("dc_append_dead_test");
+        let _ = std::fs::create_dir_all(&dir);
+        let p = dir.join("queue.json");
+
+        // A finished row whose file is gone must not block a re-download.
+        let mut old = DownloadItem::new(
+            1,
+            "https://e.com/a.zip".into(),
+            "a.zip".into(),
+            dir.to_string_lossy().into(),
+            8,
+        );
+        old.status = Status::Completed;
+        old.downloaded_bytes = 999;
+        std::fs::write(&p, serde_json::to_string_pretty(&vec![old]).unwrap()).unwrap();
+
+        let mut fresh = DownloadItem::new(
+            0,
+            "https://e.com/a.zip".into(),
+            "a.zip".into(),
+            dir.to_string_lossy().into(),
+            8,
+        );
+        fresh.total_bytes = Some(1024);
+        assert_eq!(append_to_queue_at(&p, &mut fresh), AppendResult::Added(1));
+
+        let items = read_queue_items(&p).unwrap();
+        assert_eq!(items.len(), 1, "must refresh in place, not duplicate");
+        assert_eq!(items[0].id, 1);
+        assert!(matches!(items[0].status, Status::Queued));
+        assert_eq!(items[0].downloaded_bytes, 0);
+        assert_eq!(items[0].total_bytes, Some(1024));
+
+        // A live row is reused, not duplicated.
+        let mut again = DownloadItem::new(
+            0,
+            "https://e.com/a.zip".into(),
+            "a.zip".into(),
+            dir.to_string_lossy().into(),
+            8,
+        );
+        assert_eq!(append_to_queue_at(&p, &mut again), AppendResult::AlreadyQueued(1));
+        assert_eq!(read_queue_items(&p).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn corrupt_queue_is_never_wiped() {
+        let dir = std::env::temp_dir().join("dc_append_corrupt_test");
+        let _ = std::fs::create_dir_all(&dir);
+        let p = dir.join("queue.json");
+        std::fs::write(&p, "!!! not json !!!").unwrap();
+        let before = std::fs::read_to_string(&p).unwrap();
+
+        let mut item = DownloadItem::new(
+            0,
+            "https://e.com/a.zip".into(),
+            "a.zip".into(),
+            dir.to_string_lossy().into(),
+            8,
+        );
+        assert!(matches!(
+            append_to_queue_at(&p, &mut item),
+            AppendResult::Error(_)
+        ));
+        assert_eq!(
+            std::fs::read_to_string(&p).unwrap(),
+            before,
+            "an unreadable queue must be left untouched, never overwritten"
+        );
+    }
+
+    #[test]
+    fn bom_queue_rows_survive_append() {
+        let dir = std::env::temp_dir().join("dc_append_bom_test");
+        let _ = std::fs::create_dir_all(&dir);
+        let p = dir.join("queue.json");
+        let keep = DownloadItem::new(
+            7,
+            "https://e.com/keep.zip".into(),
+            "keep.zip".into(),
+            dir.to_string_lossy().into(),
+            8,
+        );
+        std::fs::write(
+            &p,
+            format!("\u{feff}{}", serde_json::to_string_pretty(&vec![keep]).unwrap()),
+        )
+        .unwrap();
+
+        let mut item = DownloadItem::new(
+            0,
+            "https://e.com/new.zip".into(),
+            "new.zip".into(),
+            dir.to_string_lossy().into(),
+            8,
+        );
+        assert!(matches!(
+            append_to_queue_at(&p, &mut item),
+            AppendResult::Added(_)
+        ));
+        let urls: Vec<String> = read_queue_items(&p)
+            .unwrap()
+            .into_iter()
+            .map(|d| d.url)
+            .collect();
+        assert!(
+            urls.contains(&"https://e.com/keep.zip".to_string()),
+            "existing rows must survive a BOM"
+        );
+        assert!(urls.contains(&"https://e.com/new.zip".to_string()));
     }
 
     #[test]

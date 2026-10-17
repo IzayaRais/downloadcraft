@@ -8,7 +8,7 @@
 //!   (`pause_all` / `resume_all`), consumed by the main app.
 
 use crate::model::{
-    append_to_queue, apply_rename_template, category_of, config_dir, is_download_url,
+    append_to_queue, apply_rename_template, category_of, config_dir, is_download_url, AppendResult,
     DownloadItem,
 };
 
@@ -72,8 +72,9 @@ fn queue_one(url: &str) -> &'static str {
         conns,
     );
     match append_to_queue(&mut item) {
-        Some(_) => "queued",
-        None => "already queued",
+        AppendResult::Added(_) => "queued",
+        AppendResult::AlreadyQueued(_) => "already queued",
+        AppendResult::Error(_) => "queue error",
     }
 }
 
