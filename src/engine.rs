@@ -35,6 +35,10 @@ pub struct SharedState {
     /// Terminal engine error text (e.g. checksum mismatch, unrecoverable
     /// HTTP error). Set once by the download task before it exits.
     pub error: std::sync::Mutex<Option<String>>,
+    /// A non-fatal remark for the row's log: a fallback that likely cost the
+    /// audio track, a helper that could not be used, and so on. Never decides
+    /// the status.
+    pub note: std::sync::Mutex<Option<String>>,
 }
 
 impl SharedState {
@@ -53,6 +57,7 @@ impl SharedState {
             rate_limited: AtomicBool::new(false),
             phase: std::sync::Mutex::new(String::new()),
             error: std::sync::Mutex::new(None),
+            note: std::sync::Mutex::new(None),
         }
     }
 
@@ -62,6 +67,16 @@ impl SharedState {
             let p = p.into();
             if *g != p {
                 *g = p;
+            }
+        }
+    }
+
+    /// Record a non-fatal remark for the row's log (first one wins, so the
+    /// most specific cause survives later fallbacks).
+    pub fn set_note(&self, n: impl Into<String>) {
+        if let Ok(mut g) = self.note.lock() {
+            if g.is_none() {
+                *g = Some(n.into());
             }
         }
     }
@@ -544,6 +559,59 @@ fn is_fragile_cdn(url: &str) -> bool {
         || low.contains("fbsbx.com")
         || low.contains("scontent")
         || low.contains("lookaside.")
+}
+
+/// The media *page* a captured social CDN asset belongs to, when handing that
+/// page to yt-dlp is both possible and safe. Facebook/Instagram players stream
+/// adaptive representations - a video-only DASH quality plus a separate
+/// audio-only one - and the browser captures whichever the player was
+/// fetching, which is why such a capture downloads as a silent video. The page
+/// is where both legs can be found, but only a referer naming ONE video
+/// (reel/watch/video/photo page) may be used: a feed, profile or home page
+/// could resolve to a different video entirely.
+fn social_page_url(asset: &str, referer: &str) -> Option<String> {
+    if !is_fragile_cdn(asset) {
+        return None;
+    }
+    let page = referer.trim();
+    if page.is_empty() || !page.starts_with("http") {
+        return None;
+    }
+    let low = page.to_ascii_lowercase();
+    let social = low.contains("facebook.com")
+        || low.contains("fb.watch")
+        || low.contains("fb.gg")
+        || low.contains("instagram.com");
+    if !social {
+        return None;
+    }
+    let names_one_video = low.contains("/reel/")
+        || low.contains("/reels/")
+        || low.contains("/watch")
+        || low.contains("/videos/")
+        || low.contains("/video.php")
+        || low.contains("/tv/")
+        || low.contains("/p/")
+        || low.contains("/share/")
+        || low.contains("?v=");
+    if !names_one_video {
+        return None;
+    }
+    Some(page.to_string())
+}
+
+/// Which site a cookie string belongs to, for the Netscape jar yt-dlp reads.
+/// The wrong domain silently drops every cookie, and Facebook then answers as
+/// a logged-out visitor that hides the video.
+fn cookie_domain(url: &str) -> &'static str {
+    let low = url.to_ascii_lowercase();
+    if low.contains("facebook") || low.contains("fbcdn") || low.contains("fbsbx") {
+        ".facebook.com"
+    } else if low.contains("instagram") || low.contains("cdninstagram") {
+        ".instagram.com"
+    } else {
+        ".youtube.com"
+    }
 }
 
 /// Facebook progressive URLs sometimes carry `bytestart`/`byteend` slice
@@ -2763,8 +2831,14 @@ pub async fn download(
     } else {
         None
     };
+    // A captured social asset can be stale by the time the row runs (signed
+    // links expire), but when the row still remembers the video's *page* that
+    // page is the better source anyway - it carries the audio leg too. Only
+    // verify the asset when there is no page to fall back to, so re-downloading
+    // an old capture is not refused by its dead asset link.
+    let social = social_page_url(&url, &opts.referer);
     let mut range_verified: Option<Option<u64>> = None; // Some(x) = probe ran
-    if direct_delivery && seeded_total.is_some() {
+    if direct_delivery && seeded_total.is_some() && social.is_none() {
         match probe_range_once(&client, &opts, &url, seeded_total).await {
             Ok(verified) => range_verified = Some(verified),
             Err(e) => return Err(e), // expired/refused: fail fast, loudly
@@ -2845,6 +2919,48 @@ pub async fn download(
             Err(e) => {
                 if std::env::var("DOWNLOAD_CRAFT_DEBUG").is_ok() {
                     eprintln!("[dbg] yt-dlp unavailable: {e:#}");
+                }
+            }
+        }
+    }
+    // Facebook/Instagram rarely serve one progressive file: their players
+    // stream adaptive representations (a video-only DASH quality plus a
+    // separate audio-only one) and the browser captures whichever of those it
+    // was fetching - so the transfer "completes" as a silent video. Verified
+    // live: a captured reel rep of 722.80 MiB whose page also lists a 51.25
+    // MiB m4a, and `bv*+ba` merges the two into an mp4 that has sound. The
+    // row still remembers the page it came from, so hand *that* page to
+    // yt-dlp. Anything it cannot do falls through to the captured asset.
+    //
+    // Unlike the YouTube branch above this is not gated on the quality menu:
+    // there, a low request means the built-in engine can finish the job on its
+    // own (the progressive file), while here the captured asset is one leg of
+    // an adaptive pair - there is no quality at which it contains sound.
+    if let Some(page) = social {
+        match ensure_ytdlp(&client).await {
+            Ok(exe) => {
+                // The helper reports the merged size itself; the browser's
+                // measurement describes one leg of the pair, not the result.
+                shared.total.store(0, Ordering::SeqCst);
+                shared.has_total.store(false, Ordering::SeqCst);
+                match download_with_ytdlp(&exe, &page, &dest, connections, &opts, &shared).await {
+                    Ok(()) => return Ok(()),
+                    Err(e) => {
+                        shared.set_note(format!(
+                            "captured file kept as-is: merging the page failed ({e:#}) - it may have no sound"
+                        ));
+                        if std::env::var("DOWNLOAD_CRAFT_DEBUG").is_ok() {
+                            eprintln!("[dbg] social page path skipped: {e:#}");
+                        }
+                    }
+                }
+            }
+            Err(e) => {
+                shared.set_note(format!(
+                    "captured file kept as-is: no yt-dlp for the audio merge ({e:#}) - it may have no sound"
+                ));
+                if std::env::var("DOWNLOAD_CRAFT_DEBUG").is_ok() {
+                    eprintln!("[dbg] social page path: yt-dlp unavailable: {e:#}");
                 }
             }
         }
@@ -3460,7 +3576,7 @@ pub fn ytdlp_refresh_blocking() -> Result<std::path::PathBuf> {
 /// `--cookies` reads), so yt-dlp inherits the signed-in YouTube session
 /// without touching the browser's locked profile database. Removed after the
 /// run, so no credentials linger on disk.
-async fn write_cookie_jar(cookie: &str) -> Option<std::path::PathBuf> {
+async fn write_cookie_jar(cookie: &str, domain: &str) -> Option<std::path::PathBuf> {
     if cookie.trim().is_empty() {
         return None;
     }
@@ -3475,14 +3591,24 @@ async fn write_cookie_jar(cookie: &str) -> Option<std::path::PathBuf> {
         if name.is_empty() || bad(name) || bad(value) {
             continue;
         }
-        body.push_str(&format!(".youtube.com\tTRUE\t/\tFALSE\t0\t{name}\t{value}\n"));
+        body.push_str(&format!("{domain}\tTRUE\t/\tFALSE\t0\t{name}\t{value}\n"));
         rows += 1;
     }
     if rows == 0 {
         return None;
     }
+    // One jar per cookie set: the old pid-only name was shared by every
+    // concurrent download, so a YouTube job and a Facebook job could read each
+    // other's (wrong-domain) jar.
+    let tag = {
+        use std::hash::{Hash, Hasher};
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        domain.hash(&mut h);
+        cookie.hash(&mut h);
+        h.finish()
+    };
     let path = std::env::temp_dir().join(format!(
-        "download_craft_cookies_{}.txt",
+        "download_craft_cookies_{}_{tag:x}.txt",
         std::process::id()
     ));
     tokio::fs::write(&path, body).await.ok()?;
@@ -3547,6 +3673,50 @@ fn parse_progress_line(line: &str) -> Option<YtdlpProgress> {
     })
 }
 
+/// Folds the progress lines of a *merged* helper download into the numbers the
+/// UI shows. yt-dlp transfers the legs one after another (video, then audio)
+/// and each of them restarts its byte counter at 0, so both the byte count and
+/// the size have to be built from the finished legs plus the current one. While
+/// a new leg has not named its size yet the total is reported as unknown —
+/// keeping the previous leg's total there is what showed "Downloaded 847.65 MB"
+/// beside "Size 722.80 MB" on the same row.
+#[derive(Default)]
+struct MergedProgress {
+    /// Finished legs: bytes and sizes.
+    base: u64,
+    total_base: u64,
+    /// Current leg: bytes and size (0 = not named yet).
+    last: u64,
+    last_total: u64,
+    /// Whether the current leg has named its size.
+    known: bool,
+}
+
+impl MergedProgress {
+    /// Fold one line in and return `(downloaded, total)` to publish.
+    fn step(&mut self, p: &YtdlpProgress) -> (u64, Option<u64>) {
+        if let Some(done) = p.done.map(|d| d.max(0.0) as u64) {
+            if done + 1 < self.last {
+                self.base += self.last_total.max(self.last);
+                self.total_base += self.last_total;
+                self.last_total = 0;
+                self.known = false;
+            }
+            self.last = done;
+        }
+        if let Some(total) = p.total.or(p.estimate).filter(|t| *t > 0.0) {
+            self.last_total = total as u64;
+            self.known = true;
+        }
+        let total = if self.known {
+            Some(self.total_base + self.last_total)
+        } else {
+            None
+        };
+        (self.base + self.last, total)
+    }
+}
+
 /// The stage a yt-dlp *status* line reports, if it reports one.
 ///
 /// Only the stages that can leave the UI looking dead matter: extraction
@@ -3594,7 +3764,7 @@ async fn download_with_ytdlp(
     // A file already sitting at the destination makes yt-dlp report
     // "already downloaded" and exit without fetching anything.
     let _ = tokio::fs::remove_file(dest).await;
-    let jar = write_cookie_jar(&opts.cookie).await;
+    let jar = write_cookie_jar(&opts.cookie, cookie_domain(url)).await;
     let mut cmd = tokio::process::Command::new(exe);
     #[cfg(windows)]
     {
@@ -3658,12 +3828,11 @@ async fn download_with_ytdlp(
     let progress = Arc::clone(shared);
     let out_task = tokio::spawn(async move {
         let mut lines = tokio::io::BufReader::new(stdout).lines();
-        // A merged YouTube download is two transfers - video, then audio - and
-        // the second one restarts its byte counter at 0. Fold the finished one
-        // into `base` when that happens, so the bar keeps moving forward
-        // instead of snapping back, and the reported size ends up being the
-        // size of both streams together.
-        let (mut base, mut last, mut last_total) = (0u64, 0u64, 0u64);
+        // A merged download is several transfers back to back (video, then
+        // audio) and each one restarts its byte counter at 0: `MergedProgress`
+        // folds the finished legs in so the bar keeps moving forward and the
+        // size ends up being all legs together.
+        let mut folded = MergedProgress::default();
         while let Ok(Some(line)) = lines.next_line().await {
             let Some(p) = parse_progress_line(&line) else {
                 // Not a progress line: it may still name the stage the run is
@@ -3676,18 +3845,15 @@ async fn download_with_ytdlp(
             if p.done.is_some() || p.speed.is_some() {
                 progress.set_phase("Downloading");
             }
-            if let Some(done) = p.done.map(|d| d.max(0.0) as u64) {
-                if done + 1 < last {
-                    base += last_total.max(last);
-                    last_total = 0;
+            let (downloaded, total) = folded.step(&p);
+            progress.downloaded.store(downloaded, Ordering::SeqCst);
+            match total {
+                Some(t) => {
+                    progress.total.store(t, Ordering::SeqCst);
+                    progress.has_total.store(true, Ordering::SeqCst);
                 }
-                last = done;
-                progress.downloaded.store(base + done, Ordering::SeqCst);
-            }
-            if let Some(total) = p.total.or(p.estimate).filter(|t| *t > 0.0) {
-                last_total = total as u64;
-                progress.total.store(base + total as u64, Ordering::SeqCst);
-                progress.has_total.store(true, Ordering::SeqCst);
+                // No size yet (extraction, or a new leg that has not named one).
+                None => progress.has_total.store(false, Ordering::SeqCst),
             }
             if let Some(speed) = p.speed.filter(|s| *s > 0.0) {
                 progress.speed_bps.store(speed as u64, Ordering::SeqCst);
@@ -5762,6 +5928,79 @@ mod tests {
         let estimate_only = parse_progress_line("dcp@7|NA|900|NA").unwrap();
         assert_eq!(estimate_only.total, None);
         assert_eq!(estimate_only.estimate, Some(900.0));
+    }
+
+    #[test]
+    fn merged_progress_sizes_add_up_across_legs() {
+        // Live shape of a merged download: the video leg reports its size, then
+        // the audio leg restarts its counter at 0 - and on some sites reports no
+        // size of its own. Folding only the bytes left the UI showing more
+        // downloaded than the file held ("Downloaded 847.65 MB" beside "Size
+        // 722.80 MB").
+        let line = |s: &str| parse_progress_line(s).unwrap();
+        let mut f = MergedProgress::default();
+        assert_eq!(f.step(&line("dcp@1000|2300|NA|10")), (1000, Some(2300)));
+        assert_eq!(f.step(&line("dcp@2300|2300|NA|10")), (2300, Some(2300)));
+        // The audio leg starts: counter back to 0, size not named yet.
+        assert_eq!(f.step(&line("dcp@0|NA|NA|10")), (2300, None));
+        assert_eq!(f.step(&line("dcp@10|NA|NA|10")), (2310, None));
+        // …and once it names its size, both legs add up and bytes stay below it.
+        let (dl, total) = f.step(&line("dcp@100|700|NA|10"));
+        assert_eq!((dl, total), (2400, Some(3000)));
+        assert!(dl <= total.unwrap());
+        // An estimate is a size too.
+        let mut g = MergedProgress::default();
+        assert_eq!(g.step(&line("dcp@5|NA|900|NA")), (5, Some(900)));
+    }
+
+    #[test]
+    fn social_pages_are_used_for_audio_merges() {
+        // A captured Facebook/Instagram representation is video-only; the page
+        // is where the matching audio track lives. Only a page naming ONE video
+        // may be handed over - a feed could resolve to a different video - and
+        // the cookie jar domain has to match the site or every cookie is
+        // dropped and the site answers as a logged-out visitor.
+        let asset = "https://scontent.fdac90-1.fna.fbcdn.net/o1/v/t2/f2/m366/AQM3.mp4?efg=eyJ2ZW5jb2Rl";
+        assert_eq!(
+            social_page_url(asset, "https://www.facebook.com/reel/1136332525739217").as_deref(),
+            Some("https://www.facebook.com/reel/1136332525739217")
+        );
+        assert_eq!(
+            social_page_url("https://scontent.xx.fbcdn.net/v/t42/a.mp4", "https://www.facebook.com/watch/?v=123")
+                .as_deref(),
+            Some("https://www.facebook.com/watch/?v=123")
+        );
+        assert_eq!(
+            social_page_url("https://scontent.xx.fbcdn.net/x.mp4", "https://www.instagram.com/reel/abc/")
+                .as_deref(),
+            Some("https://www.instagram.com/reel/abc/")
+        );
+        // A feed, a group or the home page is not the video's own page.
+        assert_eq!(social_page_url(asset, "https://www.facebook.com/"), None);
+        assert_eq!(social_page_url(asset, "https://www.facebook.com/groups/1/"), None);
+        // Non-social assets are never redirected to a page, and neither is a
+        // missing referer.
+        assert_eq!(
+            social_page_url("https://cdn.example/v.mp4", "https://www.facebook.com/reel/9"),
+            None
+        );
+        assert_eq!(social_page_url(asset, "   "), None);
+        assert_eq!(
+            cookie_domain("https://www.facebook.com/reel/1"),
+            ".facebook.com"
+        );
+        assert_eq!(
+            cookie_domain("https://scontent.xx.fbcdn.net/x.mp4"),
+            ".facebook.com"
+        );
+        assert_eq!(
+            cookie_domain("https://www.instagram.com/reel/1"),
+            ".instagram.com"
+        );
+        assert_eq!(
+            cookie_domain("https://rr1---sn.googlevideo.com/x"),
+            ".youtube.com"
+        );
     }
 
     #[test]

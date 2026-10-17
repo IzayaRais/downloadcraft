@@ -326,12 +326,20 @@ impl ProgressApp {
         // Keep displayed progress monotonic across retry legs (see app).
         if self.snap.live {
             if let Some(it) = self.item.as_mut() {
-                let new_total = self.snap.total;
-                if new_total != it.total_bytes {
-                    it.total_bytes = new_total;
-                    it.downloaded_bytes = self.snap.downloaded;
-                } else {
-                    it.downloaded_bytes = it.downloaded_bytes.max(self.snap.downloaded);
+                // Only a *known* snapshot total may replace the row's size: the
+                // helper reports none between the legs of a merged transfer, and
+                // adopting that blank flipped the window to "Unknown".
+                if let Some(t) = self.snap.total.filter(|t| *t > 0) {
+                    if it.total_bytes != Some(t) {
+                        it.total_bytes = Some(t);
+                        it.downloaded_bytes = self.snap.downloaded;
+                    }
+                }
+                it.downloaded_bytes = it.downloaded_bytes.max(self.snap.downloaded);
+                // Never show more downloaded than the size (a retried range can
+                // overshoot the engine's own total).
+                if let Some(t) = it.total_bytes {
+                    it.downloaded_bytes = it.downloaded_bytes.min(t);
                 }
                 it.speed_bps = self.snap.speed;
             }

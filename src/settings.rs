@@ -55,7 +55,7 @@ impl Default for Settings {
     fn default() -> Self {
         Self {
             theme: "dark".to_string(),
-            close_to_tray: false,
+            close_to_tray: true,
             show_complete: true,
             save_dir: dirs::download_dir()
                 .map(|p| p.to_string_lossy().to_string())

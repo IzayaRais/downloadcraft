@@ -1472,7 +1472,9 @@ impl CraftApp {
             antivirus_cmd: String::new(),
             finish_action: "nothing".to_string(),
             category_folders: true,
-            close_to_tray: false,
+            // Closing the window tucks the app into the tray (IDM-style); the
+            // tray's Exit is how you quit. The Tasks menu switches it off.
+            close_to_tray: true,
             theme: "dark".to_string(),
             theme_applied: String::new(),
             placement_done: false,
@@ -1596,12 +1598,8 @@ impl CraftApp {
         self.last_prog_write = Instant::now();
         let mut items = serde_json::Map::new();
         for (id, task) in self.tasks.iter() {
-            let speed = self
-                .downloads
-                .iter()
-                .find(|d| d.id == *id)
-                .map(|d| d.speed_bps)
-                .unwrap_or(0.0);
+            let row = self.downloads.iter().find(|d| d.id == *id);
+            let speed = row.map(|d| d.speed_bps).unwrap_or(0.0);
             let totals = task.shared.part_total.lock().unwrap_or_else(|e| e.into_inner()).clone();
             let dones = task.shared.part_done.lock().unwrap_or_else(|e| e.into_inner()).clone();
             let parts: Vec<[u64; 3]> = totals
@@ -1609,15 +1607,28 @@ impl CraftApp {
                 .zip(dones.iter())
                 .map(|((s, e), d)| [*s, *e, *d])
                 .collect();
+            // Standalone progress windows read this file, so it must never
+            // claim more was downloaded than the size: a retried range can
+            // push the raw engine counter past its own total, and one leg of a
+            // merged transfer can leave the helper reporting no size at all
+            // (then the row's size is still the right answer).
+            let mut total = if task.shared.has_total.load(Ordering::SeqCst) {
+                Some(task.shared.total.load(Ordering::SeqCst))
+            } else {
+                None
+            };
+            if total.unwrap_or(0) == 0 {
+                total = row.and_then(|d| d.total_bytes);
+            }
+            let mut downloaded = task.shared.downloaded.load(Ordering::SeqCst);
+            if let Some(t) = total {
+                downloaded = downloaded.min(t);
+            }
             items.insert(
                 id.to_string(),
                 serde_json::json!({
-                    "downloaded": task.shared.downloaded.load(Ordering::SeqCst),
-                    "total": if task.shared.has_total.load(Ordering::SeqCst) {
-                        Some(task.shared.total.load(Ordering::SeqCst))
-                    } else {
-                        None
-                    },
+                    "downloaded": downloaded,
+                    "total": total,
                     "speed": speed,
                     "resumable": task.shared.resumable.load(Ordering::SeqCst),
                     "phase": self.phases.get(id).cloned().unwrap_or_default(),
@@ -3003,6 +3014,14 @@ impl CraftApp {
                 let mut finished_info: Option<(String, std::path::PathBuf)> = None;
                 // Set when the checksum repair below re-queues this id.
                 let mut repaired_here = false;
+                // A non-fatal engine remark (e.g. a fallback that likely cost
+                // the audio track) belongs in this row's log line.
+                let engine_note = task
+                    .shared
+                    .note
+                    .lock()
+                    .ok()
+                    .and_then(|mut g| g.take());
                 if let Some(d) = self.downloads.iter_mut().find(|d| d.id == id) {
                     d.downloaded_bytes = dl;
                     d.resumable = was_resumable;
@@ -3042,6 +3061,15 @@ impl CraftApp {
                         d.status = Status::Paused;
                     } else if complete || file_done {
                         d.status = Status::Completed;
+                        // The file on disk is the truth. A retried or merged
+                        // transfer can end with a byte counter that claims more
+                        // than the file holds, and a probe's size can be an
+                        // estimate — showing both is what produced "Downloaded
+                        // 847.65 MB" next to "Size 722.80 MB" on one row.
+                        if landed > 0 {
+                            d.downloaded_bytes = landed;
+                            d.total_bytes = Some(landed);
+                        }
                         msg = Some(format!("Finished: {}", d.filename));
                         finished_info = Some((d.filename.clone(), d.dest_path()));
                     } else {
@@ -3112,6 +3140,12 @@ impl CraftApp {
                             repaired_here = true;
                         }
                     }
+                }
+                if let Some(n) = engine_note {
+                    msg = Some(match msg.take() {
+                        Some(m) => format!("{m} — {n}"),
+                        None => format!("#{id}: {n}"),
+                    });
                 }
                 if repaired_here {
                     repair_restart.push(id);
@@ -3202,9 +3236,10 @@ impl CraftApp {
         match self.finish_action.as_str() {
             "shutdown" => {
                 self.push_log("Queue done — shutting down.");
-                let _ = std::process::Command::new("shutdown")
-                    .args(["/s", "/t", "15", "/c", "Download Craft: downloads finished"])
-                    .spawn();
+                let mut c = std::process::Command::new("shutdown");
+                c.args(["/s", "/t", "15", "/c", "Download Craft: downloads finished"]);
+                quiet(&mut c);
+                let _ = c.spawn();
             }
             "sleep" => {
                 self.push_log("Queue done — sleeping.");
@@ -3214,7 +3249,10 @@ impl CraftApp {
             }
             "hibernate" => {
                 self.push_log("Queue done — hibernating.");
-                let _ = std::process::Command::new("shutdown").args(["/h"]).spawn();
+                let mut c = std::process::Command::new("shutdown");
+                c.args(["/h"]);
+                quiet(&mut c);
+                let _ = c.spawn();
             }
             _ => {
                 self.push_log("Queue finished.");
@@ -3470,6 +3508,19 @@ impl CraftApp {
     }
 }
 
+/// Start a console program without a console window. This app is a
+/// windows-subsystem binary, so every console child it starts (reg, shutdown,
+/// cmd …) would otherwise flash a black window — six of them on every launch,
+/// one per browser probed by `ensure_native_host`.
+#[cfg(windows)]
+fn quiet(cmd: &mut std::process::Command) {
+    use std::os::windows::process::CommandExt;
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+    cmd.creation_flags(CREATE_NO_WINDOW);
+}
+#[cfg(not(windows))]
+fn quiet(_cmd: &mut std::process::Command) {}
+
 /// Open a file (or reveal it in Explorer when `reveal`).
 pub(crate) fn open_path(path: &std::path::Path, reveal: bool) {
     if reveal {
@@ -3481,9 +3532,10 @@ pub(crate) fn open_path(path: &std::path::Path, reveal: bool) {
             let _ = std::process::Command::new("explorer").arg(parent).spawn();
         }
     } else if path.exists() {
-        let _ = std::process::Command::new("cmd")
-            .args(["/C", "start", "", &path.to_string_lossy()])
-            .spawn();
+        let mut c = std::process::Command::new("cmd");
+        c.args(["/C", "start", "", &path.to_string_lossy()]);
+        quiet(&mut c);
+        let _ = c.spawn();
     }
 }
 
@@ -3557,18 +3609,19 @@ pub(crate) fn install_native_host(browser: &str) -> Result<String, String> {
     .map_err(|e| e.to_string())?;
 
     let key = native_host_key(browser);
-    let out = std::process::Command::new("reg")
-        .args(["add", key, "/ve", "/d", &manifest_path.to_string_lossy(), "/f"])
-        .output()
-        .map_err(|e| format!("reg failed: {e}"))?;
+    let mut rc = std::process::Command::new("reg");
+    rc.args(["add", key, "/ve", "/d", &manifest_path.to_string_lossy(), "/f"]);
+    quiet(&mut rc);
+    let out = rc.output().map_err(|e| format!("reg failed: {e}"))?;
     if !out.status.success() {
         return Err(String::from_utf8_lossy(&out.stderr).to_string());
     }
     // Best-effort cleanup of the legacy host registration.
     let legacy_key = legacy_host_key(browser);
-    let _ = std::process::Command::new("reg")
-        .args(["delete", legacy_key, "/f"])
-        .output();
+    let mut rc = std::process::Command::new("reg");
+    rc.args(["delete", legacy_key, "/f"]);
+    quiet(&mut rc);
+    let _ = rc.output();
     Ok(manifest_path.to_string_lossy().to_string())
 }
 
@@ -3624,8 +3677,10 @@ fn ensure_native_host(browser: &str) -> Result<bool, String> {
         })
         .unwrap_or(false);
     let key = native_host_key(browser);
-    let registered = std::process::Command::new("reg")
-        .args(["query", key, "/ve"])
+    let mut rc = std::process::Command::new("reg");
+    rc.args(["query", key, "/ve"]);
+    quiet(&mut rc);
+    let registered = rc
         .output()
         .map(|o| {
             o.status.success()
@@ -3688,7 +3743,8 @@ async fn update_check_async() -> (String, Option<String>) {
 }
 
 /// Best-effort desktop toast (ignored when unsupported).
-fn notify(title: &str, body: &str) {    let _ = notify_rust::Notification::new()
+fn notify(title: &str, body: &str) {
+    let _ = notify_rust::Notification::new()
         .summary(title)
         .body(body)
         .show();
@@ -3859,6 +3915,16 @@ impl eframe::App for CraftApp {
         {
             ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
             ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
+            // Say where the window went the first time, or a vanish reads as a
+            // crash (the tray icon is easy to miss). Once per run.
+            static HID_HINT: std::sync::atomic::AtomicBool =
+                std::sync::atomic::AtomicBool::new(false);
+            if !HID_HINT.swap(true, std::sync::atomic::Ordering::SeqCst) {
+                notify(
+                    "Download Craft is still running",
+                    "Closed to the tray — right-click its icon to Exit.",
+                );
+            }
         }
 
         // Native OS window chrome (title bar, min/max/close, drag, resize,
