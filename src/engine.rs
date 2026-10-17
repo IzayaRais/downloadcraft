@@ -1132,6 +1132,46 @@ async fn player_api(
     }
 }
 
+/// YouTube hands adaptive (DASH) legs out as `gir=yes`: to any non-browser
+/// client they expose only roughly their first minute and then 403 — verified
+/// live from this machine (varying headers, cookies, a signed-in page fetch
+/// and repeated fresh resolves all hit the same wall, while the same URL
+/// serves the prefix fine). A gated quality is therefore retried as the muxed
+/// progressive file, which YouTube does serve whole. That file tops out at
+/// 360p (720p on older uploads), so the saved name records the downgrade
+/// instead of quietly handing back a much smaller file as if it were the
+/// requested quality.
+fn note_youtube_downgrade(
+    hit: &ResolvedMedia,
+    dest: &mut std::path::PathBuf,
+    shared: &SharedState,
+) {
+    if hit.pair_url.is_some() {
+        return; // no progressive stream exists: nothing was downgraded to
+    }
+    let label = if hit.url.contains("itag=22") {
+        "720p"
+    } else if hit.url.contains("itag=18") {
+        "360p"
+    } else {
+        return;
+    };
+    let stem = dest
+        .file_stem()
+        .map(|s| s.to_string_lossy().to_string())
+        .unwrap_or_default();
+    if stem.is_empty() {
+        return;
+    }
+    let ext = dest
+        .extension()
+        .map(|e| e.to_string_lossy().to_string())
+        .unwrap_or_else(|| "mp4".to_string());
+    let name = format!("{stem} ({label} - YouTube limit).{ext}");
+    dest.set_file_name(&name);
+    mutex_guard(&shared.resolved_name).replace(name);
+}
+
 /// Direct-URL-only page resolve (legacy behavior, kept for fixtures).
 /// Production path is [`resolve_youtube_full`] (adds cipher + `n` handling).
 #[allow(dead_code)]
@@ -2804,10 +2844,20 @@ pub async fn download(
                             }
                             let mut opts2 = opts.clone();
                             if sabr {
-                                opts2.quality_pref = "720p".to_string();
+                                // Not a quality problem: YouTube caps *every*
+                                // adaptive (gir=yes) leg to roughly its first
+                                // minute for non-browser clients, so 720p fails
+                                // exactly like 1080p. Clearing the preference
+                                // asks the resolver for the muxed progressive
+                                // file, which YouTube serves in full (no
+                                // ffmpeg needed either).
+                                opts2.quality_pref = String::new();
                             }
                             match resolve_media(&client, &opts2, &page_url, &shared).await {
                                 Some(hit2) => {
+                                    if sabr && opts2.allow_rename {
+                                        note_youtube_downgrade(&hit2, &mut dest, &shared);
+                                    }
                                     return download_adaptive(
                                         hit2.url,
                                         hit2.pair_url.filter(|p| p.starts_with("http")),
@@ -2820,7 +2870,7 @@ pub async fn download(
                                     .map_err(|e2| {
                                         let m2 = format!("{e2:#}");
                                         if sabr && (m2.contains("serves only the first") || m2.contains("refused this link (403)")) {
-                                            anyhow!("{m2} (tried 720p fallback automatically — if this persists, open the video in your browser and pick a 720p or below quality row)")
+                                            anyhow!("{m2} (retried as the progressive file automatically — YouTube only serves the first ~1 minute of 1080p+ streams to non-browser clients, so 360p is the highest quality that can complete)")
                                         } else {
                                             e2
                                         }
@@ -4562,15 +4612,18 @@ async fn chunked_stream(
                             tokio::time::sleep(std::time::Duration::from_secs(wait)).await;
                             continue;
                         }
-                        // SABR-gated streams (`gir=yes`) serve only a ~2 MB
-                        // preview to plain ranged GETs outside a logged-in
-                        // browser session (verified live) — that reads exactly
-                        // like expiry ("progress then persistent refusal"),
-                        // but re-capturing cannot help. Say so plainly.
+                        // SABR-gated streams (`gir=yes`) expose only their
+                        // first ~minute to plain ranged GETs — verified live
+                        // from this machine: varying headers, cookies, a fresh
+                        // resolve and even a signed-in page fetch all 403 past
+                        // the same offset while the same URL serves the prefix
+                        // fine. That reads exactly like expiry ("progress then
+                        // persistent refusal") but re-capturing cannot help, so
+                        // say what is actually going on.
                         if url.contains("gir=yes") {
                             let got = crate::model::format_bytes(len_before);
                             return Err(final_err(format!(
-                                "YouTube serves only the first ~2 MB of this quality outside the browser (got {got}) — pick 720p or below for a complete direct file"
+                                "YouTube serves only the first ~1 minute of this quality outside the browser (got {got}) — its 1080p+ streams are SABR-gated for every non-browser client, so they cannot be downloaded directly"
                             )));
                         }
                         let got = crate::model::format_bytes(len_before);

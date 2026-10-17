@@ -1076,6 +1076,9 @@ pub struct CraftApp {
     close_to_tray: bool,
     theme: String,
     theme_applied: String,
+    /// The main window is moved into the middle of the work area once, on the
+    /// first frame where egui knows the screen geometry.
+    placement_done: bool,
     tray: Option<tray_icon::TrayIcon>,
     details_id: Option<u64>,
     details_tab: u8, // 0 info, 1 settings
@@ -1215,6 +1218,7 @@ impl CraftApp {
             close_to_tray: false,
             theme: "dark".to_string(),
             theme_applied: String::new(),
+            placement_done: false,
             tray: None,
             details_id: None,
             details_tab: 0,
@@ -3428,6 +3432,25 @@ const DATE_W: f32 = 110.0;
 
 impl eframe::App for CraftApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        // Open in the middle of the work area (Windows would cascade the
+        // window). Positions the *outer* rectangle, so the title bar does not
+        // push the visible card off centre, and never fights a maximized
+        // window. A move the user makes afterwards is left alone.
+        if !self.placement_done {
+            let info = ctx.input(|i| i.viewport().clone());
+            if info.maximized == Some(true) {
+                self.placement_done = true;
+            } else {
+                let size = info
+                    .outer_rect
+                    .or(info.inner_rect)
+                    .map(|r| r.size())
+                    .unwrap_or(egui::vec2(1050.0, 600.0));
+                if crate::model::center_window(ctx, size) {
+                    self.placement_done = true;
+                }
+            }
+        }
         // Manual pointer routing: snapshot input, then match layout rects
         // recorded below (process_hits runs after all layout, topmost first).
         self.man.begin(ctx);
