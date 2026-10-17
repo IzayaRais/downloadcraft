@@ -26,6 +26,12 @@ pub struct SharedState {
     pub part_done: std::sync::Mutex<Vec<u64>>,
     /// Set when YouTube answers with a bot-check wall (HTTP 429 /sorry).
     pub rate_limited: AtomicBool,
+    /// What the transfer is doing when it is not moving bytes — the helper's
+    /// own phase names ("Getting info", "Merging"), empty for the built-in
+    /// engine, which is always transferring once it has started. yt-dlp spends
+    /// its first seconds solving YouTube's player challenge with nothing on the
+    /// wire, which used to read as a stalled download.
+    pub phase: std::sync::Mutex<String>,
     /// Terminal engine error text (e.g. checksum mismatch, unrecoverable
     /// HTTP error). Set once by the download task before it exits.
     pub error: std::sync::Mutex<Option<String>>,
@@ -45,8 +51,27 @@ impl SharedState {
             part_total: std::sync::Mutex::new(Vec::new()),
             part_done: std::sync::Mutex::new(Vec::new()),
             rate_limited: AtomicBool::new(false),
+            phase: std::sync::Mutex::new(String::new()),
             error: std::sync::Mutex::new(None),
         }
+    }
+
+    /// Set the current stage label (see [`SharedState::phase`]).
+    pub fn set_phase(&self, p: impl Into<String>) {
+        if let Ok(mut g) = self.phase.lock() {
+            let p = p.into();
+            if *g != p {
+                *g = p;
+            }
+        }
+    }
+
+    /// The current stage label, or an empty string.
+    pub fn phase_now(&self) -> String {
+        self.phase
+            .lock()
+            .map(|g| g.clone())
+            .unwrap_or_else(|e| e.into_inner().clone())
     }
 
     /// Record the first terminal error (subsequent ones are ignored).
@@ -3288,47 +3313,147 @@ fn ytdlp_preferred(opts: &EngineOpts) -> bool {
 /// `Err` means nothing is available and the caller should stay with the
 /// built-in engine.
 async fn ensure_ytdlp(client: &reqwest::Client) -> Result<std::path::PathBuf> {
-    if let Some(p) = ytdlp_on_path() {
-        return Ok(p);
+    // Settings can pin the app to its own copy instead of whatever is on PATH.
+    if crate::model::ui_pref_bool("ytdlp_prefer_path", true) {
+        if let Some(p) = ytdlp_on_path() {
+            return Ok(p);
+        }
     }
     let dst = ytdlp_local_path().ok_or_else(|| anyhow!("no LOCALAPPDATA to keep yt-dlp in"))?;
     if dst.is_file() && !ytdlp_stale(&dst).await {
         return Ok(dst);
     }
-    let fetched = async {
-        if let Some(dir) = dst.parent() {
-            tokio::fs::create_dir_all(dir).await?;
-        }
-        let resp = client
-            .get(YTDLP_URL)
-            .send()
-            .await
-            .map_err(|e| anyhow!("yt-dlp fetch: {e}"))?;
-        if !resp.status().is_success() {
-            return Err(anyhow!("yt-dlp fetch: HTTP {}", resp.status()));
-        }
-        let bytes = resp
-            .bytes()
-            .await
-            .map_err(|e| anyhow!("yt-dlp fetch: {e}"))?;
-        if bytes.len() < 1_000_000 {
-            return Err(anyhow!(
-                "yt-dlp fetch: suspicious payload ({} bytes)",
-                bytes.len()
-            ));
-        }
-        let tmp = dst.with_extension("part");
-        tokio::fs::write(&tmp, &bytes).await?;
-        tokio::fs::rename(&tmp, &dst).await?;
-        Ok::<(), anyhow::Error>(())
-    }
-    .await;
-    match fetched {
-        // A failed refresh must not cost us a working older copy.
-        Err(e) if dst.is_file() => Ok(dst),
-        Err(e) => Err(e),
+    match fetch_ytdlp(client, &dst).await {
         Ok(()) => Ok(dst),
+        // A failed refresh must not cost us a working older copy.
+        Err(_) if dst.is_file() => Ok(dst),
+        Err(e) => Err(e),
     }
+}
+
+/// Download the helper over `dst` (fetch to a sidecar, then rename, so a
+/// half-written executable can never be launched).
+async fn fetch_ytdlp(client: &reqwest::Client, dst: &std::path::Path) -> Result<()> {
+    if let Some(dir) = dst.parent() {
+        tokio::fs::create_dir_all(dir).await?;
+    }
+    let resp = client
+        .get(YTDLP_URL)
+        .send()
+        .await
+        .map_err(|e| anyhow!("yt-dlp fetch: {e}"))?;
+    if !resp.status().is_success() {
+        return Err(anyhow!("yt-dlp fetch: HTTP {}", resp.status()));
+    }
+    let bytes = resp
+        .bytes()
+        .await
+        .map_err(|e| anyhow!("yt-dlp fetch: {e}"))?;
+    if bytes.len() < 1_000_000 {
+        return Err(anyhow!(
+            "yt-dlp fetch: suspicious payload ({} bytes)",
+            bytes.len()
+        ));
+    }
+    let tmp = dst.with_extension("part");
+    tokio::fs::write(&tmp, &bytes).await?;
+    tokio::fs::rename(&tmp, dst).await?;
+    Ok(())
+}
+
+/// What Settings shows about the YouTube helper, and the copy it would run.
+#[derive(Debug, Clone, Default)]
+pub struct YtdlpInfo {
+    /// The executable YouTube downloads would use right now.
+    pub path: Option<std::path::PathBuf>,
+    /// True when `path` is the copy this app fetched and keeps current.
+    pub managed: bool,
+    /// `yt-dlp --version`, when the executable answered.
+    pub version: Option<String>,
+    pub size: Option<u64>,
+    /// The managed copy is past its 30-day refresh window.
+    pub stale: bool,
+    /// A copy found on PATH (the app never touches that one).
+    pub on_path: Option<std::path::PathBuf>,
+    /// Preference: use the PATH copy when there is one.
+    pub prefer_path: bool,
+    /// JS runtime yt-dlp will be told about, if any.
+    pub js_runtime: Option<String>,
+}
+
+/// Where the app keeps its own yt-dlp (the folder Settings can open).
+pub fn ytdlp_bin_dir() -> Option<std::path::PathBuf> {
+    ytdlp_local_path().and_then(|p| p.parent().map(|d| d.to_path_buf()))
+}
+
+/// Ask the helper for its version. This *runs* it (about a second for the
+/// frozen build), so never call it from a UI thread.
+fn ytdlp_version(exe: &std::path::Path) -> Option<String> {
+    let mut cmd = std::process::Command::new(exe);
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x08000000;
+        cmd.creation_flags(CREATE_NO_WINDOW);
+    }
+    let out = cmd.arg("--version").output().ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let v = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    if v.is_empty() {
+        None
+    } else {
+        Some(v)
+    }
+}
+
+/// Snapshot for the Settings window. Blocking (it runs the helper to ask its
+/// version): call it from a worker thread.
+pub fn ytdlp_info() -> YtdlpInfo {
+    let prefer_path = crate::model::ui_pref_bool("ytdlp_prefer_path", true);
+    let on_path = ytdlp_on_path();
+    let local = ytdlp_local_path();
+    let managed_present = local.as_deref().map(|p| p.is_file()).unwrap_or(false);
+    let (path, managed) = match (&on_path, prefer_path) {
+        (Some(p), true) => (Some(p.clone()), false),
+        _ if managed_present => (local.clone(), true),
+        _ => (on_path.clone(), false),
+    };
+    let meta = path.as_deref().and_then(|p| std::fs::metadata(p).ok());
+    let stale = match (managed, local.as_deref()) {
+        (true, Some(p)) => std::fs::metadata(p)
+            .and_then(|m| m.modified())
+            .map(|t| t.elapsed().map(|e| e.as_secs() > 30 * 24 * 3600).unwrap_or(false))
+            .unwrap_or(true),
+        _ => false,
+    };
+    YtdlpInfo {
+        version: path.as_deref().and_then(ytdlp_version),
+        size: meta.as_ref().map(|m| m.len()),
+        path,
+        managed,
+        stale,
+        on_path,
+        prefer_path,
+        js_runtime: js_runtime().map(str::to_string),
+    }
+}
+
+/// Replace the app's own copy of yt-dlp now — the Settings "Re-download"
+/// button. Works whether or not a copy is on PATH, and whether or not the
+/// existing one looks stale; the fetched file is parsed-checked by size only
+/// (yt-dlp ships as one executable).
+pub fn ytdlp_refresh_blocking() -> Result<std::path::PathBuf> {
+    let dst = ytdlp_local_path().ok_or_else(|| anyhow!("no LOCALAPPDATA to keep yt-dlp in"))?;
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()?;
+    rt.block_on(async {
+        let client = EngineOpts::default().build_client()?;
+        fetch_ytdlp(&client, &dst).await?;
+        Ok(dst)
+    })
 }
 
 /// Write the row's captured browser cookies as a Netscape cookie jar (what
@@ -3422,6 +3547,39 @@ fn parse_progress_line(line: &str) -> Option<YtdlpProgress> {
     })
 }
 
+/// The stage a yt-dlp *status* line reports, if it reports one.
+///
+/// Only the stages that can leave the UI looking dead matter: extraction
+/// (player fetch + JS challenge, several seconds of nothing) and the merge
+/// that runs after every byte has arrived.
+fn phase_for_line(line: &str) -> Option<&'static str> {
+    let l = line.trim_start_matches(['\r', ' ']);
+    if l.starts_with("[Merger]")
+        || l.starts_with("[ffmpeg]")
+        || l.starts_with("[Fixup")
+        || l.starts_with("[ExtractAudio]")
+        || l.starts_with("[Metadata]")
+        || l.starts_with("[EmbedThumbnail]")
+        || l.starts_with("[VideoRemuxer]")
+        || l.starts_with("[VideoConvertor]")
+    {
+        return Some("Merging");
+    }
+    if l.starts_with("[download] Destination:") {
+        return Some("Downloading");
+    }
+    if l.starts_with("[youtube]")
+        || l.starts_with("[info]")
+        || l.starts_with("[generic]")
+        || l.starts_with("[vimeo]")
+        || l.starts_with("[twitter]")
+        || l.starts_with("[facebook]")
+    {
+        return Some("Getting info");
+    }
+    None
+}
+
 async fn download_with_ytdlp(
     exe: &std::path::Path,
     url: &str,
@@ -3487,6 +3645,9 @@ async fn download_with_ytdlp(
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped());
     let mut child = cmd.spawn().map_err(|e| anyhow!("yt-dlp launch: {e}"))?;
+    // Nothing is on the wire until the player challenge is solved, so say what
+    // is happening instead of showing a motionless 0%.
+    shared.set_phase("Getting info");
     let stdout = child
         .stdout
         .take()
@@ -3505,8 +3666,16 @@ async fn download_with_ytdlp(
         let (mut base, mut last, mut last_total) = (0u64, 0u64, 0u64);
         while let Ok(Some(line)) = lines.next_line().await {
             let Some(p) = parse_progress_line(&line) else {
+                // Not a progress line: it may still name the stage the run is
+                // in ("[download] Destination:", "[Merger] …").
+                if let Some(ph) = phase_for_line(&line) {
+                    progress.set_phase(ph);
+                }
                 continue;
             };
+            if p.done.is_some() || p.speed.is_some() {
+                progress.set_phase("Downloading");
+            }
             if let Some(done) = p.done.map(|d| d.max(0.0) as u64) {
                 if done + 1 < last {
                     base += last_total.max(last);
@@ -5540,6 +5709,33 @@ mod tests {
         assert!(out.ends_with(".mp4"));
         assert!(out.len() <= 124);
         assert!(String::from_utf8(out.clone().into_bytes()).is_ok());
+    }
+
+    #[test]
+    fn ytdlp_stage_lines() {
+        // Lines exactly as a merged YouTube download emits them: extraction
+        // first (seconds with nothing on the wire), then the transfer, then the
+        // merge. These names are what the row and progress window show in place
+        // of a motionless 0%.
+        assert_eq!(
+            phase_for_line("[youtube] jNQXAC9IVRw: Downloading webpage"),
+            Some("Getting info")
+        );
+        assert_eq!(
+            phase_for_line("[download] Destination: C:\\x\\y.mp4"),
+            Some("Downloading")
+        );
+        assert_eq!(
+            phase_for_line("[Merger] Merging formats into \"y.mp4\""),
+            Some("Merging")
+        );
+        // The first line of a stream can arrive with a stray carriage return,
+        // and unrelated chatter must not invent a stage.
+        assert_eq!(
+            phase_for_line("\r[youtube] Extracting URL: https://x"),
+            Some("Getting info")
+        );
+        assert_eq!(phase_for_line("some unrelated log line"), None);
     }
 
     #[test]
