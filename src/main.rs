@@ -113,8 +113,7 @@ fn main() -> eframe::Result<()> {
         options,
         Box::new(|cc| {
             crate::app::setup_fonts(cc);
-            cc.egui_ctx.set_visuals(app::dark_visuals());
-            app::apply_widget_theme(&cc.egui_ctx);
+            app::apply_theme(&cc.egui_ctx, &app::stored_theme());
 
             Ok(Box::new(CraftApp::new(rt.clone())))
         }),

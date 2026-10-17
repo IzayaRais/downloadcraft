@@ -207,6 +207,9 @@ struct SettingsApp {
     centered: bool,
     notice: String,
     browser_msg: String,
+    /// Last theme actually applied, so picking one in Appearance repaints
+    /// this window at once (and "system" keeps tracking the OS).
+    theme_applied: String,
 }
 
 fn install_one(browser: &str) -> String {
@@ -224,6 +227,7 @@ pub fn run() -> eframe::Result<()> {
         centered: false,
         notice: String::new(),
         browser_msg: String::new(),
+        theme_applied: String::new(),
     };
     // Separate OS window (own process via `--settings`): never embedded in
     // the main GUI. Compact default size so it doesn't feel "too wide".
@@ -240,8 +244,7 @@ pub fn run() -> eframe::Result<()> {
         eframe::NativeOptions { viewport, ..Default::default() },
         Box::new(|cc| {
             crate::app::setup_fonts(cc);
-            cc.egui_ctx.set_visuals(crate::app::dark_visuals());
-            crate::app::apply_widget_theme(&cc.egui_ctx);
+            crate::app::apply_theme(&cc.egui_ctx, &crate::app::stored_theme());
             Ok(Box::new(app))
         }),
     )
@@ -249,6 +252,15 @@ pub fn run() -> eframe::Result<()> {
 
 impl eframe::App for SettingsApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        let resolved = format!(
+            "{}:{}",
+            self.s.theme,
+            crate::app::theme_is_dark(ctx, &self.s.theme)
+        );
+        if self.theme_applied != resolved {
+            crate::app::apply_theme(ctx, &self.s.theme);
+            self.theme_applied = resolved;
+        }
         if !self.centered && crate::model::center_window(ctx, egui::vec2(600.0, 480.0)) {
             self.centered = true;
         }
@@ -306,8 +318,8 @@ impl SettingsApp {
         ui.heading("Appearance");
         ui.horizontal(|ui| {
             ui.label("Theme:");
-            for name in ["dark", "black", "light"] {
-                if ui.selectable_label(self.s.theme == name, name).clicked() {
+            for (name, label) in [("system", "System"), ("dark", "Dark"), ("light", "Light")] {
+                if ui.selectable_label(self.s.theme == name, label).clicked() {
                     self.s.theme = name.to_string();
                 }
             }

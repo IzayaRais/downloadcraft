@@ -7,51 +7,250 @@ use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::Instant;
 
-// ---------- theme (AB-style dark) ----------
+// ---------- theme ----------
 /// Unified geometry: every card, modal, field, and button across ALL
 /// windows (main, Add-download dialog, progress) uses this radius.
 pub const RADIUS: f32 = 10.0;
-const BG: egui::Color32 = egui::Color32::from_rgb(18, 19, 26);
-const SURFACE: egui::Color32 = egui::Color32::from_rgb(26, 27, 36);
-const SURFACE_LT: egui::Color32 = egui::Color32::from_rgb(36, 37, 50);
-const HEADER_BG: egui::Color32 = egui::Color32::from_rgb(13, 14, 20);
-const CENTRAL_BG: egui::Color32 = egui::Color32::from_rgb(15, 16, 22);
-const CARD_BD: egui::Color32 = egui::Color32::from_rgb(35, 36, 48);
-const PRIMARY: egui::Color32 = egui::Color32::from_rgb(124, 92, 252);
-const SECONDARY: egui::Color32 = egui::Color32::from_rgb(184, 93, 255);
-const TXT: egui::Color32 = egui::Color32::from_rgb(230, 230, 240);
-const DIM: egui::Color32 = egui::Color32::from_rgb(140, 142, 160);
-const SUCCESS: egui::Color32 = egui::Color32::from_rgb(76, 217, 100);
-const WARNING: egui::Color32 = egui::Color32::from_rgb(255, 159, 10);
-const ERROR: egui::Color32 = egui::Color32::from_rgb(255, 69, 58);
-const SEL_BG: egui::Color32 = egui::Color32::from_rgba_premultiplied(18, 14, 38, 38);
-const SEL_BD: egui::Color32 = egui::Color32::from_rgb(124, 92, 252);
-const HOVER_BG: egui::Color32 = egui::Color32::from_rgba_premultiplied(15, 16, 19, 26);
 
-pub fn dark_visuals() -> egui::Visuals {
+/// Every hand-painted surface reads its colours from the ACTIVE palette
+/// (`pl()`) instead of a hard-coded constant, so a theme switch repaints the
+/// whole app — not just the stock egui widgets.
+///
+/// `DARK_PAL` holds the exact values the concept designs specify, so the dark
+/// theme (and "system" while Windows is dark) still matches the concept HTML;
+/// `LIGHT_PAL` is the same layout in a light key: same accents and geometry,
+/// inverted surfaces/text.
+#[derive(Clone, Copy)]
+pub struct Palette {
+    /// Panel background behind the workspace.
+    pub bg: egui::Color32,
+    /// Cards, menus, fields, buttons.
+    pub surface: egui::Color32,
+    /// Raised/hovered surface.
+    pub surface_lt: egui::Color32,
+    /// Menu bar / window header strip.
+    pub header_bg: egui::Color32,
+    /// List body background.
+    pub central_bg: egui::Color32,
+    /// 1px card border.
+    pub card_bd: egui::Color32,
+    pub primary: egui::Color32,
+    pub secondary: egui::Color32,
+    /// Body text.
+    pub txt: egui::Color32,
+    /// Secondary text.
+    pub dim: egui::Color32,
+    pub success: egui::Color32,
+    pub warning: egui::Color32,
+    pub error: egui::Color32,
+    /// Selected row / selection wash + its border.
+    pub sel_bg: egui::Color32,
+    pub sel_bd: egui::Color32,
+    /// Translucent wash on hovered rows, check rows, buttons.
+    pub hover_bg: egui::Color32,
+    /// Modal (dialog) card fill + border.
+    pub modal_bg: egui::Color32,
+    pub modal_bd: egui::Color32,
+    /// Backdrop behind an open dialog: heavy over a dark app, light enough
+    /// that a light app doesn't turn grey.
+    pub scrim: egui::Color32,
+    /// Status-bar progress track: hairline + empty fill + pending segment.
+    pub bar_bd: egui::Color32,
+    pub track: egui::Color32,
+    /// Warm "notice" text (grabber diagnostics).
+    pub notice: egui::Color32,
+    // ---- concept tokens (see `crate::dm`) used by the restyled dialogs.
+    // The dark values are the concepts' own hex values (in brackets).
+    /// Card fill (`#0f0f22`).
+    pub dm_card: egui::Color32,
+    /// Card border *and* field fill (`#1e293b`).
+    pub dm_line: egui::Color32,
+    /// Field box border (`#334155`).
+    pub dm_box_bd: egui::Color32,
+    /// Primary text (`#e2e8f0`).
+    pub dm_txt: egui::Color32,
+    /// Secondary text (`#94a3b8`).
+    pub dm_dim: egui::Color32,
+    /// Row hover (`#1c2436`).
+    pub dm_hover: egui::Color32,
+    /// Raised wash: icon-button hover, header buttons (`#27334a`).
+    pub dm_hover2: egui::Color32,
+    /// Page/segmented trough, progress rules (`#0a0a14`).
+    pub dm_trough: egui::Color32,
+    /// Muted label grey — info rows, part indices (`#64748b`).
+    pub dm_lbl: egui::Color32,
+    /// Table column headers (`#475569`).
+    pub dm_head: egui::Color32,
+    /// Warning / failed text (`#ff9678`).
+    pub dm_warn: egui::Color32,
+    // ---- grayscale tokens of the "Download complete" concept ----
+    pub cg_bg: egui::Color32,
+    pub cg_bd: egui::Color32,
+    pub cg_txt: egui::Color32,
+    pub cg_dim: egui::Color32,
+    pub cg_ctl: egui::Color32,
+    pub cg_box_bg: egui::Color32,
+    pub cg_box_bd: egui::Color32,
+    pub cg_btn_bd: egui::Color32,
+    pub cg_box_txt: egui::Color32,
+    pub cg_hover: egui::Color32,
+}
+
+pub const DARK_PAL: Palette = Palette {
+    bg: egui::Color32::from_rgb(18, 19, 26),
+    surface: egui::Color32::from_rgb(26, 27, 36),
+    surface_lt: egui::Color32::from_rgb(36, 37, 50),
+    header_bg: egui::Color32::from_rgb(13, 14, 20),
+    central_bg: egui::Color32::from_rgb(15, 16, 22),
+    card_bd: egui::Color32::from_rgb(35, 36, 48),
+    primary: egui::Color32::from_rgb(124, 92, 252),
+    secondary: egui::Color32::from_rgb(184, 93, 255),
+    txt: egui::Color32::from_rgb(230, 230, 240),
+    dim: egui::Color32::from_rgb(140, 142, 160),
+    success: egui::Color32::from_rgb(76, 217, 100),
+    warning: egui::Color32::from_rgb(255, 159, 10),
+    error: egui::Color32::from_rgb(255, 69, 58),
+    sel_bg: egui::Color32::from_rgba_premultiplied(18, 14, 38, 38),
+    sel_bd: egui::Color32::from_rgb(124, 92, 252),
+    hover_bg: egui::Color32::from_rgba_premultiplied(15, 16, 19, 26),
+    modal_bg: egui::Color32::from_rgb(20, 21, 29),
+    modal_bd: egui::Color32::from_rgb(45, 47, 65),
+    scrim: egui::Color32::from_rgba_premultiplied(0, 0, 0, 160),
+    bar_bd: egui::Color32::from_rgba_premultiplied(20, 20, 21, 25),
+    track: egui::Color32::from_rgb(0x3A, 0x3B, 0x44),
+    notice: egui::Color32::from_rgb(255, 150, 120),
+    dm_card: egui::Color32::from_rgb(0x0f, 0x0f, 0x22),
+    dm_line: egui::Color32::from_rgb(0x1e, 0x29, 0x3b),
+    dm_box_bd: egui::Color32::from_rgb(0x33, 0x41, 0x55),
+    dm_txt: egui::Color32::from_rgb(0xe2, 0xe8, 0xf0),
+    dm_dim: egui::Color32::from_rgb(0x94, 0xa3, 0xb8),
+    dm_hover: egui::Color32::from_rgb(0x1c, 0x24, 0x36),
+    dm_hover2: egui::Color32::from_rgb(0x27, 0x33, 0x4a),
+    dm_trough: egui::Color32::from_rgb(0x0a, 0x0a, 0x14),
+    dm_lbl: egui::Color32::from_rgb(0x64, 0x74, 0x8b),
+    dm_head: egui::Color32::from_rgb(0x47, 0x55, 0x69),
+    dm_warn: egui::Color32::from_rgb(0xff, 0x96, 0x78),
+    cg_bg: egui::Color32::from_rgb(0x1b, 0x1b, 0x1b),
+    cg_bd: egui::Color32::from_rgb(0x3a, 0x3a, 0x3a),
+    cg_txt: egui::Color32::from_rgb(0xe0, 0xe0, 0xf0),
+    cg_dim: egui::Color32::from_rgb(0x99, 0x99, 0x99),
+    cg_ctl: egui::Color32::from_rgb(0x88, 0x88, 0x88),
+    cg_box_bg: egui::Color32::from_rgb(0x2b, 0x2b, 0x2b),
+    cg_box_bd: egui::Color32::from_rgb(0x44, 0x44, 0x44),
+    cg_btn_bd: egui::Color32::from_rgb(0x55, 0x55, 0x55),
+    cg_box_txt: egui::Color32::from_rgb(0xcc, 0xcc, 0xcc),
+    cg_hover: egui::Color32::from_rgb(0x38, 0x38, 0x38),
+};
+
+pub const LIGHT_PAL: Palette = Palette {
+    bg: egui::Color32::from_rgb(0xEE, 0xF0, 0xF6),
+    surface: egui::Color32::from_rgb(0xFF, 0xFF, 0xFF),
+    surface_lt: egui::Color32::from_rgb(0xE6, 0xE9, 0xF2),
+    header_bg: egui::Color32::from_rgb(0xFF, 0xFF, 0xFF),
+    central_bg: egui::Color32::from_rgb(0xFF, 0xFF, 0xFF),
+    card_bd: egui::Color32::from_rgb(0xD5, 0xD9, 0xE6),
+    primary: egui::Color32::from_rgb(124, 92, 252),
+    secondary: egui::Color32::from_rgb(154, 62, 226),
+    txt: egui::Color32::from_rgb(0x20, 0x24, 0x33),
+    dim: egui::Color32::from_rgb(0x5F, 0x67, 0x78),
+    success: egui::Color32::from_rgb(0x1A, 0xA9, 0x4B),
+    warning: egui::Color32::from_rgb(0xB4, 0x6A, 0x05),
+    error: egui::Color32::from_rgb(0xD9, 0x2B, 0x1E),
+    sel_bg: egui::Color32::from_rgba_premultiplied(18, 13, 36, 36),
+    sel_bd: egui::Color32::from_rgb(124, 92, 252),
+    hover_bg: egui::Color32::from_rgba_premultiplied(1, 2, 3, 18),
+    modal_bg: egui::Color32::from_rgb(0xFF, 0xFF, 0xFF),
+    modal_bd: egui::Color32::from_rgb(0xD5, 0xD9, 0xE6),
+    scrim: egui::Color32::from_rgba_premultiplied(0, 0, 0, 90),
+    bar_bd: egui::Color32::from_rgba_premultiplied(2, 3, 5, 30),
+    track: egui::Color32::from_rgb(0xDD, 0xE1, 0xEC),
+    notice: egui::Color32::from_rgb(0xB0, 0x4A, 0x08),
+    dm_card: egui::Color32::from_rgb(0xFF, 0xFF, 0xFF),
+    dm_line: egui::Color32::from_rgb(0xE2, 0xE8, 0xF0),
+    dm_box_bd: egui::Color32::from_rgb(0xC7, 0xD2, 0xE1),
+    dm_txt: egui::Color32::from_rgb(0x1E, 0x29, 0x3B),
+    dm_dim: egui::Color32::from_rgb(0x64, 0x74, 0x8B),
+    dm_hover: egui::Color32::from_rgb(0xEF, 0xF3, 0xFA),
+    dm_hover2: egui::Color32::from_rgb(0xE1, 0xE8, 0xF2),
+    dm_trough: egui::Color32::from_rgb(0xE8, 0xED, 0xF4),
+    dm_lbl: egui::Color32::from_rgb(0x5A, 0x68, 0x7E),
+    dm_head: egui::Color32::from_rgb(0x7C, 0x89, 0x9C),
+    dm_warn: egui::Color32::from_rgb(0xC0, 0x39, 0x0B),
+    cg_bg: egui::Color32::from_rgb(0xFF, 0xFF, 0xFF),
+    cg_bd: egui::Color32::from_rgb(0xD2, 0xD6, 0xDF),
+    cg_txt: egui::Color32::from_rgb(0x20, 0x24, 0x33),
+    cg_dim: egui::Color32::from_rgb(0x6B, 0x72, 0x80),
+    cg_ctl: egui::Color32::from_rgb(0x8A, 0x90, 0x9E),
+    cg_box_bg: egui::Color32::from_rgb(0xF5, 0xF6, 0xFA),
+    cg_box_bd: egui::Color32::from_rgb(0xCF, 0xD4, 0xDE),
+    cg_btn_bd: egui::Color32::from_rgb(0xC3, 0xC8, 0xD4),
+    cg_box_txt: egui::Color32::from_rgb(0x2E, 0x33, 0x40),
+    cg_hover: egui::Color32::from_rgb(0xE9, 0xEC, 0xF3),
+};
+
+thread_local! {
+    /// Palette of the thread doing the painting. Defaults to `DARK_PAL`, so a
+    /// window that never calls `apply_theme` keeps the concept colours.
+    static PAL: std::cell::Cell<Palette> = const { std::cell::Cell::new(DARK_PAL) };
+}
+
+pub fn set_palette(p: Palette) {
+    PAL.with(|c| c.set(p));
+}
+
+/// Active palette. Cheap: `Color32` is a plain POD and the cell read is
+/// thread-local, so calling this per painted primitive costs nothing.
+#[inline]
+pub fn pl() -> Palette {
+    PAL.with(|c| c.get())
+}
+
+fn visuals_dark(p: &Palette) -> egui::Visuals {
     let mut v = egui::Visuals::dark();
-    v.window_fill = SURFACE;
-    v.panel_fill = BG;
-    v.faint_bg_color = SURFACE;
-    v.extreme_bg_color = BG;
-    v.override_text_color = Some(TXT);
-    v.weak_text_color = Some(DIM);
+    v.window_fill = p.surface;
+    v.panel_fill = p.bg;
     // Table cells paint faint_bg: keep the list on app background.
-    v.faint_bg_color = BG;
+    v.faint_bg_color = p.bg;
+    v.extreme_bg_color = p.bg;
+    v.override_text_color = Some(p.txt);
+    v.weak_text_color = Some(p.dim);
     // Hide idle table resize lines + plain separators for a minimal look
     // (hover/drag lines still show while resizing).
-    v.widgets.noninteractive.bg_stroke = egui::Stroke::new(1.0_f32, BG);
-    v.selection.bg_fill = SEL_BG;
-    v.selection.stroke = egui::Stroke::new(1.0_f32, SEL_BD);
-    v.widgets.inactive.bg_fill = SURFACE;
-    v.widgets.hovered.bg_fill = SURFACE_LT;
-    v.widgets.active.bg_fill = egui::Color32::from_rgb(0x3A, 0x3B, 0x44);
-    v.widgets.noninteractive.bg_fill = SURFACE;
+    v.widgets.noninteractive.bg_stroke = egui::Stroke::new(1.0_f32, p.bg);
+    v.selection.bg_fill = p.sel_bg;
+    v.selection.stroke = egui::Stroke::new(1.0_f32, p.sel_bd);
+    v.widgets.inactive.bg_fill = p.surface;
+    v.widgets.hovered.bg_fill = p.surface_lt;
+    v.widgets.active.bg_fill = p.track;
+    v.widgets.noninteractive.bg_fill = p.surface;
     v
 }
 
-/// Pure-black theme preset.
+fn visuals_light(p: &Palette) -> egui::Visuals {
+    let mut v = egui::Visuals::light();
+    v.window_fill = p.surface;
+    v.panel_fill = p.bg;
+    v.faint_bg_color = p.bg;
+    v.extreme_bg_color = p.surface;
+    v.override_text_color = Some(p.txt);
+    v.weak_text_color = Some(p.dim);
+    v.widgets.noninteractive.bg_stroke = egui::Stroke::new(1.0_f32, p.bg);
+    v.window_stroke = egui::Stroke::new(1.0_f32, p.card_bd);
+    v.selection.bg_fill = p.sel_bg;
+    v.selection.stroke = egui::Stroke::new(1.0_f32, p.sel_bd);
+    // On a white panel an unfilled button needs its edge drawn.
+    v.widgets.inactive.bg_fill = p.surface;
+    v.widgets.inactive.bg_stroke = egui::Stroke::new(1.0_f32, p.card_bd);
+    v.widgets.hovered.bg_fill = p.surface_lt;
+    v.widgets.hovered.bg_stroke = egui::Stroke::new(1.0_f32, p.card_bd);
+    v.widgets.active.bg_fill = p.track;
+    v.widgets.noninteractive.bg_fill = p.surface;
+    v
+}
+
+/// Pure-black preset, kept for configs that already selected it.
 pub fn black_visuals() -> egui::Visuals {
+    let p = &DARK_PAL;
     let mut v = egui::Visuals::dark();
     let black = egui::Color32::BLACK;
     let panel = egui::Color32::from_rgb(0x0C, 0x0C, 0x0E);
@@ -59,24 +258,24 @@ pub fn black_visuals() -> egui::Visuals {
     v.panel_fill = black;
     v.faint_bg_color = black;
     v.extreme_bg_color = panel;
-    v.override_text_color = Some(TXT);
-    v.weak_text_color = Some(DIM);
+    v.override_text_color = Some(p.txt);
+    v.weak_text_color = Some(p.dim);
     v.widgets.noninteractive.bg_stroke = egui::Stroke::new(1.0_f32, black);
-    v.selection.bg_fill = SEL_BG;
-    v.selection.stroke = egui::Stroke::new(1.0_f32, SEL_BD);
+    v.selection.bg_fill = p.sel_bg;
+    v.selection.stroke = egui::Stroke::new(1.0_f32, p.sel_bd);
     v.widgets.inactive.bg_fill = panel;
-    v.widgets.hovered.bg_fill = SURFACE;
-    v.widgets.active.bg_fill = SURFACE_LT;
+    v.widgets.hovered.bg_fill = p.surface;
+    v.widgets.active.bg_fill = p.surface_lt;
     v.widgets.noninteractive.bg_fill = panel;
     v
 }
 
-/// Light theme preset.
+pub fn dark_visuals() -> egui::Visuals {
+    visuals_dark(&DARK_PAL)
+}
+
 pub fn light_visuals() -> egui::Visuals {
-    let mut v = egui::Visuals::light();
-    v.selection.bg_fill = egui::Color32::from_rgb(0xD6, 0xE4, 0xF5);
-    v.selection.stroke = egui::Stroke::new(1.0_f32, PRIMARY);
-    v
+    visuals_light(&LIGHT_PAL)
 }
 
 pub fn visuals_for(theme: &str) -> egui::Visuals {
@@ -85,6 +284,61 @@ pub fn visuals_for(theme: &str) -> egui::Visuals {
         "light" => light_visuals(),
         _ => dark_visuals(),
     }
+}
+
+/// Does `theme` ("system" | "dark" | "light" | "black") resolve to a dark
+/// palette right now? "system" follows the OS and falls back to dark when the
+/// platform reports no theme.
+pub fn theme_is_dark(ctx: &egui::Context, theme: &str) -> bool {
+    match theme {
+        "light" => false,
+        "dark" | "black" => true,
+        _ => !matches!(
+            ctx.input(|i| i.raw.system_theme),
+            Some(egui::Theme::Light)
+        ),
+    }
+}
+
+/// Apply a theme to one context: swap the palette every hand-painted surface
+/// reads from, then the stock egui visuals and the shared widget geometry.
+/// Every window (main, settings, basket, confirm, progress, complete) calls
+/// this once at start-up, so they all agree on the theme.
+pub fn apply_theme(ctx: &egui::Context, theme: &str) {
+    let dark = theme_is_dark(ctx, theme);
+    set_palette(if dark { DARK_PAL } else { LIGHT_PAL });
+    // Pin egui's own preference: with the default (`System`) an OS theme flip
+    // would swap in egui's stock visuals for the other theme, while every
+    // hand-painted surface kept OUR palette. Pinned, `set_visuals` below
+    // targets the theme we are actually using, and our own check (which
+    // carries the OS answer for "system") is the only thing that re-applies.
+    ctx.set_theme(if dark {
+        egui::ThemePreference::Dark
+    } else {
+        egui::ThemePreference::Light
+    });
+    ctx.set_visuals(if theme == "black" {
+        black_visuals()
+    } else {
+        visuals_for(if dark { "dark" } else { "light" })
+    });
+    apply_widget_theme(ctx);
+}
+
+/// Theme key as saved in `ui.json`. For the windows that live in their own
+/// process (settings, basket, confirm, progress, complete) — the main app
+/// warns them through the shared config file.
+pub fn stored_theme() -> String {
+    config_dir()
+        .map(|d| d.join("ui.json"))
+        .and_then(|p| std::fs::read_to_string(p).ok())
+        .and_then(|t| serde_json::from_str::<serde_json::Value>(&t).ok())
+        .and_then(|v| {
+            v.get("theme")
+                .and_then(|t| t.as_str())
+                .map(|s| s.to_string())
+        })
+        .unwrap_or_else(|| "dark".to_string())
 }
 
 /// Widget-level theme shared by EVERY window: rounded controls, roomy
@@ -196,8 +450,8 @@ fn mi(ui: &mut egui::Ui, glyph: &str, size: f32, color: egui::Color32) {
 /// Standard modal dialog frame (dark card, 1px border, rounded).
 fn modal_frame() -> egui::Frame {
     egui::Frame::new()
-        .fill(egui::Color32::from_rgb(20, 21, 29))
-        .stroke(egui::Stroke::new(1.0_f32, egui::Color32::from_rgb(45, 47, 65)))
+        .fill(pl().modal_bg)
+        .stroke(egui::Stroke::new(1.0_f32, pl().modal_bd))
         .corner_radius(10.0)
         .inner_margin(egui::Margin::same(16))
 }
@@ -299,24 +553,24 @@ fn side_nav_row(
     let (rect, _) = ui.allocate_exact_size(egui::vec2(w, H), egui::Sense::hover());
     let p = ui.painter();
     if selected {
-        p.rect_filled(rect, 6.0, SURFACE_LT);
+        p.rect_filled(rect, 6.0, pl().surface_lt);
         p.rect_filled(
             egui::Rect::from_min_size(
                 rect.min + egui::vec2(0.0, 6.0),
                 egui::vec2(3.0, H - 12.0),
             ),
             1.5,
-            PRIMARY,
+            pl().primary,
         );
     } else if man.hover(&rect) {
-        p.rect_filled(rect, 6.0, HOVER_BG);
+        p.rect_filled(rect, 6.0, pl().hover_bg);
     }
-    let fg = if selected { TXT } else { DIM };
+    let fg = if selected { pl().txt } else { pl().dim };
     if dot {
         p.circle_filled(
             egui::pos2(rect.min.x + 14.0, rect.center().y),
             3.0,
-            SUCCESS,
+            pl().success,
         );
     } else {
         p.text(
@@ -336,21 +590,21 @@ fn side_nav_row(
     );
     if let Some(n) = count {
         let font = egui::FontId::proportional(11.0);
-        let galley = p.layout_no_wrap(n.to_string(), font, DIM);
+        let galley = p.layout_no_wrap(n.to_string(), font, pl().dim);
         let bw = galley.size().x + 14.0;
         let bh = 18.0;
         let br = egui::Rect::from_min_size(
             egui::pos2(rect.max.x - bw - 8.0, rect.center().y - bh / 2.0),
             egui::vec2(bw, bh),
         );
-        p.rect_filled(br, bh / 2.0, SURFACE_LT);
+        p.rect_filled(br, bh / 2.0, pl().surface_lt);
         p.galley(
             egui::pos2(
                 br.center().x - galley.size().x / 2.0,
                 br.center().y - galley.size().y / 2.0,
             ),
             galley,
-            DIM,
+            pl().dim,
         );
     }
     rect
@@ -358,7 +612,7 @@ fn side_nav_row(
 
 /// Small caps section header for the sidebar.
 fn side_section(ui: &mut egui::Ui, title: &str) {
-    ui.label(egui::RichText::new(title).size(10.0).color(DIM).strong());
+    ui.label(egui::RichText::new(title).size(10.0).color(pl().dim).strong());
     ui.add_space(2.0);
 }
 
@@ -366,7 +620,7 @@ fn side_section(ui: &mut egui::Ui, title: &str) {
 fn icon_btn(ui: &mut egui::Ui, glyph: &str, tip: &str) -> egui::Response {
     ui.add_sized(
         [30.0, 30.0],
-        egui::Button::new(egui::RichText::new(glyph).size(16.0).color(DIM))
+        egui::Button::new(egui::RichText::new(glyph).size(16.0).color(pl().dim))
             .fill(egui::Color32::TRANSPARENT)
             .corner_radius(RADIUS),
     )
@@ -401,7 +655,7 @@ fn paint_check(p: &egui::Painter, rect: egui::Rect, checked: bool, hov: bool) {
         rect,
         3.0,
         if checked {
-            PRIMARY
+            pl().primary
         } else {
             egui::Color32::TRANSPARENT
         },
@@ -409,7 +663,7 @@ fn paint_check(p: &egui::Painter, rect: egui::Rect, checked: bool, hov: bool) {
     p.rect_stroke(
         rect,
         3.0,
-        egui::Stroke::new(1.2, if hov || checked { TXT } else { DIM }),
+        egui::Stroke::new(1.2, if hov || checked { pl().txt } else { pl().dim }),
         egui::StrokeKind::Inside,
     );
     if checked {
@@ -451,8 +705,8 @@ enum ButtonId {
     AbClose,
     TAdd,
     TDismiss,
+    ThemeSystem,
     ThemeDark,
-    ThemeBlack,
     ThemeLight,
     GrabStart,
     GrabQueue,
@@ -521,21 +775,21 @@ fn mbutton(
     if primary {
         p.rect_filled(rect, RADIUS, egui::Color32::from_rgb(108, 62, 220));
     } else {
-        p.rect_filled(rect, RADIUS, SURFACE);
+        p.rect_filled(rect, RADIUS, pl().surface);
         if man.hover(&rect) {
-            p.rect_filled(rect, RADIUS, SURFACE_LT);
+            p.rect_filled(rect, RADIUS, pl().surface_lt);
         }
         p.rect_stroke(
             rect,
             RADIUS,
-            egui::Stroke::new(1.0, egui::Color32::from_rgb(45, 47, 65)),
+            egui::Stroke::new(1.0, pl().modal_bd),
             egui::StrokeKind::Inside,
         );
     }
     let g = p.layout_no_wrap(
         label.to_string(),
         egui::FontId::proportional(13.0),
-        if primary { egui::Color32::WHITE } else { TXT },
+        if primary { egui::Color32::WHITE } else { pl().txt },
     );
     p.galley(
         egui::pos2(
@@ -543,7 +797,7 @@ fn mbutton(
             rect.center().y - g.size().y / 2.0,
         ),
         g,
-        if primary { egui::Color32::WHITE } else { TXT },
+        if primary { egui::Color32::WHITE } else { pl().txt },
     );
     rect
 }
@@ -553,7 +807,7 @@ fn mcheck(ui: &mut egui::Ui, man: &ManState, label: &str, checked: bool) -> egui
     let w = ui.available_width().max(80.0);
     let (rect, _) = ui.allocate_exact_size(egui::vec2(w, 24.0), egui::Sense::hover());
     if man.hover(&rect) {
-        ui.painter().rect_filled(rect, 4.0, HOVER_BG);
+        ui.painter().rect_filled(rect, 4.0, pl().hover_bg);
     }
     let p = ui.painter();
     let br = egui::Rect::from_min_size(
@@ -566,7 +820,7 @@ fn mcheck(ui: &mut egui::Ui, man: &ManState, label: &str, checked: bool) -> egui
         egui::Align2::LEFT_CENTER,
         label.to_string(),
         egui::FontId::proportional(12.0),
-        TXT,
+        pl().txt,
     );
     rect
 }
@@ -594,14 +848,14 @@ fn mslider(
         egui::Align2::LEFT_CENTER,
         label.to_string(),
         egui::FontId::proportional(12.0),
-        DIM,
+        pl().dim,
     );
     let (tx0, tw) = slider_track(&rect);
     let ty = rect.min.y + 22.0;
     p.rect_filled(
         egui::Rect::from_min_size(egui::pos2(tx0, ty - 2.0), egui::vec2(tw, 4.0)),
         2.0,
-        SURFACE_LT,
+        pl().surface_lt,
     );
     let kx = tx0 + tw * frac as f32;
     if man.hover(&rect) {
@@ -611,7 +865,7 @@ fn mslider(
             egui::Color32::from_rgba_unmultiplied(124, 92, 252, 40),
         );
     }
-    p.circle_filled(egui::pos2(kx, ty), 7.0, PRIMARY);
+    p.circle_filled(egui::pos2(kx, ty), 7.0, pl().primary);
     rect
 }
 
@@ -645,14 +899,14 @@ fn mtext(
 fn micon(ui: &mut egui::Ui, man: &ManState, glyph: &str) -> egui::Rect {
     let (rect, _) = ui.allocate_exact_size(egui::vec2(30.0, 30.0), egui::Sense::hover());
     if man.hover(&rect) {
-        ui.painter().rect_filled(rect, 6.0, SURFACE_LT);
+        ui.painter().rect_filled(rect, 6.0, pl().surface_lt);
     }
     ui.painter().text(
         rect.center(),
         egui::Align2::CENTER_CENTER,
         glyph.to_string(),
         egui::FontId::proportional(16.0),
-        DIM,
+        pl().dim,
     );
     rect
 }
@@ -666,13 +920,13 @@ fn focus_field(ctx: &egui::Context, id: &str) {
 fn paint_progress(p: &egui::Painter, center_x: f32, top_y: f32, width: f32, frac: f32) {
     let w = width.max(20.0);
     let bar = egui::Rect::from_min_size(egui::pos2(center_x - w / 2.0, top_y), egui::vec2(w, 6.0));
-    p.rect_filled(bar, 3.0, SURFACE);
+    p.rect_filled(bar, 3.0, pl().surface);
     let fw = (w * frac.clamp(0.0, 1.0)).max(if frac > 0.0 { 5.0 } else { 0.0 });
     if fw > 0.0 {
         p.rect_filled(
             egui::Rect::from_min_size(bar.min, egui::vec2(fw, 6.0)),
             3.0,
-            PRIMARY,
+            pl().primary,
         );
     }
 }
@@ -740,24 +994,24 @@ fn name_cell(p: &egui::Painter, rect: egui::Rect, icon: &str, fname: &str, cat: 
         egui::Align2::CENTER_CENTER,
         icon.to_owned(),
         egui::FontId::proportional(16.0),
-        TXT,
+        pl().txt,
     );
     let tx = rect.min.x + 28.0;
     let max_tw = (rect.max.x - 4.0 - tx).max(20.0);
-    let name = truncate_to_width(p, fname, egui::FontId::proportional(12.0), TXT, max_tw);
+    let name = truncate_to_width(p, fname, egui::FontId::proportional(12.0), pl().txt, max_tw);
     p.text(
         egui::pos2(tx, rect.center().y - 8.0),
         egui::Align2::LEFT_CENTER,
         name,
         egui::FontId::proportional(12.0),
-        TXT,
+        pl().txt,
     );
     p.text(
         egui::pos2(tx, rect.center().y + 9.0),
         egui::Align2::LEFT_CENTER,
         cat.to_owned(),
         egui::FontId::proportional(9.0),
-        DIM,
+        pl().dim,
     );
 }
 
@@ -806,9 +1060,9 @@ fn tool_button(
 ) -> egui::Rect {
     let (rect, _) = ui.allocate_exact_size(egui::vec2(88.0, TOOL_H), egui::Sense::hover());
     if enabled && man.hover(&rect) {
-        ui.painter().rect_filled(rect, 6.0, SURFACE_LT);
+        ui.painter().rect_filled(rect, 6.0, pl().surface_lt);
     }
-    let c = if enabled { TXT } else { DIM };
+    let c = if enabled { pl().txt } else { pl().dim };
     let p = ui.painter();
     // Icon and label share the height evenly so all buttons align.
     p.text(
@@ -849,25 +1103,25 @@ fn add_url_button(ui: &mut egui::Ui, man: &ManState) -> egui::Rect {
     p.rect_filled(
         rect,
         6.0,
-        if man.hover(&hit) { SURFACE_LT } else { SURFACE },
+        if man.hover(&hit) { pl().surface_lt } else { pl().surface },
     );
     p.text(
         egui::pos2(rect.min.x + 26.0, rect.center().y),
         egui::Align2::CENTER_CENTER,
         MI_ADD_LINK.to_string(),
         egui::FontId::proportional(16.0),
-        TXT,
+        pl().txt,
     );
     p.text(
         egui::pos2(rect.min.x + 40.0, rect.center().y),
         egui::Align2::LEFT_CENTER,
         "Add URL".to_string(),
         egui::FontId::proportional(12.0),
-        TXT,
+        pl().txt,
     );
     let c = egui::pos2(rect.max.x - 15.0, rect.center().y);
-    p.circle_filled(c, 10.0, SECONDARY);
-    p.circle_filled(c + egui::vec2(-2.0, -2.0), 8.0, PRIMARY);
+    p.circle_filled(c, 10.0, pl().secondary);
+    p.circle_filled(c + egui::vec2(-2.0, -2.0), 8.0, pl().primary);
     p.text(
         c,
         egui::Align2::CENTER_CENTER,
@@ -882,11 +1136,11 @@ fn status_bar_w(ui: &mut egui::Ui, w: f32, frac: f32, c0: egui::Color32, c1: egu
     let w = w.max(20.0);
     let (rect, _) = ui.allocate_exact_size(egui::vec2(w, 5.0), egui::Sense::hover());
     let p = ui.painter();
-    p.rect_filled(rect, 2.5, SURFACE);
+    p.rect_filled(rect, 2.5, pl().surface);
     p.rect_stroke(
         rect,
         2.5,
-        egui::Stroke::new(1.0_f32, egui::Color32::from_rgba_unmultiplied(200, 200, 210, 25)),
+        egui::Stroke::new(1.0_f32, pl().bar_bd),
         egui::StrokeKind::Inside,
     );
     if frac > 0.0 {
@@ -1714,7 +1968,7 @@ impl CraftApp {
 
     /// Menu/dropdown action codes shared by the menubar and popups.
     /// 1 add, 2 folder, 4/5/6/7 tasks, 8 queues, 9 settings, 10 about,
-    /// 11/12 import/export, 13 retry-failed, 14 exit, 20/21/22 themes.
+    /// 11/12 import/export, 13 retry-failed, 14 exit, 19/20/22 themes.
     fn do_menu_act(&mut self, ctx: &egui::Context, act: u8) {
         self.diag_acts += 1;
         match act {
@@ -1763,8 +2017,9 @@ impl CraftApp {
             12 => self.export_list(),
             13 => self.retry_all_failed(),
             14 => ctx.send_viewport_cmd(egui::ViewportCommand::Close),
-            20 | 21 | 22 => {
+            19 | 20 | 21 | 22 => {
                 self.theme = match act {
+                    19 => "system",
                     20 => "dark",
                     21 => "black",
                     _ => "light",
@@ -1797,7 +2052,11 @@ impl CraftApp {
                 ("Clear finished".into(), 7),
             ],
             2 => vec![("Open Queues".into(), 8), ("Settings".into(), 9)],
-            3 => vec![("Dark".into(), 20), ("Black".into(), 21), ("Light".into(), 22)],
+            3 => vec![
+                ("System".into(), 19),
+                ("Dark".into(), 20),
+                ("Light".into(), 22),
+            ],
             _ => vec![("About".into(), 10)],
         }
     }
@@ -3507,11 +3766,12 @@ impl eframe::App for CraftApp {
         let tick_ms = if self.tasks.is_empty() { 250 } else { 100 };
         ctx.request_repaint_after(std::time::Duration::from_millis(tick_ms));
 
-        // theme (re-applied when the user switches it)
-        if self.theme_applied != self.theme {
-            ctx.set_visuals(visuals_for(&self.theme));
-            apply_widget_theme(ctx);
-            self.theme_applied = self.theme.clone();
+        // theme (re-applied when the user switches it, and while "system"
+        // follows the OS: the resolved key carries the OS's answer)
+        let resolved = format!("{}:{}", self.theme, theme_is_dark(ctx, &self.theme));
+        if self.theme_applied != resolved {
+            apply_theme(ctx, &self.theme);
+            self.theme_applied = resolved;
         }
 
         // system tray
@@ -3560,7 +3820,7 @@ impl eframe::App for CraftApp {
         // Flat desktop menu bar: manual text buttons (no backgrounds),
         // dropdowns render at the end of update (topmost).
         egui::TopBottomPanel::top("menubar")
-            .frame(egui::Frame::new().fill(BG).inner_margin(egui::Margin {
+            .frame(egui::Frame::new().fill(pl().bg).inner_margin(egui::Margin {
                 left: 8,
                 right: 8,
                 top: 4,
@@ -3570,12 +3830,12 @@ impl eframe::App for CraftApp {
                 ui.horizontal(|ui| {
                     ui.spacing_mut().item_spacing.x = 2.0;
                     for (m, label) in
-                        ["File", "Tasks", "Tools", "View", "Help"].iter().enumerate()
+                        ["File", "Tasks", "Tools", "Theme", "Help"].iter().enumerate()
                     {
                         let g = ui.painter().layout_no_wrap(
                             label.to_string(),
                             egui::FontId::proportional(12.5),
-                            TXT,
+                            pl().txt,
                         );
                         let (rect, _) = ui.allocate_exact_size(
                             egui::vec2(g.size().x + 20.0, 26.0),
@@ -3584,7 +3844,7 @@ impl eframe::App for CraftApp {
                         let hov = self.man.hover(&rect);
                         let open = self.drop_menu == Some(m as u8);
                         if hov || open {
-                            ui.painter().rect_filled(rect, 4.0, SURFACE_LT);
+                            ui.painter().rect_filled(rect, 4.0, pl().surface_lt);
                         }
                         ui.painter().galley(
                             egui::pos2(
@@ -3592,13 +3852,13 @@ impl eframe::App for CraftApp {
                                 rect.center().y - g.size().y / 2.0,
                             ),
                             g,
-                            TXT,
+                            pl().txt,
                         );
                         self.hits.push((HitKind::MenuBtn(m as u8), rect));
                     }
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     egui::Frame::new()
-                        .fill(SURFACE)
+                        .fill(pl().surface)
                         .corner_radius(18.0)
                         .inner_margin(egui::Margin {
                             left: 12,
@@ -3609,7 +3869,7 @@ impl eframe::App for CraftApp {
                         .show(ui, |ui| {
                             ui.horizontal(|ui| {
                                 ui.spacing_mut().item_spacing.x = 6.0;
-                                mi(ui, MI_SEARCH, 16.0, DIM);
+                                mi(ui, MI_SEARCH, 16.0, pl().dim);
                                 let r = mtext(ui, "search", &mut self.search, "Search in the List", 210.0, false);
                                 self.hits.push((HitKind::Field("search"), r));
                             });
@@ -3626,7 +3886,7 @@ impl eframe::App for CraftApp {
             .exact_width(200.0)
             .frame(
                 egui::Frame::new()
-                    .fill(BG)
+                    .fill(pl().bg)
                     .inner_margin(egui::Margin::same(12)),
             )
             .show(ctx, |ui| {
@@ -3763,23 +4023,23 @@ impl eframe::App for CraftApp {
                 let active = self.tasks.len();
                 ui.horizontal(|ui| {
                     ui.spacing_mut().item_spacing.x = 5.0;
-                    mi(ui, MI_CLOUD_DL, 15.0, DIM);
+                    mi(ui, MI_CLOUD_DL, 15.0, pl().dim);
                     ui.label(egui::RichText::new(if total_speed > 0.0 {
                         format_speed(total_speed)
                     } else {
                         String::new()
                     })
-                    .color(DIM));
+                    .color(pl().dim));
                     ui.add_space(10.0);
-                    mi(ui, MI_MENU, 15.0, DIM);
-                    ui.label(egui::RichText::new(format!("{active}")).color(DIM));
+                    mi(ui, MI_MENU, 15.0, pl().dim);
+                    ui.label(egui::RichText::new(format!("{active}")).color(pl().dim));
                 });
             });
         });
 
         // ================= main area (toolbar + list, beside the sidebar) =================
         egui::CentralPanel::default()
-            .frame(egui::Frame::new().fill(CENTRAL_BG).inner_margin(egui::Margin {
+            .frame(egui::Frame::new().fill(pl().central_bg).inner_margin(egui::Margin {
                 left: 16,
                 right: 16,
                 top: 12,
@@ -3815,8 +4075,8 @@ impl eframe::App for CraftApp {
                 // clipboard toast: dismissible banner card, never loose text
                 if let Some(url) = self.clipboard_toast.clone() {
                     egui::Frame::new()
-                        .fill(SURFACE)
-                        .stroke(egui::Stroke::new(1.0_f32, PRIMARY))
+                        .fill(pl().surface)
+                        .stroke(egui::Stroke::new(1.0_f32, pl().primary))
                         .corner_radius(RADIUS)
                         .inner_margin(egui::Margin {
                             left: 12,
@@ -3826,7 +4086,7 @@ impl eframe::App for CraftApp {
                         })
                         .show(ui, |ui| {
                             ui.horizontal(|ui| {
-                                mi(ui, MI_ADD_LINK, 16.0, PRIMARY);
+                                mi(ui, MI_ADD_LINK, 16.0, pl().primary);
                                 ui.vertical(|ui| {
                                     ui.spacing_mut().item_spacing.y = 0.0;
                                     ui.label(
@@ -3837,7 +4097,7 @@ impl eframe::App for CraftApp {
                                             url.chars().take(90).collect::<String>(),
                                         )
                                         .small()
-                                        .color(DIM),
+                                        .color(pl().dim),
                                     );
                                 });
                                 ui.with_layout(
@@ -3859,16 +4119,16 @@ impl eframe::App for CraftApp {
                         ui.vertical_centered(|ui| {
                             ui.add_space(40.0);
                             ui.label(
-                                egui::RichText::new(MI_CLOUD_DL).size(48.0).color(SURFACE_LT),
+                                egui::RichText::new(MI_CLOUD_DL).size(48.0).color(pl().surface_lt),
                             );
                             ui.add_space(8.0);
                             ui.label(
-                                egui::RichText::new("No downloads yet").size(14.0).color(DIM),
+                                egui::RichText::new("No downloads yet").size(14.0).color(pl().dim),
                             );
                             ui.label(
                                 egui::RichText::new("Click Add URL to start downloading.")
                                     .size(12.0)
-                                    .color(DIM),
+                                    .color(pl().dim),
                             );
                         });
                     });
@@ -3910,7 +4170,7 @@ impl eframe::App for CraftApp {
                         });
                     // ---- header bar (fixed, scrolls horizontally with body) ----
                     egui::Frame::new()
-                        .fill(HEADER_BG)
+                        .fill(pl().header_bg)
                         .corner_radius(RADIUS)
                         .show(ui, |ui| {
                             ui.spacing_mut().item_spacing.x = 0.0;
@@ -3944,7 +4204,7 @@ impl eframe::App for CraftApp {
                                     let g = ui.painter().layout_no_wrap(
                                         txt,
                                         egui::FontId::proportional(12.0),
-                                        DIM,
+                                        pl().dim,
                                     );
                                     ui.painter().galley(
                                         egui::pos2(
@@ -3952,7 +4212,7 @@ impl eframe::App for CraftApp {
                                             r.center().y - g.size().y / 2.0,
                                         ),
                                         g,
-                                        DIM,
+                                        pl().dim,
                                     );
                                     self.hits.push((HitKind::HdrCol(*col), r));
                                     if ci + 1 < cols.len() {
@@ -4009,19 +4269,19 @@ impl eframe::App for CraftApp {
                                             ui.painter().rect_filled(
                                                 rrect.expand(2.0),
                                                 RADIUS,
-                                                SEL_BG,
+                                                pl().sel_bg,
                                             );
                                             ui.painter().rect_stroke(
                                                 rrect.expand(2.0),
                                                 RADIUS,
-                                                egui::Stroke::new(1.0_f32, SEL_BD),
+                                                egui::Stroke::new(1.0_f32, pl().sel_bd),
                                                 egui::StrokeKind::Inside,
                                             );
                                         } else if self.man.hover(&rrect) {
                                             ui.painter().rect_filled(
                                                 rrect.expand(2.0),
                                                 RADIUS,
-                                                HOVER_BG,
+                                                pl().hover_bg,
                                             );
                                         }
                                         self.hits.push((HitKind::Row(id), rrect));
@@ -4065,7 +4325,7 @@ impl eframe::App for CraftApp {
                                             );
                                         }
                                         SortCol::Size => {
-                                            centered_label_at(&p, crect, &size_s, 12.0, TXT);
+                                            centered_label_at(&p, crect, &size_s, 12.0, pl().txt);
                                         }
                                         SortCol::Status => match &st {
                                             Status::Downloading => {
@@ -4079,7 +4339,7 @@ impl eframe::App for CraftApp {
                                                         "{}%",
                                                         (prog * 100.0) as u32
                                                     ),
-                                                    PRIMARY,
+                                                    pl().primary,
                                                 );
                                                 paint_progress(
                                                     &p,
@@ -4090,7 +4350,7 @@ impl eframe::App for CraftApp {
                                                 );
                                             }
                                             Status::Queued => {
-                                                centered_label_at(&p, crect, "Added", 12.0, TXT);
+                                                centered_label_at(&p, crect, "Added", 12.0, pl().txt);
                                             }
                                             Status::Paused => {
                                                 status_pill_at(
@@ -4100,14 +4360,14 @@ impl eframe::App for CraftApp {
                                                         "{}% Paused",
                                                         (prog * 100.0) as u32
                                                     ),
-                                                    WARNING,
+                                                    pl().warning,
                                                 );
                                             }
                                             Status::Completed => {
-                                                status_pill_at(&p, crect, "Finished", SUCCESS);
+                                                status_pill_at(&p, crect, "Finished", pl().success);
                                             }
                                             Status::Failed(_) => {
-                                                status_pill_at(&p, crect, "Failed", ERROR);
+                                                status_pill_at(&p, crect, "Failed", pl().error);
                                             }
                                         },
                                         SortCol::Speed => {
@@ -4116,15 +4376,15 @@ impl eframe::App for CraftApp {
                                             } else {
                                                 "-".to_string()
                                             };
-                                            centered_label_at(&p, crect, &spd_s, 12.0, TXT);
+                                            centered_label_at(&p, crect, &spd_s, 12.0, pl().txt);
                                         }
                                         SortCol::Eta => {
                                             let eta_s: &str =
                                                 if eta == "-" { "" } else { &eta };
-                                            centered_label_at(&p, crect, eta_s, 12.0, DIM);
+                                            centered_label_at(&p, crect, eta_s, 12.0, pl().dim);
                                         }
                                         SortCol::Date => {
-                                            centered_label_at(&p, crect, &date, 12.0, DIM);
+                                            centered_label_at(&p, crect, &date, 12.0, pl().dim);
                                         }
                                     }
                                     x += w;
@@ -4164,7 +4424,7 @@ impl eframe::App for CraftApp {
             .rect_filled(
                 ctx.screen_rect(),
                 0.0,
-                egui::Color32::from_black_alpha(160),
+                pl().scrim,
             );
         }
 
@@ -4247,8 +4507,8 @@ impl eframe::App for CraftApp {
                     p.rect(
                         card,
                         8.0,
-                        DM_CARD,
-                        egui::Stroke::new(1.0, DM_LINE),
+                        pl().dm_card,
+                        egui::Stroke::new(1.0, pl().dm_line),
                         egui::StrokeKind::Inside,
                     );
                     // ---- header: mark + title + window controls ----
@@ -4258,14 +4518,14 @@ impl eframe::App for CraftApp {
                         egui::Align2::LEFT_CENTER,
                         "Add download",
                         crate::fonts::semi(13.0),
-                        DM_TXT,
+                        pl().dm_txt,
                     );
                     p.line_segment(
                         [
                             egui::pos2(o.x + 1.0, o.y + 39.5),
                             egui::pos2(o.x + DM_W - 1.0, o.y + 39.5),
                         ],
-                        egui::Stroke::new(1.0, DM_LINE),
+                        egui::Stroke::new(1.0, pl().dm_line),
                     );
                     // The dialog lives in the main canvas, so minimise/restore
                     // drive the real OS window and the X closes the dialog.
@@ -4275,7 +4535,7 @@ impl eframe::App for CraftApp {
                         (541.0, DmIcon::Close, 2),
                     ] {
                         let r = at(cx - 8.0, 12.0, 16.0, 16.0);
-                        dm_icon_btn(&p, &self.man, r, icon, 12.0, 2.0, DM_DIM);
+                        dm_icon_btn(&p, &self.man, r, icon, 12.0, 2.0, pl().dm_dim);
                         if self.man.clicked(&r) {
                             match ctl {
                                 0 => ui
@@ -4312,7 +4572,7 @@ impl eframe::App for CraftApp {
                         false,
                     );
                     self.hits.push((HitKind::Field("add_url"), url_box));
-                    dm_icon_btn(&p, &self.man, url_btn, DmIcon::Clipboard, 14.0, 1.5, DM_DIM);
+                    dm_icon_btn(&p, &self.man, url_btn, DmIcon::Clipboard, 14.0, 1.5, pl().dm_dim);
                     self.hits.push((HitKind::Btn(ButtonId::AddPaste), url_btn));
                     // ---- row 2: save folder + carets | size chip ----
                     let path_box = at(DM_X, DM_ROW2, DM_PATH_W, DM_BOX_H);
@@ -4334,9 +4594,9 @@ impl eframe::App for CraftApp {
                         false,
                     );
                     self.hits.push((HitKind::Field("add_dir"), path_box));
-                    dm_icon_btn(&p, &self.man, folder_btn, DmIcon::Folder, 14.0, 1.5, DM_DIM);
+                    dm_icon_btn(&p, &self.man, folder_btn, DmIcon::Folder, 14.0, 1.5, pl().dm_dim);
                     self.hits.push((HitKind::Btn(ButtonId::AddFolder), folder_btn));
-                    dm_icon_btn(&p, &self.man, caret_btn, DmIcon::Chevron, 10.0, 2.0, DM_DIM);
+                    dm_icon_btn(&p, &self.man, caret_btn, DmIcon::Chevron, 10.0, 2.0, pl().dm_dim);
                     self.add_caret = Some(caret_btn);
                     if self.man.clicked(&caret_btn) {
                         self.add_recent_open = !self.add_recent_open;
@@ -4363,13 +4623,13 @@ impl eframe::App for CraftApp {
                             .map(format_bytes)
                             .unwrap_or_else(|| "—".to_string())
                     };
-                    let g = p.layout_no_wrap(sz_txt, crate::fonts::reg(11.0), DM_TXT);
+                    let g = p.layout_no_wrap(sz_txt, crate::fonts::reg(11.0), pl().dm_txt);
                     let tw = g.size().x;
                     let tx = chip.min.x + 37.0;
                     p.galley(
                         egui::pos2(tx, chip.center().y - g.size().y * 0.5),
                         g,
-                        DM_TXT,
+                        pl().dm_txt,
                     );
                     if known {
                         dm_icon(
@@ -4403,9 +4663,9 @@ impl eframe::App for CraftApp {
                         false,
                     );
                     self.hits.push((HitKind::Field("add_file"), file_box));
-                    dm_icon_btn(&p, &self.man, refr_btn, DmIcon::Refresh, 14.0, 1.5, DM_DIM);
+                    dm_icon_btn(&p, &self.man, refr_btn, DmIcon::Refresh, 14.0, 1.5, pl().dm_dim);
                     self.hits.push((HitKind::Btn(ButtonId::AddRefresh), refr_btn));
-                    dm_icon_btn(&p, &self.man, gear_btn, DmIcon::Settings, 14.0, 1.5, DM_DIM);
+                    dm_icon_btn(&p, &self.man, gear_btn, DmIcon::Settings, 14.0, 1.5, pl().dm_dim);
                     self.hits.push((HitKind::Btn(ButtonId::AddAdv), gear_btn));
                     // ---- advanced panel (gear): same tokens, placeholders
                     // instead of labels, per the concept's field style ----
@@ -4421,7 +4681,7 @@ impl eframe::App for CraftApp {
                             egui::Align2::LEFT_CENTER,
                             "Connections",
                             crate::fonts::reg(11.0),
-                            DM_DIM,
+                            pl().dm_dim,
                         );
                         let srect = egui::Rect::from_min_size(
                             egui::pos2(row.min.x + 92.0, row.min.y + 5.0),
@@ -4439,7 +4699,7 @@ impl eframe::App for CraftApp {
                             egui::Align2::RIGHT_CENTER,
                             format!("{}", self.add_conns),
                             crate::fonts::reg(11.0),
-                            DM_TXT,
+                            pl().dm_txt,
                         );
                         cy += 38.0;
                         let half = (cw - 8.0) / 2.0;
@@ -4485,8 +4745,8 @@ impl eframe::App for CraftApp {
                             p.rect(
                                 cbx,
                                 4.0,
-                                DM_CARD,
-                                egui::Stroke::new(1.0, DM_BOX_BD),
+                                pl().dm_card,
+                                egui::Stroke::new(1.0, pl().dm_box_bd),
                                 egui::StrokeKind::Inside,
                             );
                         }
@@ -4495,7 +4755,7 @@ impl eframe::App for CraftApp {
                             egui::Align2::LEFT_CENTER,
                             "Overwrite file if it already exists",
                             crate::fonts::reg(11.0),
-                            DM_DIM,
+                            pl().dm_dim,
                         );
                         self.hits.push((HitKind::Check(CheckId::AddOverwrite), ow));
                     }
@@ -4562,8 +4822,8 @@ impl eframe::App for CraftApp {
                             .fixed_pos(dm_menu_rect(caret, anchors.len()).min)
                             .show(ctx, |ui| {
                                 egui::Frame::new()
-                                    .fill(DM_CARD)
-                                    .stroke(egui::Stroke::new(1.0, DM_LINE))
+                                    .fill(pl().dm_card)
+                                    .stroke(egui::Stroke::new(1.0, pl().dm_line))
                                     .corner_radius(DM_RAD)
                                     .inner_margin(egui::Margin::same(6))
                                     .show(ui, |ui| {
@@ -4575,7 +4835,7 @@ impl eframe::App for CraftApp {
                                                     egui::Button::new(
                                                         egui::RichText::new(elide_left(d, 46))
                                                             .size(11.0)
-                                                            .color(DM_TXT),
+                                                            .color(pl().dm_txt),
                                                     )
                                                     .fill(egui::Color32::TRANSPARENT)
                                                     .stroke(egui::Stroke::NONE),
@@ -4657,7 +4917,7 @@ impl eframe::App for CraftApp {
                         self.hits.push((HitKind::Check(CheckId::GrabDepth), r));
                     });
                     if !self.grab_notice.is_empty() {
-                        ui.colored_label(egui::Color32::from_rgb(255, 150, 120), &self.grab_notice);
+                        ui.colored_label(pl().notice, &self.grab_notice);
                     }
                     if self.grab_busy {
                         ui.horizontal(|ui| {
@@ -4726,7 +4986,7 @@ impl eframe::App for CraftApp {
                         "Max simultaneous downloads: {}",
                         self.max_concurrent
                     ))
-                    .color(DIM),
+                    .color(pl().dim),
                 );
                 let r = mslider(
                     ui,
@@ -4753,25 +5013,25 @@ impl eframe::App for CraftApp {
                     let g = ui.painter().layout_no_wrap(
                         cur.to_string(),
                         egui::FontId::proportional(12.5),
-                        TXT,
+                        pl().txt,
                     );
                     let (r, _) = ui.allocate_exact_size(
                         egui::vec2((g.size().x + 40.0).max(140.0), 28.0),
                         egui::Sense::hover(),
                     );
                     if self.man.hover(&r) {
-                        ui.painter().rect_filled(r, 6.0, SURFACE_LT);
+                        ui.painter().rect_filled(r, 6.0, pl().surface_lt);
                     }
                     ui.painter().rect_stroke(
                         r,
                         6.0,
-                        egui::Stroke::new(1.0, egui::Color32::from_rgb(45, 47, 65)),
+                        egui::Stroke::new(1.0, pl().modal_bd),
                         egui::StrokeKind::Inside,
                     );
                     ui.painter().galley(
                         egui::pos2(r.min.x + 10.0, r.center().y - g.size().y / 2.0),
                         g,
-                        TXT,
+                        pl().txt,
                     );
                     // dropdown arrow
                     ui.painter().text(
@@ -4779,7 +5039,7 @@ impl eframe::App for CraftApp {
                         egui::Align2::CENTER_CENTER,
                         "▾".to_string(),
                         egui::FontId::proportional(12.0),
-                        DIM,
+                        pl().dim,
                     );
                     self.hits.push((HitKind::ComboAnchor, r));
                 });
@@ -4881,16 +5141,16 @@ impl eframe::App for CraftApp {
                                     let g = ui.painter().layout_no_wrap(
                                         label.to_string(),
                                         egui::FontId::proportional(12.5),
-                                        if tab == t { TXT } else { DIM },
+                                        if tab == t { pl().txt } else { pl().dim },
                                     );
                                     let (r, _) = ui.allocate_exact_size(
                                         egui::vec2(g.size().x + 24.0, 26.0),
                                         egui::Sense::hover(),
                                     );
                                     if tab == t {
-                                        ui.painter().rect_filled(r, 4.0, SURFACE_LT);
+                                        ui.painter().rect_filled(r, 4.0, pl().surface_lt);
                                     } else if self.man.hover(&r) {
-                                        ui.painter().rect_filled(r, 4.0, HOVER_BG);
+                                        ui.painter().rect_filled(r, 4.0, pl().hover_bg);
                                     }
                                     ui.painter().galley(
                                         egui::pos2(
@@ -4898,7 +5158,7 @@ impl eframe::App for CraftApp {
                                             r.center().y - g.size().y / 2.0,
                                         ),
                                         g,
-                                        if tab == t { TXT } else { DIM },
+                                        if tab == t { pl().txt } else { pl().dim },
                                     );
                                     self.hits.push((HitKind::DetTab(t), r));
                                 }
@@ -4910,7 +5170,7 @@ impl eframe::App for CraftApp {
                                     .spacing([24.0, 6.0])
                                     .show(ui, |ui| {
                                         let row = |ui: &mut egui::Ui, k: &str, v: String| {
-                                            ui.label(egui::RichText::new(k).color(DIM));
+                                            ui.label(egui::RichText::new(k).color(pl().dim));
                                             ui.label(egui::RichText::new(v).size(13.0));
                                             ui.end_row();
                                         };
@@ -4944,7 +5204,7 @@ impl eframe::App for CraftApp {
                                                 format_eta(&item)
                                             },
                                         );
-                                        ui.label(egui::RichText::new("Resume Support:").color(DIM));
+                                        ui.label(egui::RichText::new("Resume Support:").color(pl().dim));
                                         ui.label(
                                             egui::RichText::new(if item.resumable {
                                                 "Yes"
@@ -4952,13 +5212,13 @@ impl eframe::App for CraftApp {
                                                 "No"
                                             })
                                             .color(if item.resumable {
-                                                SUCCESS
+                                                pl().success
                                             } else {
-                                                ERROR
+                                                pl().error
                                             }),
                                         );
                                         ui.end_row();
-                                        ui.label(egui::RichText::new("Integrity (SHA-256):").color(DIM));
+                                        ui.label(egui::RichText::new("Integrity (SHA-256):").color(pl().dim));
                                         ui.label(
                                             egui::RichText::new(if item.checksum_sha256.trim().is_empty() {
                                                 "not set".to_string()
@@ -4974,8 +5234,8 @@ impl eframe::App for CraftApp {
                                     ui,
                                     ui.available_width(),
                                     item.progress(),
-                                    PRIMARY,
-                                    SECONDARY,
+                                    pl().primary,
+                                    pl().secondary,
                                 );
                                 ui.add_space(8.0);
                                 // P5 speed history: raw quarter-second samples
@@ -4992,14 +5252,14 @@ impl eframe::App for CraftApp {
                                             "Speed history (peak {}):",
                                             format_speed(peak)
                                         ))
-                                        .color(DIM),
+                                        .color(pl().dim),
                                     );
                                     let (grect, _) = ui.allocate_exact_size(
                                         egui::vec2(ui.available_width(), 40.0),
                                         egui::Sense::hover(),
                                     );
                                     let gp = ui.painter();
-                                    gp.rect_filled(grect, 4.0, SURFACE);
+                                    gp.rect_filled(grect, 4.0, pl().surface);
                                     let n = hist.len();
                                     let pts: Vec<egui::Pos2> = hist
                                         .iter()
@@ -5022,7 +5282,7 @@ impl eframe::App for CraftApp {
                                         egui::Color32::from_rgba_unmultiplied(124, 92, 252, 40),
                                         egui::Stroke::new(0.0, egui::Color32::TRANSPARENT),
                                     ));
-                                    gp.add(egui::Shape::line(pts, egui::Stroke::new(1.5, PRIMARY)));
+                                    gp.add(egui::Shape::line(pts, egui::Stroke::new(1.5, pl().primary)));
                                     ui.add_space(8.0);
                                 }
                                 ui.horizontal(|ui| {
@@ -5062,7 +5322,7 @@ impl eframe::App for CraftApp {
                                             egui::Sense::hover(),
                                         );
                                         let p = ui.painter();
-                                        p.rect_filled(rect, 5.0, SURFACE);
+                                        p.rect_filled(rect, 5.0, pl().surface);
                                         if total > 0 {
                                             let mut x = rect.min.x;
                                             for (i, (s, e)) in ranges.iter().enumerate() {
@@ -5072,11 +5332,11 @@ impl eframe::App for CraftApp {
                                                 let frac = (done as f64 / part_len.max(1) as f64)
                                                     .clamp(0.0, 1.0);
                                                 let c = if frac >= 1.0 {
-                                                    SUCCESS
+                                                    pl().success
                                                 } else if active && done > 0 {
-                                                    WARNING
+                                                    pl().warning
                                                 } else {
-                                                    egui::Color32::from_rgb(0x3A, 0x3B, 0x44)
+                                                    pl().track
                                                 };
                                                 let seg = egui::Rect::from_min_size(
                                                     egui::pos2(x + 1.0, rect.min.y),
@@ -5094,12 +5354,12 @@ impl eframe::App for CraftApp {
                                             .spacing([16.0, 4.0])
                                             .striped(true)
                                             .show(ui, |ui| {
-                                                ui.label(egui::RichText::new("#").color(DIM));
-                                                ui.label(egui::RichText::new("Status").color(DIM));
+                                                ui.label(egui::RichText::new("#").color(pl().dim));
+                                                ui.label(egui::RichText::new("Status").color(pl().dim));
                                                 ui.label(
-                                                    egui::RichText::new("Downloaded").color(DIM),
+                                                    egui::RichText::new("Downloaded").color(pl().dim),
                                                 );
-                                                ui.label(egui::RichText::new("Total").color(DIM));
+                                                ui.label(egui::RichText::new("Total").color(pl().dim));
                                                 ui.end_row();
                                                 for (i, (s, e)) in ranges.iter().enumerate() {
                                                     let part_len = e.saturating_sub(*s) + 1;
@@ -5138,7 +5398,7 @@ impl eframe::App for CraftApp {
                                         "Connections: {}",
                                         item.connections
                                     ))
-                                    .color(DIM),
+                                    .color(pl().dim),
                                 );
                                 let r = mslider(
                                     ui,
@@ -5164,7 +5424,7 @@ impl eframe::App for CraftApp {
                                                 self.max_retries
                                             ))
                                     ))
-                                    .color(DIM),
+                                    .color(pl().dim),
                                 );
                                 let r = mslider(
                                     ui,
@@ -5189,7 +5449,7 @@ impl eframe::App for CraftApp {
                                                 self.timeout_secs
                                             ))
                                     ))
-                                    .color(DIM),
+                                    .color(pl().dim),
                                 );
                                 let r = mslider(
                                     ui,
@@ -5347,7 +5607,7 @@ impl eframe::App for CraftApp {
 
 impl CraftApp {
     /// Menubar dropdown items for `render_popup`. (label, MenuItem act.)
-    /// The View menu marks the active theme.
+    /// The Theme menu marks the active theme (19 system, 20 dark, 22 light).
     fn drop_rows(&self, menu: u8) -> Vec<(String, Option<HitKind>)> {
         let mut out = Vec::new();
         for (label, act) in Self::menu_items(menu) {
@@ -5358,11 +5618,12 @@ impl CraftApp {
             let mut text = label.clone();
             if menu == 3 {
                 let key = match act {
+                    19 => "system",
                     20 => "dark",
-                    21 => "black",
-                    _ => "light",
+                    22 => "light",
+                    _ => "",
                 };
-                if self.theme == key {
+                if !key.is_empty() && self.theme == key {
                     text = format!("✓ {text}");
                 }
             }
@@ -5709,12 +5970,12 @@ impl CraftApp {
                 }
                 self.save_ui_state();
             }
-            ButtonId::ThemeDark => {
-                self.theme = "dark".to_string();
+            ButtonId::ThemeSystem => {
+                self.theme = "system".to_string();
                 self.save_ui_state();
             }
-            ButtonId::ThemeBlack => {
-                self.theme = "black".to_string();
+            ButtonId::ThemeDark => {
+                self.theme = "dark".to_string();
                 self.save_ui_state();
             }
             ButtonId::ThemeLight => {
@@ -5777,10 +6038,10 @@ impl CraftApp {
             .fixed_pos(pos)
             .show(ctx, |ui| {
                 egui::Frame::new()
-                    .fill(egui::Color32::from_rgb(20, 21, 29))
+                    .fill(pl().modal_bg)
                     .stroke(egui::Stroke::new(
                         1.0_f32,
-                        egui::Color32::from_rgb(45, 47, 65),
+                        pl().modal_bd,
                     ))
                     .corner_radius(RADIUS)
                     .inner_margin(egui::Margin::same(6))
@@ -5798,14 +6059,14 @@ impl CraftApp {
                                 egui::Sense::hover(),
                             );
                             if self.man.hover(&r) {
-                                ui.painter().rect_filled(r, 4.0, SURFACE_LT);
+                                ui.painter().rect_filled(r, 4.0, pl().surface_lt);
                             }
                             ui.painter().text(
                                 egui::pos2(r.min.x + 10.0, r.center().y),
                                 egui::Align2::LEFT_CENTER,
                                 label,
                                 egui::FontId::proportional(12.5),
-                                TXT,
+                                pl().txt,
                             );
                             if let Some(h) = hit {
                                 self.hits.push((h, r));

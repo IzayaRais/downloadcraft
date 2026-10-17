@@ -15,30 +15,17 @@
 //! manager window drives a manual hit table, the popup uses egui responses),
 //! so hover state arrives as a plain `bool`.
 
+use crate::app::pl;
+
 // ================= tokens =================
 
 pub const DM_W: f32 = 562.0;
 /// Card height with the advanced panel closed — the concept's exact size.
 pub const DM_H: f32 = 253.0;
 
-pub const DM_CARD: egui::Color32 = egui::Color32::from_rgb(0x0f, 0x0f, 0x22);
-/// Card border *and* field fill (#1e293b in the concept).
-pub const DM_LINE: egui::Color32 = egui::Color32::from_rgb(0x1e, 0x29, 0x3b);
-pub const DM_BOX_BD: egui::Color32 = egui::Color32::from_rgb(0x33, 0x41, 0x55);
-pub const DM_TXT: egui::Color32 = egui::Color32::from_rgb(0xe2, 0xe8, 0xf0);
-pub const DM_DIM: egui::Color32 = egui::Color32::from_rgb(0x94, 0xa3, 0xb8);
 pub const DM_ACC: egui::Color32 = egui::Color32::from_rgb(0x3b, 0x82, 0xf6);
 pub const DM_ACC2: egui::Color32 = egui::Color32::from_rgb(0x8b, 0x5c, 0xf6);
 pub const DM_OK: egui::Color32 = egui::Color32::from_rgb(0x22, 0xc5, 0x5e);
-pub const DM_HOVER: egui::Color32 = egui::Color32::from_rgb(0x1c, 0x24, 0x36);
-pub const DM_HOVER2: egui::Color32 = egui::Color32::from_rgb(0x27, 0x33, 0x4a);
-pub const DM_WARN: egui::Color32 = egui::Color32::from_rgb(0xff, 0x96, 0x78);
-/// Page/segmented-trough colour, also the progress concept's row rules.
-pub const DM_TROUGH: egui::Color32 = egui::Color32::from_rgb(0x0a, 0x0a, 0x14);
-/// Muted label grey (#64748b) — info rows and part indices.
-pub const DM_LBL: egui::Color32 = egui::Color32::from_rgb(0x64, 0x74, 0x8b);
-/// Table column headers (#475569).
-pub const DM_HEAD: egui::Color32 = egui::Color32::from_rgb(0x47, 0x55, 0x69);
 /// "Connecting..." amber (#eab308).
 pub const DM_YEL: egui::Color32 = egui::Color32::from_rgb(0xea, 0xb3, 0x08);
 pub const DM_RAD: f32 = 6.0;
@@ -71,15 +58,15 @@ pub fn dm_box(p: &egui::Painter, r: egui::Rect) {
     p.rect(
         r,
         DM_RAD,
-        DM_LINE,
-        egui::Stroke::new(1.0, DM_BOX_BD),
+        pl().dm_line,
+        egui::Stroke::new(1.0, pl().dm_box_bd),
         egui::StrokeKind::Inside,
     );
 }
 
 /// One concept row: painted box plus a frameless editor inside it (the concept
 /// draws its values dim, but a real input reads better in the design's own
-/// content colour; unknown text stays `DM_DIM` as the hint). `text_r` bounds
+/// content colour; unknown text stays `pl().dm_dim` as the hint). `text_r` bounds
 /// the editor so in-box icon buttons keep their room. Returns the box rect.
 pub fn dm_field(
     ui: &mut egui::Ui,
@@ -106,8 +93,8 @@ pub fn dm_field(
         .desired_width(line.width());
     ui.scope(|ui| {
         let v = ui.visuals_mut();
-        v.override_text_color = Some(DM_TXT);
-        v.weak_text_color = Some(DM_DIM);
+        v.override_text_color = Some(pl().dm_txt);
+        v.weak_text_color = Some(pl().dm_dim);
         v.selection.bg_fill = egui::Color32::from_rgba_premultiplied(59, 130, 246, 90);
         ui.put(line, te);
     });
@@ -283,7 +270,7 @@ pub fn dm_icon(p: &egui::Painter, r: egui::Rect, icon: DmIcon, color: egui::Colo
             line((10.0, 16.0), (20.0, 16.0));
             // Knobs: the concept fills them with the trough colour behind the ring.
             for (cx, cy) in [(16.0, 8.0), (8.0, 16.0)] {
-                p.circle_filled(m(cx, cy), 2.0 * s, DM_TROUGH);
+                p.circle_filled(m(cx, cy), 2.0 * s, pl().dm_trough);
                 p.circle_stroke(m(cx, cy), 2.0 * s, st);
             }
         }
@@ -342,7 +329,7 @@ pub fn icon_btn(
     color: egui::Color32,
 ) {
     if hovered {
-        p.rect_filled(rect, DM_RAD, DM_HOVER2);
+        p.rect_filled(rect, DM_RAD, pl().dm_hover2);
     }
     dm_icon(
         p,
@@ -355,7 +342,7 @@ pub fn icon_btn(
 
 /// Outline button (concept "Add" / "Cancel").
 pub fn btn_flat(p: &egui::Painter, r: egui::Rect, hov: bool, label: &str) {
-    btn_flat_c(p, r, hov, label, if hov { DM_TXT } else { DM_DIM });
+    btn_flat_c(p, r, hov, label, if hov { pl().dm_txt } else { pl().dm_dim });
 }
 
 /// Same outline button with an explicit label colour (destructive actions).
@@ -367,12 +354,12 @@ pub fn btn_flat_c(
     col: egui::Color32,
 ) {
     if hov {
-        p.rect_filled(r, DM_RAD, DM_HOVER);
+        p.rect_filled(r, DM_RAD, pl().dm_hover);
     }
     p.rect_stroke(
         r,
         DM_RAD,
-        egui::Stroke::new(1.0, DM_BOX_BD),
+        egui::Stroke::new(1.0, pl().dm_box_bd),
         egui::StrokeKind::Inside,
     );
     p.text(
@@ -471,7 +458,7 @@ pub fn slider(
 ) {
     let ty = rect.center().y;
     let track = egui::Rect::from_min_size(egui::pos2(track_x, ty - 2.0), egui::vec2(track_w, 4.0));
-    p.rect_filled(track, 2.0, DM_BOX_BD);
+    p.rect_filled(track, 2.0, pl().dm_box_bd);
     p.rect_filled(
         egui::Rect::from_min_size(track.min, egui::vec2(track_w * frac, 4.0)),
         2.0,
@@ -503,8 +490,8 @@ pub fn dm_check(p: &egui::Painter, r: egui::Rect, checked: bool) {
         p.rect(
             r,
             4.0,
-            DM_CARD,
-            egui::Stroke::new(1.0, DM_BOX_BD),
+            pl().dm_card,
+            egui::Stroke::new(1.0, pl().dm_box_bd),
             egui::StrokeKind::Inside,
         );
     }

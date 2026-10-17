@@ -244,8 +244,9 @@ pub fn run_basket() -> eframe::Result<()> {
         centered_window("Drop Basket", 420.0, 520.0),
         Box::new(|cc| {
             crate::app::setup_fonts(cc);
-            cc.egui_ctx.set_visuals(crate::app::dark_visuals());
-            crate::app::apply_widget_theme(&cc.egui_ctx);
+            // Spawned as its own process: pick up whatever theme `ui.json`
+            // holds (written by the main app / the Settings window).
+            crate::app::apply_theme(&cc.egui_ctx, &crate::app::stored_theme());
             Ok(Box::new(app))
         }),
     )
@@ -316,8 +317,9 @@ pub fn run_mini() -> eframe::Result<()> {
         centered_window("Download Craft Mini", 340.0, 230.0),
         Box::new(|cc| {
             crate::app::setup_fonts(cc);
-            cc.egui_ctx.set_visuals(crate::app::dark_visuals());
-            crate::app::apply_widget_theme(&cc.egui_ctx);
+            // Spawned as its own process: pick up whatever theme `ui.json`
+            // holds (written by the main app / the Settings window).
+            crate::app::apply_theme(&cc.egui_ctx, &crate::app::stored_theme());
             Ok(Box::new(app))
         }),
     )

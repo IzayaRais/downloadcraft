@@ -11,6 +11,7 @@
 //! once from `queue.json` and never polled, because nothing about a completed
 //! transfer changes any more.
 
+use crate::app::pl;
 use crate::dm::*;
 use crate::fonts::{reg, semi};
 use crate::model::{claim_window, config_dir, format_bytes, DownloadItem};
@@ -66,17 +67,7 @@ const CHK_TXT: &str = "Don't show this dialog again";
 
 /// The dialog's own palette (the concept is a neutral dark card, not the
 /// app's blue-violet theme): accent, though, is the same #3b82f6.
-const CARD_BG: egui::Color32 = egui::Color32::from_rgb(0x1b, 0x1b, 0x1b);
-const CARD_BD: egui::Color32 = egui::Color32::from_rgb(0x3a, 0x3a, 0x3a);
-const TXT: egui::Color32 = egui::Color32::from_rgb(0xe0, 0xe0, 0xf0);
-const DIM: egui::Color32 = egui::Color32::from_rgb(0x99, 0x99, 0x99);
 /// Title-bar control glyphs.
-const CTL: egui::Color32 = egui::Color32::from_rgb(0x88, 0x88, 0x88);
-const BOX_BG: egui::Color32 = egui::Color32::from_rgb(0x2b, 0x2b, 0x2b);
-const BOX_BD: egui::Color32 = egui::Color32::from_rgb(0x44, 0x44, 0x44);
-const BTN_BD: egui::Color32 = egui::Color32::from_rgb(0x55, 0x55, 0x55);
-const BOX_TXT: egui::Color32 = egui::Color32::from_rgb(0xcc, 0xcc, 0xcc);
-const HOVER: egui::Color32 = egui::Color32::from_rgb(0x38, 0x38, 0x38);
 
 fn at(o: egui::Pos2, x: f32, y: f32, w: f32, h: f32) -> egui::Rect {
     egui::Rect::from_min_size(egui::pos2(o.x + x, o.y + y), egui::vec2(w, h))
@@ -115,11 +106,11 @@ impl CompleteApp {
         let item = self.item.clone();
 
         // The card *is* the window.
-        p.rect_filled(at(o, 0.0, 0.0, CW, CH), RAD, CARD_BG);
+        p.rect_filled(at(o, 0.0, 0.0, CW, CH), RAD, pl().cg_bg);
         p.rect_stroke(
             at(o, 0.0, 0.0, CW, CH),
             RAD,
-            egui::Stroke::new(1.0, CARD_BD),
+            egui::Stroke::new(1.0, pl().cg_bd),
             egui::StrokeKind::Inside,
         );
         self.title_bar(&ctx, ui, &p, o);
@@ -131,7 +122,7 @@ impl CompleteApp {
             egui::Align2::LEFT_TOP,
             "Download complete".to_string(),
             semi(14.0),
-            TXT,
+            pl().cg_txt,
         );
         p.text(
             egui::pos2(o.x + SUM_X, o.y + SUM_SUB_Y),
@@ -142,7 +133,7 @@ impl CompleteApp {
                 item.downloaded_bytes
             ),
             reg(11.0),
-            DIM,
+            pl().cg_dim,
         );
 
         // ---- address + destination ----
@@ -184,7 +175,7 @@ impl CompleteApp {
         // ---- opt-out ----
         let cbr = at(o, PAD_X, CHK_Y, CHK_S, CHK_S);
         let lw = p
-            .layout_no_wrap(CHK_TXT.to_string(), reg(10.0), DIM)
+            .layout_no_wrap(CHK_TXT.to_string(), reg(10.0), pl().cg_dim)
             .size()
             .x;
         let hit = at(
@@ -208,11 +199,11 @@ impl CompleteApp {
                 2.2,
             );
         } else {
-            p.rect_filled(cbr, 3.0, BOX_BG);
+            p.rect_filled(cbr, 3.0, pl().cg_box_bg);
             p.rect_stroke(
                 cbr,
                 3.0,
-                egui::Stroke::new(1.0, BTN_BD),
+                egui::Stroke::new(1.0, pl().cg_btn_bd),
                 egui::StrokeKind::Inside,
             );
         }
@@ -221,7 +212,7 @@ impl CompleteApp {
             egui::Align2::LEFT_CENTER,
             CHK_TXT.to_string(),
             reg(10.0),
-            DIM,
+            pl().cg_dim,
         );
         if b.clicked() {
             self.dont_show = !self.dont_show;
@@ -253,7 +244,7 @@ impl CompleteApp {
             egui::Align2::LEFT_CENTER,
             "Download complete".to_string(),
             semi(13.0),
-            TXT,
+            pl().cg_txt,
         );
         if ui
             .interact(
@@ -284,10 +275,10 @@ impl CompleteApp {
             };
             let live = i != 1;
             if b.hovered() && live {
-                p.rect_filled(r.expand(5.0), 3.0, HOVER);
+                p.rect_filled(r.expand(5.0), 3.0, pl().cg_hover);
                 ctx.set_cursor_icon(egui::CursorIcon::PointingHand);
             }
-            dm_icon(p, r, icon, if b.hovered() && live { TXT } else { CTL }, 2.0);
+            dm_icon(p, r, icon, if b.hovered() && live { pl().cg_txt } else { pl().cg_ctl }, 2.0);
             if b.clicked() && live {
                 if i == 0 {
                     ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(true));
@@ -308,14 +299,14 @@ fn field(p: &egui::Painter, o: egui::Pos2, y: f32, label: &str, value: &str) {
         egui::Align2::LEFT_TOP,
         label.to_string(),
         reg(11.0),
-        DIM,
+        pl().cg_dim,
     );
     let r = at(o, PAD_X, y + LBL_BOX_GAP, IN_R - PAD_X, BOX_H);
-    p.rect_filled(r, 3.0, BOX_BG);
+    p.rect_filled(r, 3.0, pl().cg_box_bg);
     p.rect_stroke(
         r,
         3.0,
-        egui::Stroke::new(1.0, BOX_BD),
+        egui::Stroke::new(1.0, pl().cg_box_bd),
         egui::StrokeKind::Inside,
     );
     let txt = elide_mid(p, value, reg(10.0), r.width() - 2.0 * BOX_PAD);
@@ -324,17 +315,17 @@ fn field(p: &egui::Painter, o: egui::Pos2, y: f32, label: &str, value: &str) {
         egui::Align2::LEFT_CENTER,
         txt,
         reg(10.0),
-        BOX_TXT,
+        pl().cg_box_txt,
     );
 }
 
 /// The concept's button: outlined box, 11px label.
 fn dlg_btn(p: &egui::Painter, r: egui::Rect, hov: bool, label: &str) {
-    p.rect_filled(r, 3.0, if hov { HOVER } else { BOX_BG });
+    p.rect_filled(r, 3.0, if hov { pl().cg_hover } else { pl().cg_box_bg });
     p.rect_stroke(
         r,
         3.0,
-        egui::Stroke::new(1.0, if hov { CTL } else { BTN_BD }),
+        egui::Stroke::new(1.0, if hov { pl().cg_ctl } else { pl().cg_btn_bd }),
         egui::StrokeKind::Inside,
     );
     p.text(
@@ -342,7 +333,7 @@ fn dlg_btn(p: &egui::Painter, r: egui::Rect, hov: bool, label: &str) {
         egui::Align2::CENTER_CENTER,
         label.to_string(),
         reg(11.0),
-        TXT,
+        pl().cg_txt,
     );
 }
 
@@ -409,8 +400,8 @@ pub fn run() -> eframe::Result<()> {
             // `true`: the whole window is the concept, so Segoe UI also becomes
             // its default proportional face.
             crate::fonts::install(cc, true);
-            cc.egui_ctx.set_visuals(crate::app::dark_visuals());
-            crate::app::apply_widget_theme(&cc.egui_ctx);
+            // Standalone process: follow the theme saved in `ui.json`.
+            crate::app::apply_theme(&cc.egui_ctx, &crate::app::stored_theme());
             Ok(Box::new(app))
         }),
     )

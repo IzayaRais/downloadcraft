@@ -10,6 +10,7 @@
 //! It writes straight to the shared `queue.json` (+ `wake.json` for
 //! Start Download), so it works even when the main app is closed.
 
+use crate::app::pl;
 use crate::dm::*;
 use crate::engine::{self, EngineOpts};
 use crate::model::{
@@ -284,8 +285,8 @@ fn options_menu(
         .gap(6.0)
         .frame(
             egui::Frame::new()
-                .fill(DM_CARD)
-                .stroke(egui::Stroke::new(1.0_f32, DM_LINE))
+                .fill(pl().dm_card)
+                .stroke(egui::Stroke::new(1.0_f32, pl().dm_line))
                 .corner_radius(DM_RAD)
                 .inner_margin(egui::Margin::symmetric(4, 4)),
         )
@@ -300,7 +301,7 @@ fn options_menu(
                         let (r, ir) =
                             ui.allocate_exact_size(egui::vec2(w, 24.0), egui::Sense::click());
                         if ir.hovered() {
-                            ui.painter().rect_filled(r, 4.0, DM_HOVER);
+                            ui.painter().rect_filled(r, 4.0, pl().dm_hover);
                             ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
                         }
                         ui.painter().text(
@@ -308,7 +309,7 @@ fn options_menu(
                             egui::Align2::LEFT_CENTER,
                             elide_left(o, 52),
                             reg(11.0),
-                            if o.as_str() == selected { DM_ACC } else { DM_TXT },
+                            if o.as_str() == selected { DM_ACC } else { pl().dm_txt },
                         );
                         if ir.clicked() {
                             picked = Some(o.clone());
@@ -342,7 +343,7 @@ fn combo(
         egui::Align2::LEFT_CENTER,
         elide_left(current, 26),
         reg(11.0),
-        DM_TXT,
+        pl().dm_txt,
     );
     dm_icon(
         p,
@@ -351,7 +352,7 @@ fn combo(
             egui::Vec2::splat(11.0),
         ),
         DmIcon::Chevron,
-        DM_DIM,
+        pl().dm_dim,
         2.0,
     );
     if resp.clicked() {
@@ -382,7 +383,7 @@ fn check_row(
         egui::Align2::LEFT_CENTER,
         label,
         reg(11.0),
-        if r.hovered() { DM_TXT } else { DM_DIM },
+        if r.hovered() { pl().dm_txt } else { pl().dm_dim },
     );
     r
 }
@@ -792,8 +793,7 @@ pub fn run() -> eframe::Result<()> {
         },
         Box::new(|cc| {
             setup_popup_fonts(cc);
-            cc.egui_ctx.set_visuals(crate::app::dark_visuals());
-            crate::app::apply_widget_theme(&cc.egui_ctx);
+            crate::app::apply_theme(&cc.egui_ctx, &crate::app::stored_theme());
             Ok(Box::new(app))
         }),
     )
@@ -885,8 +885,8 @@ impl eframe::App for ConfirmApp {
             p.rect(
                 card,
                 8.0,
-                DM_CARD,
-                egui::Stroke::new(1.0, DM_LINE),
+                pl().dm_card,
+                egui::Stroke::new(1.0, pl().dm_line),
                 egui::StrokeKind::Inside,
             );
             // ---- header: mark + title + window controls (drag to move) ----
@@ -896,14 +896,14 @@ impl eframe::App for ConfirmApp {
                 egui::Align2::LEFT_CENTER,
                 "Download File Info",
                 semi(13.0),
-                DM_TXT,
+                pl().dm_txt,
             );
             p.line_segment(
                 [
                     egui::pos2(o.x + 1.0, o.y + 39.5),
                     egui::pos2(o.x + DM_W - 1.0, o.y + 39.5),
                 ],
-                egui::Stroke::new(1.0, DM_LINE),
+                egui::Stroke::new(1.0, pl().dm_line),
             );
             if ui
                 .interact(
@@ -931,15 +931,15 @@ impl eframe::App for ConfirmApp {
                 (close_r, close_b.hovered()),
             ] {
                 if hov {
-                    p.rect_filled(r.expand(4.0), DM_RAD, DM_HOVER2);
+                    p.rect_filled(r.expand(4.0), DM_RAD, pl().dm_hover2);
                 }
             }
             if min_b.hovered() || max_b.hovered() || close_b.hovered() {
                 ctx.set_cursor_icon(egui::CursorIcon::PointingHand);
             }
-            dm_icon(&p, min_r, DmIcon::Minimize, DM_DIM, 2.0);
-            dm_icon(&p, max_r, DmIcon::Maximize, DM_DIM, 2.0);
-            dm_icon(&p, close_r, DmIcon::Close, DM_DIM, 2.0);
+            dm_icon(&p, min_r, DmIcon::Minimize, pl().dm_dim, 2.0);
+            dm_icon(&p, max_r, DmIcon::Maximize, pl().dm_dim, 2.0);
+            dm_icon(&p, close_r, DmIcon::Close, pl().dm_dim, 2.0);
             if min_b.clicked() {
                 ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(true));
             }
@@ -969,7 +969,7 @@ impl eframe::App for ConfirmApp {
             if clip_b.hovered() {
                 ctx.set_cursor_icon(egui::CursorIcon::PointingHand);
             }
-            icon_btn(&p, clip_btn, clip_b.hovered(), DmIcon::Clipboard, 14.0, 1.5, DM_DIM);
+            icon_btn(&p, clip_btn, clip_b.hovered(), DmIcon::Clipboard, 14.0, 1.5, pl().dm_dim);
             if clip_b.clicked() {
                 if let Ok(mut cb) = arboard::Clipboard::new() {
                     let _ = cb.set_text(self.url.clone());
@@ -1004,9 +1004,9 @@ impl eframe::App for ConfirmApp {
                 .on_hover_text(format!("→ {}", self.effective_dir()));
             }
             let f_b = ui.interact(folder_btn, egui::Id::new("popup-folder"), egui::Sense::click());
-            icon_btn(&p, folder_btn, f_b.hovered(), DmIcon::Folder, 14.0, 1.5, DM_DIM);
+            icon_btn(&p, folder_btn, f_b.hovered(), DmIcon::Folder, 14.0, 1.5, pl().dm_dim);
             let c_b = ui.interact(caret_btn, egui::Id::new("popup-caret"), egui::Sense::click());
-            icon_btn(&p, caret_btn, c_b.hovered(), DmIcon::Chevron, 10.0, 2.0, DM_DIM);
+            icon_btn(&p, caret_btn, c_b.hovered(), DmIcon::Chevron, 10.0, 2.0, pl().dm_dim);
             if f_b.hovered() || c_b.hovered() {
                 ctx.set_cursor_icon(egui::CursorIcon::PointingHand);
             }
@@ -1056,10 +1056,10 @@ impl eframe::App for ConfirmApp {
                     None => "—".to_string(),
                 }
             };
-            let g = p.layout_no_wrap(sz_txt, reg(11.0), DM_TXT);
+            let g = p.layout_no_wrap(sz_txt, reg(11.0), pl().dm_txt);
             let tw = g.size().x;
             let tx = chip.min.x + 37.0;
-            p.galley(egui::pos2(tx, chip.center().y - g.size().y * 0.5), g, DM_TXT);
+            p.galley(egui::pos2(tx, chip.center().y - g.size().y * 0.5), g, pl().dm_txt);
             if known {
                 dm_icon(
                     &p,
@@ -1093,7 +1093,7 @@ impl eframe::App for ConfirmApp {
             );
             let r_b = ui.interact(refr_btn, egui::Id::new("popup-refresh"), egui::Sense::click());
             let g_b = ui.interact(gear_btn, egui::Id::new("popup-gear"), egui::Sense::click());
-            icon_btn(&p, refr_btn, r_b.hovered(), DmIcon::Refresh, 14.0, 1.5, DM_DIM);
+            icon_btn(&p, refr_btn, r_b.hovered(), DmIcon::Refresh, 14.0, 1.5, pl().dm_dim);
             icon_btn(
                 &p,
                 gear_btn,
@@ -1101,7 +1101,7 @@ impl eframe::App for ConfirmApp {
                 DmIcon::Settings,
                 14.0,
                 1.5,
-                if self.show_adv { DM_ACC } else { DM_DIM },
+                if self.show_adv { DM_ACC } else { pl().dm_dim },
             );
             if r_b.hovered() || g_b.hovered() {
                 ctx.set_cursor_icon(egui::CursorIcon::PointingHand);
@@ -1219,7 +1219,7 @@ impl eframe::App for ConfirmApp {
                     egui::Align2::LEFT_CENTER,
                     "Connections",
                     reg(11.0),
-                    DM_DIM,
+                    pl().dm_dim,
                 );
                 let srect = egui::Rect::from_min_size(
                     egui::pos2(row.min.x + 92.0, row.min.y + 5.0),
@@ -1234,7 +1234,7 @@ impl eframe::App for ConfirmApp {
                     egui::Align2::RIGHT_CENTER,
                     format!("{}", self.connections),
                     reg(11.0),
-                    DM_TXT,
+                    pl().dm_txt,
                 );
                 cy += 30.0 + 8.0;
                 let rem = egui::Rect::from_min_size(egui::pos2(cx, cy), egui::vec2(cw, 22.0));
@@ -1256,7 +1256,7 @@ impl eframe::App for ConfirmApp {
                         egui::Align2::LEFT_CENTER,
                         n,
                         reg(11.0),
-                        DM_DIM,
+                        pl().dm_dim,
                     );
                     cy += NOTE_H;
                 }
@@ -1308,7 +1308,7 @@ impl eframe::App for ConfirmApp {
                     egui::Align2::LEFT_CENTER,
                     shown,
                     reg(11.0),
-                    DM_WARN,
+                    pl().dm_warn,
                 );
             }
         });
