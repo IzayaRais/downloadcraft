@@ -8,6 +8,7 @@ mod app;
 mod basket;
 mod cli;
 mod confirm;
+mod dm;
 mod engine;
 mod fonts;
 mod ftp;

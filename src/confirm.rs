@@ -10,6 +10,7 @@
 //! It writes straight to the shared `queue.json` (+ `wake.json` for
 //! Start Download), so it works even when the main app is closed.
 
+use crate::dm::*;
 use crate::engine::{self, EngineOpts};
 use crate::model::{
     atomic_write, category_of, config_dir, filename_from_url, format_bytes, is_download_url,
@@ -203,6 +204,8 @@ struct ConfirmApp {
     notice: String,
     /// State for controls the concept does not show (dropdown + extras).
     cat_open: bool,
+    /// Path field's recent-folders menu (same pattern as the category combo).
+    recent_open: bool,
     win_h: f32,
     adding_cat: bool,
     new_cat: String,
@@ -219,53 +222,16 @@ const CATEGORIES: &[&str] = &[
     "Other",
 ];
 
-// ---------- "Compact Blue" concept geometry ----------
-// `popup_concepts.html` draws the card as `width:500px` with 16px side
-// padding and a 1px border. CSS `box-sizing` is content-box, so the box that
-// actually appears on screen is 534 x 228 px. Everything below is expressed
-// in those exact pixels so the Rust dialog matches the mock 1:1.
-const CARD_W: f32 = 534.0;
-const CARD_H: f32 = 228.0;
-const PAD_X: f32 = 16.0;
-const PAD_Y: f32 = 12.0;
-const CONTENT_W: f32 = CARD_W - 2.0 - 2.0 * PAD_X; // 500
-const CARD_RAD: f32 = 10.0;
-const RAD: f32 = 5.0; // inputs and buttons
-const LBL_H: f32 = 11.0; // 9px label line box
-const LBL_GAP: f32 = 2.0;
-const ROW_GAP: f32 = 6.0;
-const FIELD_H: f32 = 21.0;
-const PATH_H: f32 = 19.0;
-const DESC_H: f32 = 24.0;
-const BTN_H: f32 = 24.0;
-
-const C_CARD: egui::Color32 = egui::Color32::from_rgb(0x0f, 0x0f, 0x22);
-const C_INPUT: egui::Color32 = egui::Color32::from_rgb(0x0a, 0x0a, 0x1a);
-const C_BORDER: egui::Color32 = egui::Color32::from_rgb(0x2a, 0x2a, 0x4a);
-const C_ACCENT: egui::Color32 = egui::Color32::from_rgb(0x3b, 0x82, 0xf6);
-const C_ACCENT_DK: egui::Color32 = egui::Color32::from_rgb(0x1d, 0x4e, 0xd8);
-const C_ACCENT_HI: egui::Color32 = egui::Color32::from_rgb(0x4a, 0x8f, 0xf8);
-const C_TXT: egui::Color32 = egui::Color32::from_rgb(0xe0, 0xe0, 0xf0);
-const C_LBL: egui::Color32 = egui::Color32::from_rgb(0x88, 0x88, 0xa8);
-const C_FTXT: egui::Color32 = egui::Color32::from_rgb(0xa0, 0xa0, 0xb8);
-const C_DIM: egui::Color32 = egui::Color32::from_rgb(0x60, 0x60, 0x80);
-const C_BTN_BD: egui::Color32 = egui::Color32::from_rgb(0x3a, 0x3a, 0x5a);
-const C_HOVER: egui::Color32 = egui::Color32::from_rgb(0x1a, 0x1a, 0x2f);
-
-// Material Icons glyphs for the concept's own chrome.
-const GL_CARET: &str = "\u{e5c5}"; // arrow_drop_down, the "▾"
-const GL_ADD: &str = "\u{e145}"; // add, the "+"
-const GL_CLOSE: &str = "\u{e5cd}"; // close, the "✕"
-
-const FONT_SEMI: &str = crate::fonts::FONT_SEMI;
-
-fn reg(size: f32) -> egui::FontId {
-    egui::FontId::new(size, egui::FontFamily::Proportional)
-}
-
-fn semi(size: f32) -> egui::FontId {
-    egui::FontId::new(size, egui::FontFamily::Name(FONT_SEMI.into()))
-}
+// ---------- concept geometry (tokens live in `crate::dm`) ----------
+// The capture popup is the same "Add download" card as the in-canvas modal,
+// so it reuses `dm`'s tokens and row offsets verbatim: 562x253 at rest, with
+// the header's window controls, the size chip and the gear panel in the same
+// places.
+/// Advanced (gear) panel height: category + description, referer + cookie,
+/// connections, remember-path. The concept draws this collapsed.
+const PANEL_H: f32 = 178.0;
+/// Height of one dim note line inside the panel.
+const NOTE_H: f32 = 12.0;
 
 /// Loads Segoe UI — the family the concept asks for — plus a semibold cut for
 /// its 600-weight title and primary button. Missing system fonts fall back to
@@ -276,153 +242,87 @@ fn setup_popup_fonts(cc: &eframe::CreationContext<'_>) {
     crate::fonts::install(cc, true);
 }
 
-/// The 20px gradient mark: rounded accent square + white download arrow,
-/// traced from the concept's inline SVG (24x24 viewBox scaled to 10px).
-fn app_mark(p: &egui::Painter, rect: egui::Rect) {
-    p.rect(rect, RAD, C_ACCENT, egui::Stroke::NONE, egui::StrokeKind::Inside);
-    let s = 10.0 / 24.0;
-    let o = rect.min.to_vec2() + egui::vec2(5.0, 5.0);
-    let m = |x: f32, y: f32| egui::pos2(o.x + x * s, o.y + y * s);
-    let stroke = egui::Stroke::new(3.0 * s, egui::Color32::WHITE);
-    p.line_segment([m(12.0, 4.0), m(12.0, 16.0)], stroke);
-    p.line_segment([m(6.0, 10.0), m(12.0, 16.0)], stroke);
-    p.line_segment([m(12.0, 16.0), m(18.0, 10.0)], stroke);
-}
-
-/// Rounded input box with a frameless single-line editor inside it.
-fn field(
-    ui: &mut egui::Ui,
-    rect: egui::Rect,
-    buf: &mut String,
-    hint: &str,
-) -> egui::Response {
-    ui.painter().rect(
+/// Concept "+" square: accent fill, white plus (adds a custom category).
+fn plus_square(ui: &mut egui::Ui, rect: egui::Rect, salt: u64) -> egui::Response {
+    let r = ui.interact(rect, egui::Id::new(("popup-plus", salt)), egui::Sense::click());
+    if r.hovered() {
+        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+    }
+    let p = ui.painter();
+    p.rect(
         rect,
-        RAD,
-        C_INPUT,
-        egui::Stroke::new(1.0_f32, C_BORDER),
+        DM_RAD,
+        if r.hovered() { DM_ACC2 } else { DM_ACC },
+        egui::Stroke::NONE,
         egui::StrokeKind::Inside,
     );
-    let inner = egui::Rect::from_min_max(
-        egui::pos2(rect.left() + 8.0, rect.top()),
-        egui::pos2(rect.right() - 8.0, rect.bottom()),
-    );
-    ui.scope_builder(
-        egui::UiBuilder::new()
-            .max_rect(inner)
-            .layout(egui::Layout::left_to_right(egui::Align::Center)),
-        |ui| {
-            ui.add(
-                egui::TextEdit::singleline(buf)
-                    .frame(false)
-                    .margin(egui::Margin::ZERO)
-                    .desired_width(inner.width())
-                    .text_color(C_FTXT)
-                    .font(reg(9.0))
-                    .hint_text(egui::RichText::new(hint).size(9.0).color(C_DIM)),
-            )
-        },
-    )
-    .inner
-}
-
-#[derive(Clone, Copy, PartialEq)]
-enum Btn {
-    Ghost,
-    Primary,
-}
-
-/// Concept button: equal-height pill, 10px label, accent fill for primary.
-fn button(
-    ui: &mut egui::Ui,
-    rect: egui::Rect,
-    label: &str,
-    kind: Btn,
-    salt: u64,
-) -> egui::Response {
-    let r = ui.interact(rect, egui::Id::new(("popup-btn", salt)), egui::Sense::click());
-    if r.hovered() {
-        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
-    }
-    let (fill, stroke, txt, font) = match kind {
-        Btn::Primary => (
-            if r.is_pointer_button_down_on() {
-                C_ACCENT_DK
-            } else if r.hovered() {
-                C_ACCENT_HI
-            } else {
-                C_ACCENT
-            },
-            egui::Stroke::NONE,
-            egui::Color32::WHITE,
-            semi(10.0),
-        ),
-        Btn::Ghost => (
-            if r.hovered() {
-                C_HOVER
-            } else {
-                egui::Color32::TRANSPARENT
-            },
-            egui::Stroke::new(1.0_f32, C_BTN_BD),
-            C_FTXT,
-            reg(10.0),
-        ),
-    };
-    let p = ui.painter();
-    p.rect(rect, RAD, fill, stroke, egui::StrokeKind::Inside);
-    p.text(rect.center(), egui::Align2::CENTER_CENTER, label, font, txt);
+    let c = rect.center();
+    let st = egui::Stroke::new(2.0, egui::Color32::WHITE);
+    p.line_segment([egui::pos2(c.x - 6.0, c.y), egui::pos2(c.x + 6.0, c.y)], st);
+    p.line_segment([egui::pos2(c.x, c.y - 6.0), egui::pos2(c.x, c.y + 6.0)], st);
     r
 }
 
-/// The concept's 20px squares: filled accent ("+") or outlined dark ("...").
-fn square(
-    ui: &mut egui::Ui,
-    rect: egui::Rect,
-    glyph: &str,
-    filled: bool,
-    salt: u64,
-) -> egui::Response {
-    let r = ui.interact(rect, egui::Id::new(("popup-sq", salt)), egui::Sense::click());
-    if r.hovered() {
-        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+/// Floating option list anchored under `resp` — the concept's dropdown body,
+/// shared by the category combo and the path field's recent folders, so both
+/// menus look and behave identically.
+fn options_menu(
+    resp: &egui::Response,
+    options: &[String],
+    open: &mut bool,
+    selected: &str,
+) -> Option<String> {
+    if options.is_empty() {
+        *open = false;
+        return None;
     }
-    let p = ui.painter();
-    if filled {
-        p.rect(
-            rect,
-            RAD,
-            if r.hovered() { C_ACCENT_HI } else { C_ACCENT },
-            egui::Stroke::NONE,
-            egui::StrokeKind::Inside,
-        );
-        p.text(
-            rect.center(),
-            egui::Align2::CENTER_CENTER,
-            glyph,
-            reg(12.0),
-            egui::Color32::WHITE,
-        );
-    } else {
-        p.rect(
-            rect,
-            RAD,
-            if r.hovered() { C_HOVER } else { C_INPUT },
-            egui::Stroke::new(1.0_f32, C_BORDER),
-            egui::StrokeKind::Inside,
-        );
-        p.text(
-            rect.center(),
-            egui::Align2::CENTER_CENTER,
-            glyph,
-            reg(10.0),
-            C_FTXT,
-        );
+    let mut picked = None;
+    egui::Popup::from_response(resp)
+        .open_bool(&mut *open)
+        .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside)
+        .align(egui::RectAlign::BOTTOM_START)
+        .gap(6.0)
+        .frame(
+            egui::Frame::new()
+                .fill(DM_CARD)
+                .stroke(egui::Stroke::new(1.0_f32, DM_LINE))
+                .corner_radius(DM_RAD)
+                .inner_margin(egui::Margin::symmetric(4, 4)),
+        )
+        .show(|ui| {
+            ui.set_min_width(280.0);
+            egui::ScrollArea::vertical()
+                .max_height(220.0)
+                .show(ui, |ui| {
+                    ui.spacing_mut().item_spacing = egui::vec2(0.0, 2.0);
+                    let w = ui.available_width().max(272.0);
+                    for o in options {
+                        let (r, ir) =
+                            ui.allocate_exact_size(egui::vec2(w, 24.0), egui::Sense::click());
+                        if ir.hovered() {
+                            ui.painter().rect_filled(r, 4.0, DM_HOVER);
+                            ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+                        }
+                        ui.painter().text(
+                            egui::pos2(r.left() + 8.0, r.center().y),
+                            egui::Align2::LEFT_CENTER,
+                            elide_left(o, 52),
+                            reg(11.0),
+                            if o.as_str() == selected { DM_ACC } else { DM_TXT },
+                        );
+                        if ir.clicked() {
+                            picked = Some(o.clone());
+                        }
+                    }
+                });
+        });
+    if picked.is_some() {
+        *open = false;
     }
-    r
+    picked
 }
 
-/// Concept dropdown: dark rounded box, 9px value, trailing caret, and a
-/// floating list anchored under the box.
+/// Concept dropdown: field box, current value, trailing caret, option list.
 fn combo(
     ui: &mut egui::Ui,
     rect: egui::Rect,
@@ -436,73 +336,76 @@ fn combo(
         ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
     }
     let p = ui.painter();
-    p.rect(
-        rect,
-        RAD,
-        C_INPUT,
-        egui::Stroke::new(1.0_f32, C_BORDER),
-        egui::StrokeKind::Inside,
-    );
+    dm_box(p, rect);
     p.text(
-        egui::pos2(rect.left() + 8.0, rect.center().y),
+        egui::pos2(rect.left() + 13.0, rect.center().y),
         egui::Align2::LEFT_CENTER,
-        current,
-        reg(9.0),
-        C_FTXT,
+        elide_left(current, 26),
+        reg(11.0),
+        DM_TXT,
     );
-    p.text(
-        egui::pos2(rect.right() - 4.0, rect.center().y),
-        egui::Align2::RIGHT_CENTER,
-        GL_CARET,
-        reg(12.0),
-        C_DIM,
+    dm_icon(
+        p,
+        egui::Rect::from_center_size(
+            egui::pos2(rect.right() - 16.0, rect.center().y),
+            egui::Vec2::splat(11.0),
+        ),
+        DmIcon::Chevron,
+        DM_DIM,
+        2.0,
     );
     if resp.clicked() {
         *open = !*open;
     }
-    let mut picked = None;
-    egui::Popup::from_response(&resp)
-        .open_bool(&mut *open)
-        .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside)
-        .align(egui::RectAlign::BOTTOM_START)
-        .gap(2.0)
-        .frame(
-            egui::Frame::new()
-                .fill(C_CARD)
-                .stroke(egui::Stroke::new(1.0_f32, C_BORDER))
-                .corner_radius(RAD)
-                .inner_margin(egui::Margin::symmetric(3, 3)),
-        )
-        .show(|ui| {
-            egui::ScrollArea::vertical()
-                .max_height(140.0)
-                .show(ui, |ui| {
-                    ui.spacing_mut().item_spacing = egui::vec2(0.0, 1.0);
-                    let w = rect.width() - 10.0;
-                    for o in options {
-                        let (r, ir) =
-                            ui.allocate_exact_size(egui::vec2(w, 18.0), egui::Sense::click());
-                        if ir.hovered() {
-                            ui.painter().rect_filled(r, 3.0, C_HOVER);
-                            ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
-                        }
-                        ui.painter().text(
-                            egui::pos2(r.left() + 6.0, r.center().y),
-                            egui::Align2::LEFT_CENTER,
-                            o,
-                            reg(9.0),
-                            if o.as_str() == current { C_ACCENT } else { C_FTXT },
-                        );
-                        if ir.clicked() {
-                            picked = Some(o.clone());
-                        }
-                    }
-                });
-        });
-    if picked.is_some() {
-        *open = false;
+    options_menu(&resp, options, open, current)
+}
+
+/// Concept checkbox row: 16px box plus label.
+fn check_row(
+    ui: &mut egui::Ui,
+    rect: egui::Rect,
+    id: &str,
+    checked: bool,
+    label: &str,
+) -> egui::Response {
+    let r = ui.interact(rect, egui::Id::new(("popup-check", id)), egui::Sense::click());
+    if r.hovered() {
+        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
     }
-    picked
+    let box_r = egui::Rect::from_min_size(
+        egui::pos2(rect.left(), rect.center().y - 8.0),
+        egui::Vec2::splat(16.0),
+    );
+    dm_check(ui.painter(), box_r, checked);
+    ui.painter().text(
+        egui::pos2(box_r.right() + 8.0, rect.center().y),
+        egui::Align2::LEFT_CENTER,
+        label,
+        reg(11.0),
+        if r.hovered() { DM_TXT } else { DM_DIM },
+    );
+    r
+}
+
+/// Concept slider with its drag handling on the same rect, so painting and
+/// input can never disagree. Returns the new fraction when it changed.
+fn slider_row(ui: &mut egui::Ui, rect: egui::Rect, id: &str, frac: f32) -> Option<f32> {
+    let r = ui.interact(rect, egui::Id::new(("popup-slider", id)), egui::Sense::click_and_drag());
+    if r.hovered() {
+        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+    }
+    let mut out = None;
+    if r.dragged() || r.clicked() {
+        if let Some(pos) = ui.ctx().pointer_interact_pos() {
+            let f = ((pos.x - rect.left()) / rect.width().max(1.0)).clamp(0.0, 1.0);
+            if (f - frac).abs() > 0.001 {
+                out = Some(f);
+            }
+        }
+    }
+    let shown = out.unwrap_or(frac);
+    slider(ui.painter(), rect, r.hovered(), shown, rect.left(), rect.width());
+    out
 }
 
 impl ConfirmApp {
@@ -526,6 +429,33 @@ impl ConfirmApp {
         } else {
             self.save_base.clone()
         }
+    }
+
+    /// Recent folders for the path field's caret: the shell folders first,
+    /// then whatever the field currently holds (mirrors the main window).
+    fn recent_dirs(&self) -> Vec<String> {
+        let mut out: Vec<String> = Vec::new();
+        for d in [
+            dirs::download_dir(),
+            dirs::desktop_dir(),
+            dirs::document_dir(),
+            dirs::picture_dir(),
+            dirs::video_dir(),
+            dirs::audio_dir(),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            let s = d.to_string_lossy().to_string();
+            if !out.contains(&s) {
+                out.push(s);
+            }
+        }
+        let cur = self.save_base.trim().to_string();
+        if !cur.is_empty() && !out.contains(&cur) {
+            out.push(cur);
+        }
+        out
     }
 
     /// Extra one-line facts the concept has no place for; shown under the
@@ -830,6 +760,7 @@ pub fn run() -> eframe::Result<()> {
         exited: false,
         notice: initial_notice,
         cat_open: false,
+        recent_open: false,
         win_h: 0.0,
         adding_cat: false,
         new_cat: String::new(),
@@ -845,7 +776,7 @@ pub fn run() -> eframe::Result<()> {
 
     let mut viewport = egui::ViewportBuilder::default()
         .with_title("Add download")
-        .with_inner_size([CARD_W, CARD_H])
+        .with_inner_size([DM_W, DM_H])
         .with_resizable(false)
         .with_decorations(false)
         .with_transparent(true)
@@ -894,7 +825,7 @@ impl eframe::App for ConfirmApp {
             self.centered = true;
             let mon = ctx.input(|i| i.viewport().monitor_size);
             if let Some(m) = mon {
-                let (w, h) = (CARD_W, CARD_H);
+                let (w, h) = (DM_W, DM_H);
                 if m.x > w && m.y > h {
                     ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(
                         egui::Pos2::new((m.x - w) / 2.0, (m.y - h) / 2.0),
@@ -927,55 +858,64 @@ impl eframe::App for ConfirmApp {
         if self.probing {
             ctx.request_repaint();
         }
-        // Grow the window when the hidden extras are open, so the concept
-        // surface itself never changes size or position.
+        // Grow the window when the gear panel (or a notice) needs room, so the
+        // concept surface itself never changes size or position.
         let notes = self.extra_notes();
-        let mut extra_h = if self.show_adv {
-            10.0 + 3.0 * (FIELD_H + ROW_GAP)
+        let panel_h = if self.show_adv {
+            PANEL_H + if notes.is_empty() { 0.0 } else { 4.0 + NOTE_H * notes.len() as f32 }
         } else {
             0.0
         };
-        if self.adding_cat {
-            extra_h += FIELD_H + ROW_GAP;
-        }
-        if self.show_adv && !notes.is_empty() {
-            extra_h += 4.0 + 12.0 * notes.len() as f32;
-        }
+        let adv_h = if self.show_adv { panel_h + 14.0 } else { 0.0 };
+        let mut want_h = DM_H + adv_h;
         if !self.notice.is_empty() {
-            extra_h += 16.0;
+            want_h += 16.0;
         }
-        let want_h = CARD_H + extra_h;
         if (self.win_h - want_h).abs() > 0.5 {
             self.win_h = want_h;
-            ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(egui::vec2(CARD_W, want_h)));
+            ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(egui::vec2(DM_W, want_h)));
+        }
+        // Esc closes, unless a menu is open (those close on the same key).
+        if ctx.input(|i| i.key_pressed(egui::Key::Escape)) && !self.cat_open && !self.recent_open {
+            self.done = true;
         }
 
         let panel = egui::CentralPanel::default().frame(egui::Frame::NONE);
         panel.show(ctx, |ui| {
-            // The concept card IS the window: 534x228, 1px #2a2a4a border,
-            // 10px radius, painted edge to edge.
+            // The concept card IS the window: 562x253, 1px #1e293b border,
+            // 8px radius, painted edge to edge over the clear surface.
             let card = ui.max_rect();
+            let o = card.min;
             let p = ui.painter().clone();
+            let at = |x: f32, y: f32, w: f32, h: f32| {
+                egui::Rect::from_min_size(egui::pos2(o.x + x, o.y + y), egui::vec2(w, h))
+            };
             p.rect(
                 card,
-                CARD_RAD,
-                C_CARD,
-                egui::Stroke::new(1.0_f32, C_BORDER),
+                8.0,
+                DM_CARD,
+                egui::Stroke::new(1.0, DM_LINE),
                 egui::StrokeKind::Inside,
             );
-            // Content box: card minus the 1px border minus the 16/12 padding.
-            let left = card.left() + 1.0 + PAD_X;
-            let right = card.right() - 1.0 - PAD_X;
-            let mut y = card.top() + 1.0 + PAD_Y;
-
-            // --- header: mark + title + gear/close; drag anywhere to move ---
-            let hdr = egui::Rect::from_min_size(
-                egui::pos2(left, y),
-                egui::vec2(CONTENT_W - 46.0, 20.0),
+            // ---- header: mark + title + window controls (drag to move) ----
+            dm_mark(&p, at(15.0, 11.0, 18.0, 18.0));
+            p.text(
+                egui::pos2(o.x + 41.0, o.y + 20.0),
+                egui::Align2::LEFT_CENTER,
+                "Download File Info",
+                semi(13.0),
+                DM_TXT,
+            );
+            p.line_segment(
+                [
+                    egui::pos2(o.x + 1.0, o.y + 39.5),
+                    egui::pos2(o.x + DM_W - 1.0, o.y + 39.5),
+                ],
+                egui::Stroke::new(1.0, DM_LINE),
             );
             if ui
                 .interact(
-                    hdr,
+                    at(0.0, 0.0, DM_W - 100.0, 39.0),
                     egui::Id::new("popup-header"),
                     egui::Sense::click_and_drag(),
                 )
@@ -983,343 +923,402 @@ impl eframe::App for ConfirmApp {
             {
                 ctx.send_viewport_cmd(egui::ViewportCommand::StartDrag);
             }
-            app_mark(
-                &p,
-                egui::Rect::from_min_size(egui::pos2(left, y), egui::vec2(20.0, 20.0)),
-            );
-            p.text(
-                egui::pos2(left + 26.0, y + 10.0),
-                egui::Align2::LEFT_CENTER,
-                "Download File Info",
-                semi(12.0),
-                C_TXT,
-            );
-            let close_r = egui::Rect::from_center_size(
-                egui::pos2(right - 5.5, y + 10.0),
-                egui::vec2(12.0, 12.0),
-            );
-            let gear_r = egui::Rect::from_center_size(
-                egui::pos2(right - 27.5, y + 10.0),
-                egui::vec2(12.0, 12.0),
-            );
-            let gear = ui.interact(gear_r, egui::Id::new("popup-gear"), egui::Sense::click());
-            let close = ui.interact(close_r, egui::Id::new("popup-close"), egui::Sense::click());
-            p.text(
-                gear_r.center(),
-                egui::Align2::CENTER_CENTER,
-                crate::app::MI_SETTINGS,
-                reg(11.0),
-                if gear.hovered() { C_FTXT } else { C_DIM },
-            );
-            p.text(
-                close_r.center(),
-                egui::Align2::CENTER_CENTER,
-                GL_CLOSE,
-                reg(11.0),
-                if close.hovered() { C_FTXT } else { C_DIM },
-            );
-            if gear.hovered() || close.hovered() {
+            let ctl = |x: f32| {
+                egui::Rect::from_center_size(
+                    egui::pos2(o.x + x, o.y + 20.0),
+                    egui::Vec2::splat(12.0),
+                )
+            };
+            let (min_r, max_r, close_r) = (ctl(485.0), ctl(513.0), ctl(541.0));
+            let min_b = ui.interact(min_r, egui::Id::new("popup-min"), egui::Sense::click());
+            let max_b = ui.interact(max_r, egui::Id::new("popup-max"), egui::Sense::click());
+            let close_b = ui.interact(close_r, egui::Id::new("popup-close"), egui::Sense::click());
+            for (r, hov) in [
+                (min_r, min_b.hovered()),
+                (max_r, max_b.hovered()),
+                (close_r, close_b.hovered()),
+            ] {
+                if hov {
+                    p.rect_filled(r.expand(4.0), DM_RAD, DM_HOVER2);
+                }
+            }
+            if min_b.hovered() || max_b.hovered() || close_b.hovered() {
                 ctx.set_cursor_icon(egui::CursorIcon::PointingHand);
             }
-            if gear.clicked() {
-                self.show_adv = !self.show_adv;
+            dm_icon(&p, min_r, DmIcon::Minimize, DM_DIM, 2.0);
+            dm_icon(&p, max_r, DmIcon::Maximize, DM_DIM, 2.0);
+            dm_icon(&p, close_r, DmIcon::Close, DM_DIM, 2.0);
+            if min_b.clicked() {
+                ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(true));
             }
-            if close.clicked() {
+            if max_b.clicked() {
+                let max = ctx.input(|i| i.viewport().maximized.unwrap_or(false));
+                ctx.send_viewport_cmd(egui::ViewportCommand::Maximized(!max));
+            }
+            if close_b.clicked() {
                 self.done = true;
             }
-            y += 20.0 + 8.0;
-
-            // --- URL ---
-            p.text(
-                egui::pos2(left, y + LBL_H / 2.0),
-                egui::Align2::LEFT_CENTER,
-                "URL",
-                reg(9.0),
-                C_LBL,
+            // ---- row 1: URL + clipboard (copies the captured link) ----
+            let url_box = at(DM_X, DM_ROW1, DM_W_IN, DM_BOX_H);
+            let clip_btn = egui::Rect::from_min_size(
+                egui::pos2(url_box.max.x - 33.0, url_box.min.y + 5.0),
+                egui::Vec2::splat(28.0),
             );
-            let url_rect = egui::Rect::from_min_size(
-                egui::pos2(left, y + LBL_H + LBL_GAP),
-                egui::vec2(CONTENT_W, FIELD_H),
+            dm_field(
+                ui,
+                "popup_url",
+                url_box,
+                clip_btn.min.x - 6.0,
+                &mut self.url,
+                "https://…",
+                false,
             );
-            field(ui, url_rect, &mut self.url, "https://...");
-            y += LBL_H + LBL_GAP + FIELD_H + ROW_GAP;
-            // --- Category (flex 1) + Save As (flex 2) ---
-            let unit = (CONTENT_W - ROW_GAP) / 3.0;
-            let cat_w = unit;
-            let save_x = left + cat_w + ROW_GAP;
-            let save_w = unit * 2.0;
-            p.text(
-                egui::pos2(left, y + LBL_H / 2.0),
-                egui::Align2::LEFT_CENTER,
-                "Category",
-                reg(9.0),
-                C_LBL,
-            );
-            p.text(
-                egui::pos2(save_x, y + LBL_H / 2.0),
-                egui::Align2::LEFT_CENTER,
-                "Save As",
-                reg(9.0),
-                C_LBL,
-            );
-            let fy = y + LBL_H + LBL_GAP;
-            let dd_w = cat_w - 4.0 - 20.0;
-            let cat_rect =
-                egui::Rect::from_min_size(egui::pos2(left, fy), egui::vec2(dd_w, FIELD_H));
-            let plus_rect = egui::Rect::from_min_size(
-                egui::pos2(left + dd_w + 4.0, fy),
-                egui::vec2(20.0, 20.0),
-            );
-            let sd_w = save_w - 4.0 - 20.0;
-            let save_rect =
-                egui::Rect::from_min_size(egui::pos2(save_x, fy), egui::vec2(sd_w, FIELD_H));
-            let dots_rect = egui::Rect::from_min_size(
-                egui::pos2(save_x + sd_w + 4.0, fy),
-                egui::vec2(20.0, 20.0),
-            );
-            let mut cats: Vec<String> = CATEGORIES.iter().map(|c| c.to_string()).collect();
-            cats.extend(self.custom_cats.iter().cloned());
-            if let Some(pick) =
-                combo(ui, cat_rect, "cat", &self.category, &cats, &mut self.cat_open)
-            {
-                self.category = pick;
+            let clip_b = ui.interact(clip_btn, egui::Id::new("popup-clip"), egui::Sense::click());
+            if clip_b.hovered() {
+                ctx.set_cursor_icon(egui::CursorIcon::PointingHand);
             }
-            if square(ui, plus_rect, GL_ADD, true, 1).clicked() {
-                self.adding_cat = !self.adding_cat;
+            icon_btn(&p, clip_btn, clip_b.hovered(), DmIcon::Clipboard, 14.0, 1.5, DM_DIM);
+            if clip_b.clicked() {
+                if let Ok(mut cb) = arboard::Clipboard::new() {
+                    let _ = cb.set_text(self.url.clone());
+                }
             }
-            field(ui, save_rect, &mut self.filename, "filename");
-            if square(ui, dots_rect, "...", false, 2).clicked() {
+            // ---- row 2: save folder | size chip ----
+            let path_box = at(DM_X, DM_ROW2, DM_PATH_W, DM_BOX_H);
+            let caret_btn = egui::Rect::from_min_size(
+                egui::pos2(path_box.max.x - 32.0, path_box.min.y + 5.0),
+                egui::Vec2::splat(28.0),
+            );
+            let folder_btn = egui::Rect::from_min_size(
+                egui::pos2(caret_btn.min.x - 30.0, caret_btn.min.y),
+                egui::Vec2::splat(28.0),
+            );
+            dm_field(
+                ui,
+                "popup_dir",
+                path_box,
+                folder_btn.min.x - 6.0,
+                &mut self.save_base,
+                "Save folder",
+                false,
+            );
+            if self.remember_path {
+                // The field holds the base folder; say where the rule sends it.
+                ui.interact(
+                    path_box,
+                    egui::Id::new("popup_dir_tip"),
+                    egui::Sense::hover(),
+                )
+                .on_hover_text(format!("→ {}", self.effective_dir()));
+            }
+            let f_b = ui.interact(folder_btn, egui::Id::new("popup-folder"), egui::Sense::click());
+            icon_btn(&p, folder_btn, f_b.hovered(), DmIcon::Folder, 14.0, 1.5, DM_DIM);
+            let c_b = ui.interact(caret_btn, egui::Id::new("popup-caret"), egui::Sense::click());
+            icon_btn(&p, caret_btn, c_b.hovered(), DmIcon::Chevron, 10.0, 2.0, DM_DIM);
+            if f_b.hovered() || c_b.hovered() {
+                ctx.set_cursor_icon(egui::CursorIcon::PointingHand);
+            }
+            if c_b.clicked() {
+                self.recent_open = !self.recent_open;
+            }
+            let recents = self.recent_dirs();
+            if let Some(dir) = options_menu(
+                &c_b,
+                &recents,
+                &mut self.recent_open,
+                &self.save_base,
+            ) {
+                self.save_base = dir;
+            }
+            if f_b.clicked() {
                 let mut dlg = rfd::FileDialog::new();
                 if !self.save_base.trim().is_empty() {
                     dlg = dlg.set_directory(&self.save_base);
                 }
-                if let Some(dir) = dlg.pick_folder() {
-                    self.save_base = dir.to_string_lossy().to_string();
+                if let Some(d) = dlg.pick_folder() {
+                    self.save_base = d.to_string_lossy().to_string();
                 }
             }
-            y += LBL_H + LBL_GAP + FIELD_H + ROW_GAP;
-
-            if self.adding_cat {
-                let w = CONTENT_W - 4.0 - 44.0;
-                let f = egui::Rect::from_min_size(egui::pos2(left, y), egui::vec2(w, FIELD_H));
-                field(ui, f, &mut self.new_cat, "New category name");
-                let b = egui::Rect::from_min_size(
-                    egui::pos2(left + w + 4.0, y),
-                    egui::vec2(44.0, FIELD_H),
-                );
-                let enter = ui.input(|i| i.key_pressed(egui::Key::Enter));
-                if button(ui, b, "Add", Btn::Primary, 3).clicked() || enter {
-                    let name = self.new_cat.trim().to_string();
-                    if !name.is_empty() {
-                        if !self.custom_cats.iter().any(|c| c.eq_ignore_ascii_case(&name)) {
-                            self.custom_cats.push(name.clone());
-                        }
-                        self.category = name;
-                        self.new_cat.clear();
-                        self.adding_cat = false;
-                    }
-                }
-                y += FIELD_H + ROW_GAP;
-            }
-            // --- remember + size + folder (one compact row) ---
-            let cy = y + PATH_H / 2.0;
-            let cb = ui.interact(
-                egui::Rect::from_center_size(egui::pos2(left + 5.0, cy), egui::vec2(18.0, 18.0)),
-                egui::Id::new("popup-remember"),
-                egui::Sense::click(),
+            // size chip: grid mark, size (with duration when known), tick
+            let chip = at(DM_X + DM_PATH_W + 8.0, DM_ROW2, DM_SIZE_W, DM_BOX_H);
+            dm_box(&p, chip);
+            dm_icon(
+                &p,
+                egui::Rect::from_center_size(
+                    egui::pos2(chip.min.x + 21.0, chip.center().y),
+                    egui::Vec2::splat(16.0),
+                ),
+                DmIcon::Grid,
+                DM_ACC,
+                0.0,
             );
-            if cb.hovered() {
-                ctx.set_cursor_icon(egui::CursorIcon::PointingHand);
-            }
-            let box_r =
-                egui::Rect::from_center_size(egui::pos2(left + 5.0, cy), egui::vec2(10.0, 10.0));
-            if self.remember_path {
-                p.rect(box_r, 2.0, C_ACCENT, egui::Stroke::NONE, egui::StrokeKind::Inside);
-                let stroke = egui::Stroke::new(1.3_f32, egui::Color32::WHITE);
-                let m = |x: f32, yy: f32| egui::pos2(box_r.left() + x, box_r.top() + yy);
-                p.line_segment([m(2.4, 5.2), m(4.3, 7.2)], stroke);
-                p.line_segment([m(4.3, 7.2), m(7.7, 3.0)], stroke);
-            } else {
-                p.rect(
-                    box_r,
-                    2.0,
-                    C_INPUT,
-                    egui::Stroke::new(1.0_f32, C_BORDER),
-                    egui::StrokeKind::Inside,
-                );
-            }
-            if cb.clicked() {
-                self.remember_path = !self.remember_path;
-            }
-            let lr = p.text(
-                egui::pos2(left + 14.0, cy),
-                egui::Align2::LEFT_CENTER,
-                "Remember this path",
-                reg(8.0),
-                C_LBL,
-            );
-            let mut sx = lr.right() + 8.0;
-            let known = self.probe_size.filter(|s| *s > 0);
-            let size_txt = if self.probing {
+            let known = !self.probing && self.probe_size.filter(|s| *s > 0).is_some();
+            let sz_txt: String = if self.probing {
                 "…".to_string()
             } else {
-                match known {
+                match self.probe_size.filter(|s| *s > 0) {
                     Some(sz) if self.duration_secs > 0 => {
                         format!("{} • {}", format_dur(self.duration_secs), format_bytes(sz))
                     }
                     Some(sz) => format_bytes(sz),
-                    None => "size unknown".to_string(),
+                    None => "—".to_string(),
                 }
             };
-            let sr = p.text(
-                egui::pos2(sx, cy),
-                egui::Align2::LEFT_CENTER,
-                &size_txt,
-                reg(8.0),
-                if known.is_some() { C_ACCENT } else { C_DIM },
-            );
-            sx = sr.right() + 8.0;
-            let br = p.text(
-                egui::pos2(sx, cy),
-                egui::Align2::LEFT_CENTER,
-                "|",
-                reg(8.0),
-                C_DIM,
-            );
-            sx = br.right() + 8.0;
-            let path_rect = egui::Rect::from_min_size(
-                egui::pos2(sx, y),
-                egui::vec2((right - sx).max(60.0), PATH_H),
-            );
-            field(ui, path_rect, &mut self.save_base, "folder")
-                .on_hover_text(format!("→ {}", self.effective_dir()));
-            y += PATH_H + ROW_GAP;
-
-            // --- description ---
-            p.text(
-                egui::pos2(left, y + LBL_H / 2.0),
-                egui::Align2::LEFT_CENTER,
-                "Description",
-                reg(9.0),
-                C_LBL,
-            );
-            let desc_rect = egui::Rect::from_min_size(
-                egui::pos2(left, y + LBL_H + LBL_GAP),
-                egui::vec2(CONTENT_W, DESC_H),
-            );
-            field(ui, desc_rect, &mut self.description, "optional note");
-            y += LBL_H + LBL_GAP + DESC_H + 8.0;
-            // --- actions: Download Later | Start Download | Cancel ---
-            let bw = (CONTENT_W - 2.0 * ROW_GAP) / 3.0;
-            let later = button(
-                ui,
-                egui::Rect::from_min_size(egui::pos2(left, y), egui::vec2(bw, BTN_H)),
-                "Download Later",
-                Btn::Ghost,
-                4,
-            );
-            let start = button(
-                ui,
-                egui::Rect::from_min_size(
-                    egui::pos2(left + bw + ROW_GAP, y),
-                    egui::vec2(bw, BTN_H),
-                ),
-                "Start Download",
-                Btn::Primary,
-                5,
-            );
-            let cancel = button(
-                ui,
-                egui::Rect::from_min_size(
-                    egui::pos2(left + 2.0 * (bw + ROW_GAP), y),
-                    egui::vec2(bw, BTN_H),
-                ),
-                "Cancel",
-                Btn::Ghost,
-                6,
-            );
-            if later.clicked() {
-                self.commit(false);
+            let g = p.layout_no_wrap(sz_txt, reg(11.0), DM_TXT);
+            let tw = g.size().x;
+            let tx = chip.min.x + 37.0;
+            p.galley(egui::pos2(tx, chip.center().y - g.size().y * 0.5), g, DM_TXT);
+            if known {
+                dm_icon(
+                    &p,
+                    egui::Rect::from_min_size(
+                        egui::pos2(tx + tw + 8.0, chip.min.y + 13.0),
+                        egui::Vec2::splat(12.0),
+                    ),
+                    DmIcon::Check,
+                    DM_OK,
+                    2.5,
+                );
             }
-            if start.clicked() {
-                self.commit(true);
+            // ---- row 3: filename + refresh + advanced ----
+            let file_box = at(DM_X, DM_ROW3, DM_FILE_W, DM_BOX_H);
+            let refr_btn = egui::Rect::from_min_size(
+                egui::pos2(file_box.max.x + 8.0, file_box.min.y),
+                egui::Vec2::splat(38.0),
+            );
+            let gear_btn = egui::Rect::from_min_size(
+                egui::pos2(refr_btn.max.x + 8.0, refr_btn.min.y),
+                egui::Vec2::splat(38.0),
+            );
+            dm_field(
+                ui,
+                "popup_file",
+                file_box,
+                file_box.max.x - 13.0,
+                &mut self.filename,
+                "Filename",
+                false,
+            );
+            let r_b = ui.interact(refr_btn, egui::Id::new("popup-refresh"), egui::Sense::click());
+            let g_b = ui.interact(gear_btn, egui::Id::new("popup-gear"), egui::Sense::click());
+            icon_btn(&p, refr_btn, r_b.hovered(), DmIcon::Refresh, 14.0, 1.5, DM_DIM);
+            icon_btn(
+                &p,
+                gear_btn,
+                g_b.hovered(),
+                DmIcon::Settings,
+                14.0,
+                1.5,
+                if self.show_adv { DM_ACC } else { DM_DIM },
+            );
+            if r_b.hovered() || g_b.hovered() {
+                ctx.set_cursor_icon(egui::CursorIcon::PointingHand);
             }
-            if cancel.clicked() {
-                self.done = true;
+            if r_b.clicked() {
+                self.start_probe();
             }
-            y += BTN_H;
-
-            // --- extras: the concept has no such rows, so they live in a
-            // panel that is closed by default and grows the window. ---
+            if g_b.clicked() {
+                self.show_adv = !self.show_adv;
+            }
+            // ---- gear panel: the rows the concept has no place for ----
             if self.show_adv {
-                y += 10.0;
-                let rows: [(&str, &mut String, &str); 2] = [
-                    ("Referer", &mut self.referer, "http://..."),
-                    ("Cookie", &mut self.cookie, "name=value; ..."),
-                ];
-                for (lbl, buf, hint) in rows {
-                    p.text(
-                        egui::pos2(left, y + FIELD_H / 2.0),
-                        egui::Align2::LEFT_CENTER,
-                        lbl,
-                        reg(9.0),
-                        C_LBL,
+                let panel = at(DM_X, DM_ACT, DM_W_IN, panel_h);
+                dm_box(&p, panel);
+                let cx = panel.min.x + 13.0;
+                let cw = panel.width() - 26.0;
+                let half = (cw - 8.0) / 2.0;
+                let mut cy = panel.min.y + 13.0;
+                let cat_r = egui::Rect::from_min_size(
+                    egui::pos2(cx, cy),
+                    egui::vec2(half - 34.0, DM_BOX_H),
+                );
+                let plus_r = egui::Rect::from_min_size(
+                    egui::pos2(cx + half - 30.0, cy),
+                    egui::vec2(30.0, DM_BOX_H),
+                );
+                let desc_r = egui::Rect::from_min_size(
+                    egui::pos2(cx + half + 8.0, cy),
+                    egui::vec2(half, DM_BOX_H),
+                );
+                let mut cats: Vec<String> = CATEGORIES.iter().map(|c| c.to_string()).collect();
+                cats.extend(self.custom_cats.iter().cloned());
+                if self.adding_cat {
+                    let name_r = egui::Rect::from_min_size(
+                        cat_r.min,
+                        egui::vec2(cat_r.width() - 48.0, DM_BOX_H),
                     );
-                    let f = egui::Rect::from_min_size(
-                        egui::pos2(left + 62.0, y),
-                        egui::vec2(CONTENT_W - 62.0, FIELD_H),
+                    let add_r = egui::Rect::from_min_size(
+                        egui::pos2(cat_r.max.x - 44.0, cy),
+                        egui::vec2(44.0, DM_BOX_H),
                     );
-                    field(ui, f, buf, hint);
-                    y += FIELD_H + ROW_GAP;
+                    dm_field(
+                        ui,
+                        "popup_newcat",
+                        name_r,
+                        name_r.max.x - 10.0,
+                        &mut self.new_cat,
+                        "New category",
+                        false,
+                    );
+                    let a_b = ui.interact(add_r, egui::Id::new("popup-catadd"), egui::Sense::click());
+                    btn_flat(&p, add_r, a_b.hovered(), "Add");
+                    let enter = ui.input(|i| i.key_pressed(egui::Key::Enter));
+                    if a_b.clicked() || enter {
+                        let name = self.new_cat.trim().to_string();
+                        if !name.is_empty() {
+                            if !self
+                                .custom_cats
+                                .iter()
+                                .any(|c| c.eq_ignore_ascii_case(&name))
+                            {
+                                self.custom_cats.push(name.clone());
+                            }
+                            self.category = name;
+                            self.new_cat.clear();
+                            self.adding_cat = false;
+                        }
+                    }
+                } else if let Some(pick) =
+                    combo(ui, cat_r, "cat", &self.category, &cats, &mut self.cat_open)
+                {
+                    self.category = pick;
                 }
-                let ccy = y + FIELD_H / 2.0;
+                let p_b = plus_square(ui, plus_r, 1);
+                if p_b.clicked() {
+                    self.adding_cat = !self.adding_cat;
+                }
+                dm_field(
+                    ui,
+                    "popup_desc",
+                    desc_r,
+                    desc_r.max.x - 13.0,
+                    &mut self.description,
+                    "Description (optional)",
+                    false,
+                );
+                cy += DM_BOX_H + 8.0;
+                let ref_r = egui::Rect::from_min_size(egui::pos2(cx, cy), egui::vec2(half, DM_BOX_H));
+                let cok_r = egui::Rect::from_min_size(
+                    egui::pos2(cx + half + 8.0, cy),
+                    egui::vec2(half, DM_BOX_H),
+                );
+                dm_field(
+                    ui,
+                    "popup_ref",
+                    ref_r,
+                    ref_r.max.x - 13.0,
+                    &mut self.referer,
+                    "Referer (optional)",
+                    false,
+                );
+                dm_field(
+                    ui,
+                    "popup_cookie",
+                    cok_r,
+                    cok_r.max.x - 13.0,
+                    &mut self.cookie,
+                    "Cookie (optional)",
+                    false,
+                );
+                cy += DM_BOX_H + 8.0;
+                let row = egui::Rect::from_min_size(egui::pos2(cx, cy), egui::vec2(cw, 30.0));
                 p.text(
-                    egui::pos2(left, ccy),
+                    egui::pos2(row.min.x, row.center().y),
                     egui::Align2::LEFT_CENTER,
                     "Connections",
-                    reg(9.0),
-                    C_LBL,
+                    reg(11.0),
+                    DM_DIM,
                 );
+                let srect = egui::Rect::from_min_size(
+                    egui::pos2(row.min.x + 92.0, row.min.y + 5.0),
+                    egui::vec2(row.width() - 144.0, 20.0),
+                );
+                let frac = ((self.connections as f32 - 1.0) / 15.0).clamp(0.0, 1.0);
+                if let Some(nf) = slider_row(ui, srect, "conns", frac) {
+                    self.connections = ((nf * 15.0).round() as usize + 1).clamp(1, 16);
+                }
                 p.text(
-                    egui::pos2(left + 62.0, ccy),
-                    egui::Align2::LEFT_CENTER,
-                    self.connections.to_string(),
-                    reg(9.0),
-                    C_FTXT,
+                    egui::pos2(row.max.x, row.center().y),
+                    egui::Align2::RIGHT_CENTER,
+                    format!("{}", self.connections),
+                    reg(11.0),
+                    DM_TXT,
                 );
-                ui.put(
-                    egui::Rect::from_min_size(
-                        egui::pos2(left + 96.0, ccy - 8.0),
-                        egui::vec2(CONTENT_W - 96.0, 16.0),
-                    ),
-                    egui::Slider::new(&mut self.connections, 1..=16).show_value(false),
-                );
-                y += FIELD_H + ROW_GAP;
+                cy += 30.0 + 8.0;
+                let rem = egui::Rect::from_min_size(egui::pos2(cx, cy), egui::vec2(cw, 22.0));
+                if check_row(
+                    ui,
+                    rem,
+                    "remember",
+                    self.remember_path,
+                    "Remember this path (category subfolder)",
+                )
+                .clicked()
+                {
+                    self.remember_path = !self.remember_path;
+                }
+                cy += 22.0;
                 for n in &notes {
                     p.text(
-                        egui::pos2(left, y),
+                        egui::pos2(cx, cy + 6.0),
                         egui::Align2::LEFT_CENTER,
                         n,
-                        reg(8.0),
-                        C_DIM,
+                        reg(11.0),
+                        DM_DIM,
                     );
-                    y += 12.0;
+                    cy += NOTE_H;
                 }
             }
-
+            // ---- actions: Add (queue only) | Download (start) | Cancel ----
+            let act_y = DM_ACT + adv_h;
+            let add_r = at(DM_X, act_y, 100.0, 36.0);
+            let dl_r = egui::Rect::from_min_size(
+                egui::pos2(add_r.max.x + 8.0, add_r.min.y),
+                egui::vec2(140.0, 36.0),
+            );
+            let cancel_r = egui::Rect::from_min_size(
+                egui::pos2(o.x + DM_W - 17.0 - 100.0, add_r.min.y),
+                egui::vec2(100.0, 36.0),
+            );
+            let a_b = ui.interact(add_r, egui::Id::new("popup-add"), egui::Sense::click());
+            let d_b = ui.interact(dl_r, egui::Id::new("popup-start"), egui::Sense::click());
+            let x_b = ui.interact(cancel_r, egui::Id::new("popup-cancel"), egui::Sense::click());
+            btn_flat(&p, add_r, a_b.hovered(), "Add");
+            dm_gradient(&p, dl_r, DM_RAD, DM_ACC, DM_ACC2);
+            if d_b.hovered() {
+                p.rect_filled(dl_r, DM_RAD, egui::Color32::from_white_alpha(22));
+            }
+            p.text(
+                dl_r.center(),
+                egui::Align2::CENTER_CENTER,
+                "Download",
+                semi(13.0),
+                egui::Color32::WHITE,
+            );
+            btn_flat(&p, cancel_r, x_b.hovered(), "Cancel");
+            if a_b.hovered() || d_b.hovered() || x_b.hovered() {
+                ctx.set_cursor_icon(egui::CursorIcon::PointingHand);
+            }
+            if a_b.clicked() {
+                self.commit(false);
+            }
+            if d_b.clicked() {
+                self.commit(true);
+            }
+            if x_b.clicked() {
+                self.done = true;
+            }
+            // ---- notice (the window grew 16px for it) ----
             if !self.notice.is_empty() {
-                // Clamp: the notice carries I/O messages that can be long, and
-                // `p.text` does not wrap or clip inside the fixed card.
-                let shown: String = self.notice.chars().take(70).collect();
+                let shown: String = self.notice.chars().take(78).collect();
                 p.text(
-                    egui::pos2(left, y + 8.0),
+                    egui::pos2(o.x + DM_X, act_y + 36.0 + 10.0),
                     egui::Align2::LEFT_CENTER,
-                    &shown,
-                    reg(9.0),
-                    egui::Color32::from_rgb(255, 150, 120),
+                    shown,
+                    reg(11.0),
+                    DM_WARN,
                 );
             }
-            let _ = y;
         });
     }
 }
