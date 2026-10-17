@@ -467,6 +467,85 @@ pub fn claim_window(name: &str) -> Option<std::fs::File> {
     opts.open(dir.join(name)).ok()
 }
 
+/// The monitor's work area in points: the desktop minus the taskbar (and any
+/// other docked bar), so a window centred inside it can never end up half
+/// behind the taskbar. Falls back to the whole monitor when the work area is
+/// not known yet.
+pub fn work_area_rect(ctx: &egui::Context) -> Option<egui::Rect> {
+    let monitor = ctx.input(|i| i.viewport().monitor_size);
+    #[cfg(windows)]
+    {
+        let scale = ctx
+            .input(|i| i.viewport().native_pixels_per_point)
+            .filter(|s| *s > 0.05);
+        if let (Some(scale), Some((l, t, r, b))) = (scale, primary_work_area_px()) {
+            let rect = egui::Rect::from_min_max(
+                egui::pos2(l / scale, t / scale),
+                egui::pos2(r / scale, b / scale),
+            );
+            // egui reports monitor_size in points; if the scaled work area
+            // disagrees with it wildly the scale factor was wrong (mixed DPI),
+            // so prefer the monitor rectangle in that case.
+            let plausible = match monitor {
+                Some(m) => {
+                    rect.width() > m.x * 0.25
+                        && rect.width() < m.x * 2.5
+                        && rect.height() > m.y * 0.25
+                        && rect.height() < m.y * 2.5
+                }
+                None => rect.width() > 200.0 && rect.height() > 200.0,
+            };
+            if plausible {
+                return Some(rect);
+            }
+        }
+    }
+    monitor.map(|m| egui::Rect::from_min_size(egui::Pos2::ZERO, m))
+}
+
+/// `SPI_GETWORKAREA` of the primary monitor, in physical pixels.
+#[cfg(windows)]
+fn primary_work_area_px() -> Option<(f32, f32, f32, f32)> {
+    #[repr(C)]
+    struct Rect {
+        left: i32,
+        top: i32,
+        right: i32,
+        bottom: i32,
+    }
+    const SPI_GETWORKAREA: u32 = 0x0030;
+    #[link(name = "user32")]
+    unsafe extern "system" {
+        fn SystemParametersInfoW(
+            action: u32,
+            param: u32,
+            data: *mut std::ffi::c_void,
+            win_ini: u32,
+        ) -> i32;
+    }
+    let mut r = Rect { left: 0, top: 0, right: 0, bottom: 0 };
+    let ok = unsafe { SystemParametersInfoW(SPI_GETWORKAREA, 0, &mut r as *mut _ as *mut _, 0) };
+    (ok != 0).then(|| (r.left as f32, r.top as f32, r.right as f32, r.bottom as f32))
+}
+
+/// Put a fixed-size window in the middle of the work area. Returns `false`
+/// while the monitor geometry is still unknown so callers retry next frame
+/// instead of latching a bad position (Windows cascades otherwise).
+pub fn center_window(ctx: &egui::Context, size: egui::Vec2) -> bool {
+    let Some(work) = work_area_rect(ctx) else {
+        return false;
+    };
+    if work.width() < 120.0 || work.height() < 120.0 {
+        return false;
+    }
+    // Clamp to the top-left corner: a window taller than the work area should
+    // hug the top edge rather than run off the bottom.
+    let x = (work.center().x - size.x / 2.0).max(work.min.x);
+    let y = (work.center().y - size.y / 2.0).max(work.min.y);
+    ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(egui::pos2(x, y)));
+    true
+}
+
 /// Read a boolean preference out of ui.json (the main app's settings file)
 /// with a default, so standalone windows honour app settings without pulling
 /// in the app module.

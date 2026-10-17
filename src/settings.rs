@@ -249,16 +249,8 @@ pub fn run() -> eframe::Result<()> {
 
 impl eframe::App for SettingsApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        if !self.centered {
+        if !self.centered && crate::model::center_window(ctx, egui::vec2(600.0, 480.0)) {
             self.centered = true;
-            if let Some(m) = ctx.input(|i| i.viewport().monitor_size) {
-                if m.x > 600.0 && m.y > 480.0 {
-                    ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(egui::Pos2::new(
-                        (m.x - 600.0) / 2.0,
-                        (m.y - 480.0) / 2.0,
-                    )));
-                }
-            }
         }
         egui::CentralPanel::default().show(ctx, |ui| {
             ui.horizontal(|ui| {

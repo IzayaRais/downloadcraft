@@ -1316,7 +1316,8 @@ impl CraftApp {
     }
 
     /// Publish live per-download numbers for standalone progress windows
-    /// (`progress.json`, ~1/s while anything is active; removed when idle).
+    /// (`progress.json`, several times a second while anything is active;
+    /// removed when idle).
     fn write_progress_snapshot(&mut self) {
         let Some(path) = crate::model::config_dir().map(|p| p.join("progress.json")) else {
             return;
@@ -1327,7 +1328,7 @@ impl CraftApp {
             }
             return;
         }
-        if self.last_prog_write.elapsed().as_millis() < 1000 {
+        if self.last_prog_write.elapsed().as_millis() < 100 {
             return;
         }
         self.last_prog_write = Instant::now();
@@ -2670,22 +2671,24 @@ impl CraftApp {
                 }
                 d.resumable = resumable;
                 let el = task.last_sample.elapsed().as_secs_f64();
-                if el >= 0.5 {
+                if el >= 0.25 {
                     // Speed from the MONOTONIC displayed value (never the raw
                     // engine counter): a leg reset would otherwise show a
                     // negative spike followed by an inflated catch-up burst.
-                    // P5: EWMA smoothing (α=0.4) so the readout and ETA stop
-                    // flickering on bursty CDNs; raw samples feed the graph.
+                    // P5: EWMA smoothing (α=0.55) so the readout and ETA stop
+                    // flickering on bursty CDNs while still reacting quickly
+                    // (a quarter-second cadence reads as live); raw samples
+                    // feed the graph.
                     let delta = d.downloaded_bytes.saturating_sub(task.last_bytes) as f64;
                     let raw = if el > 0.0 { delta / el } else { 0.0 };
                     d.speed_bps = if d.speed_bps <= 0.0 {
                         raw
                     } else {
-                        0.4 * raw + 0.6 * d.speed_bps
+                        0.55 * raw + 0.45 * d.speed_bps
                     };
                     let hist = self.speed_hist.entry(*id).or_default();
                     hist.push_back(raw);
-                    while hist.len() > 60 {
+                    while hist.len() > 120 {
                         hist.pop_front();
                     }
                     task.last_sample = Instant::now();
@@ -3475,9 +3478,11 @@ impl eframe::App for CraftApp {
                 ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
             }
         }
-        // Repaint a few times per second for live progress/speed; pointer
-        // input repaints immediately on its own.
-        ctx.request_repaint_after(std::time::Duration::from_millis(250));
+        // Repaint often while a transfer is live so the speed column and the
+        // progress windows move in real time; idle, a few times a second is
+        // plenty (pointer input repaints immediately on its own).
+        let tick_ms = if self.tasks.is_empty() { 250 } else { 100 };
+        ctx.request_repaint_after(std::time::Duration::from_millis(tick_ms));
 
         // theme (re-applied when the user switches it)
         if self.theme_applied != self.theme {
@@ -4950,8 +4955,8 @@ impl eframe::App for CraftApp {
                                     SECONDARY,
                                 );
                                 ui.add_space(8.0);
-                                // P5 speed history: raw half-second samples as
-                                // a mini area chart (EWMA readout above it).
+                                // P5 speed history: raw quarter-second samples
+                                // as a mini area chart (EWMA readout above it).
                                 let hist: Vec<f64> = self
                                     .speed_hist
                                     .get(&did)

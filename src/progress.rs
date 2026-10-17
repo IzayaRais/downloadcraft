@@ -11,7 +11,8 @@
 //! included (the concept renders 522 wide, 553 tall at its six sample parts).
 //!
 //! The main app (which owns the engine tasks) publishes live numbers to
-//! `progress.json` ~1/s; this window polls that file + `queue.json` and draws
+//! `progress.json` several times a second; this window polls that file +
+//! `queue.json` and draws
 //! them. Pause/Resume/Cancel go back through `cmd.json`, polled by the main
 //! app. Closing this window never stops the download (like IDM).
 
@@ -285,7 +286,9 @@ fn info_row(
 
 struct ProgressApp {
     id: u64,
-    centered: bool,
+    /// Set whenever the card's height changes; cleared once the window has been
+    /// re-centred, so a growing part list never drifts off the middle.
+    recenter: bool,
     last_poll: Instant,
     item: Option<DownloadItem>,
     snap: Snap,
@@ -377,7 +380,7 @@ pub fn run() -> eframe::Result<()> {
     let (limit_input, finish_sel) = read_ui_prefs();
     let mut app = ProgressApp {
         id,
-        centered: false,
+        recenter: true,
         last_poll: Instant::now() - Duration::from_secs(10),
         item: None,
         snap: Snap::default(),
@@ -432,13 +435,15 @@ impl eframe::App for ProgressApp {
     }
 
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        if self.last_poll.elapsed() >= Duration::from_millis(500) {
+        // Fast enough that the speed readout visibly moves while a transfer
+        // runs: the app republishes progress.json about ten times a second.
+        if self.last_poll.elapsed() >= Duration::from_millis(150) {
             self.refresh();
         }
         if self.handoff {
             Self::close_soon(ctx);
         }
-        ctx.request_repaint_after(Duration::from_millis(500));
+        ctx.request_repaint_after(Duration::from_millis(150));
 
         // The card follows the concept's own rules: one 25px row per part,
         // everything else fixed. A monitor-sized cap keeps a 32-connection
@@ -454,25 +459,20 @@ impl eframe::App for ProgressApp {
             (Some(_), 0) => PG_PART_HEAD_H,
             _ => PG_MIN_H,
         };
-        let want_h = match ctx.input(|i| i.viewport().monitor_size) {
-            Some(m) => want_h.min((m.y - 80.0).max(PG_MIN_H)),
+        let want_h = match crate::model::work_area_rect(ctx) {
+            Some(w) => want_h.min((w.height() - 40.0).max(PG_MIN_H)),
             None => want_h,
         };
         if (self.win_h - want_h).abs() > 0.5 {
             self.win_h = want_h;
             ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(egui::vec2(PG_W, want_h)));
+            // The card grows as the part rows appear: re-centre on every size
+            // change so the whole window stays in the middle of the screen
+            // (taskbar excluded) instead of sliding behind it.
+            self.recenter = true;
         }
-        // Center once on the primary monitor (Windows otherwise cascades).
-        if !self.centered {
-            self.centered = true;
-            if let Some(m) = ctx.input(|i| i.viewport().monitor_size) {
-                if m.x > PG_W && m.y > want_h {
-                    ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(egui::Pos2::new(
-                        (m.x - PG_W) / 2.0,
-                        (m.y - want_h) / 2.0,
-                    )));
-                }
-            }
+        if self.recenter && crate::model::center_window(ctx, egui::vec2(PG_W, want_h)) {
+            self.recenter = false;
         }
 
         let item = self.item.clone();

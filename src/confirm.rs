@@ -820,18 +820,10 @@ impl eframe::App for ConfirmApp {
             }
             return;
         }
-        // Center once on the primary monitor (Windows otherwise cascades).
-        if !self.centered {
+        // Middle of the work area (taskbar excluded), once the monitor
+        // geometry is known; Windows would otherwise cascade the window.
+        if !self.centered && crate::model::center_window(ctx, egui::vec2(DM_W, DM_H)) {
             self.centered = true;
-            let mon = ctx.input(|i| i.viewport().monitor_size);
-            if let Some(m) = mon {
-                let (w, h) = (DM_W, DM_H);
-                if m.x > w && m.y > h {
-                    ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(
-                        egui::Pos2::new((m.x - w) / 2.0, (m.y - h) / 2.0),
-                    ));
-                }
-            }
         }
         // Collect probe result.
         if let Some(rx) = self.probe_rx.as_ref() {

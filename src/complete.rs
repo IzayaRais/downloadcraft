@@ -424,18 +424,13 @@ impl eframe::App for CompleteApp {
     }
 
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        // Centre once on the primary monitor and come to the front: a dialog
-        // spawned by a background app must not open behind it.
+        // Come to the front and sit in the middle of the work area: a dialog
+        // spawned by a background app must not open behind it, and must not
+        // hang over the taskbar.
         if !self.placed {
-            self.placed = true;
             ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
-            if let Some(m) = ctx.input(|i| i.viewport().monitor_size) {
-                if m.x > CW && m.y > CH {
-                    ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(egui::Pos2::new(
-                        (m.x - CW) / 2.0,
-                        (m.y - CH) / 2.0,
-                    )));
-                }
+            if crate::model::center_window(ctx, egui::vec2(CW, CH)) {
+                self.placed = true;
             }
         }
         if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {

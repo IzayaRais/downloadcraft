@@ -169,14 +169,10 @@ fn center_on_first(ctx: &egui::Context, done: &mut bool, w: f32, h: f32) {
     if *done {
         return;
     }
-    *done = true;
-    if let Some(m) = ctx.input(|i| i.viewport().monitor_size) {
-        if m.x > w && m.y > h {
-            ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(egui::Pos2::new(
-                (m.x - w) / 2.0,
-                (m.y - h) / 2.0,
-            )));
-        }
+    // Retries until the monitor geometry is known, then lands in the middle of
+    // the work area (taskbar excluded).
+    if crate::model::center_window(ctx, egui::vec2(w, h)) {
+        *done = true;
     }
 }
 
