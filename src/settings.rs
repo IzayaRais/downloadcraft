@@ -10,10 +10,16 @@ use crate::model::{default_folder_rules, FolderRule, SpeedWindow};
 const PANES: &[&str] = &[
     "Appearance",
     "Download Engine",
+    "YouTube",
     "Browser Integration",
     "Categories & Rules",
     "Updates",
 ];
+
+/// Rail index of the YouTube pane (the helper's status is probed when it is
+/// first shown, not at startup: asking a frozen build for its version costs
+/// about a second).
+const PANE_YTDLP: usize = 2;
 
 #[derive(Debug, Clone)]
 struct Settings {
@@ -38,6 +44,9 @@ struct Settings {
     // Rules
     rename_template: String,
     folder_rules: Vec<FolderRule>,
+    /// YouTube helper: use a yt-dlp found on PATH instead of the copy this app
+    /// fetches and refreshes itself.
+    ytdlp_prefer_path: bool,
     // Updates
     update_check_on: bool,
 }
@@ -68,6 +77,7 @@ impl Default for Settings {
             }],
             rename_template: "{name}".to_string(),
             folder_rules: default_folder_rules(),
+            ytdlp_prefer_path: true,
             update_check_on: false,
         }
     }
@@ -112,6 +122,9 @@ fn load() -> Settings {
     }
     if let Some(b) = g("update_check_on").and_then(|x| x.as_bool()) {
         s.update_check_on = b;
+    }
+    if let Some(b) = g("ytdlp_prefer_path").and_then(|x| x.as_bool()) {
+        s.ytdlp_prefer_path = b;
     }
     if let Some(n) = g("connections_default").and_then(|x| x.as_u64()) {
         s.connections_default = (n as usize).clamp(1, 16);
@@ -188,6 +201,7 @@ fn save(s: &Settings) -> bool {
     set(obj, "finish_action", s.finish_action.clone().into());
     set(obj, "speed_windows_on", s.speed_windows_on.into());
     set(obj, "rename_template", s.rename_template.clone().into());
+    set(obj, "ytdlp_prefer_path", s.ytdlp_prefer_path.into());
     set(obj, "update_check_on", s.update_check_on.into());
     set(obj, "folder_rules", serde_json::to_value(&s.folder_rules).unwrap_or_default());
     set(
@@ -210,6 +224,29 @@ struct SettingsApp {
     /// Last theme actually applied, so picking one in Appearance repaints
     /// this window at once (and "system" keeps tracking the OS).
     theme_applied: String,
+    /// YouTube helper status. Both asking it for a version and re-fetching it
+    /// run a process (or a download), so they happen on a worker thread and
+    /// the pane shows the last answer.
+    ytdlp: Option<crate::engine::YtdlpInfo>,
+    ytdlp_msg: String,
+    ytdlp_busy: bool,
+    ytdlp_rx: Option<std::sync::mpsc::Receiver<(String, crate::engine::YtdlpInfo)>>,
+}
+
+/// Probe the helper, and optionally re-download it first, off the UI thread.
+fn ytdlp_probe(force: bool) -> std::sync::mpsc::Receiver<(String, crate::engine::YtdlpInfo)> {
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let mut msg = String::new();
+        if force {
+            msg = match crate::engine::ytdlp_refresh_blocking() {
+                Ok(p) => format!("Fetched the newest build into {}", p.display()),
+                Err(e) => format!("Re-download failed: {e}"),
+            };
+        }
+        let _ = tx.send((msg, crate::engine::ytdlp_info()));
+    });
+    rx
 }
 
 fn install_one(browser: &str) -> String {
@@ -228,6 +265,10 @@ pub fn run() -> eframe::Result<()> {
         notice: String::new(),
         browser_msg: String::new(),
         theme_applied: String::new(),
+        ytdlp: None,
+        ytdlp_msg: String::new(),
+        ytdlp_busy: false,
+        ytdlp_rx: None,
     };
     // Separate OS window (own process via `--settings`): never embedded in
     // the main GUI. Compact default size so it doesn't feel "too wide".
@@ -264,34 +305,27 @@ impl eframe::App for SettingsApp {
         if !self.centered && crate::model::center_window(ctx, egui::vec2(600.0, 480.0)) {
             self.centered = true;
         }
-        egui::CentralPanel::default().show(ctx, |ui| {
-            ui.horizontal(|ui| {
-                // Rail.
-                ui.vertical(|ui| {
-                    ui.set_width(140.0);
-                    ui.add_space(4.0);
-                    for (i, name) in PANES.iter().enumerate() {
-                        if ui.selectable_label(self.pane == i, *name).clicked() {
-                            self.pane = i;
-                        }
-                    }
-                });
-                ui.separator();
-                // Content.
-                ui.vertical(|ui| {
-                    egui::ScrollArea::vertical()
-                        .max_height(370.0)
-                        .auto_shrink([false, false])
-                        .show(ui, |ui| match self.pane {
-                            0 => self.pane_appearance(ui),
-                            1 => self.pane_engine(ui),
-                            2 => self.pane_browser(ui),
-                            3 => self.pane_rules(ui),
-                            _ => self.pane_updates(ui),
-                        });
-                });
-            });
-            ui.separator();
+        // The helper's status is asked for when the pane is first opened.
+        if self.pane == PANE_YTDLP && self.ytdlp.is_none() && self.ytdlp_rx.is_none() {
+            self.ytdlp_rx = Some(ytdlp_probe(false));
+            self.ytdlp_busy = true;
+        }
+        if let Some(rx) = &self.ytdlp_rx {
+            if let Ok((msg, info)) = rx.try_recv() {
+                if !msg.is_empty() {
+                    self.ytdlp_msg = msg;
+                }
+                self.ytdlp = Some(info);
+                self.ytdlp_rx = None;
+                self.ytdlp_busy = false;
+            }
+        }
+        // Action bar as its own panel: the pane above it then gets exactly the
+        // space that is left, and a short window scrolls instead of clipping
+        // its last rows (the previous fixed-height scroll area cut off
+        // whatever did not fit).
+        egui::TopBottomPanel::bottom("settings_actions").show(ctx, |ui| {
+            ui.add_space(6.0);
             ui.horizontal(|ui| {
                 if ui.button("Save").clicked() {
                     self.notice = if save(&self.s) {
@@ -309,6 +343,30 @@ impl eframe::App for SettingsApp {
                     }
                 });
             });
+            ui.add_space(6.0);
+        });
+        egui::SidePanel::left("settings_rail")
+            .exact_width(148.0)
+            .resizable(false)
+            .show(ctx, |ui| {
+                ui.add_space(6.0);
+                for (i, name) in PANES.iter().enumerate() {
+                    if ui.selectable_label(self.pane == i, *name).clicked() {
+                        self.pane = i;
+                    }
+                }
+            });
+        egui::CentralPanel::default().show(ctx, |ui| {
+            egui::ScrollArea::vertical()
+                .auto_shrink([false, false])
+                .show(ui, |ui| match self.pane {
+                    0 => self.pane_appearance(ui),
+                    1 => self.pane_engine(ui),
+                    PANE_YTDLP => self.pane_ytdlp(ui),
+                    3 => self.pane_browser(ui),
+                    4 => self.pane_rules(ui),
+                    _ => self.pane_updates(ui),
+                });
         });
     }
 }
@@ -418,6 +476,111 @@ impl SettingsApp {
                 });
             }
         });
+    }
+
+    /// YouTube: the helper those links are handed to, where it comes from, and
+    /// how to refresh it. The engine fetches and updates this copy itself, so
+    /// there was no way to see it from inside the app before.
+    fn pane_ytdlp(&mut self, ui: &mut egui::Ui) {
+        ui.heading("YouTube");
+        ui.small(
+            "YouTube links are handed to yt-dlp: it speaks the streaming protocol browsers \
+             use (what gates 1080p and up) and merges the audio leg itself.",
+        );
+        ui.add_space(8.0);
+        match self.ytdlp.clone() {
+            None => {
+                ui.label(if self.ytdlp_busy {
+                    "Checking the helper…"
+                } else {
+                    "Not checked yet."
+                });
+            }
+            Some(info) => {
+                let ver = info
+                    .version
+                    .clone()
+                    .unwrap_or_else(|| "version unknown".to_string());
+                match (&info.path, info.managed) {
+                    (None, _) => {
+                        ui.label("No yt-dlp present yet.");
+                        ui.small(
+                            "The first YouTube download fetches it automatically — there is \
+                             nothing to install by hand.",
+                        );
+                    }
+                    (Some(p), true) => {
+                        ui.label(format!("Using this app's own yt-dlp — {ver}."));
+                        ui.small(p.display().to_string());
+                    }
+                    (Some(p), false) => {
+                        ui.label(format!("Using the yt-dlp installed on your PATH — {ver}."));
+                        ui.small(p.display().to_string());
+                    }
+                }
+                if let Some(sz) = info.size {
+                    ui.small(format!("{} on disk.", crate::model::format_bytes(sz)));
+                }
+                if info.stale {
+                    ui.small(
+                        "Past the 30-day refresh window — YouTube's extractors change \
+                         often: press Re-download.",
+                    );
+                }
+                if info.managed && info.on_path.is_some() {
+                    ui.small(
+                        "Your PATH copy is ignored right now. Tick the box below to use it \
+                         instead.",
+                    );
+                }
+                ui.small(match &info.js_runtime {
+                    Some(r) => format!(
+                        "JavaScript runtime: {r} — solves YouTube's player challenge."
+                    ),
+                    None => "No JavaScript runtime found. Install Node.js if YouTube \
+                             downloads stop at \"Getting info\" or fail with \"The page \
+                             needs to be reloaded\"."
+                        .to_string(),
+                });
+            }
+        }
+        ui.add_space(8.0);
+        ui.horizontal(|ui| {
+            if ui
+                .add_enabled(!self.ytdlp_busy, egui::Button::new("Re-download"))
+                .on_hover_text("Fetch the newest yt-dlp build now")
+                .clicked()
+            {
+                self.ytdlp_rx = Some(ytdlp_probe(true));
+                self.ytdlp_busy = true;
+                self.ytdlp_msg.clear();
+            }
+            if ui
+                .button("Show in folder")
+                .on_hover_text("Open the folder the app keeps it in")
+                .clicked()
+            {
+                if let Some(dir) = crate::engine::ytdlp_bin_dir() {
+                    let _ = std::fs::create_dir_all(&dir);
+                    crate::app::open_path(&dir, false);
+                }
+            }
+            if self.ytdlp_busy {
+                ui.spinner();
+            }
+        });
+        if !self.ytdlp_msg.is_empty() {
+            ui.small(&self.ytdlp_msg);
+        }
+        ui.add_space(6.0);
+        ui.checkbox(
+            &mut self.s.ytdlp_prefer_path,
+            "Prefer a yt-dlp already installed on my PATH",
+        );
+        ui.small(
+            "Unchecked: always use the copy this app fetches and keeps current. Applies to \
+             the next download (press Save).",
+        );
     }
 
     fn pane_browser(&mut self, ui: &mut egui::Ui) {

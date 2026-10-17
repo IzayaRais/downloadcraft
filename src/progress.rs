@@ -46,6 +46,9 @@ struct Snap {
     speed: f64,
     resumable: bool,
     live: bool,
+    /// Stage the transfer is in while it is not moving bytes (yt-dlp's
+    /// "Getting info"/"Merging"); empty for the built-in engine.
+    phase: String,
     parts: Vec<(u64, u64, u64)>, // (start, end, done)
 }
 
@@ -67,6 +70,11 @@ fn read_snap(id: u64) -> Snap {
     out.total = e.get("total").and_then(|x| x.as_u64());
     out.speed = e.get("speed").and_then(|x| x.as_f64()).unwrap_or(0.0);
     out.resumable = e.get("resumable").and_then(|x| x.as_bool()).unwrap_or(false);
+    out.phase = e
+        .get("phase")
+        .and_then(|x| x.as_str())
+        .unwrap_or("")
+        .to_string();
     if let Some(arr) = e.get("parts").and_then(|x| x.as_array()) {
         for p in arr.iter().take(32) {
             let n = |i: usize| p.get(i).and_then(|x| x.as_u64()).unwrap_or(0);
@@ -646,6 +654,27 @@ impl ProgressApp {
         }
     }
 
+    /// True while a helper is in a stage that moves no bytes yet (YouTube's
+    /// player challenge, a merge). The size may well be known already — the
+    /// extension measured it before the transfer started — so "nothing has
+    /// arrived" is the signal, not "size unknown".
+    fn preparing(&self) -> bool {
+        self.snap.live
+            && self.snap.downloaded == 0
+            && !self.snap.phase.is_empty()
+            && self.snap.phase != "Downloading"
+    }
+
+    /// The stage a live transfer is in, worded for the Status row:
+    /// `Some("Downloading — Getting info")`, or `None` when there is nothing
+    /// more to say than the status label.
+    fn stage_text(&self) -> Option<String> {
+        if !self.preparing() {
+            return None;
+        }
+        Some(format!("Downloading — {}", self.snap.phase))
+    }
+
     /// Concept Info tab: the seven detail rows.
     fn body_info(&mut self, ui: &mut egui::Ui, o: egui::Pos2, item: &DownloadItem, downloading: bool) {
         let p = ui.painter().clone();
@@ -656,7 +685,19 @@ impl ProgressApp {
             _ => pl().dm_txt,
         };
         info_row(&p, o, 0, "Name:", item.filename.clone(), pl().dm_txt, reg(13.0));
-        info_row(&p, o, 1, "Status:", item.status.label(), status_col, reg(13.0));
+        // A helper in a stage that moves no bytes yet (YouTube's player
+        // challenge, a merge) is named here: "Downloading" with 0 of "-" and
+        // no speed reads as a hang, and this can last ten seconds.
+        let stage = self.stage_text();
+        info_row(
+            &p,
+            o,
+            1,
+            "Status:",
+            stage.unwrap_or_else(|| item.status.label()),
+            status_col,
+            reg(13.0),
+        );
         info_row(
             &p,
             o,
@@ -893,7 +934,30 @@ impl ProgressApp {
         let p = ui.painter().clone();
         let track = at(o, PAD_X, PROG_Y, PROG_W, PROG_H);
         p.rect_filled(track, 4.0, pl().dm_line);
-        if frac > 0.0 {
+        // Before a single byte has arrived the bar sweeps a segment instead of
+        // sitting empty: yt-dlp resolves YouTube's player challenge for several
+        // seconds first, and a frozen bar is indistinguishable from a stalled
+        // download. (The size is often already known from the browser probe, so
+        // "no bytes yet" — not "no size" — is the signal.)
+        let preparing = self.preparing();
+        if preparing {
+            let t = ui.input(|i| i.time) as f32;
+            let span = PROG_W * 0.32;
+            // ~2.5s per sweep: detectable without being a strobe at the
+            // window's 150ms repaint cadence.
+            let left = (t * 0.4).fract() * (PROG_W + span) - span;
+            let l = (track.min.x + left).max(track.min.x);
+            let r = (track.min.x + left + span).min(track.max.x);
+            if r - l > 1.0 {
+                dm_gradient_x(
+                    &p,
+                    egui::Rect::from_min_size(egui::pos2(l, track.min.y), egui::vec2(r - l, PROG_H)),
+                    4.0,
+                    DM_ACC,
+                    DM_ACC2,
+                );
+            }
+        } else if frac > 0.0 {
             let w = (PROG_W * frac).max(PROG_H);
             dm_gradient_x(
                 &p,
@@ -911,14 +975,18 @@ impl ProgressApp {
             egui::Id::new("pg-bar"),
             egui::Sense::hover(),
         )
-        .on_hover_text(format!(
-            "{} of {} ({:.0}%)",
-            format_bytes(item.downloaded_bytes),
-            item.total_bytes
-                .map(format_bytes)
-                .unwrap_or_else(|| "unknown size".into()),
-            frac * 100.0
-        ));
+        .on_hover_text(if preparing && !self.snap.phase.is_empty() {
+            format!("{} — no data on the wire yet", self.snap.phase)
+        } else {
+            format!(
+                "{} of {} ({:.0}%)",
+                format_bytes(item.downloaded_bytes),
+                item.total_bytes
+                    .map(format_bytes)
+                    .unwrap_or_else(|| "unknown size".into()),
+                frac * 100.0
+            )
+        });
     }
 
     /// Part Info section: rule, header row with the state actions, the part

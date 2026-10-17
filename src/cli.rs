@@ -467,12 +467,23 @@ fn run_engine(
                 truncate(&name, 40),
             );
         } else {
-            eprint!(
-                "\r{} downloaded @ {}/s  {}",
-                format_bytes(dl),
-                format_bytes(spd as u64),
-                truncate(&name, 40)
-            );
+            // No size yet: during yt-dlp's extraction phase nothing is moving,
+            // so name the stage instead of printing a bare "0 B".
+            let phase = shared.phase_now();
+            if dl == 0 && !phase.is_empty() {
+                eprint!(
+                    "\r{}…  {}                    ",
+                    phase,
+                    truncate(&name, 40)
+                );
+            } else {
+                eprint!(
+                    "\r{} downloaded @ {}/s  {}",
+                    format_bytes(dl),
+                    format_bytes(spd as u64),
+                    truncate(&name, 40)
+                );
+            }
         }
         use std::io::Write;
         let _ = std::io::stderr().flush();

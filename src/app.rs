@@ -1372,6 +1372,9 @@ pub struct CraftApp {
     // ---- P5: per-download speed history (EWMA input + Details graph) ----
     // Last ≤60 half-second samples per download id, pruned with tasks.
     speed_hist: std::collections::HashMap<u64, std::collections::VecDeque<f64>>,
+    /// Stage label per active task (yt-dlp's "Getting info"/"Merging"): what a
+    /// transfer is doing while it is not moving bytes yet. Pruned with tasks.
+    phases: std::collections::HashMap<u64, String>,
     // TEMPORARY input diagnostics (removed after the hover investigation):
     // ring buffer of recent pointer/selection/action states, flushed to
     // input.log so pointer delivery can be verified without watching.
@@ -1510,6 +1513,7 @@ impl CraftApp {
             update_asset: None,
             update_auto_done: false,
             speed_hist: std::collections::HashMap::new(),
+            phases: std::collections::HashMap::new(),
             diag_lines: Vec::new(),
             diag_last: Instant::now(),
             diag_acts: 0,
@@ -1616,6 +1620,7 @@ impl CraftApp {
                     },
                     "speed": speed,
                     "resumable": task.shared.resumable.load(Ordering::SeqCst),
+                    "phase": self.phases.get(id).cloned().unwrap_or_default(),
                     "parts": parts,
                 }),
             );
@@ -2825,6 +2830,8 @@ impl CraftApp {
             t.shared.cancelled.store(true, Ordering::SeqCst);
             t.handle.abort();
         }
+        // The stage label belongs to the running helper, not the row.
+        self.phases.remove(&id);
         // Reflect the stop immediately (the finish handler would only get
         // here on its next poll): a cancelled transfer rests Paused with
         // its partial state kept for resume.
@@ -2891,6 +2898,15 @@ impl CraftApp {
         for (id, task) in self.tasks.iter_mut() {
             let dl = task.shared.downloaded.load(Ordering::SeqCst);
             let resumable = task.shared.resumable.load(Ordering::SeqCst);
+            // What the helper is doing while it is not moving bytes (yt-dlp's
+            // "Getting info"/"Merging"). Empty for the built-in engine, which
+            // is always transferring once it starts.
+            let phase = task.shared.phase_now();
+            if phase.is_empty() {
+                self.phases.remove(id);
+            } else {
+                self.phases.insert(*id, phase);
+            }
             if let Ok(mut g) = task.shared.resolved_name.lock() {
                 if let Some(name) = g.take() {
                     if let Some(d) = self.downloads.iter_mut().find(|d| d.id == *id) {
@@ -2975,6 +2991,8 @@ impl CraftApp {
         }
         let mut repair_restart: Vec<u64> = Vec::new();
         for id in finished {
+            // The helper's stage label dies with the helper.
+            self.phases.remove(&id);
             if let Some(task) = self.tasks.remove(&id) {
                 let cancelled = task.shared.cancelled.load(Ordering::SeqCst);
                 let dl = task.shared.downloaded.load(Ordering::SeqCst);
@@ -3124,6 +3142,7 @@ impl CraftApp {
             let live: std::collections::HashSet<u64> =
                 self.downloads.iter().map(|d| d.id).collect();
             self.speed_hist.retain(|id, _| live.contains(id));
+            self.phases.retain(|id, _| live.contains(id));
         }
         self.fill_next();
         self.maybe_finish_action();
@@ -4270,12 +4289,28 @@ impl eframe::App for CraftApp {
                                 .show(ui, |ui| {
                                     for id in &ids {
                                         let id = *id;
-                                        let (sel, fname, cat, size_s, prog, spd, eta, date, st) = {
+                                        let (sel, fname, cat, size_s, prog, spd, eta, date, st, preparing) = {
                                             let d = self
                                                 .downloads
                                                 .iter()
                                                 .find(|d| d.id == id)
                                                 .unwrap();
+                                            // Nothing has arrived yet: the row is in a
+                                            // phase that moves no bytes (YouTube's player
+                                            // challenge, a merge), where a motionless 0%
+                                            // reads as a hang. Say what is happening
+                                            // instead. A known size does not rule this
+                                            // out — the browser probe often measured it
+                                            // before the transfer even started.
+                                            let preparing = match self.phases.get(&id) {
+                                                Some(p)
+                                                    if d.downloaded_bytes == 0
+                                                        && p != "Downloading" =>
+                                                {
+                                                    p.clone()
+                                                }
+                                                _ => String::new(),
+                                            };
                                             (
                                                 d.selected,
                                                 d.filename.clone(),
@@ -4288,6 +4323,7 @@ impl eframe::App for CraftApp {
                                                 format_eta(d),
                                                 relative_time(&d.created_at),
                                                 d.status.clone(),
+                                                preparing,
                                             )
                                         };
                                         // Row spacer = hit + paint rect.
@@ -4359,16 +4395,21 @@ impl eframe::App for CraftApp {
                                         }
                                         SortCol::Status => match &st {
                                             Status::Downloading => {
+                                                // While a phase that moves no bytes is
+                                                // running, the pill names it instead of
+                                                // sitting on a motionless 0%.
+                                                let pill = if preparing.is_empty() {
+                                                    format!("{}%", (prog * 100.0) as u32)
+                                                } else {
+                                                    preparing.clone()
+                                                };
                                                 status_pill_at(
                                                     &p,
                                                     egui::Rect::from_min_size(
                                                         crect.min,
                                                         egui::vec2(w, 24.0),
                                                     ),
-                                                    &format!(
-                                                        "{}%",
-                                                        (prog * 100.0) as u32
-                                                    ),
+                                                    &pill,
                                                     pl().primary,
                                                 );
                                                 paint_progress(
@@ -5210,7 +5251,19 @@ impl eframe::App for CraftApp {
                                             "Status:",
                                             match item.status {
                                                 Status::Queued => "Queued".to_string(),
-                                                Status::Downloading => "Downloading".to_string(),
+                                                Status::Downloading => match self.phases.get(&item.id) {
+                                                    // "Downloading" with a motionless 0% reads
+                                                    // as a hang: name the stage the helper is
+                                                    // in while nothing is on the wire yet.
+                                                    Some(p)
+                                                        if item.downloaded_bytes == 0
+                                                            && !p.is_empty()
+                                                            && p != "Downloading" =>
+                                                    {
+                                                        format!("Downloading — {p}")
+                                                    }
+                                                    _ => "Downloading".to_string(),
+                                                },
                                                 Status::Paused => "Paused".to_string(),
                                                 Status::Completed => "Finished".to_string(),
                                                 Status::Failed(_) => "Failed".to_string(),
