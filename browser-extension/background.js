@@ -11,7 +11,7 @@ let lastFallbackError = "";
 // Must match manifest version + content.js EXT_VER. Tabs running an older
 // content script are rejected with a "reload the tab" error instead of
 // failing mysteriously (their extension APIs are gone after a reload).
-const EXT_VER = "0.6.0";
+const EXT_VER = "0.9.0";
 
 // Shared ranking (P4): playlist/segment/file kinds, scores, duplicate
 // collapse. Service workers support importScripts; if it ever fails the
