@@ -1,10 +1,17 @@
-//! Segoe UI registration shared by every window.
+//! Font registration shared by every window.
 //!
 //! The Add-download dialog and the browser-capture popup are drawn to the
 //! concept in `popup_concepts.html`, which asks for Segoe UI. Loading it as a
 //! *named* family lets those dialogs use the exact face the design was drawn in
 //! while the manager window keeps its own font. Missing system fonts fall back
 //! to the bundled defaults, so this is safe on any machine.
+//!
+//! On top of that, every window gets the system's script fonts as *fallbacks*.
+//! egui's bundled face is Latin only, so anything else - Bengali, Devanagari,
+//! Tamil, Thai, Korean, Chinese - used to come out as tofu boxes: the file
+//! name of a video titled in Bangla showed up as "Kalachan _ ▯▯▯▯▯▯ _ Tosiba".
+//! Fallbacks are consulted per glyph, so the app's own typography is untouched
+//! and only the characters it cannot draw are picked up from elsewhere.
 
 /// Named family holding Segoe UI regular (falls back to the app font).
 pub const FONT_UI: &str = "segoe";
@@ -21,7 +28,87 @@ pub fn semi(size: f32) -> egui::FontId {
     egui::FontId::new(size, egui::FontFamily::Name(FONT_SEMI.into()))
 }
 
-/// Register Material Icons plus Segoe UI.
+/// System files tried as script fallbacks: `(key, file, face index)`.
+///
+/// `Nirmala.ttc` carries the Indic scripts in one collection — Bengali
+/// (also the national language of Bangladesh), Devanagari, Gujarati,
+/// Gurmukhi, Kannada, Malayalam, Odia, Sinhala, Tamil and Telugu. The rest
+/// cover the other scripts Windows ships fonts for.
+#[cfg(windows)]
+const SYSTEM_FONTS: &[(&str, &str, u32)] = &[
+    ("nirmala", "Nirmala.ttc", 0),
+    ("leelawadee", "LeelawUI.ttf", 0),
+    ("myanmar", "mmrtext.ttf", 0),
+    ("himalaya", "himalaya.ttf", 0),
+    ("sylfaen", "sylfaen.ttf", 0),
+    ("ebrima", "ebrima.ttf", 0),
+    ("malgun", "malgun.ttf", 0),
+    ("msyh", "msyh.ttc", 0),
+    ("yugoth", "YuGothR.ttc", 0),
+    ("seguisym", "seguisym.ttf", 0),
+];
+
+#[cfg(not(windows))]
+const SYSTEM_FONTS: &[(&str, &str, u32)] = &[];
+
+/// Where the OS keeps its fonts. Windows is the only platform this app ships
+/// for (it embeds Windows resources, drives Explorer and the tray), but the
+/// lookup is written so a missing directory is simply a no-op.
+#[cfg(windows)]
+fn font_dirs() -> Vec<std::path::PathBuf> {
+    let mut dirs = Vec::new();
+    // A per-user font (`%LOCALAPPDATA%\Microsoft\Windows\Fonts`) is where a
+    // user-installed script font would land, and it is checked first so it can
+    // override the machine copy.
+    if let Ok(local) = std::env::var("LOCALAPPDATA") {
+        dirs.push(
+            std::path::Path::new(&local)
+                .join("Microsoft")
+                .join("Windows")
+                .join("Fonts"),
+        );
+    }
+    let win = std::env::var("WINDIR").unwrap_or_else(|_| "C:\\Windows".to_owned());
+    dirs.push(std::path::Path::new(&win).join("Fonts"));
+    dirs
+}
+
+/// Read one system font and register it under `key`.
+///
+/// Returns whether it was registered. epaint *panics* on a font it cannot
+/// parse (it builds the faces on first use, outside any `catch_unwind`), so a
+/// file that fails to parse is dropped here instead — a broken or exotic font
+/// in the system directory must not take the app down with it.
+fn load_system(
+    fonts: &mut egui::FontDefinitions,
+    key: &str,
+    file: &str,
+    index: u32,
+) -> bool {
+    #[cfg(not(windows))]
+    {
+        let _ = (fonts, key, file, index);
+        false
+    }
+    #[cfg(windows)]
+    {
+        let bytes = font_dirs()
+            .into_iter()
+            .find_map(|dir| std::fs::read(dir.join(file)).ok());
+        let Some(bytes) = bytes else {
+            return false;
+        };
+        if ab_glyph::FontVec::try_from_vec_and_index(bytes.clone(), index).is_err() {
+            return false;
+        }
+        let mut data = egui::FontData::from_owned(bytes);
+        data.index = index;
+        fonts.font_data.insert(key.to_owned(), std::sync::Arc::new(data));
+        true
+    }
+}
+
+/// Register Material Icons, Segoe UI and the system script fallbacks.
 ///
 /// `primary` also promotes Segoe UI to the head of the proportional family,
 /// which is what the standalone dialogs want (their whole surface is the
@@ -35,20 +122,17 @@ pub fn install(cc: &eframe::CreationContext<'_>, primary: bool) {
             "../assets/fonts/MaterialIcons-Regular.ttf"
         ))),
     );
-    let mut has_reg = false;
-    let mut has_semi = false;
-    for (key, file) in [("segoe", "segoeui.ttf"), ("segoe_semi", "seguisb.ttf")] {
-        let path = std::path::Path::new("C:\\Windows\\Fonts").join(file);
-        if let Ok(bytes) = std::fs::read(&path) {
-            fonts.font_data.insert(
-                key.to_owned(),
-                std::sync::Arc::new(egui::FontData::from_owned(bytes)),
-            );
-            if key == "segoe" {
-                has_reg = true;
-            } else {
-                has_semi = true;
-            }
+    let has_reg = load_system(&mut fonts, "segoe", "segoeui.ttf", 0);
+    let has_semi = load_system(&mut fonts, "segoe_semi", "seguisb.ttf", 0);
+    // Script fallbacks, in the order they are consulted. Segoe UI leads: it
+    // covers Greek, Cyrillic, Arabic, Hebrew and the wider Latin ranges.
+    let mut fallbacks: Vec<String> = Vec::new();
+    if has_reg {
+        fallbacks.push("segoe".to_owned());
+    }
+    for &(key, file, index) in SYSTEM_FONTS {
+        if load_system(&mut fonts, key, file, index) {
+            fallbacks.push(key.to_owned());
         }
     }
     {
@@ -59,10 +143,29 @@ pub fn install(cc: &eframe::CreationContext<'_>, primary: bool) {
         if primary && has_reg {
             prop.insert(0, "segoe".to_owned());
         }
+        for key in &fallbacks {
+            if !prop.contains(key) {
+                prop.push(key.clone());
+            }
+        }
         prop.push("material".to_owned());
     }
+    // Monospace falls back the same way: the URL and destination boxes are
+    // drawn in it, and a name in any script has to stay readable there too.
+    {
+        let mono = fonts
+            .families
+            .entry(egui::FontFamily::Monospace)
+            .or_default();
+        for key in &fallbacks {
+            if !mono.contains(key) {
+                mono.push(key.clone());
+            }
+        }
+    }
     // Named families: the regular cut prefers Segoe UI, then the app font, so
-    // icon glyphs (Material Icons) keep resolving inside the dialog too.
+    // icon glyphs (Material Icons) and every script keep resolving inside the
+    // dialog too.
     let base = fonts.families[&egui::FontFamily::Proportional].clone();
     let regular = if has_reg {
         let mut v = vec!["segoe".to_owned()];
@@ -71,8 +174,13 @@ pub fn install(cc: &eframe::CreationContext<'_>, primary: bool) {
     } else {
         base
     };
+    // Semibold keeps the concept's weight for Latin and falls through to the
+    // same fallbacks for everything else (a Bangla heading is still semibold
+    // *looking* because the fallback face is picked per glyph, not per run).
     let semibold = if has_semi {
-        vec!["segoe_semi".to_owned(), "material".to_owned()]
+        let mut v = vec!["segoe_semi".to_owned()];
+        v.extend(regular.iter().filter(|f| f.as_str() != "segoe").cloned());
+        v
     } else {
         regular.clone()
     };

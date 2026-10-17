@@ -18,6 +18,7 @@ chrono = { version = "0.4", features = ["serde", "clock"] }
 dirs = "5"
 url = "2"
 anyhow = "1"
+ab_glyph = "0.2"
 arboard = "3"
 clap = { version = "4", features = ["derive"] }
 notify-rust = "4"
