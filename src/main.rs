@@ -7,6 +7,7 @@ mod aes128;
 mod app;
 mod basket;
 mod cli;
+mod complete;
 mod confirm;
 mod dm;
 mod engine;
@@ -57,6 +58,11 @@ fn main() -> eframe::Result<()> {
     // IDM-style standalone per-download progress window.
     if args.iter().any(|a| a == "--progress") {
         return progress::run();
+    }
+    // IDM-style standalone "Download complete" dialog (popped by the app when
+    // a download finishes).
+    if args.iter().any(|a| a == "--complete") {
+        return complete::run();
     }
     // P3.3 companions: drop basket + mini status.
     if args.iter().any(|a| a == "--basket") {

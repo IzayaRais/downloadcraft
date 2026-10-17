@@ -20,6 +20,8 @@ struct Settings {
     // Appearance
     theme: String,
     close_to_tray: bool,
+    /// Pop the standalone "Download complete" dialog when a transfer ends.
+    show_complete: bool,
     // Engine
     save_dir: String,
     category_folders: bool,
@@ -45,6 +47,7 @@ impl Default for Settings {
         Self {
             theme: "dark".to_string(),
             close_to_tray: false,
+            show_complete: true,
             save_dir: dirs::download_dir()
                 .map(|p| p.to_string_lossy().to_string())
                 .unwrap_or_else(|| "C:\\Downloads".to_string()),
@@ -97,6 +100,9 @@ fn load() -> Settings {
     str_in("rename_template", &mut s.rename_template);
     if let Some(b) = g("close_to_tray").and_then(|x| x.as_bool()) {
         s.close_to_tray = b;
+    }
+    if let Some(b) = g("show_complete").and_then(|x| x.as_bool()) {
+        s.show_complete = b;
     }
     if let Some(b) = g("category_folders").and_then(|x| x.as_bool()) {
         s.category_folders = b;
@@ -169,6 +175,7 @@ fn save(s: &Settings) -> bool {
     };
     set(obj, "theme", s.theme.clone().into());
     set(obj, "close_to_tray", s.close_to_tray.into());
+    set(obj, "show_complete", s.show_complete.into());
     set(obj, "save_dir", s.save_dir.clone().into());
     set(obj, "category_folders", s.category_folders.into());
     set(obj, "connections_default", (s.connections_default as u64).into());
@@ -329,6 +336,10 @@ impl SettingsApp {
             }
         });
         ui.checkbox(&mut self.s.category_folders, "Sort into category subfolders");
+        ui.checkbox(
+            &mut self.s.show_complete,
+            "Show the \u{201c}Download complete\u{201d} dialog",
+        );
         ui.horizontal(|ui| {
             ui.label("Default connections:");
             ui.add(egui::Slider::new(&mut self.s.connections_default, 1..=16));

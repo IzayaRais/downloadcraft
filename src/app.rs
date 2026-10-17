@@ -1061,6 +1061,9 @@ pub struct CraftApp {
     col_w: std::collections::HashMap<SortCol, f32>,
     // ---- power features ----
     max_concurrent: usize,
+    /// Pop the standalone "Download complete" dialog when a download finishes.
+    /// Its own "Don't show this dialog again" checkbox clears this.
+    show_complete: bool,
     queue_running: bool,
     had_active: bool,
     timeout_secs: u64,
@@ -1199,6 +1202,7 @@ impl CraftApp {
             ],
             col_w: Default::default(),
             max_concurrent: 3,
+            show_complete: true,
             queue_running: false,
             had_active: false,
             timeout_secs: 60,
@@ -1422,6 +1426,21 @@ impl CraftApp {
         }
         let _ = cmd.spawn();
     }
+
+    /// Pop the standalone "Download complete" dialog for one finished download.
+    fn spawn_complete(id: u64) {
+        let Ok(exe) = std::env::current_exe() else {
+            return;
+        };
+        let mut cmd = std::process::Command::new(exe);
+        cmd.arg("--complete").arg(id.to_string());
+        #[cfg(windows)]
+        {
+            use std::os::windows::process::CommandExt;
+            cmd.creation_flags(0x00000008);
+        }
+        let _ = cmd.spawn();
+    }
     fn ui_state_path() -> Option<std::path::PathBuf> {
         crate::model::config_dir().map(|p| p.join("ui.json"))
     }
@@ -1474,6 +1493,7 @@ impl CraftApp {
                 "columns": order,
                 "widths": widths,
                 "max_concurrent": self.max_concurrent,
+                "show_complete": self.show_complete,
                 "timeout_secs": self.timeout_secs,
                 "max_retries": self.max_retries,
                 "user_agent": self.user_agent,
@@ -1544,6 +1564,9 @@ impl CraftApp {
                     let g = |k: &str| v.get(k);
                     if let Some(n) = g("max_concurrent").and_then(|x| x.as_u64()) {
                         self.max_concurrent = (n as usize).clamp(1, 16);
+                    }
+                    if let Some(b) = g("show_complete").and_then(|x| x.as_bool()) {
+                        self.show_complete = b;
                     }
                     if let Some(n) = g("timeout_secs").and_then(|x| x.as_u64()) {
                         self.timeout_secs = n.clamp(5, 600);
@@ -2392,6 +2415,12 @@ impl CraftApp {
         if self.tasks.contains_key(&id) {
             return;
         }
+        // IDM-style: a download that begins gets its own progress window, no
+        // matter which path started it (Add dialog, capture popup, Redownload,
+        // Resume, Start Queue, retry-all). The window claims a per-download
+        // slot, so a start while one is already open never stacks duplicates,
+        // while a window the user closed comes straight back on Retry.
+        Self::spawn_progress(id);
         let item = self.downloads[idx].clone();
         let shared = Arc::new(SharedState::new());
         if let Some(t) = item.total_bytes {
@@ -2510,6 +2539,9 @@ impl CraftApp {
             if let Some(d) = self.downloads.iter_mut().find(|d| d.id == id) {
                 d.status = Status::Downloading;
             }
+            // The window may have been closed while the transfer sat paused:
+            // reopening is cheap and a live one is left alone by its slot.
+            Self::spawn_progress(id);
             self.push_log(format!("Resumed #{id}"));
             self.save_queue();
         } else if let Some(d) = self.downloads.iter().find(|d| d.id == id) {
@@ -2794,6 +2826,11 @@ impl CraftApp {
                 }
                 if let Some((name, path)) = finished_info {
                     self.on_download_finished(&name, &path);
+                    // IDM pops its "Download complete" dialog for a finished
+                    // transfer (the dialog's own checkbox switches it off).
+                    if self.show_complete {
+                        Self::spawn_complete(id);
+                    }
                 }
                 if let Some(m) = msg {
                     self.push_log(m);
@@ -3094,7 +3131,6 @@ impl CraftApp {
             if ready {
                 self.queue_running = true;
                 self.start(id);
-                Self::spawn_progress(id);
             }
         }
     }
@@ -3142,7 +3178,7 @@ impl CraftApp {
 }
 
 /// Open a file (or reveal it in Explorer when `reveal`).
-fn open_path(path: &std::path::Path, reveal: bool) {
+pub(crate) fn open_path(path: &std::path::Path, reveal: bool) {
     if reveal {
         if path.exists() {
             let _ = std::process::Command::new("explorer")
@@ -5495,7 +5531,6 @@ impl CraftApp {
         if download {
             self.queue_running = true;
             self.start(id);
-            Self::spawn_progress(id);
         }
     }
 

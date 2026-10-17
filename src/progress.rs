@@ -300,6 +300,9 @@ struct ProgressApp {
     parts_open: bool,
     /// Part-table scroll offset in pixels (long part lists).
     scroll: f32,
+    /// The transfer finished and the "Download complete" dialog took over:
+    /// this window closes itself.
+    handoff: bool,
 }
 
 impl ProgressApp {
@@ -322,6 +325,13 @@ impl ProgressApp {
             }
         }
         self.last_poll = Instant::now();
+        // A finished transfer hands over to the standalone "Download complete"
+        // dialog, so this window has done its job (IDM closes it the same way).
+        // With that dialog switched off it stays put, which keeps its
+        // Open file / Open folder actions reachable.
+        self.handoff = !self.snap.live
+            && matches!(self.item.as_ref().map(|d| &d.status), Some(Status::Completed))
+            && crate::model::ui_pref_bool("show_complete", true);
     }
 
     /// Close bulletproofing: viewport Close is async and has been observed
@@ -356,6 +366,13 @@ pub fn run() -> eframe::Result<()> {
             eprintln!("--progress needs <id>");
             std::process::exit(2);
         });
+    // One window per download: a second start (Resume, Retry, a Redownload
+    // while one is open) must not stack duplicates, while a window the user
+    // closed must be replaceable straight away. Windows drops the claim the
+    // moment this process ends, so nothing has to clean up after a crash.
+    let Some(_slot) = crate::model::claim_window(&format!("progress_{id}")) else {
+        return Ok(());
+    };
     // Seed controls from shared settings (global limit + finish action).
     let (limit_input, finish_sel) = read_ui_prefs();
     let mut app = ProgressApp {
@@ -371,6 +388,7 @@ pub fn run() -> eframe::Result<()> {
         win_h: 0.0,
         parts_open: true,
         scroll: 0.0,
+        handoff: false,
     };
     app.refresh();
     let title = app
@@ -417,6 +435,9 @@ impl eframe::App for ProgressApp {
         if self.last_poll.elapsed() >= Duration::from_millis(500) {
             self.refresh();
         }
+        if self.handoff {
+            Self::close_soon(ctx);
+        }
         ctx.request_repaint_after(Duration::from_millis(500));
 
         // The card follows the concept's own rules: one 25px row per part,
@@ -426,7 +447,11 @@ impl eframe::App for ProgressApp {
         let want_h = match (&self.item, self.tab) {
             (None, _) => PG_DEAD_H,
             (Some(_), 0) if parts > 0 && self.parts_open => card_h(parts),
-            (Some(_), 0) if parts > 0 => PG_PART_HEAD_H,
+            // Info always keeps the part header row: it carries the state
+            // actions (Pause/Resume/Cancel, and Open file/folder + Close once
+            // the transfer is done), so a finished download is not a dead end
+            // even though the engine drops the part snapshot at the end.
+            (Some(_), 0) => PG_PART_HEAD_H,
             _ => PG_MIN_H,
         };
         let want_h = match ctx.input(|i| i.viewport().monitor_size) {
@@ -591,7 +616,7 @@ impl ProgressApp {
             _ => self.body_info(ui, o, item, downloading),
         }
         self.progress_bar(ui, o, item, frac);
-        if self.tab == 0 && !self.snap.parts.is_empty() {
+        if self.tab == 0 {
             self.parts(ui, o, item, downloading);
         }
     }
@@ -903,6 +928,10 @@ impl ProgressApp {
         let done = matches!(item.status, Status::Completed);
         let failed = matches!(item.status, Status::Failed(_));
         let paused = matches!(item.status, Status::Paused);
+        // A live transfer always has parts; a finished/failed one has none
+        // (the engine drops the snapshot), which must not cost the header row
+        // its actions.
+        let has_parts = !self.snap.parts.is_empty();
         p.line_segment(
             [
                 egui::pos2(o.x + 1.0, o.y + PART_Y + 0.5),
@@ -915,13 +944,17 @@ impl ProgressApp {
             egui::Vec2::splat(12.0),
         );
         let cb = ui
-            .interact(chev.expand(6.0), egui::Id::new("pg-chev"), egui::Sense::click())
-            .on_hover_text(if self.parts_open {
+            .interact(chev.expand(6.0), egui::Id::new("pg-chev"), egui::Sense::click());
+        let cb = if has_parts {
+            cb.on_hover_text(if self.parts_open {
                 "Hide the part list"
             } else {
                 "Show the part list"
-            });
-        if cb.hovered() {
+            })
+        } else {
+            cb
+        };
+        if cb.hovered() && has_parts {
             ctx.set_cursor_icon(egui::CursorIcon::PointingHand);
         }
         dm_icon(
@@ -942,7 +975,7 @@ impl ProgressApp {
             reg(12.0),
             DM_DIM,
         );
-        if cb.clicked() {
+        if cb.clicked() && has_parts {
             self.parts_open = !self.parts_open;
         }
         // Right cluster, right-aligned on the content edge: the concept's
@@ -1024,7 +1057,9 @@ impl ProgressApp {
             }
             right -= w + 18.0;
         }
-        if !self.parts_open {
+        // No snapshot (finished, failed or not yet started): the header row
+        // above *is* the whole section — it still holds the state actions.
+        if !has_parts || !self.parts_open {
             return;
         }
 

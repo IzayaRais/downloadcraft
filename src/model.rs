@@ -448,6 +448,55 @@ pub fn config_dir() -> Option<std::path::PathBuf> {
     dirs::config_dir().map(|p| p.join(APP_SLUG))
 }
 
+/// Claim the single-instance slot for a standalone window (`name` values look
+/// like `progress_12` / `complete_12`). Windows enforces the exclusivity and
+/// releases it when the owning process ends, so a window the user closed frees
+/// its slot immediately — that is what lets a later Retry pop a fresh one
+/// instead of a duplicate. `None` means another process already holds it.
+pub fn claim_window(name: &str) -> Option<std::fs::File> {
+    let dir = config_dir()?.join("win");
+    let _ = std::fs::create_dir_all(&dir);
+    let mut opts = std::fs::OpenOptions::new();
+    opts.write(true).create(true).truncate(false);
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        // No other process may even open it while this handle lives.
+        opts.share_mode(0);
+    }
+    opts.open(dir.join(name)).ok()
+}
+
+/// Read a boolean preference out of ui.json (the main app's settings file)
+/// with a default, so standalone windows honour app settings without pulling
+/// in the app module.
+pub fn ui_pref_bool(key: &str, default: bool) -> bool {
+    config_dir()
+        .and_then(|p| std::fs::read_to_string(p.join("ui.json")).ok())
+        .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
+        .and_then(|v| v.get(key).and_then(|x| x.as_bool()))
+        .unwrap_or(default)
+}
+
+/// Merge one boolean into ui.json, leaving every other key alone. The main app
+/// watches that file's mtime and reloads it, so the change lands live.
+pub fn ui_pref_set_bool(key: &str, value: bool) {
+    let Some(p) = config_dir().map(|d| d.join("ui.json")) else {
+        return;
+    };
+    let mut v: serde_json::Value = std::fs::read_to_string(&p)
+        .ok()
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_else(|| serde_json::json!({}));
+    let Some(obj) = v.as_object_mut() else {
+        return;
+    };
+    obj.insert(key.to_string(), serde_json::Value::Bool(value));
+    if let Ok(json) = serde_json::to_string_pretty(&v) {
+        let _ = atomic_write(&p, json.as_bytes());
+    }
+}
+
 /// One-time migration from the legacy `idm_rust` config dir: moves
 /// queue/settings/inbox files so existing installs keep their history.
 /// Safe to call on every startup (no-op once migrated).
