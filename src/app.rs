@@ -2944,7 +2944,15 @@ impl CraftApp {
                     // feed the graph.
                     let delta = d.downloaded_bytes.saturating_sub(task.last_bytes) as f64;
                     let raw = if el > 0.0 { delta / el } else { 0.0 };
-                    d.speed_bps = if d.speed_bps <= 0.0 {
+                    // A helper that measures the rate itself (yt-dlp) is more
+                    // accurate than differencing a counter that spans several
+                    // connections and streams - but only use it while bytes are
+                    // still arriving, so a stalled transfer cannot show a rate
+                    // frozen at its last value.
+                    let reported = task.shared.speed_bps.load(Ordering::SeqCst) as f64;
+                    d.speed_bps = if delta > 0.0 && reported > 0.0 {
+                        reported
+                    } else if d.speed_bps <= 0.0 {
                         raw
                     } else {
                         0.55 * raw + 0.45 * d.speed_bps

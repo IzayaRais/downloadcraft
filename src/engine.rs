@@ -10,6 +10,10 @@ pub struct SharedState {
     pub downloaded: AtomicU64,
     pub total: AtomicU64,
     pub has_total: AtomicBool,
+    /// Transfer rate in bytes/s reported by the helper itself (yt-dlp). Left at
+    /// 0 by the built-in engine, which lets the UI measure the rate from the
+    /// byte counter instead.
+    pub speed_bps: AtomicU64,
     pub paused: AtomicBool,
     pub cancelled: AtomicBool,
     /// Engine-detected filename (Content-Disposition / video title).
@@ -33,6 +37,7 @@ impl SharedState {
             downloaded: AtomicU64::new(0),
             total: AtomicU64::new(0),
             has_total: AtomicBool::new(false),
+            speed_bps: AtomicU64::new(0),
             paused: AtomicBool::new(false),
             cancelled: AtomicBool::new(false),
             resolved_name: std::sync::Mutex::new(None),
@@ -3374,6 +3379,49 @@ fn ytdlp_format(pref: &str) -> String {
 /// that gates 1080p+ (plain HTTP sees only the stream's first ~minute, then
 /// 403 forever) and merges the legs itself. Progress lines keep the row and
 /// the progress window live; cancelling kills the child.
+/// Marker in front of every progress line yt-dlp prints.
+///
+/// `--progress-template [TYPES:]TEMPLATE` keeps only the template text, so the
+/// type cannot be used as the marker the reader looks for - which is exactly
+/// why a yt-dlp download used to show no progress at all while the transfer
+/// ran at full speed: the line `@1024/NA` never matched `download:@`.
+const PROGRESS_MARK: &str = "dcp@";
+
+/// The `--progress-template` value: `bytes done | size | size estimate | rate`.
+///
+/// `total_bytes` is `NA` until the response headers are in, and stays `NA`
+/// forever for some formats (DASH/HLS fragments), which is what the estimate
+/// covers.
+fn ytdlp_progress_template() -> String {
+    format!(
+        "download:{PROGRESS_MARK}%(progress.downloaded_bytes)s|%(progress.total_bytes)s|%(progress.total_bytes_estimate)s|%(progress.speed)s"
+    )
+}
+
+/// One progress line, parsed. A field is `None` when yt-dlp printed `NA`.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+struct YtdlpProgress {
+    done: Option<f64>,
+    total: Option<f64>,
+    estimate: Option<f64>,
+    speed: Option<f64>,
+}
+
+/// Read a progress line, or `None` when this line is not one.
+fn parse_progress_line(line: &str) -> Option<YtdlpProgress> {
+    // Searched for rather than prefix-matched: the first line of a stream can
+    // carry a stray carriage return, and yt-dlp interleaves other messages.
+    let at = line.find(PROGRESS_MARK)?;
+    let mut field = line[at + PROGRESS_MARK.len()..].split('|');
+    let num = |v: Option<&str>| v.map(str::trim).and_then(|v| v.parse::<f64>().ok());
+    Some(YtdlpProgress {
+        done: num(field.next()),
+        total: num(field.next()),
+        estimate: num(field.next()),
+        speed: num(field.next()),
+    })
+}
+
 async fn download_with_ytdlp(
     exe: &std::path::Path,
     url: &str,
@@ -3400,7 +3448,7 @@ async fn download_with_ytdlp(
         .arg("--no-warnings")
         .arg("--newline")
         .arg("--progress-template")
-        .arg("download:@%(progress.downloaded_bytes)s/%(progress.total_bytes_estimate)s")
+        .arg(ytdlp_progress_template())
         .arg("--retries")
         .arg(opts.max_retries.max(1).to_string())
         .arg("--socket-timeout")
@@ -3449,19 +3497,31 @@ async fn download_with_ytdlp(
     let progress = Arc::clone(shared);
     let out_task = tokio::spawn(async move {
         let mut lines = tokio::io::BufReader::new(stdout).lines();
+        // A merged YouTube download is two transfers - video, then audio - and
+        // the second one restarts its byte counter at 0. Fold the finished one
+        // into `base` when that happens, so the bar keeps moving forward
+        // instead of snapping back, and the reported size ends up being the
+        // size of both streams together.
+        let (mut base, mut last, mut last_total) = (0u64, 0u64, 0u64);
         while let Ok(Some(line)) = lines.next_line().await {
-            let Some(rest) = line.strip_prefix("download:@") else {
+            let Some(p) = parse_progress_line(&line) else {
                 continue;
             };
-            let mut parts = rest.split('/');
-            let done = parts.next().and_then(|v| v.trim().parse::<u64>().ok());
-            let total = parts.next().and_then(|v| v.trim().parse::<u64>().ok());
-            if let Some(d) = done {
-                progress.downloaded.store(d, Ordering::SeqCst);
+            if let Some(done) = p.done.map(|d| d.max(0.0) as u64) {
+                if done + 1 < last {
+                    base += last_total.max(last);
+                    last_total = 0;
+                }
+                last = done;
+                progress.downloaded.store(base + done, Ordering::SeqCst);
             }
-            if let Some(t) = total.filter(|t| *t > 0) {
-                progress.total.store(t, Ordering::SeqCst);
+            if let Some(total) = p.total.or(p.estimate).filter(|t| *t > 0.0) {
+                last_total = total as u64;
+                progress.total.store(base + total as u64, Ordering::SeqCst);
                 progress.has_total.store(true, Ordering::SeqCst);
+            }
+            if let Some(speed) = p.speed.filter(|s| *s > 0.0) {
+                progress.speed_bps.store(speed as u64, Ordering::SeqCst);
             }
         }
     });
@@ -5480,6 +5540,32 @@ mod tests {
         assert!(out.ends_with(".mp4"));
         assert!(out.len() <= 124);
         assert!(String::from_utf8(out.clone().into_bytes()).is_ok());
+    }
+
+    #[test]
+    fn ytdlp_progress_lines_are_read() {
+        // Captured live from yt-dlp (`--newline`, local HTTP server). The
+        // reader used to look for the `download:` type prefix, which yt-dlp
+        // strips before printing, so a whole yt-dlp transfer ran with no
+        // progress, no size and no speed in the UI.
+        let p = parse_progress_line("dcp@1024|20480000|NA|339953.0865917366").unwrap();
+        assert_eq!(p.done, Some(1024.0));
+        assert_eq!(p.total, Some(20480000.0));
+        assert_eq!(p.estimate, None);
+        assert!(p.speed.unwrap() > 300_000.0);
+        // The marker has to be part of the *template*, since the type prefix
+        // never reaches stdout.
+        let tpl = ytdlp_progress_template();
+        assert!(tpl.starts_with("download:"));
+        assert!(tpl.contains(PROGRESS_MARK));
+        assert!(tpl.contains("%(progress.downloaded_bytes)s"));
+        // Other lines are ignored, a leading CR is tolerated, and `NA` fields
+        // simply stay unknown instead of zeroing the counters.
+        assert!(parse_progress_line("[download] Destination: x.mp4").is_none());
+        assert_eq!(parse_progress_line("\rdcp@5|10|NA|1").unwrap().done, Some(5.0));
+        let estimate_only = parse_progress_line("dcp@7|NA|900|NA").unwrap();
+        assert_eq!(estimate_only.total, None);
+        assert_eq!(estimate_only.estimate, Some(900.0));
     }
 
     #[test]
