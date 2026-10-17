@@ -560,6 +560,47 @@
     return `${Math.floor(n / 60)}:${String(n % 60).padStart(2, "0")}`;
   }
 
+  // Brand mark for the floating "Download this video" buttons: the outlined
+  // accent circle with a download arrow — the same mark the app draws in its
+  // own title bar (and the icon shipped in assets/icon.png). Inline SVG keeps
+  // it crisp at every UI scale and needs no web_accessible_resources entry.
+  function brandIcon(px) {
+    const NS = "http://www.w3.org/2000/svg";
+    const svg = document.createElementNS(NS, "svg");
+    svg.setAttribute("viewBox", "0 0 24 24");
+    svg.setAttribute("width", String(px));
+    svg.setAttribute("height", String(px));
+    svg.setAttribute("aria-hidden", "true");
+    svg.setAttribute("focusable", "false");
+    svg.style.cssText = "flex:0 0 auto;display:block;pointer-events:none;";
+    const add = (tag, attrs) => {
+      const el = document.createElementNS(NS, tag);
+      for (const k in attrs) el.setAttribute(k, attrs[k]);
+      svg.appendChild(el);
+    };
+    add("circle", { cx: "12", cy: "12", r: "9", fill: "none", stroke: "#3b82f6", "stroke-width": "2" });
+    add("path", {
+      d: "M12 8v7M8.5 11.5 12 15l3.5-3.5",
+      fill: "none",
+      stroke: "#3b82f6",
+      "stroke-width": "2",
+      "stroke-linecap": "round",
+      "stroke-linejoin": "round",
+    });
+    return svg;
+  }
+
+  // "[icon] Download this video": the label lives in its own span so a state
+  // update that rewrites a button's text can never drop the mark.
+  function labelButton(b, text, iconPx) {
+    b.appendChild(brandIcon(iconPx));
+    const span = document.createElement("span");
+    span.setAttribute("data-dc", "label");
+    span.textContent = text;
+    b.appendChild(span);
+    return span;
+  }
+
   // In-page menu theming (dark + light like the "extension ui.png" mockup).
   // Real implementation lives in rank.js (node-tested); these wrappers
   // degrade to the historic dark look when rank.js failed to load.
@@ -751,9 +792,10 @@
     btn.dataset.vid = info.videoId;
     btn.dataset.gen = String(GEN);
     btn.dataset.sig = sigParts.join("|");
-    btn.textContent = "⬇ Download this video";
+    labelButton(btn, "Download this video", 15);
     btn.title = "Send video to Download Craft";
     btn.style.cssText = [
+      "display:inline-flex", "align-items:center", "gap:7px", "white-space:nowrap",
       "padding:6px 13px", "border-radius:999px", "border:1px solid rgba(255,255,255,.13)",
       "background:rgba(12,12,16,.68)", "backdrop-filter:blur(10px)",
       "color:#f2f2f7", "font:500 12px/1.4 system-ui,sans-serif", "letter-spacing:.02em",
@@ -1034,11 +1076,12 @@
         const r = v.getBoundingClientRect ? v.getBoundingClientRect() : null;
         if (r && (r.width < 120 || r.height < 70)) continue;
         const pill = document.createElement("button");
-        pill.textContent = "⬇ Download this video";
+        labelButton(pill, "Download this video", 13);
         pill.title = "Send to Download Craft";
         pill.setAttribute("data-dc-pill", "1");
         pill.dataset.gen = String(GEN);
         pill.style.cssText = [
+          "display:inline-flex", "align-items:center", "gap:6px", "white-space:nowrap",
           "position:absolute", "top:8px", "right:8px", "z-index:2147483646",
           "padding:4px 10px", "border-radius:999px",
           "border:1px solid rgba(255,255,255,.15)",
