@@ -1,18 +1,23 @@
 //! IDM-style standalone per-download progress window.
 //!
-//! Launched as a separate always-on-top OS window when a download starts
-//! from a confirm dialog or the main Add dialog:
-//!   `download_craft.exe --progress <id>`
+//! Launched as a separate window when a download starts from a confirm dialog
+//! or the main Add dialog: `download_craft.exe --progress <id>`.
+//!
+//! The surface is the card drawn in `Downloading gui concepts.html` — frameless
+//! and transparent, so that rounded card *is* the window: title bar with the
+//! IDM percentage prefix, the Info/Speed/Settings segmented tabs, the info
+//! rows, the accent progress bar and the Part Info strip + table. Every offset
+//! below is that layout in egui space, origin = card top-left, card border
+//! included (the concept renders 522 wide, 553 tall at its six sample parts).
 //!
 //! The main app (which owns the engine tasks) publishes live numbers to
-//! `progress.json` ~1/s; this window polls that file + `queue.json` and
-//! renders Name/Status/Size/Downloaded/Speed/ETA + per-part table.
-//! Pause/Resume/Cancel go back through `cmd.json`, polled by the main app.
-//! Closing this window never stops the download (like IDM).
+//! `progress.json` ~1/s; this window polls that file + `queue.json` and draws
+//! them. Pause/Resume/Cancel go back through `cmd.json`, polled by the main
+//! app. Closing this window never stops the download (like IDM).
 
-use crate::model::{config_dir, format_bytes, DownloadItem};
+use crate::dm::*;
+use crate::model::{config_dir, format_bytes, DownloadItem, Status};
 use std::time::{Duration, Instant};
-
 fn queue_path() -> Option<std::path::PathBuf> {
     config_dir().map(|p| p.join("queue.json"))
 }
@@ -149,7 +154,8 @@ fn open_path(p: &std::path::Path) {
     }
 }
 
-fn fmt_eta(left: u64, speed: f64) -> String {    if speed <= 1.0 {
+fn fmt_eta(left: u64, speed: f64) -> String {
+    if speed <= 1.0 {
         return "-".to_string();
     }
     let secs = (left as f64 / speed) as u64;
@@ -162,16 +168,138 @@ fn fmt_eta(left: u64, speed: f64) -> String {    if speed <= 1.0 {
     }
 }
 
+// ================= concept geometry =================
+// `Downloading gui concepts.html` (measured in Chrome, border-box):
+//   card     522 wide (520 content + 2x1px border), 403 + 25n tall
+//   header   1..45     mark 20 at (17,13), title 14/500 at x=45, controls 14
+//   tabs     45..82    trough (17,53,488,29), three 161.33x25 segments
+//   info     82..293   seven 13px rows at y=98 step 27, right edge 503
+//   progress 293..313  track (19,293,484,8), r4, accent gradient fill
+//   parts    313..     rule, Part Info row (h16 at y=324), strip (y=348,h10),
+//                      table header (y=366,h23), rows at y=389 step 25, pad 14
+
+/// Concept card width, border-box.
+const PG_W: f32 = 522.0;
+/// Card height with no part list: title + tabs + info + progress + rule.
+const PG_MIN_H: f32 = 314.0;
+/// Card height with the part list collapsed but its header row still shown
+/// (the chevron and the Pause/Close actions must stay reachable).
+const PG_PART_HEAD_H: f32 = 349.0;
+/// Dead state (the item left the queue): title + notice + Close.
+const PG_DEAD_H: f32 = 163.0;
+
+const HDR_H: f32 = 44.0;
+const MARK_X: f32 = 17.0;
+const MARK_Y: f32 = 13.0;
+const MARK_S: f32 = 20.0;
+const TITLE_X: f32 = 45.0;
+/// Vertical centre of the header (and of its two window controls).
+const HDR_CY: f32 = 23.0;
+const CTL_X1: f32 = 468.0;
+const CTL_X2: f32 = 498.0;
+
+const SEG_X: f32 = 17.0;
+const SEG_Y: f32 = 53.0;
+const SEG_W: f32 = 488.0;
+const SEG_H: f32 = 29.0;
+const SEG_PAD: f32 = 2.0;
+const TAB_H: f32 = 25.0;
+const TAB_ICON: f32 = 15.0;
+
+/// Content gutter (the concept's 16/18px padding inside the 1px border).
+const PAD_X: f32 = 19.0;
+/// Content right edge.
+const IN_R: f32 = 503.0;
+const INFO_Y: f32 = 98.0;
+const ROW_STEP: f32 = 27.0;
+const ROW_H: f32 = 17.0;
+
+const PROG_Y: f32 = 293.0;
+const PROG_W: f32 = 484.0;
+const PROG_H: f32 = 8.0;
+
+const PART_Y: f32 = 313.0;
+const HEAD_Y: f32 = 324.0;
+const HEAD_H: f32 = 16.0;
+const STRIP_Y: f32 = 348.0;
+const STRIP_H: f32 = 10.0;
+const TBL_HDR_Y: f32 = 366.0;
+const TBL_HDR_H: f32 = 23.0;
+const TBL_Y: f32 = 389.0;
+const TBL_STEP: f32 = 25.0;
+const TBL_PAD: f32 = 5.0;
+const FOOT_PAD: f32 = 14.0;
+/// Table columns: # | Status (flex) | Downloaded | Total, both right on IN_R.
+const COL_NUM_W: f32 = 24.0;
+const COL_DL_X: f32 = IN_R - 170.0;
+const COL_TOT_X: f32 = IN_R - 80.0;
+
+/// Card height with `n` part rows — 553 at the concept's six samples.
+fn card_h(n: usize) -> f32 {
+    403.0 + TBL_STEP * n as f32
+}
+
+/// The concept's three tabs, in its order.
+const TABS: [(DmIcon, &str); 3] = [
+    (DmIcon::Info, "Info"),
+    (DmIcon::Chart, "Speed"),
+    (DmIcon::Sliders, "Settings"),
+];
+
+/// Card-local rect (origin = the card's top-left, border included).
+fn at(o: egui::Pos2, x: f32, y: f32, w: f32, h: f32) -> egui::Rect {
+    egui::Rect::from_min_size(egui::pos2(o.x + x, o.y + y), egui::vec2(w, h))
+}
+
+/// One concept info row: dim 13px label at the gutter, value right on IN_R.
+fn info_row(
+    p: &egui::Painter,
+    o: egui::Pos2,
+    i: usize,
+    label: &str,
+    value: String,
+    col: egui::Color32,
+    font: egui::FontId,
+) {
+    let y = o.y + INFO_Y + ROW_STEP * i as f32;
+    let lw = p
+        .layout_no_wrap(label.to_string(), reg(13.0), DM_LBL)
+        .size()
+        .x;
+    p.text(
+        egui::pos2(o.x + PAD_X, y),
+        egui::Align2::LEFT_TOP,
+        label.to_string(),
+        reg(13.0),
+        DM_LBL,
+    );
+    let v = elide_mid(p, &value, font.clone(), IN_R - PAD_X - lw - 12.0);
+    p.text(
+        egui::pos2(o.x + IN_R, y),
+        egui::Align2::RIGHT_TOP,
+        v,
+        font,
+        col,
+    );
+}
+
 struct ProgressApp {
     id: u64,
     centered: bool,
     last_poll: Instant,
     item: Option<DownloadItem>,
     snap: Snap,
-    tab: u8, // 0 info, 1 speed, 2 on-completion
+    /// 0 Info, 1 Speed, 2 Settings — the concept's tabs.
+    tab: u8,
     limit_input: String,
     limit_known: Option<u64>,
     finish_sel: String,
+    /// Last height sent to the OS, so the window is only resized on change.
+    win_h: f32,
+    /// Chevron state of the part section.
+    parts_open: bool,
+    /// Part-table scroll offset in pixels (long part lists).
+    scroll: f32,
 }
 
 impl ProgressApp {
@@ -188,8 +316,7 @@ impl ProgressApp {
                     it.total_bytes = new_total;
                     it.downloaded_bytes = self.snap.downloaded;
                 } else {
-                    it.downloaded_bytes =
-                        it.downloaded_bytes.max(self.snap.downloaded);
+                    it.downloaded_bytes = it.downloaded_bytes.max(self.snap.downloaded);
                 }
                 it.speed_bps = self.snap.speed;
             }
@@ -208,17 +335,12 @@ impl ProgressApp {
         });
     }
 
-    /// Single-line middle-truncated filename (`AQPu4kS…-fq.mp4`); full name
-    /// rides along as hover text at the call site.
-    fn short_name(name: &str) -> String {
-        const MAX: usize = 44;
-        let chars: Vec<char> = name.chars().collect();
-        if chars.len() <= MAX {
-            return name.to_string();
+    /// Progress as a 0..1 fraction (unknown size = 0).
+    fn frac(item: &DownloadItem) -> f32 {
+        match item.total_bytes {
+            Some(t) if t > 0 => (item.downloaded_bytes as f32 / t as f32).clamp(0.0, 1.0),
+            _ => 0.0,
         }
-        let head: String = chars[..20].iter().collect();
-        let tail: String = chars[chars.len() - 20..].iter().collect();
-        format!("{head}…{tail}")
     }
 }
 
@@ -246,6 +368,9 @@ pub fn run() -> eframe::Result<()> {
         limit_input,
         limit_known: None,
         finish_sel,
+        win_h: 0.0,
+        parts_open: true,
+        scroll: 0.0,
     };
     app.refresh();
     let title = app
@@ -256,10 +381,11 @@ pub fn run() -> eframe::Result<()> {
 
     let mut viewport = egui::ViewportBuilder::default()
         .with_title(title)
-        .with_inner_size([420.0, 320.0])
-        .with_min_inner_size([400.0, 300.0])
-        .with_always_on_top()
-        .with_resizable(true);
+        .with_inner_size([PG_W, PG_MIN_H])
+        .with_resizable(false)
+        .with_decorations(false)
+        .with_transparent(true)
+        .with_always_on_top();
     if let Ok(icon) = eframe::icon_data::from_png_bytes(include_bytes!("../assets/icon.png")) {
         viewport = viewport.with_icon(std::sync::Arc::new(icon));
     }
@@ -270,7 +396,9 @@ pub fn run() -> eframe::Result<()> {
             ..Default::default()
         },
         Box::new(|cc| {
-            crate::app::setup_fonts(cc);
+            // `true`: this whole window is the concept, so Segoe UI also
+            // becomes its default proportional face.
+            crate::fonts::install(cc, true);
             cc.egui_ctx.set_visuals(crate::app::dark_visuals());
             crate::app::apply_widget_theme(&cc.egui_ctx);
             Ok(Box::new(app))
@@ -279,274 +407,797 @@ pub fn run() -> eframe::Result<()> {
 }
 
 impl eframe::App for ProgressApp {
+    /// Transparent and frameless: the concept's rounded card is painted by
+    /// hand, so the surface behind it must stay clear.
+    fn clear_color(&self, _visuals: &egui::Visuals) -> [f32; 4] {
+        [0.0, 0.0, 0.0, 0.0]
+    }
+
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        if !self.centered {
-            self.centered = true;
-            let mon = ctx.input(|i| i.viewport().monitor_size);
-            if let Some(m) = mon {
-                let (w, h) = (420.0, 320.0);
-                if m.x > w && m.y > h {
-                    ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(
-                        egui::Pos2::new((m.x - w) / 2.0, (m.y - h) / 2.0),
-                    ));
-                }
-            }
-        }
         if self.last_poll.elapsed() >= Duration::from_millis(500) {
             self.refresh();
         }
         ctx.request_repaint_after(Duration::from_millis(500));
 
-        let green = egui::Color32::from_rgb(80, 200, 120);
-        let Some(item) = self.item.clone() else {
-            egui::CentralPanel::default().show(ctx, |ui| {
-                ui.heading(format!("Download #{}", self.id));
-                ui.label("No longer in the queue.");
-                if ui.button("Close").clicked() {
-                    Self::close_soon(ctx);
+        // The card follows the concept's own rules: one 25px row per part,
+        // everything else fixed. A monitor-sized cap keeps a 32-connection
+        // list usable — the table scrolls instead of leaving the screen.
+        let parts = self.snap.parts.len();
+        let want_h = match (&self.item, self.tab) {
+            (None, _) => PG_DEAD_H,
+            (Some(_), 0) if parts > 0 && self.parts_open => card_h(parts),
+            (Some(_), 0) if parts > 0 => PG_PART_HEAD_H,
+            _ => PG_MIN_H,
+        };
+        let want_h = match ctx.input(|i| i.viewport().monitor_size) {
+            Some(m) => want_h.min((m.y - 80.0).max(PG_MIN_H)),
+            None => want_h,
+        };
+        if (self.win_h - want_h).abs() > 0.5 {
+            self.win_h = want_h;
+            ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(egui::vec2(PG_W, want_h)));
+        }
+        // Center once on the primary monitor (Windows otherwise cascades).
+        if !self.centered {
+            self.centered = true;
+            if let Some(m) = ctx.input(|i| i.viewport().monitor_size) {
+                if m.x > PG_W && m.y > want_h {
+                    ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(egui::Pos2::new(
+                        (m.x - PG_W) / 2.0,
+                        (m.y - want_h) / 2.0,
+                    )));
+                }
+            }
+        }
+
+        let item = self.item.clone();
+        egui::CentralPanel::default()
+            .frame(egui::Frame::NONE)
+            .show(ctx, |ui| {
+                let o = ui.max_rect().min;
+                match item.as_ref() {
+                    Some(it) => self.paint(ui, it, o),
+                    None => self.paint_dead(ui, o),
                 }
             });
-            return;
-        };
-        let downloading = self.snap.live
-            && matches!(
-                item.status,
-                crate::model::Status::Downloading | crate::model::Status::Queued
-            );
-        let paused = matches!(item.status, crate::model::Status::Paused);
-        let done = matches!(item.status, crate::model::Status::Completed);
-        let failed = matches!(item.status, crate::model::Status::Failed(_));
+    }
+}
 
-        // Pinned action row: reserved by the OS layout pass, so the buttons
-        // can never be scrolled or clipped out of the window.
-        egui::TopBottomPanel::bottom("progress_actions").show(ctx, |ui| {
-            ui.add_space(4.0);
-            ui.horizontal(|ui| {
-                if done {
-                    if ui.add_sized([110.0, 32.0], egui::Button::new("Open file")).clicked() {
-                        open_path(&item.dest_path());
-                    }
-                    if ui.add_sized([110.0, 32.0], egui::Button::new("Open folder")).clicked() {
+impl ProgressApp {
+    /// Card background, title bar and the tab strip — every state shares it.
+    fn chrome(&mut self, ui: &mut egui::Ui, o: egui::Pos2, title: &str) {
+        let ctx = ui.ctx().clone();
+        let p = ui.painter().clone();
+        p.rect(
+            ui.max_rect(),
+            8.0,
+            DM_CARD,
+            egui::Stroke::new(1.0, DM_LINE),
+            egui::StrokeKind::Inside,
+        );
+        dm_mark(&p, at(o, MARK_X, MARK_Y, MARK_S, MARK_S));
+        p.text(
+            egui::pos2(o.x + TITLE_X, o.y + HDR_CY),
+            egui::Align2::LEFT_CENTER,
+            title.to_string(),
+            semi(14.0),
+            DM_TXT,
+        );
+        // The bar drags the window, like the capture popup's header.
+        if ui
+            .interact(
+                at(o, 0.0, 0.0, PG_W - 100.0, HDR_H),
+                egui::Id::new("pg-header"),
+                egui::Sense::click_and_drag(),
+            )
+            .drag_started()
+        {
+            ctx.send_viewport_cmd(egui::ViewportCommand::StartDrag);
+        }
+        for (i, cx, icon, id, tip) in [
+            (0usize, CTL_X1, DmIcon::Minimize, "pg-min", "Minimise"),
+            (1, CTL_X2, DmIcon::Close, "pg-close", "Close"),
+        ] {
+            let r = egui::Rect::from_center_size(
+                egui::pos2(o.x + cx, o.y + HDR_CY),
+                egui::Vec2::splat(14.0),
+            );
+            let b = ui
+                .interact(r.expand(5.0), egui::Id::new(id), egui::Sense::click())
+                .on_hover_text(tip);
+            if b.hovered() {
+                p.rect_filled(r.expand(5.0), DM_RAD, DM_HOVER2);
+                ctx.set_cursor_icon(egui::CursorIcon::PointingHand);
+            }
+            dm_icon(&p, r, icon, if b.hovered() { DM_TXT } else { DM_DIM }, 2.0);
+            if b.clicked() {
+                if i == 0 {
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(true));
+                } else {
+                    Self::close_soon(&ctx);
+                }
+            }
+        }
+    }
+
+    /// The concept's segmented control: trough, one segment per tab.
+    fn tabs(&mut self, ui: &mut egui::Ui, o: egui::Pos2) {
+        let ctx = ui.ctx().clone();
+        let p = ui.painter().clone();
+        p.rect_filled(at(o, SEG_X, SEG_Y, SEG_W, SEG_H), 7.0, DM_TROUGH);
+        let tw = (SEG_W - 2.0 * SEG_PAD) / TABS.len() as f32;
+        for (i, (icon, name)) in TABS.iter().enumerate() {
+            let r = at(o, SEG_X + SEG_PAD + i as f32 * tw, SEG_Y + SEG_PAD, tw, TAB_H);
+            let b = ui.interact(r, egui::Id::new(("pg-tab", i)), egui::Sense::click());
+            let sel = self.tab as usize == i;
+            if sel {
+                dm_gradient(&p, r, 5.0, DM_ACC, DM_ACC2);
+            } else if b.hovered() {
+                p.rect_filled(r, 5.0, DM_HOVER);
+            }
+            if b.hovered() {
+                ctx.set_cursor_icon(egui::CursorIcon::PointingHand);
+            }
+            let col = if sel { egui::Color32::WHITE } else { DM_LBL };
+            let font = if sel { semi(10.0) } else { reg(10.0) };
+            let gw = p
+                .layout_no_wrap((*name).to_string(), font.clone(), col)
+                .size()
+                .x;
+            let x0 = r.center().x - (TAB_ICON + 5.0 + gw) / 2.0;
+            dm_icon(
+                &p,
+                egui::Rect::from_center_size(
+                    egui::pos2(x0 + TAB_ICON / 2.0, r.center().y),
+                    egui::Vec2::splat(TAB_ICON),
+                ),
+                *icon,
+                col,
+                2.0,
+            );
+            p.text(
+                egui::pos2(x0 + TAB_ICON + 5.0, r.center().y),
+                egui::Align2::LEFT_CENTER,
+                (*name).to_string(),
+                font,
+                col,
+            );
+            if b.clicked() {
+                self.tab = i as u8;
+            }
+        }
+    }
+
+    /// The card for a live queue item: chrome, tabs, the active tab's body,
+    /// the progress bar and — on Info — the part section.
+    fn paint(&mut self, ui: &mut egui::Ui, item: &DownloadItem, o: egui::Pos2) {
+        let p = ui.painter().clone();
+        let frac = Self::frac(item);
+        let pct = (frac * 100.0).floor() as u64;
+        // IDM's title: "<pct>%-<name>" (the design shows 39%-Stories-…).
+        let raw_title = if item.total_bytes.unwrap_or(0) > 0 {
+            format!("{pct}%-{}", item.filename)
+        } else {
+            item.filename.clone()
+        };
+        let title = elide_mid(&p, &raw_title, semi(14.0), CTL_X1 - 34.0 - TITLE_X);
+        self.chrome(ui, o, &title);
+        self.tabs(ui, o);
+        let downloading = self.snap.live
+            && matches!(item.status, Status::Downloading | Status::Queued);
+        match self.tab {
+            1 => self.body_speed(ui, o, item, downloading),
+            2 => self.body_settings(ui, o, item),
+            _ => self.body_info(ui, o, item, downloading),
+        }
+        self.progress_bar(ui, o, item, frac);
+        if self.tab == 0 && !self.snap.parts.is_empty() {
+            self.parts(ui, o, item, downloading);
+        }
+    }
+
+    /// The item left the queue (removed or cancelled elsewhere).
+    fn paint_dead(&mut self, ui: &mut egui::Ui, o: egui::Pos2) {
+        let ctx = ui.ctx().clone();
+        let p = ui.painter().clone();
+        let title = format!("Download #{}", self.id);
+        self.chrome(ui, o, &title);
+        p.text(
+            egui::pos2(o.x + PAD_X, o.y + 82.0),
+            egui::Align2::LEFT_TOP,
+            "No longer in the queue.",
+            reg(13.0),
+            DM_DIM,
+        );
+        let r = at(o, PAD_X, 110.0, 100.0, 36.0);
+        let b = ui.interact(r, egui::Id::new("pg-dead-close"), egui::Sense::click());
+        btn_flat(&p, r, b.hovered(), "Close");
+        if b.hovered() {
+            ctx.set_cursor_icon(egui::CursorIcon::PointingHand);
+        }
+        if b.clicked() {
+            Self::close_soon(&ctx);
+        }
+    }
+
+    /// Concept Info tab: the seven detail rows.
+    fn body_info(&mut self, ui: &mut egui::Ui, o: egui::Pos2, item: &DownloadItem, downloading: bool) {
+        let p = ui.painter().clone();
+        let status_col = match &item.status {
+            Status::Completed => DM_OK,
+            Status::Failed(_) => DM_WARN,
+            Status::Paused | Status::Queued => DM_YEL,
+            _ => DM_TXT,
+        };
+        info_row(&p, o, 0, "Name:", item.filename.clone(), DM_TXT, reg(13.0));
+        info_row(&p, o, 1, "Status:", item.status.label(), status_col, reg(13.0));
+        info_row(
+            &p,
+            o,
+            2,
+            "Size:",
+            item.total_bytes
+                .map(format_bytes)
+                .unwrap_or_else(|| "-".into()),
+            DM_TXT,
+            reg(13.0),
+        );
+        info_row(
+            &p,
+            o,
+            3,
+            "Downloaded:",
+            format_bytes(item.downloaded_bytes),
+            DM_TXT,
+            reg(13.0),
+        );
+        info_row(
+            &p,
+            o,
+            4,
+            "Speed:",
+            if downloading && item.speed_bps > 0.0 {
+                format!("{}/s", format_bytes(item.speed_bps as u64))
+            } else {
+                "-".into()
+            },
+            DM_TXT,
+            reg(13.0),
+        );
+        info_row(
+            &p,
+            o,
+            5,
+            "Remaining Time:",
+            match item.total_bytes {
+                Some(t) => fmt_eta(t.saturating_sub(item.downloaded_bytes), item.speed_bps),
+                None => "-".into(),
+            },
+            DM_TXT,
+            reg(13.0),
+        );
+        let res = item.resumable || self.snap.resumable;
+        info_row(
+            &p,
+            o,
+            6,
+            "Resume Support:",
+            if res { "Yes".into() } else { "No".into() },
+            if res { DM_OK } else { DM_LBL },
+            if res { semi(13.0) } else { reg(13.0) },
+        );
+        // The status row carries the full server error as hover text (the
+        // design's single line can only hold the short form).
+        if let Status::Failed(e) = &item.status {
+            ui.interact(
+                at(o, PAD_X, INFO_Y + ROW_STEP, IN_R - PAD_X, ROW_H),
+                egui::Id::new("pg-status"),
+                egui::Sense::hover(),
+            )
+            .on_hover_text(e.clone());
+        }
+    }
+
+    /// Concept Speed tab: thread count, live rate and the global cap.
+    fn body_speed(&mut self, ui: &mut egui::Ui, o: egui::Pos2, item: &DownloadItem, downloading: bool) {
+        let ctx = ui.ctx().clone();
+        let p = ui.painter().clone();
+        let cap: u64 = self.limit_input.trim().parse().unwrap_or(0);
+        info_row(
+            &p,
+            o,
+            0,
+            "Connections:",
+            format!("{} threads (fixed at start)", item.connections),
+            DM_TXT,
+            reg(13.0),
+        );
+        info_row(
+            &p,
+            o,
+            1,
+            "Current Speed:",
+            if downloading && item.speed_bps > 0.0 {
+                format!("{}/s", format_bytes(item.speed_bps as u64))
+            } else {
+                "-".into()
+            },
+            DM_TXT,
+            reg(13.0),
+        );
+        info_row(
+            &p,
+            o,
+            2,
+            "Global Speed Cap:",
+            if cap == 0 {
+                "Unlimited".into()
+            } else {
+                format!("{cap} KB/s")
+            },
+            DM_TXT,
+            reg(13.0),
+        );
+        let field = at(o, PAD_X, 182.0, 280.0, DM_BOX_H);
+        dm_field(
+            ui,
+            "pg_limit",
+            field,
+            field.max.x - 12.0,
+            &mut self.limit_input,
+            "0 = unlimited",
+            false,
+        );
+        let apply = at(o, PAD_X + 288.0, 182.0, 100.0, DM_BOX_H);
+        let ab = ui.interact(apply, egui::Id::new("pg-apply"), egui::Sense::click());
+        dm_gradient(&p, apply, DM_RAD, DM_ACC, DM_ACC2);
+        p.text(
+            apply.center(),
+            egui::Align2::CENTER_CENTER,
+            "Apply",
+            semi(12.0),
+            egui::Color32::WHITE,
+        );
+        if ab.hovered() {
+            ctx.set_cursor_icon(egui::CursorIcon::PointingHand);
+        }
+        if ab.clicked() {
+            match self.limit_input.trim().parse::<u64>() {
+                Ok(k) => {
+                    send_cmd_kv("limit", "kbps", serde_json::Value::from(k));
+                    self.limit_known = Some(k);
+                }
+                Err(_) => self.limit_known = None,
+            }
+        }
+        let note = match self.limit_known {
+            Some(k) => format!("Cap {k} KB/s sent — the app applies it live."),
+            None => "Type a number and Apply.".to_string(),
+        };
+        p.text(
+            egui::pos2(o.x + PAD_X, o.y + 228.0),
+            egui::Align2::LEFT_TOP,
+            note,
+            reg(12.0),
+            DM_DIM,
+        );
+        p.text(
+            egui::pos2(o.x + PAD_X, o.y + 246.0),
+            egui::Align2::LEFT_TOP,
+            "Tip: Settings → Speed windows automates caps by time of day.",
+            reg(12.0),
+            DM_LBL,
+        );
+    }
+
+    /// Concept Settings tab: what happens when the queue drains, plus the
+    /// folder/cancel actions the design has no room for elsewhere.
+    fn body_settings(&mut self, ui: &mut egui::Ui, o: egui::Pos2, item: &DownloadItem) {
+        let ctx = ui.ctx().clone();
+        let p = ui.painter().clone();
+        p.text(
+            egui::pos2(o.x + PAD_X, o.y + INFO_Y),
+            egui::Align2::LEFT_TOP,
+            "When the queue drains:",
+            reg(13.0),
+            DM_LBL,
+        );
+        for (i, (val, label)) in [
+            ("nothing", "Nothing"),
+            ("shutdown", "Shut down"),
+            ("sleep", "Sleep"),
+            ("hibernate", "Hibernate"),
+        ]
+        .iter()
+        .enumerate()
+        {
+            let r = at(o, PAD_X, 124.0 + 28.0 * i as f32, IN_R - PAD_X, 26.0);
+            let b = ui.interact(r, egui::Id::new(("pg-fin", i)), egui::Sense::click());
+            let sel = self.finish_sel == *val;
+            if b.hovered() {
+                p.rect_filled(r, DM_RAD, DM_HOVER);
+                ctx.set_cursor_icon(egui::CursorIcon::PointingHand);
+            }
+            let c = egui::pos2(o.x + PAD_X + 7.0, r.center().y);
+            if sel {
+                p.circle_filled(c, 7.0, DM_ACC);
+                p.circle_filled(c, 2.5, egui::Color32::WHITE);
+            } else {
+                p.circle_stroke(c, 7.0, egui::Stroke::new(1.0, DM_BOX_BD));
+            }
+            p.text(
+                egui::pos2(o.x + PAD_X + 22.0, r.center().y),
+                egui::Align2::LEFT_CENTER,
+                (*label).to_string(),
+                reg(13.0),
+                if sel { DM_TXT } else { DM_DIM },
+            );
+            if b.clicked() {
+                self.finish_sel = (*val).to_string();
+                send_cmd_kv("finish", "value", serde_json::Value::from(*val));
+            }
+        }
+        let open = at(o, PAD_X, 246.0, 180.0, DM_BOX_H);
+        let ob = ui.interact(open, egui::Id::new("pg-open-dir"), egui::Sense::click());
+        btn_flat(&p, open, ob.hovered(), "Open download folder");
+        if ob.hovered() {
+            ctx.set_cursor_icon(egui::CursorIcon::PointingHand);
+        }
+        if ob.clicked() {
+            if let Some(dir) = item.dest_path().parent() {
+                open_path(dir);
+            }
+        }
+        if !matches!(item.status, Status::Completed) {
+            let cancel = at(o, PAD_X + 190.0, 246.0, 150.0, DM_BOX_H);
+            let cb = ui.interact(cancel, egui::Id::new("pg-cancel"), egui::Sense::click());
+            btn_flat_c(&p, cancel, cb.hovered(), "Cancel download", DM_WARN);
+            if cb.hovered() {
+                ctx.set_cursor_icon(egui::CursorIcon::PointingHand);
+            }
+            if cb.clicked() {
+                send_cmd(self.id, "cancel");
+            }
+        }
+    }
+
+    /// The concept's 8px accent bar (every tab keeps it: it is the "still
+    /// running" signal), with the exact numbers as hover text.
+    fn progress_bar(&mut self, ui: &mut egui::Ui, o: egui::Pos2, item: &DownloadItem, frac: f32) {
+        let p = ui.painter().clone();
+        let track = at(o, PAD_X, PROG_Y, PROG_W, PROG_H);
+        p.rect_filled(track, 4.0, DM_LINE);
+        if frac > 0.0 {
+            let w = (PROG_W * frac).max(PROG_H);
+            dm_gradient_x(
+                &p,
+                egui::Rect::from_min_size(track.min, egui::vec2(w, PROG_H)),
+                4.0,
+                DM_ACC,
+                DM_ACC2,
+            );
+        }
+        ui.interact(
+            egui::Rect::from_min_max(
+                track.min - egui::vec2(0.0, 6.0),
+                track.max + egui::vec2(0.0, 8.0),
+            ),
+            egui::Id::new("pg-bar"),
+            egui::Sense::hover(),
+        )
+        .on_hover_text(format!(
+            "{} of {} ({:.0}%)",
+            format_bytes(item.downloaded_bytes),
+            item.total_bytes
+                .map(format_bytes)
+                .unwrap_or_else(|| "unknown size".into()),
+            frac * 100.0
+        ));
+    }
+
+    /// Part Info section: rule, header row with the state actions, the part
+    /// strip and the per-part table (scrolled when it outgrows the card).
+    fn parts(&mut self, ui: &mut egui::Ui, o: egui::Pos2, item: &DownloadItem, downloading: bool) {
+        let ctx = ui.ctx().clone();
+        let p = ui.painter().clone();
+        let done = matches!(item.status, Status::Completed);
+        let failed = matches!(item.status, Status::Failed(_));
+        let paused = matches!(item.status, Status::Paused);
+        p.line_segment(
+            [
+                egui::pos2(o.x + 1.0, o.y + PART_Y + 0.5),
+                egui::pos2(o.x + PG_W - 1.0, o.y + PART_Y + 0.5),
+            ],
+            egui::Stroke::new(1.0, DM_LINE),
+        );
+        let chev = egui::Rect::from_center_size(
+            egui::pos2(o.x + 25.0, o.y + HEAD_Y + HEAD_H / 2.0),
+            egui::Vec2::splat(12.0),
+        );
+        let cb = ui
+            .interact(chev.expand(6.0), egui::Id::new("pg-chev"), egui::Sense::click())
+            .on_hover_text(if self.parts_open {
+                "Hide the part list"
+            } else {
+                "Show the part list"
+            });
+        if cb.hovered() {
+            ctx.set_cursor_icon(egui::CursorIcon::PointingHand);
+        }
+        dm_icon(
+            &p,
+            chev,
+            if self.parts_open {
+                DmIcon::ChevronUp
+            } else {
+                DmIcon::Chevron
+            },
+            if cb.hovered() { DM_TXT } else { DM_DIM },
+            2.0,
+        );
+        p.text(
+            egui::pos2(o.x + 37.0, o.y + HEAD_Y + HEAD_H / 2.0),
+            egui::Align2::LEFT_CENTER,
+            "Part Info",
+            reg(12.0),
+            DM_DIM,
+        );
+        if cb.clicked() {
+            self.parts_open = !self.parts_open;
+        }
+        // Right cluster, right-aligned on the content edge: the concept's
+        // [Pause] [Close], swapping in whatever this state can actually do.
+        let actions: Vec<(Option<DmIcon>, &str, &str)> = if done {
+            vec![
+                (Some(DmIcon::Doc), "Open file", "file"),
+                (Some(DmIcon::Folder), "Open folder", "dir"),
+                (None, "Close", "close"),
+            ]
+        } else if failed {
+            vec![
+                (Some(DmIcon::Folder), "Open folder", "dir"),
+                (None, "Close", "close"),
+            ]
+        } else if paused {
+            vec![
+                (Some(DmIcon::Play), "Resume", "resume"),
+                (None, "Close", "close"),
+            ]
+        } else if !downloading {
+            vec![(None, "Cancel", "cancel"), (None, "Close", "close")]
+        } else {
+            vec![
+                (Some(DmIcon::Pause), "Pause", "pause"),
+                (None, "Close", "close"),
+            ]
+        };
+        let mut right = IN_R;
+        for (icon, label, act) in actions.iter().rev() {
+            let gw = p
+                .layout_no_wrap((*label).to_string(), reg(12.0), DM_DIM)
+                .size()
+                .x;
+            let iw = if icon.is_some() { 17.0 } else { 0.0 };
+            let w = iw + gw;
+            let r = egui::Rect::from_min_size(
+                egui::pos2(o.x + right - w, o.y + HEAD_Y - 4.0),
+                egui::vec2(w, HEAD_H + 8.0),
+            );
+            let b = ui.interact(r, egui::Id::new(("pg-act", act)), egui::Sense::click());
+            let col = if b.hovered() { DM_TXT } else { DM_DIM };
+            if b.hovered() {
+                ctx.set_cursor_icon(egui::CursorIcon::PointingHand);
+            }
+            if let Some(ic) = icon {
+                dm_icon(
+                    &p,
+                    egui::Rect::from_center_size(
+                        egui::pos2(r.min.x + 6.0, r.center().y),
+                        egui::Vec2::splat(12.0),
+                    ),
+                    *ic,
+                    col,
+                    2.0,
+                );
+            }
+            p.text(
+                egui::pos2(r.min.x + iw, r.center().y),
+                egui::Align2::LEFT_CENTER,
+                (*label).to_string(),
+                reg(12.0),
+                col,
+            );
+            if b.clicked() {
+                match *act {
+                    "pause" => send_cmd(self.id, "pause"),
+                    "resume" => send_cmd(self.id, "resume"),
+                    "cancel" => send_cmd(self.id, "cancel"),
+                    "close" => Self::close_soon(&ctx),
+                    "file" => open_path(&item.dest_path()),
+                    "dir" => {
                         if let Some(dir) = item.dest_path().parent() {
                             open_path(dir);
                         }
                     }
-                } else if !failed {
-                    let label = if paused {
-                        "Resume".to_string()
-                    } else {
-                        format!("{} Pause", crate::app::MI_PAUSE)
-                    };
-                    if ui.add_sized([110.0, 32.0], egui::Button::new(label)).clicked() {
-                        send_cmd(self.id, if paused { "resume" } else { "pause" });
-                    }
-                    if ui.add_sized([110.0, 32.0], egui::Button::new("Cancel")).clicked() {
-                        send_cmd(self.id, "cancel");
-                    }
+                    _ => {}
                 }
-                ui.with_layout(
-                    egui::Layout::right_to_left(egui::Align::Center),
-                    |ui| {
-                        if ui.add_sized([110.0, 32.0], egui::Button::new("Close")).clicked() {
-                            // Finished/failed: closes immediately. Active:
-                            // hides this window only — the download keeps
-                            // running in the main app (never cancelled here).
-                            Self::close_soon(ctx);
-                        }
-                    },
-                );
-            });
-            if failed {
-                ui.colored_label(
-                    egui::Color32::from_rgb(255, 150, 120),
-                    item.status.label(),
-                );
             }
-            ui.add_space(2.0);
-        });
+            right -= w + 18.0;
+        }
+        if !self.parts_open {
+            return;
+        }
 
-        egui::CentralPanel::default().show(ctx, |ui| {
-            ui.heading(Self::short_name(&item.filename))
-                .on_hover_text(item.filename.clone());
-            // Tab bar: Info | Speed | On Completion.
-            ui.horizontal(|ui| {
-                for (i, name) in [(0u8, "Info"), (1, "Speed"), (2, "On Completion")] {
-                    let sel = self.tab == i;
-                    if ui
-                        .selectable_label(sel, name)
-                        .on_hover_text(match i {
-                            0 => "Progress and parts",
-                            1 => "Live speed cap (applies instantly)",
-                            _ => "What happens when the queue drains",
-                        })
-                        .clicked()
-                    {
-                        self.tab = i;
-                    }
-                }
-            });
-            ui.separator();
-            // Scrollable content with a pinned action row below: short
-            // windows scroll instead of clipping buttons off-screen.
-            egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
-            if self.tab == 1 {
-                // ---- Speed tab: live global cap (main app applies via the
-                // shared atomic, no restart). Thread count is fixed at start:
-                // changing it mid-transfer would discard part files, so it
-                // is shown read-only with that explanation.
-                ui.label(format!("This download runs {} thread(s) (fixed at start).", item.connections));
-                ui.add_space(4.0);
-                ui.horizontal(|ui| {
-                    ui.label("Global cap KB/s (0 = unlimited):");
-                    ui.add(
-                        egui::TextEdit::singleline(&mut self.limit_input)
-                            .desired_width(90.0),
-                    );
-                    if ui.button("Apply").clicked() {
-                        match self.limit_input.trim().parse::<u64>() {
-                            Ok(k) => {
-                                send_cmd_kv("limit", "kbps", serde_json::Value::from(k));
-                                self.limit_known = Some(k);
-                            }
-                            Err(_) => {
-                                self.limit_known = None;
-                            }
-                        }
-                    }
-                });
-                ui.small(match self.limit_known {
-                    Some(k) => format!("Sent cap {k} KB/s — main app applies it live."),
-                    None => "Type a number and Apply.".to_string(),
-                });
-                ui.small("Tip: Settings → Speed windows automates caps by time of day.");
-            } else if self.tab == 2 {
-                // ---- On Completion tab.
-                ui.label("When the queue drains:");
-                for name in ["nothing", "shutdown", "sleep", "hibernate"] {
-                    if ui
-                        .selectable_label(self.finish_sel == name, name)
-                        .clicked()
-                    {
-                        self.finish_sel = name.to_string();
-                        send_cmd_kv("finish", "value", serde_json::Value::from(name));
-                    }
-                }
-                ui.add_space(4.0);
-                if ui.button("Open download folder").clicked() {
-                    if let Some(dir) = item.dest_path().parent() {
-                        open_path(dir);
-                    }
-                }
+        // ---- part strip: one segment per part, as wide as its byte span ----
+        let strip = at(o, PAD_X, STRIP_Y, PROG_W, STRIP_H);
+        let n = self.snap.parts.len();
+        let lens: Vec<u64> = self
+            .snap
+            .parts
+            .iter()
+            .map(|(s, e, _)| e.saturating_sub(*s) + 1)
+            .collect();
+        let sum = lens.iter().sum::<u64>().max(1);
+        let corner = |first: bool, last: bool| egui::CornerRadius {
+            nw: if first { 2 } else { 0 },
+            sw: if first { 2 } else { 0 },
+            ne: if last { 2 } else { 0 },
+            se: if last { 2 } else { 0 },
+        };
+        let mut x = strip.min.x;
+        for (i, (_, _, d)) in self.snap.parts.iter().enumerate() {
+            let len = lens[i];
+            let w = strip.width() * (len as f32 / sum as f32);
+            let seg = egui::Rect::from_min_size(egui::pos2(x, strip.min.y), egui::vec2(w, STRIP_H));
+            let f = if len > 0 {
+                (*d as f32 / len as f32).clamp(0.0, 1.0)
             } else {
-            egui::Frame::new()
-                .corner_radius(crate::app::RADIUS)
-                .inner_margin(egui::Margin::same(10))
-                .show(ui, |ui| {
-                    let row = |ui: &mut egui::Ui, k: &str, v: String| {
-                        ui.horizontal(|ui| {
-                            ui.label(egui::RichText::new(k).weak());
-                            ui.with_layout(
-                                egui::Layout::right_to_left(egui::Align::Center),
-                                |ui| {
-                                    ui.label(v);
-                                },
-                            );
-                        });
-                    };
-                    row(ui, "Status:", item.status.label());
-                    row(
-                        ui,
-                        "Size:",
-                        item.total_bytes.map(format_bytes).unwrap_or_else(|| "-".into()),
-                    );
-                    row(ui, "Downloaded:", format_bytes(item.downloaded_bytes));
-                    row(
-                        ui,
-                        "Speed:",
-                        if downloading && item.speed_bps > 0.0 {
-                            format!("{}/s", format_bytes(item.speed_bps as u64))
-                        } else {
-                            "-".into()
-                        },
-                    );
-                    row(
-                        ui,
-                        "Remaining Time:",
-                        match item.total_bytes {
-                            Some(t) => fmt_eta(
-                                t.saturating_sub(item.downloaded_bytes),
-                                item.speed_bps,
-                            ),
-                            None => "-".into(),
-                        },
-                    );
-                    ui.horizontal(|ui| {
-                        ui.label(egui::RichText::new("Resume Support:").weak());
-                        ui.with_layout(
-                            egui::Layout::right_to_left(egui::Align::Center),
-                            |ui| {
-                                let r = item.resumable || self.snap.resumable;
-                                ui.colored_label(
-                                    if r { green } else { egui::Color32::GRAY },
-                                    if r { "Yes" } else { "No" },
-                                );
-                            },
-                        );
-                    });
-                });
-
-            // Progress bar.
-            let frac = match item.total_bytes {
-                Some(t) if t > 0 => {
-                    (item.downloaded_bytes as f32 / t as f32).clamp(0.0, 1.0)
-                }
-                _ => 0.0,
+                0.0
             };
-            ui.add_space(4.0);
-            ui.add(
-                egui::ProgressBar::new(frac)
-                    .desired_height(14.0)
-                    .corner_radius(7)
-                    .show_percentage(),
-            );
-
-            // Clean segment progress: a single unified chunk map. No per-part
-            // text percentages underneath (the bar itself is sufficient).
-            if !self.snap.parts.is_empty() {
-                ui.add_space(4.0);
-                let n = self.snap.parts.len();
-                // Unified chunk map: one cell per part, filled by fraction.
-                let bar_w = ui.available_width();
-                let (rrect, _) = ui.allocate_exact_size(
-                    egui::vec2(bar_w, 12.0),
-                    egui::Sense::hover(),
+            // Green finished/receiving, amber while it has nothing yet (the
+            // concept's "Connecting..."), slate otherwise.
+            let base = if f >= 1.0 {
+                DM_OK
+            } else if f > 0.0 || !downloading {
+                DM_BOX_BD
+            } else {
+                DM_YEL
+            };
+            p.rect_filled(seg, corner(i == 0, i + 1 == n), base);
+            if f > 0.0 && f < 1.0 {
+                p.rect_filled(
+                    egui::Rect::from_min_size(seg.min, egui::vec2(seg.width() * f, STRIP_H)),
+                    corner(i == 0, false),
+                    DM_OK,
                 );
-                let p = ui.painter();
-                p.rect_filled(rrect, 6.0, egui::Color32::from_rgb(30, 31, 42));
-                let gap = 2.0;
-                let cw = (bar_w - gap * (n as f32 - 1.0).max(0.0)) / n as f32;
-                for (i, (s, e, d)) in self.snap.parts.iter().enumerate() {
-                    let len = e.saturating_sub(*s) + 1;
-                    let f = if len > 0 { (*d as f32 / len as f32).clamp(0.0, 1.0) } else { 0.0 };
-                    let x0 = rrect.min.x + i as f32 * (cw + gap);
-                    let cell = egui::Rect::from_min_size(
-                        egui::pos2(x0, rrect.min.y),
-                        egui::vec2(cw.max(1.0), 12.0),
-                    );
-                    if f >= 1.0 {
-                        p.rect_filled(cell, 3.0, green);
-                    } else if f > 0.0 {
-                        p.rect_filled(cell, 3.0, egui::Color32::from_rgb(30, 31, 42));
-                        let fill = egui::Rect::from_min_size(
-                            cell.min,
-                            egui::vec2(cell.width() * f, 12.0),
-                        );
-                        p.rect_filled(fill, 3.0, egui::Color32::from_rgb(96, 165, 250));
-                    }
-                }
             }
-            } // end Info tab
-            }); // end scrollable content
-        });
+            x += w;
+        }
+
+        // ---- table: header row, then one row per part ----
+        let hdr_y = o.y + TBL_HDR_Y + 4.0;
+        p.text(
+            egui::pos2(o.x + PAD_X, hdr_y),
+            egui::Align2::LEFT_TOP,
+            "#",
+            reg(10.0),
+            DM_HEAD,
+        );
+        p.text(
+            egui::pos2(o.x + PAD_X + COL_NUM_W, hdr_y),
+            egui::Align2::LEFT_TOP,
+            "Status",
+            reg(10.0),
+            DM_HEAD,
+        );
+        p.text(
+            egui::pos2(o.x + COL_DL_X + 90.0, hdr_y),
+            egui::Align2::RIGHT_TOP,
+            "Downloaded",
+            reg(10.0),
+            DM_HEAD,
+        );
+        p.text(
+            egui::pos2(o.x + COL_TOT_X + 80.0, hdr_y),
+            egui::Align2::RIGHT_TOP,
+            "Total",
+            reg(10.0),
+            DM_HEAD,
+        );
+        p.line_segment(
+            [
+                egui::pos2(o.x + PAD_X, o.y + TBL_HDR_Y + TBL_HDR_H - 0.5),
+                egui::pos2(o.x + IN_R, o.y + TBL_HDR_Y + TBL_HDR_H - 0.5),
+            ],
+            egui::Stroke::new(1.0, DM_LINE),
+        );
+        let rows_top = o.y + TBL_Y;
+        let rows_bottom = (ui.max_rect().max.y - 1.0 - FOOT_PAD).max(rows_top);
+        let rows_rect = egui::Rect::from_min_max(
+            egui::pos2(o.x + 1.0, rows_top),
+            egui::pos2(o.x + PG_W - 1.0, rows_bottom),
+        );
+        let table_h = TBL_STEP * n as f32;
+        let max_scroll = (table_h - rows_rect.height()).max(0.0);
+        self.scroll = self.scroll.clamp(0.0, max_scroll);
+        let rows = ui.interact(rows_rect, egui::Id::new("pg-rows"), egui::Sense::hover());
+        if rows.hovered() {
+            let dy = ui.input(|i| i.smooth_scroll_delta.y);
+            if dy != 0.0 {
+                self.scroll = (self.scroll - dy).clamp(0.0, max_scroll);
+            }
+        }
+        let pc = p.with_clip_rect(rows_rect);
+        for (i, (_, _, d)) in self.snap.parts.iter().enumerate() {
+            let y = rows_top + TBL_STEP * i as f32 - self.scroll;
+            if y > rows_bottom || y + TBL_STEP < rows_top {
+                continue;
+            }
+            let len = lens[i];
+            let f = if len > 0 {
+                (*d as f32 / len as f32).clamp(0.0, 1.0)
+            } else {
+                0.0
+            };
+            let (status, col) = if len > 0 && *d >= len {
+                ("Finished", DM_OK)
+            } else if downloading && f > 0.0 {
+                ("Receiving Data", DM_OK)
+            } else if downloading {
+                ("Connecting...", DM_YEL)
+            } else if f > 0.0 {
+                ("Incomplete", DM_DIM)
+            } else {
+                ("Waiting", DM_LBL)
+            };
+            pc.text(
+                egui::pos2(o.x + PAD_X, y + TBL_PAD),
+                egui::Align2::LEFT_TOP,
+                (i + 1).to_string(),
+                reg(10.0),
+                DM_LBL,
+            );
+            pc.text(
+                egui::pos2(o.x + PAD_X + COL_NUM_W, y + TBL_PAD),
+                egui::Align2::LEFT_TOP,
+                status,
+                reg(10.0),
+                col,
+            );
+            pc.text(
+                egui::pos2(o.x + COL_DL_X + 90.0, y + TBL_PAD),
+                egui::Align2::RIGHT_TOP,
+                // The concept leaves the cell blank while a part has nothing.
+                if *d > 0 { format_bytes(*d) } else { String::new() },
+                reg(10.0),
+                DM_DIM,
+            );
+            pc.text(
+                egui::pos2(o.x + COL_TOT_X + 80.0, y + TBL_PAD),
+                egui::Align2::RIGHT_TOP,
+                format_bytes(len),
+                reg(10.0),
+                DM_DIM,
+            );
+            if i + 1 < n {
+                pc.line_segment(
+                    [
+                        egui::pos2(o.x + 1.0, y + TBL_STEP - 0.5),
+                        egui::pos2(o.x + PG_W - 1.0, y + TBL_STEP - 0.5),
+                    ],
+                    egui::Stroke::new(1.0, DM_TROUGH),
+                );
+            }
+        }
+        if max_scroll > 0.0 {
+            let bar_h = (rows_rect.height() * rows_rect.height() / table_h).max(24.0);
+            let t = self.scroll / max_scroll;
+            let y = rows_top + (rows_rect.height() - bar_h) * t;
+            p.rect_filled(
+                egui::Rect::from_min_size(egui::pos2(o.x + PG_W - 7.0, y), egui::vec2(3.0, bar_h)),
+                2.0,
+                DM_BOX_BD,
+            );
+        }
     }
 }

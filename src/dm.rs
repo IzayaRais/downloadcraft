@@ -7,6 +7,10 @@
 //! card border included, top-to-bottom order
 //! header (39) | URL | folder + size | filename | actions.
 //!
+//! `Downloading gui concepts.html` is the source of truth for the standalone
+//! progress window in `progress.rs`; it adds the same palette plus the tokens
+//! and glyphs that concept draws (segmented tabs, part table, pause/play).
+//!
 //! Everything here is pure painting: hit testing stays with the caller (the
 //! manager window drives a manual hit table, the popup uses egui responses),
 //! so hover state arrives as a plain `bool`.
@@ -29,6 +33,14 @@ pub const DM_OK: egui::Color32 = egui::Color32::from_rgb(0x22, 0xc5, 0x5e);
 pub const DM_HOVER: egui::Color32 = egui::Color32::from_rgb(0x1c, 0x24, 0x36);
 pub const DM_HOVER2: egui::Color32 = egui::Color32::from_rgb(0x27, 0x33, 0x4a);
 pub const DM_WARN: egui::Color32 = egui::Color32::from_rgb(0xff, 0x96, 0x78);
+/// Page/segmented-trough colour, also the progress concept's row rules.
+pub const DM_TROUGH: egui::Color32 = egui::Color32::from_rgb(0x0a, 0x0a, 0x14);
+/// Muted label grey (#64748b) — info rows and part indices.
+pub const DM_LBL: egui::Color32 = egui::Color32::from_rgb(0x64, 0x74, 0x8b);
+/// Table column headers (#475569).
+pub const DM_HEAD: egui::Color32 = egui::Color32::from_rgb(0x47, 0x55, 0x69);
+/// "Connecting..." amber (#eab308).
+pub const DM_YEL: egui::Color32 = egui::Color32::from_rgb(0xea, 0xb3, 0x08);
 pub const DM_RAD: f32 = 6.0;
 /// Field box height including its 1px stroke (the concept's 36px + 2px).
 pub const DM_BOX_H: f32 = 38.0;
@@ -126,6 +138,21 @@ pub enum DmIcon {
     Check,
     Refresh,
     Settings,
+    // ---- progress concept (Downloading gui concepts.html) ----
+    /// Circled "i" — the Info tab.
+    Info,
+    /// Rising line over a baseline — the Speed tab.
+    Chart,
+    /// Two rails with knobs — the Settings tab.
+    Sliders,
+    /// Two filled bars.
+    Pause,
+    /// Filled right-pointing triangle (resume).
+    Play,
+    /// Chevron pointing up (the part section's collapse toggle).
+    ChevronUp,
+    /// Sheet with a folded corner (open the finished file).
+    Doc,
 }
 
 /// Polyline arc, degrees, screen space (0 = right, 90 = down).
@@ -230,6 +257,76 @@ pub fn dm_icon(p: &egui::Painter, r: egui::Rect, icon: DmIcon, color: egui::Colo
                 line((x, y), (x + (12.0 - x) * 0.28, y + (12.0 - y) * 0.28));
             }
         }
+        DmIcon::Info => {
+            p.circle_stroke(m(12.0, 12.0), 9.0 * s, st);
+            line((12.0, 10.0), (12.0, 16.0));
+            // Traced dot: the concept's near-zero "M12 7v.5" cap.
+            p.circle_filled(m(12.0, 7.2), (w * s / 2.0).max(0.7), color);
+        }
+        DmIcon::Chart => {
+            p.add(egui::Shape::line(
+                vec![
+                    m(3.0, 17.0),
+                    m(8.0, 11.0),
+                    m(12.0, 14.0),
+                    m(18.0, 6.0),
+                    m(21.0, 10.0),
+                ],
+                st,
+            ));
+            line((3.0, 21.0), (21.0, 21.0));
+        }
+        DmIcon::Sliders => {
+            line((4.0, 8.0), (10.0, 8.0));
+            line((18.0, 8.0), (20.0, 8.0));
+            line((4.0, 16.0), (6.0, 16.0));
+            line((10.0, 16.0), (20.0, 16.0));
+            // Knobs: the concept fills them with the trough colour behind the ring.
+            for (cx, cy) in [(16.0, 8.0), (8.0, 16.0)] {
+                p.circle_filled(m(cx, cy), 2.0 * s, DM_TROUGH);
+                p.circle_stroke(m(cx, cy), 2.0 * s, st);
+            }
+        }
+        DmIcon::Pause => {
+            for x in [6.0f32, 14.0] {
+                p.rect_filled(
+                    egui::Rect::from_min_size(m(x, 5.0), egui::vec2(4.0 * s, 14.0 * s)),
+                    egui::CornerRadius::same(1),
+                    color,
+                );
+            }
+        }
+        DmIcon::Play => {
+            p.add(egui::Shape::convex_polygon(
+                vec![m(7.0, 5.0), m(19.0, 12.0), m(7.0, 19.0)],
+                color,
+                egui::Stroke::NONE,
+            ));
+        }
+        DmIcon::ChevronUp => {
+            line((6.0, 15.0), (12.0, 9.0));
+            line((12.0, 9.0), (18.0, 15.0));
+        }
+        DmIcon::Doc => {
+            p.add(egui::Shape::line(
+                vec![
+                    m(14.0, 3.0),
+                    m(6.0, 3.0),
+                    m(5.0, 4.0),
+                    m(5.0, 20.0),
+                    m(6.0, 21.0),
+                    m(18.0, 21.0),
+                    m(19.0, 20.0),
+                    m(19.0, 8.0),
+                    m(14.0, 3.0),
+                ],
+                st,
+            ));
+            p.add(egui::Shape::line(
+                vec![m(14.0, 3.0), m(14.0, 8.0), m(19.0, 8.0)],
+                st,
+            ));
+        }
     }
 }
 
@@ -258,6 +355,17 @@ pub fn icon_btn(
 
 /// Outline button (concept "Add" / "Cancel").
 pub fn btn_flat(p: &egui::Painter, r: egui::Rect, hov: bool, label: &str) {
+    btn_flat_c(p, r, hov, label, if hov { DM_TXT } else { DM_DIM });
+}
+
+/// Same outline button with an explicit label colour (destructive actions).
+pub fn btn_flat_c(
+    p: &egui::Painter,
+    r: egui::Rect,
+    hov: bool,
+    label: &str,
+    col: egui::Color32,
+) {
     if hov {
         p.rect_filled(r, DM_RAD, DM_HOVER);
     }
@@ -272,7 +380,7 @@ pub fn btn_flat(p: &egui::Painter, r: egui::Rect, hov: bool, label: &str) {
         egui::Align2::CENTER_CENTER,
         label.to_string(),
         crate::fonts::reg(12.0),
-        if hov { DM_TXT } else { DM_DIM },
+        col,
     );
 }
 
@@ -281,6 +389,22 @@ pub fn btn_flat(p: &egui::Painter, r: egui::Rect, hov: bool, label: &str) {
 /// vertex is tinted by (x + y), and linear interpolation across the triangles
 /// reproduces the diagonal exactly.
 pub fn dm_gradient(p: &egui::Painter, r: egui::Rect, rad: f32, a: egui::Color32, b: egui::Color32) {
+    grad_mesh(p, r, rad, a, b, true);
+}
+
+/// Horizontal (90 degree) cut of the same gradient — the progress bar's fill.
+pub fn dm_gradient_x(p: &egui::Painter, r: egui::Rect, rad: f32, a: egui::Color32, b: egui::Color32) {
+    grad_mesh(p, r, rad, a, b, false);
+}
+
+fn grad_mesh(
+    p: &egui::Painter,
+    r: egui::Rect,
+    rad: f32,
+    a: egui::Color32,
+    b: egui::Color32,
+    diagonal: bool,
+) {
     let mix = |t: f32| {
         egui::Color32::from_rgb(
             (a.r() as f32 + (b.r() as f32 - a.r() as f32) * t).round() as u8,
@@ -288,8 +412,19 @@ pub fn dm_gradient(p: &egui::Painter, r: egui::Rect, rad: f32, a: egui::Color32,
             (a.b() as f32 + (b.b() as f32 - a.b() as f32) * t).round() as u8,
         )
     };
-    let span = (r.width() + r.height()).max(1.0);
-    let tint = |q: egui::Pos2| mix((((q.x - r.min.x) + (q.y - r.min.y)) / span).clamp(0.0, 1.0));
+    let span = if diagonal {
+        (r.width() + r.height()).max(1.0)
+    } else {
+        r.width().max(1.0)
+    };
+    let tint = |q: egui::Pos2| {
+        let d = if diagonal {
+            (q.x - r.min.x) + (q.y - r.min.y)
+        } else {
+            q.x - r.min.x
+        };
+        mix((d / span).clamp(0.0, 1.0))
+    };
     let mut pts: Vec<egui::Pos2> = Vec::new();
     for (cx, cy, a0, a1) in [
         (r.right() - rad, r.top() + rad, -90.0f32, 0.0f32),
@@ -393,4 +528,36 @@ pub fn elide_left(s: &str, max: usize) -> String {
     } else {
         format!("…{}", s.chars().skip(n - max + 1).collect::<String>())
     }
+}
+
+/// Single line that measures no wider than `max_w`, elided in the middle so a
+/// long filename keeps both its head and its extension visible.
+pub fn elide_mid(
+    p: &egui::Painter,
+    s: &str,
+    font: egui::FontId,
+    max_w: f32,
+) -> String {
+    let width = |t: &str| {
+        p.layout_no_wrap(t.to_string(), font.clone(), egui::Color32::WHITE)
+            .size()
+            .x
+    };
+    if width(s) <= max_w {
+        return s.to_string();
+    }
+    let chars: Vec<char> = s.chars().collect();
+    let mut keep = chars.len().saturating_sub(1);
+    while keep > 3 {
+        let head = keep.div_ceil(2);
+        let tail = keep - head;
+        let cut: String = chars[..head].iter().collect::<String>()
+            + "…"
+            + &chars[chars.len() - tail..].iter().collect::<String>();
+        if width(&cut) <= max_w {
+            return cut;
+        }
+        keep -= 1;
+    }
+    "…".to_string()
 }
