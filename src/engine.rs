@@ -3,7 +3,7 @@ use futures_util::StreamExt;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
-use tokio::io::{AsyncSeekExt, AsyncWriteExt};
+use tokio::io::{AsyncBufReadExt, AsyncSeekExt, AsyncWriteExt};
 
 /// Shared state between the UI thread and the download task.
 pub struct SharedState {
@@ -2792,6 +2792,33 @@ pub async fn download(
     // On YouTube hosts always resolve first: the probe alone is
     // meaningless there (walls, page variants), the page/API decides.
     let is_yt = url.contains("youtube.com") || url.contains("youtu.be");
+    // YouTube gates its 1080p+ streams behind the browser-only SABR protocol:
+    // to any non-browser client they hand out roughly their first minute and
+    // then 403 forever (verified live — changed headers, the row's own
+    // captured cookies, freshly resolved URLs and a fetch from a signed-in
+    // page all hit the same wall). yt-dlp speaks that protocol, so when one
+    // is installed — or can be fetched once — it takes every quality above
+    // the progressive file. Anything it cannot do falls through to the
+    // built-in engine below, progressive fallback and all.
+    if is_yt && ytdlp_preferred(&opts) {
+        match ensure_ytdlp(&client).await {
+            Ok(exe) => {
+                match download_with_ytdlp(&exe, &url, &dest, connections, &opts, &shared).await {
+                    Ok(()) => return Ok(()),
+                    Err(e) => {
+                        if std::env::var("DOWNLOAD_CRAFT_DEBUG").is_ok() {
+                            eprintln!("[dbg] yt-dlp path skipped: {e:#}");
+                        }
+                    }
+                }
+            }
+            Err(e) => {
+                if std::env::var("DOWNLOAD_CRAFT_DEBUG").is_ok() {
+                    eprintln!("[dbg] yt-dlp unavailable: {e:#}");
+                }
+            }
+        }
+    }
     if is_html || is_yt {
         let page_url = url.clone();
         match resolve_media(&client, &opts, &url, &shared).await {
@@ -2870,7 +2897,7 @@ pub async fn download(
                                     .map_err(|e2| {
                                         let m2 = format!("{e2:#}");
                                         if sabr && (m2.contains("serves only the first") || m2.contains("refused this link (403)")) {
-                                            anyhow!("{m2} (retried as the progressive file automatically — YouTube only serves the first ~1 minute of 1080p+ streams to non-browser clients, so 360p is the highest quality that can complete)")
+                                            anyhow!("{m2} (retried as the progressive file automatically — YouTube serves only the first ~1 minute of 1080p+ streams to non-browser clients, so 360p is all the built-in engine can finish; install yt-dlp (`winget install yt-dlp`) for the higher qualities)")
                                         } else {
                                             e2
                                         }
@@ -3161,6 +3188,349 @@ pub async fn ffmpeg_mux(
         let tail: String = tail.chars().rev().take(400).collect::<String>().chars().rev().collect();
         return Err(anyhow!("ffmpeg merge failed: {}", tail.trim()));
     }
+    Ok(())
+}
+
+/// yt-dlp release asset, fetched only when a YouTube download needs one and
+/// no copy is on PATH.
+const YTDLP_URL: &str = if cfg!(windows) {
+    "https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp.exe"
+} else {
+    "https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp"
+};
+const YTDLP_BIN: &str = if cfg!(windows) {
+    "yt-dlp.exe"
+} else {
+    "yt-dlp"
+};
+
+/// `yt-dlp` on PATH. A copy the user installed is theirs to keep up to date.
+fn ytdlp_on_path() -> Option<std::path::PathBuf> {
+    let names: &[&str] = if cfg!(windows) {
+        &["yt-dlp.exe", "yt-dlp"]
+    } else {
+        &["yt-dlp"]
+    };
+    let path_var = std::env::var("PATH").ok()?;
+    for dir in std::env::split_paths(&path_var) {
+        for n in names {
+            let cand = dir.join(n);
+            if cand.is_file() {
+                return Some(cand);
+            }
+        }
+    }
+    None
+}
+
+/// Where a self-fetched yt-dlp lives.
+fn ytdlp_local_path() -> Option<std::path::PathBuf> {
+    let base = if cfg!(windows) {
+        std::path::PathBuf::from(std::env::var_os("LOCALAPPDATA")?)
+    } else {
+        std::path::PathBuf::from(std::env::var_os("HOME")?)
+            .join(".local")
+            .join("share")
+    };
+    Some(base.join("download_craft").join("bin").join(YTDLP_BIN))
+}
+
+/// The JS runtime yt-dlp needs to solve YouTube's player challenges. Only
+/// deno is enabled by default, while node is far more commonly installed —
+/// without one, extraction fails outright on many videos with yt-dlp's
+/// "The page needs to be reloaded" (verified live here: same URL and cookies,
+/// same release, works with `--js-runtimes node` and fails without it).
+fn js_runtime() -> Option<&'static str> {
+    let path_var = std::env::var("PATH").ok()?;
+    for (name, files) in [
+        ("node", ["node.exe", "node"]),
+        ("deno", ["deno.exe", "deno"]),
+        ("bun", ["bun.exe", "bun"]),
+    ] {
+        for dir in std::env::split_paths(&path_var) {
+            for f in files {
+                if dir.join(f).is_file() {
+                    return Some(name);
+                }
+            }
+        }
+    }
+    None
+}
+
+/// Whether a helper we fetched is old enough that YouTube has probably moved
+/// on (extractors break within weeks).
+async fn ytdlp_stale(path: &std::path::Path) -> bool {
+    let Ok(meta) = tokio::fs::metadata(path).await else {
+        return true;
+    };
+    match meta.modified().ok().and_then(|t| t.elapsed().ok()) {
+        Some(age) => age.as_secs() > 30 * 24 * 3600,
+        None => false,
+    }
+}
+
+/// Whether a YouTube link should try yt-dlp first. The progressive file the
+/// built-in engine can complete on its own tops out at 360p, so anything
+/// above that — or an open "best" request — goes to the helper when one is
+/// installed. Its failures fall straight back to the built-in path.
+fn ytdlp_preferred(opts: &EngineOpts) -> bool {
+    quality_cap(&opts.quality_pref).map(|h| h > 360).unwrap_or(true)
+}
+
+/// Path to a usable yt-dlp: the user's if they have one, else the copy this
+/// app fetched (refreshed when it has gone stale, since YouTube moves on).
+/// `Err` means nothing is available and the caller should stay with the
+/// built-in engine.
+async fn ensure_ytdlp(client: &reqwest::Client) -> Result<std::path::PathBuf> {
+    if let Some(p) = ytdlp_on_path() {
+        return Ok(p);
+    }
+    let dst = ytdlp_local_path().ok_or_else(|| anyhow!("no LOCALAPPDATA to keep yt-dlp in"))?;
+    if dst.is_file() && !ytdlp_stale(&dst).await {
+        return Ok(dst);
+    }
+    let fetched = async {
+        if let Some(dir) = dst.parent() {
+            tokio::fs::create_dir_all(dir).await?;
+        }
+        let resp = client
+            .get(YTDLP_URL)
+            .send()
+            .await
+            .map_err(|e| anyhow!("yt-dlp fetch: {e}"))?;
+        if !resp.status().is_success() {
+            return Err(anyhow!("yt-dlp fetch: HTTP {}", resp.status()));
+        }
+        let bytes = resp
+            .bytes()
+            .await
+            .map_err(|e| anyhow!("yt-dlp fetch: {e}"))?;
+        if bytes.len() < 1_000_000 {
+            return Err(anyhow!(
+                "yt-dlp fetch: suspicious payload ({} bytes)",
+                bytes.len()
+            ));
+        }
+        let tmp = dst.with_extension("part");
+        tokio::fs::write(&tmp, &bytes).await?;
+        tokio::fs::rename(&tmp, &dst).await?;
+        Ok::<(), anyhow::Error>(())
+    }
+    .await;
+    match fetched {
+        // A failed refresh must not cost us a working older copy.
+        Err(e) if dst.is_file() => Ok(dst),
+        Err(e) => Err(e),
+        Ok(()) => Ok(dst),
+    }
+}
+
+/// Write the row's captured browser cookies as a Netscape cookie jar (what
+/// `--cookies` reads), so yt-dlp inherits the signed-in YouTube session
+/// without touching the browser's locked profile database. Removed after the
+/// run, so no credentials linger on disk.
+async fn write_cookie_jar(cookie: &str) -> Option<std::path::PathBuf> {
+    if cookie.trim().is_empty() {
+        return None;
+    }
+    let mut body = String::from("# Netscape HTTP Cookie File\n");
+    let mut rows = 0usize;
+    for part in cookie.split(';') {
+        let Some((name, value)) = part.trim().split_once('=') else {
+            continue;
+        };
+        let name = name.trim();
+        let bad = |s: &str| s.contains('\t') || s.contains('\n') || s.contains('\r');
+        if name.is_empty() || bad(name) || bad(value) {
+            continue;
+        }
+        body.push_str(&format!(".youtube.com\tTRUE\t/\tFALSE\t0\t{name}\t{value}\n"));
+        rows += 1;
+    }
+    if rows == 0 {
+        return None;
+    }
+    let path = std::env::temp_dir().join(format!(
+        "download_craft_cookies_{}.txt",
+        std::process::id()
+    ));
+    tokio::fs::write(&path, body).await.ok()?;
+    Some(path)
+}
+
+/// yt-dlp format expression for a menu preference: best video+audio at or
+/// below the asked height, mp4/m4a first so the merge stays a plain mp4.
+fn ytdlp_format(pref: &str) -> String {
+    match quality_cap(pref) {
+        Some(h) => format!(
+            "bv*[height<={h}][ext=mp4]+ba[ext=m4a]/bv*[height<={h}]+ba/b[height<={h}]/bv*+ba/b"
+        ),
+        None => "bv*[ext=mp4]+ba[ext=m4a]/bv*+ba/b".to_string(),
+    }
+}
+
+/// Hand a YouTube link to yt-dlp: it speaks the browser-only SABR protocol
+/// that gates 1080p+ (plain HTTP sees only the stream's first ~minute, then
+/// 403 forever) and merges the legs itself. Progress lines keep the row and
+/// the progress window live; cancelling kills the child.
+async fn download_with_ytdlp(
+    exe: &std::path::Path,
+    url: &str,
+    dest: &PathBuf,
+    connections: usize,
+    opts: &EngineOpts,
+    shared: &Arc<SharedState>,
+) -> Result<()> {
+    if let Some(parent) = dest.parent() {
+        tokio::fs::create_dir_all(parent).await?;
+    }
+    // A file already sitting at the destination makes yt-dlp report
+    // "already downloaded" and exit without fetching anything.
+    let _ = tokio::fs::remove_file(dest).await;
+    let jar = write_cookie_jar(&opts.cookie).await;
+    let mut cmd = tokio::process::Command::new(exe);
+    #[cfg(windows)]
+    {
+        // No console flash for the helper process.
+        const CREATE_NO_WINDOW: u32 = 0x08000000;
+        cmd.creation_flags(CREATE_NO_WINDOW);
+    }
+    cmd.arg("--no-playlist")
+        .arg("--no-warnings")
+        .arg("--newline")
+        .arg("--progress-template")
+        .arg("download:@%(progress.downloaded_bytes)s/%(progress.total_bytes_estimate)s")
+        .arg("--retries")
+        .arg(opts.max_retries.max(1).to_string())
+        .arg("--socket-timeout")
+        .arg(opts.timeout_secs.max(5).to_string())
+        .arg("--concurrent-fragments")
+        .arg(connections.clamp(1, 8).to_string())
+        .arg("--merge-output-format")
+        .arg("mp4")
+        .arg("-f")
+        .arg(ytdlp_format(&opts.quality_pref))
+        .arg("-o")
+        .arg(dest);
+    if let Some(ff) = ffmpeg_path() {
+        cmd.arg("--ffmpeg-location").arg(ff);
+    }
+    // Without a JS runtime yt-dlp cannot solve YouTube's player challenges:
+    // extraction fails on many videos and it reports only "The page needs to
+    // be reloaded" (reproduced live against this very URL).
+    if let Some(rt) = js_runtime() {
+        cmd.arg("--js-runtimes").arg(rt);
+    }
+    if let Some(jar) = &jar {
+        cmd.arg("--cookies").arg(jar);
+    }
+    if !opts.referer.trim().is_empty() {
+        cmd.arg("--referer").arg(opts.referer.trim());
+    }
+    if !opts.proxy_url.trim().is_empty() {
+        cmd.arg("--proxy").arg(opts.proxy_url.trim());
+    }
+    if opts.overwrite_existing {
+        cmd.arg("--force-overwrites");
+    }
+    cmd.arg(url);
+    cmd.stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+    let mut child = cmd.spawn().map_err(|e| anyhow!("yt-dlp launch: {e}"))?;
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| anyhow!("yt-dlp stdout unavailable"))?;
+    let stderr = child.stderr.take();
+    // Drain stdout for progress (both pipes must be drained, or a chatty
+    // helper fills the pipe buffer and deadlocks).
+    let progress = Arc::clone(shared);
+    let out_task = tokio::spawn(async move {
+        let mut lines = tokio::io::BufReader::new(stdout).lines();
+        while let Ok(Some(line)) = lines.next_line().await {
+            let Some(rest) = line.strip_prefix("download:@") else {
+                continue;
+            };
+            let mut parts = rest.split('/');
+            let done = parts.next().and_then(|v| v.trim().parse::<u64>().ok());
+            let total = parts.next().and_then(|v| v.trim().parse::<u64>().ok());
+            if let Some(d) = done {
+                progress.downloaded.store(d, Ordering::SeqCst);
+            }
+            if let Some(t) = total.filter(|t| *t > 0) {
+                progress.total.store(t, Ordering::SeqCst);
+                progress.has_total.store(true, Ordering::SeqCst);
+            }
+        }
+    });
+    let err_task = tokio::spawn(async move {
+        let mut kept: std::collections::VecDeque<String> = std::collections::VecDeque::new();
+        if let Some(err) = stderr {
+            let mut lines = tokio::io::BufReader::new(err).lines();
+            while let Ok(Some(line)) = lines.next_line().await {
+                if kept.len() == 8 {
+                    kept.pop_front();
+                }
+                kept.push_back(line);
+            }
+        }
+        kept.into_iter().collect::<Vec<_>>().join(" | ")
+    });
+    let finish = loop {
+        if shared.cancelled.load(Ordering::SeqCst) {
+            let _ = child.kill().await;
+            let _ = child.wait().await;
+            break Err(anyhow!("cancelled"));
+        }
+        match tokio::time::timeout(std::time::Duration::from_millis(200), child.wait()).await {
+            Ok(Ok(status)) => break Ok(status),
+            Ok(Err(e)) => break Err(anyhow!("yt-dlp wait: {e}")),
+            Err(_) => continue,
+        }
+    };
+    let _ = out_task.await;
+    let err_tail = err_task.await.unwrap_or_default();
+    if let Some(jar) = &jar {
+        let _ = tokio::fs::remove_file(jar).await;
+    }
+    let status = finish?;
+    if !status.success() {
+        // yt-dlp's own words are far more useful than an exit code.
+        let msg = if err_tail.trim().is_empty() {
+            format!("yt-dlp exited with {status}")
+        } else {
+            format!("yt-dlp exited with {status}: {}", err_tail.trim())
+        };
+        return Err(anyhow!(msg));
+    }
+    // It can still land the file under a different container extension.
+    if !dest.is_file() {
+        let stem = dest
+            .file_stem()
+            .map(|s| s.to_string_lossy().to_string())
+            .unwrap_or_default();
+        if let Some(dir) = dest.parent() {
+            if let Ok(mut rd) = tokio::fs::read_dir(dir).await {
+                while let Ok(Some(entry)) = rd.next_entry().await {
+                    let name = entry.file_name().to_string_lossy().to_string();
+                    let usable = !name.ends_with(".part") && !name.ends_with(".ytdl");
+                    if usable && name.starts_with(&stem) && entry.path() != *dest {
+                        let _ = tokio::fs::rename(entry.path(), dest).await;
+                        break;
+                    }
+                }
+            }
+        }
+    }
+    let len = tokio::fs::metadata(dest).await.map(|m| m.len()).unwrap_or(0);
+    if len == 0 {
+        return Err(anyhow!("yt-dlp finished without writing a file"));
+    }
+    shared.downloaded.store(len, Ordering::SeqCst);
+    shared.total.store(len, Ordering::SeqCst);
+    shared.has_total.store(true, Ordering::SeqCst);
     Ok(())
 }
 
