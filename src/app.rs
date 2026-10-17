@@ -3447,16 +3447,38 @@ impl CraftApp {
 pub(crate) fn open_path(path: &std::path::Path, reveal: bool) {
     if reveal {
         if path.exists() {
-            let _ = std::process::Command::new("explorer")
-                .arg(format!("/select,\"{}\"", path.display()))
-                .spawn();
+            select_in_file_manager(path);
         } else if let Some(parent) = path.parent() {
+            // The file itself is gone: the folder it was meant for is still
+            // the useful answer.
             let _ = std::process::Command::new("explorer").arg(parent).spawn();
         }
     } else if path.exists() {
         let _ = std::process::Command::new("cmd")
             .args(["/C", "start", "", &path.to_string_lossy()])
             .spawn();
+    }
+}
+
+/// Show `path` selected in the file manager.
+#[cfg(windows)]
+fn select_in_file_manager(path: &std::path::Path) {
+    use std::os::windows::process::CommandExt;
+    // `/select,"<path>"` has to reach Explorer *verbatim*. Built as one
+    // `Command::arg`, Rust escapes the quotes (`\"`), which Explorer does not
+    // parse: it drops the switch and opens its default folder instead - a file
+    // downloaded into `Downloads\Video` made "Open folder" land in
+    // `OneDrive\Documents`. `raw_arg` appends it unescaped, the documented
+    // form, and the path is quoted because it may contain spaces.
+    let _ = std::process::Command::new("explorer")
+        .raw_arg(format!("/select,\"{}\"", path.display()))
+        .spawn();
+}
+
+#[cfg(not(windows))]
+fn select_in_file_manager(path: &std::path::Path) {
+    if let Some(parent) = path.parent() {
+        let _ = std::process::Command::new("xdg-open").arg(parent).spawn();
     }
 }
 
