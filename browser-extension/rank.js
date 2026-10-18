@@ -90,48 +90,97 @@
     return `${m}:${s}`;
   }
 
-  // In-page menu theme tokens (P4 polish): the dark card is the historic
-  // look; the light card follows the "extension ui.png" mockup (white
-  // card, gray section labels, bordered pills). Same keys both modes so
-  // paint code never branches on missing fields.
-  function menuTokens(mode) {
+  // Floating panel tokens: the "extension_popup.html" design — a circle
+  // trigger opening a message-bubble panel with a 2-column quality grid,
+  // other-file chips and a Download / Cancel / X action row. Same keys in
+  // both modes so the paint code never branches on missing fields.
+  function panelTokens(mode) {
     if (mode === "light") {
       return {
         mode: "light",
         bg: "#ffffff",
-        border: "1px solid rgba(0,0,0,.08)",
-        radius: "16px",
-        shadow: "0 12px 32px rgba(0,0,0,.18)",
-        text: "#202124",
-        dim: "#9aa0a6",
-        itemBg: "#ffffff",
-        itemBorder: "1px solid #e1e3e6",
-        itemHover: "#f1f3f4",
-        toggleBorder: "rgba(0,0,0,.2)",
+        card: "#f8fafc",
+        hover: "#eef2f7",
+        border: "#e2e8f0",
+        text: "#0f172a",
+        dim: "#64748b",
+        muted: "#94a3b8",
+        accent: "#2563eb",
+        accentLight: "rgba(37,99,235,.10)",
+        shadow: "0 12px 32px rgba(15,23,42,.18)",
+        thumbBg: "linear-gradient(135deg,#c7d2fe,#a5b4fc)",
+        toggleBorder: "rgba(15,23,42,.2)",
         toggle: "☾",
       };
     }
     return {
       mode: "dark",
-      bg: "rgba(16,17,23,.92)",
-      border: "1px solid rgba(255,255,255,.1)",
-      radius: "12px",
-      shadow: "0 8px 28px rgba(0,0,0,.5)",
-      text: "#e6e6f0",
-      dim: "rgba(230,230,240,.6)",
-      itemBg: "transparent",
-      itemBorder: "1px solid transparent",
-      itemHover: "#35363e",
-      toggleBorder: "rgba(255,255,255,.25)",
+      bg: "#0f172a",
+      card: "#1e293b",
+      hover: "#334155",
+      border: "#334155",
+      text: "#f1f5f9",
+      dim: "#94a3b8",
+      muted: "#64748b",
+      accent: "#3b82f6",
+      accentLight: "rgba(59,130,246,.16)",
+      shadow: "0 8px 32px rgba(0,0,0,.4)",
+      thumbBg: "linear-gradient(135deg,#667eea,#764ba2)",
+      toggleBorder: "rgba(241,245,249,.25)",
       toggle: "☀",
     };
   }
 
-  // In-page menu theming: historic dark card + a light card following the
-  // "extension ui.png" mockup (white card, gray sections, bordered pills).
-  // Auto from prefers-color-scheme, overridable per page via the toggle.
-  // These run against the real DOM in content scripts AND under node with
-  // stubbed globals (see rank.test.js "menu paint").
+  // Repaint a built panel in the current theme. Role tags live in
+  // `data-dc-p` (layout is inline-styled at build time and never touched
+  // here), and the bubble arrow reads `data-dc-arrow` for its side.
+  function paintDcPanel(root) {
+    if (!root) return;
+    const T = panelTokens(dcThemeMode());
+    root._dcT = T;
+    root.style.background = T.bg;
+    root.style.borderColor = T.border;
+    root.style.color = T.text;
+    root.style.boxShadow = T.shadow;
+    root.querySelectorAll("[data-dc-p]").forEach((el) => {
+      const k = el.getAttribute("data-dc-p");
+      if (k === "text") el.style.color = T.text;
+      else if (k === "dim") el.style.color = T.dim;
+      else if (k === "muted") el.style.color = T.muted;
+      else if (k === "accent") el.style.color = T.accent;
+      else if (k === "icon") el.style.color = T.accent;
+      else if (k === "thumb") el.style.background = T.thumbBg;
+      else if (k === "divider") el.style.background = T.border;
+      else if (k === "borders") el.style.borderColor = T.border;
+      else if (k === "card") { el.style.background = T.card; el.style.borderColor = T.border; }
+      else if (k === "chip") { el.style.background = T.card; el.style.borderColor = T.border; el.style.color = T.text; }
+      else if (k === "chipmini") { el.style.background = T.hover; el.style.color = T.dim; }
+      else if (k === "btn") { el.style.background = T.card; el.style.borderColor = T.border; el.style.color = T.text; }
+      else if (k === "btnp") { el.style.background = T.accent; el.style.borderColor = T.accent; el.style.color = "#fff"; }
+      else if (k === "badge") { el.style.background = T.accentLight; el.style.color = T.accent; }
+      else if (k === "item") {
+        const sel = !!el.getAttribute("data-dc-sel");
+        el.style.background = sel ? T.accentLight : T.card;
+        el.style.borderColor = sel ? T.accent : T.border;
+        el.style.color = T.text;
+      } else if (k === "arrow") {
+        const side = el.getAttribute("data-dc-arrow") === "bottom" ? "bottom" : "top";
+        el.style.background = T.bg;
+        el.style.borderLeftColor = side === "top" ? T.border : "transparent";
+        el.style.borderTopColor = side === "top" ? T.border : "transparent";
+        el.style.borderRightColor = side === "top" ? "transparent" : T.border;
+        el.style.borderBottomColor = side === "top" ? "transparent" : T.border;
+      } else if (k === "toggle") {
+        el.style.color = T.text;
+        el.style.borderColor = T.toggleBorder;
+        el.textContent = T.toggle;
+      }
+    });
+  }
+
+  // In-page theme: auto from prefers-color-scheme, overridable per page via
+  // the panel's toggle. Runs against the real DOM in content scripts AND
+  // under node with stubbed globals (see rank.test.js "panel paint").
   function dcThemeMode() {
     try {
       const g = (typeof globalThis !== "undefined") ? globalThis : {};
@@ -144,9 +193,6 @@
     } catch (e) {}
     return "dark";
   }
-  function dcTokens() {
-    return menuTokens(dcThemeMode());
-  }
   function dcSetTheme(mode) {
     try {
       const g = (typeof globalThis !== "undefined") ? globalThis : {};
@@ -156,46 +202,8 @@
       }
     } catch (e) {}
   }
-  // Repaint a built menu in the current theme without touching layout
-  // (position/display belong to the open/close toggles).
-  function paintDcMenu(menu) {
-    if (!menu) return;
-    const T = dcTokens();
-    menu._dcT = T;
-    menu.style.background = T.bg;
-    menu.style.border = T.border;
-    menu.style.borderRadius = T.radius;
-    menu.style.boxShadow = T.shadow;
-    menu.style.color = T.text;
-    menu.querySelectorAll('[data-dc="sec"],[data-dc="hint"]').forEach((el) => { el.style.color = T.dim; });
-    menu.querySelectorAll('[data-dc="head"]').forEach((el) => { el.style.color = T.text; });
-    menu.querySelectorAll('[data-dc="item"]').forEach((el) => {
-      el.style.background = T.itemBg;
-      el.style.border = T.itemBorder;
-      el.style.color = T.text;
-    });
-    menu.querySelectorAll('[data-dc="toggle"]').forEach((el) => {
-      el.style.color = T.text;
-      el.style.borderColor = T.toggleBorder;
-      el.textContent = T.toggle;
-    });
-  }
-  function dcThemeToggle(menu, doc) {
-    const d = doc || ((typeof document !== "undefined") ? document : null);
-    if (!d) return null;
-    const t = d.createElement("button");
-    t.setAttribute("data-dc", "toggle");
-    t.title = "Toggle light / dark";
-    t.style.cssText = "margin-left:auto;width:26px;height:26px;border-radius:999px;border:1px solid;cursor:pointer;background:transparent;font-size:13px;line-height:1;flex-shrink:0;";
-    t.onclick = (ev) => {
-      if (ev && ev.stopPropagation) ev.stopPropagation();
-      dcSetTheme(dcThemeMode() === "light" ? "dark" : "light");
-      paintDcMenu(menu);
-    };
-    return t;
-  }
 
-  const DCRank = { isPlaylistUrl, isSegmentUrl, canonicalUrl, kindOf, scoreMedia, collapseDupes, fmtDur, menuTokens, dcThemeMode, dcTokens, dcSetTheme, paintDcMenu, dcThemeToggle };
+  const DCRank = { isPlaylistUrl, isSegmentUrl, canonicalUrl, kindOf, scoreMedia, collapseDupes, fmtDur, panelTokens, dcThemeMode, dcSetTheme, paintDcPanel };
   g.DCRank = DCRank;
   if (typeof module !== "undefined" && module.exports) module.exports = DCRank;
 })(typeof globalThis !== "undefined" ? globalThis : this);

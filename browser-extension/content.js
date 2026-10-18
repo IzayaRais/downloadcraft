@@ -177,7 +177,7 @@
     const pr = prs.find((p) => p && p.videoDetails && p.videoDetails.videoId === id) || null;
     const docTitle = document.title.replace(/ - YouTube$/, "");
     if (!pr || !pr.streamingData) {
-      return { videoId: id, title: docTitle || "youtube_video", thumb: ytThumb(pr, id), streams: [], videoOnly: [], audio: [] };
+      return { videoId: id, title: docTitle || "youtube_video", thumb: ytThumb(pr, id), streams: [], videoOnly: [], audio: [], subs: [] };
     }
     const title = (pr.videoDetails && pr.videoDetails.title) || docTitle || "youtube_video";
     // Stream URLs carry `expire=<unix>` and are session-locked: rows older
@@ -229,12 +229,12 @@
                       : String(f.mimeType || "").startsWith("audio/")));
     const cipherRows = (arr, wantVideo, kind) => ciphered(arr, wantVideo).map((f) => {
       const mime = String(f.mimeType || "").split(";")[0];
-      return { url: null, label: qlabel(f), mime, disp: contOf(mime), kind, itag: f.itag || 0, ciphered: true, _size: sizeOf(f), _dur: durOf(f) };
+      return { url: null, label: qlabel(f), mime, disp: contOf(mime), kind, itag: f.itag || 0, ciphered: true, _size: sizeOf(f), _dur: durOf(f), w: f.width || 0, h: f.height || 0 };
     });
     // Progressive = video+audio in one file (ready to play).
     const streams = direct(pr.streamingData.formats).map((f) => {
       const mime = String(f.mimeType || "").split(";")[0];
-      return { url: f.url, label: qlabel(f), mime, disp: contOf(mime), kind: "av", itag: f.itag || 0, _size: sizeOf(f), _dur: durOf(f) };
+      return { url: f.url, label: qlabel(f), mime, disp: contOf(mime), kind: "av", itag: f.itag || 0, _size: sizeOf(f), _dur: durOf(f), w: f.width || 0, h: f.height || 0 };
     });
     cipherRows(pr.streamingData.formats, true, "av").forEach((s) => {
       if (!streams.some((x) => x.label === s.label && x.disp === s.disp)) streams.push(s);
@@ -247,7 +247,7 @@
       .filter((f) => String(f.mimeType || "").startsWith("video/"))
       .map((f) => {
         const mime = String(f.mimeType || "").split(";")[0];
-        return { url: f.url, label: qlabel(f), mime, disp: contOf(mime), kind: "v", itag: f.itag || 0, _size: sizeOf(f), _dur: durOf(f) };
+        return { url: f.url, label: qlabel(f), mime, disp: contOf(mime), kind: "v", itag: f.itag || 0, _size: sizeOf(f), _dur: durOf(f), w: f.width || 0, h: f.height || 0 };
       })
       .filter((s) => {
         const k = `${s.label}|${s.disp}`;
@@ -286,7 +286,29 @@
         };
       })
       .slice(0, 6);
-    return { videoId: id, title, thumb: ytThumb(pr, id), streams, videoOnly, audio, sizes };
+    // Subtitle tracks (VTT): shown as "Other Files" chips in the panel and
+    // sent to the app as plain file downloads — the timedtext URL is a
+    // normal https GET, and `fmt=vtt` yields a straight .vtt file.
+    const subs = [];
+    try {
+      const list = pr.captions && pr.captions.playerCaptionsTracklistRenderer
+        && pr.captions.playerCaptionsTracklistRenderer.captionTracks;
+      for (const c of (list || []).slice(0, 8)) {
+        const u = String((c && c.baseUrl) || "");
+        if (!/^https?:\/\//i.test(u)) continue;
+        const nm = (c.name && (c.name.simpleText
+          || (c.name.runs && c.name.runs[0] && c.name.runs[0].text))) || c.languageCode || "sub";
+        // YouTube already says "(auto-generated)" — don't stack "(auto)" on
+        // top of it, just normalize the label to a short one.
+        const short = String(nm).replace(/\s*\([^)]*\bauto[^)]*\)\s*/i, "").trim() || c.languageCode || "sub";
+        subs.push({
+          url: /[?&]fmt=/i.test(u) ? u : u + "&fmt=vtt",
+          label: `${short}${c.kind === "asr" ? " (auto)" : ""}`,
+          lang: c.languageCode || "",
+        });
+      }
+    } catch (e) { /* captions are optional */ }
+    return { videoId: id, title, thumb: ytThumb(pr, id), streams, videoOnly, audio, sizes, subs };
   }
 
   function stripFbSlice(url) {
@@ -484,23 +506,43 @@
     return base.endsWith(".mp4") ? base : base + ".mp4";
   }
 
-  // IDM-style: the button lives ON the video player (top-right corner),
-  // falling back to a fixed viewport corner when no player is found.
-  function placeInPlayer(btn, menu) {
+  // IDM-style: the circle lives ON the video player (top-right corner),
+  // falling back to a fixed viewport corner when no player is found. The
+  // bubble's arrow always points back at the circle (up when the panel sits
+  // below it, down when it sits above it).
+  function placeInPlayer(btn, panel) {
     if (!btn) return false;
+    const setArrow = (side) => {
+      if (!panel) return;
+      const a = panel.querySelector('[data-dc-p="arrow"]');
+      if (!a) return;
+      const T = panel._dcT || dcPanelTokens();
+      const top = side === "top";
+      a.setAttribute("data-dc-arrow", top ? "top" : "bottom");
+      a.style.background = T.bg;
+      a.style.right = "11px";
+      a.style.left = "auto";
+      a.style.top = top ? "-7px" : "auto";
+      a.style.bottom = top ? "auto" : "-7px";
+      a.style.borderLeftColor = top ? T.border : "transparent";
+      a.style.borderTopColor = top ? T.border : "transparent";
+      a.style.borderRightColor = top ? "transparent" : T.border;
+      a.style.borderBottomColor = top ? "transparent" : T.border;
+    };
     const player = document.getElementById("movie_player");
     if (player) {
       btn.style.position = "absolute";
       btn.style.top = "12px";
       btn.style.right = "12px";
       btn.style.bottom = "auto";
-      if (menu) {
-        menu.style.position = "absolute";
-        menu.style.top = "52px";
-        menu.style.right = "12px";
-        menu.style.bottom = "auto";
-        if (menu.parentElement !== player) player.appendChild(menu);
+      if (panel) {
+        panel.style.position = "absolute";
+        panel.style.top = "56px";
+        panel.style.right = "12px";
+        panel.style.bottom = "auto";
+        if (panel.parentElement !== player) player.appendChild(panel);
       }
+      setArrow("top");
       if (btn.parentElement !== player) player.appendChild(btn);
       return true;
     }
@@ -508,19 +550,20 @@
     btn.style.right = "18px";
     btn.style.bottom = "18px";
     btn.style.top = "auto";
-    if (menu) {
-      menu.style.position = "fixed";
-      menu.style.right = "18px";
-      menu.style.bottom = "62px";
-      menu.style.top = "auto";
-      if (menu.parentElement !== document.documentElement) document.documentElement.appendChild(menu);
+    if (panel) {
+      panel.style.position = "fixed";
+      panel.style.right = "18px";
+      panel.style.bottom = "62px";
+      panel.style.top = "auto";
+      if (panel.parentElement !== document.documentElement) document.documentElement.appendChild(panel);
+      setArrow("bottom");
     }
     if (btn.parentElement !== document.documentElement) document.documentElement.appendChild(btn);
     return false;
   }
 
-  // Presence pre-check: rows already in the app queue get a "✓ Queued"
-  // tag and toast instead of re-sending into an "already in queue" error.
+  // Presence pre-check: qualities already in the app queue get a "✓ Queued"
+  // tag and a toast instead of re-sending into an "already in queue" error.
   function markQueuedRows(pairs) {
     try {
       const urls = pairs.map((p) => p.st.url).filter(Boolean).slice(0, 25);
@@ -531,11 +574,12 @@
         const hit = new Set((res && res.queued) || []);
         if (!hit.size) return;
         for (const p of pairs) {
-          if (!hit.has(p.st.url) || !p.btn.isConnected) continue;
-          if (!p.btn.textContent.includes("✓ Queued")) {
-            p.btn.textContent = `${p.btn.textContent} ✓ Queued`;
-          }
-          p.btn.onclick = (ev) => {
+          if (!hit.has(p.st.url) || !p.item || !p.item.el.isConnected) continue;
+          if (p.item.el.getAttribute("data-dc-queued")) continue;
+          p.item.el.setAttribute("data-dc-queued", "1");
+          p.item.fmtEl.textContent = "✓ Queued";
+          p.item.el.title = "Already in the download queue";
+          p.item.el.onclick = (ev) => {
             ev.stopPropagation();
             toast("Download Craft: already in queue");
           };
@@ -560,77 +604,425 @@
     return `${Math.floor(n / 60)}:${String(n % 60).padStart(2, "0")}`;
   }
 
-  // Brand mark for the floating "Download this video" buttons: the outlined
-  // accent circle with a download arrow — the same mark the app draws in its
-  // own title bar (and the icon shipped in assets/icon.png). Inline SVG keeps
-  // it crisp at every UI scale and needs no web_accessible_resources entry.
-  function brandIcon(px) {
-    const NS = "http://www.w3.org/2000/svg";
-    const svg = document.createElementNS(NS, "svg");
+  // ---------- In-page floating panel (extension_popup.html design) ----------
+  // The trigger is always a circle; the panel is a message bubble with an
+  // arrow, a "send link" row, video info, a 2-column quality grid, "Other
+  // Files" chips and a Download / Cancel / X action row. Every rule is set
+  // inline (a page's own CSS can never leak in), and each element carries a
+  // `data-dc-p` role so the light/dark toggle can repaint it without
+  // touching layout.
+  const SVG_NS = "http://www.w3.org/2000/svg";
+  const ICON_DOWN = "M12 4V16M6 10L12 16L18 10";
+  const ICON_SEND = "M22 2L11 13M22 2l-7 20-4-9-9-4 20-7z";
+  const ICON_CLOSE = "M6 6l12 12M18 6L6 18";
+  const ICON_PLAY = "M8 5.5v13l11-6.5-11-6.5z";
+  const CIRCLED_BG = "#3b82f6";
+  const CIRCLED_HOVER = "#60a5fa";
+
+  // Transparent-background inline SVG (no web_accessible_resources, crisp at
+  // every UI scale). `currentColor` lets the caller theme it with `color`.
+  function svgIcon(px, d, w) {
+    const svg = document.createElementNS(SVG_NS, "svg");
     svg.setAttribute("viewBox", "0 0 24 24");
     svg.setAttribute("width", String(px));
     svg.setAttribute("height", String(px));
     svg.setAttribute("aria-hidden", "true");
     svg.setAttribute("focusable", "false");
-    svg.style.cssText = "flex:0 0 auto;display:block;pointer-events:none;";
-    const add = (tag, attrs) => {
-      const el = document.createElementNS(NS, tag);
-      for (const k in attrs) el.setAttribute(k, attrs[k]);
-      svg.appendChild(el);
-    };
-    add("circle", { cx: "12", cy: "12", r: "9", fill: "none", stroke: "#3b82f6", "stroke-width": "2" });
-    add("path", {
-      d: "M12 8v7M8.5 11.5 12 15l3.5-3.5",
-      fill: "none",
-      stroke: "#3b82f6",
-      "stroke-width": "2",
-      "stroke-linecap": "round",
-      "stroke-linejoin": "round",
-    });
+    svg.style.cssText = "display:block;flex:0 0 auto;pointer-events:none;";
+    const path = document.createElementNS(SVG_NS, "path");
+    path.setAttribute("d", d);
+    if (w === 0) {
+      path.setAttribute("fill", "currentColor");
+      path.setAttribute("stroke", "none");
+    } else {
+      path.setAttribute("fill", "none");
+      path.setAttribute("stroke", "currentColor");
+      path.setAttribute("stroke-width", String(w || 2));
+      path.setAttribute("stroke-linecap", "round");
+      path.setAttribute("stroke-linejoin", "round");
+    }
+    svg.appendChild(path);
     return svg;
   }
 
-  // "[icon] Download this video": the label lives in its own span so a state
-  // update that rewrites a button's text can never drop the mark.
-  function labelButton(b, text, iconPx) {
-    b.appendChild(brandIcon(iconPx));
-    const span = document.createElement("span");
-    span.setAttribute("data-dc", "label");
-    span.textContent = text;
-    b.appendChild(span);
-    return span;
+  // The circle trigger (mock: "always a circle"), shared by the YouTube
+  // button and the universal pill so both look identical.
+  function circleButton(px, iconPx, title) {
+    const b = document.createElement("button");
+    b.type = "button";
+    b.title = title;
+    b.style.cssText = [
+      "display:flex", "align-items:center", "justify-content:center",
+      "width:" + px + "px", "height:" + px + "px", "padding:0", "margin:0",
+      "border:none", "border-radius:50%", "background:" + CIRCLED_BG, "color:#fff",
+      "cursor:pointer", "box-shadow:0 2px 12px rgba(0,0,0,.4)",
+      "z-index:2147483647", "transition:background .15s ease,transform .15s ease",
+    ].join(";");
+    b.appendChild(svgIcon(iconPx, ICON_DOWN, 2.5));
+    b.onmouseenter = () => { b.style.background = CIRCLED_HOVER; b.style.transform = "scale(1.06)"; };
+    b.onmouseleave = () => { b.style.background = CIRCLED_BG; b.style.transform = "none"; };
+    return b;
   }
 
-  // In-page menu theming (dark + light like the "extension ui.png" mockup).
-  // Real implementation lives in rank.js (node-tested); these wrappers
-  // degrade to the historic dark look when rank.js failed to load.
-  const DCUI = (typeof DCRank !== "undefined" && DCRank.paintDcMenu) ? DCRank : null;
+  // Theme: tokens + painter live in rank.js (node-tested); these wrappers
+  // fall back to the dark mock when rank.js failed to load.
+  const DCUI = (typeof DCRank !== "undefined" && DCRank.paintDcPanel) ? DCRank : null;
+  const DC_FALLBACK = {
+    mode: "dark", bg: "#0f172a", card: "#1e293b", hover: "#334155", border: "#334155",
+    text: "#f1f5f9", dim: "#94a3b8", muted: "#64748b", accent: "#3b82f6",
+    accentLight: "rgba(59,130,246,.16)", shadow: "0 8px 32px rgba(0,0,0,.4)",
+    thumbBg: "linear-gradient(135deg,#667eea,#764ba2)",
+    toggleBorder: "rgba(241,245,249,.25)", toggle: "☀",
+  };
   function dcThemeMode() { return DCUI ? DCUI.dcThemeMode() : "dark"; }
-  function dcTokens() {
-    if (DCUI) return DCUI.dcTokens();
-    return { mode: "dark", bg: "rgba(16,17,23,.92)", border: "1px solid rgba(255,255,255,.1)", radius: "12px", shadow: "0 8px 28px rgba(0,0,0,.5)", text: "#e6e6f0", dim: "rgba(230,230,240,.6)", itemBg: "transparent", itemBorder: "1px solid transparent", itemHover: "#35363e", toggleBorder: "rgba(255,255,255,.25)", toggle: "☀" };
+  function dcSetTheme(mode) { if (DCUI) DCUI.dcSetTheme(mode); }
+  function dcPanelTokens() { return (DCUI && DCUI.panelTokens(dcThemeMode())) || DC_FALLBACK; }
+  function paintDcPanel(root) { if (root && DCUI) DCUI.paintDcPanel(root); }
+  function allPanels() { try { return [...document.querySelectorAll("[data-dc-panel]")]; } catch (e) { return []; } }
+  function hidePanels() { allPanels().forEach((p) => { p.style.display = "none"; }); }
+  // Click-away / Escape closes any open panel. One listener per page (a
+  // per-rebuild listener leaked and stale closures fought the new panel);
+  // panels stop their own clicks from reaching the document.
+  function installDcCloser() {
+    if (window.__dcDocClick) return;
+    window.__dcDocClick = true;
+    document.addEventListener("click", () => { hidePanels(); });
+    document.addEventListener("keydown", (e) => {
+      if (e && (e.key === "Escape" || e.keyCode === 27)) hidePanels();
+    });
   }
-  function paintDcMenu(menu) { if (DCUI) DCUI.paintDcMenu(menu); }
-  function dcThemeToggle(menu) { return DCUI ? DCUI.dcThemeToggle(menu, document) : null; }
 
+  // A plain styled div (role = data-dc-p paint role, may be null).
+  function dcText(text, role, css) {
+    const el = document.createElement("div");
+    if (role) el.setAttribute("data-dc-p", role);
+    if (css) el.style.cssText = css;
+    el.textContent = text == null ? "" : String(text);
+    return el;
+  }
+
+  // Light/dark toggle for a panel (same idea as rank.js's menu toggle, but
+  // it repaints the panel design and any other open panel).
+  function panelThemeToggle(panel) {
+    const b = document.createElement("button");
+    b.type = "button";
+    b.setAttribute("data-dc-p", "toggle");
+    b.title = "Toggle light / dark";
+    b.style.cssText = "flex:0 0 auto;width:22px;height:22px;padding:0;margin:0;border-radius:999px;"
+      + "border:1px solid;background:transparent;cursor:pointer;font:11px/1 system-ui,sans-serif;";
+    b.onclick = (ev) => {
+      if (ev && ev.stopPropagation) ev.stopPropagation();
+      dcSetTheme(dcThemeMode() === "light" ? "dark" : "light");
+      try { allPanels().forEach(paintDcPanel); } catch (e) { /* theme is best-effort */ }
+    };
+    return b;
+  }
+
+  // One quality cell: container + resolution on the left, size on the right.
+  function dcQualityItem(o) {
+    const T = dcPanelTokens();
+    const el = document.createElement("div");
+    el.setAttribute("data-dc-p", "item");
+    el.style.cssText = "display:flex;align-items:center;justify-content:space-between;gap:6px;box-sizing:border-box;"
+      + "border:1px solid " + T.border + ";border-radius:6px;background:" + T.card + ";cursor:pointer;padding:6px 8px;";
+    if (o.tip) el.title = o.tip;
+    const col = document.createElement("div");
+    col.style.cssText = "display:flex;flex-direction:column;gap:1px;min-width:0;";
+    const fmt = dcText(o.format || "", "text", "font-size:10px;font-weight:600;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;");
+    const res = dcText(o.res || "", "muted", "font-size:9px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;");
+    col.appendChild(fmt);
+    col.appendChild(res);
+    const size = dcText(o.size || "—", "dim", "flex:0 0 auto;font-size:10px;text-align:right;white-space:nowrap;");
+    el.appendChild(col);
+    el.appendChild(size);
+    el.onmouseenter = () => { if (!el.getAttribute("data-dc-sel")) el.style.background = dcPanelTokens().hover; };
+    el.onmouseleave = () => { if (!el.getAttribute("data-dc-sel")) el.style.background = dcPanelTokens().card; };
+    return { el, fmtEl: fmt, resEl: res, sizeEl: size, setSize: (t) => { size.textContent = t; } };
+  }
+
+  // "Other Files" chip (subtitles, audio-only tracks).
+  function dcFileChip(f) {
+    const T = dcPanelTokens();
+    const el = document.createElement("div");
+    el.setAttribute("data-dc-p", "chip");
+    el.style.cssText = "display:inline-flex;align-items:center;gap:5px;box-sizing:border-box;padding:4px 8px;"
+      + "border:1px solid " + T.border + ";border-radius:5px;background:" + T.card + ";cursor:pointer;"
+      + "font-size:10px;font-weight:500;";
+    if (f.tip) el.title = f.tip;
+    el.appendChild(dcText(f.label || "file", null, "white-space:nowrap;"));
+    el.onclick = (ev) => {
+      if (ev && ev.stopPropagation) ev.stopPropagation();
+      hidePanels();
+      if (f.send) f.send();
+    };
+    el.onmouseenter = () => { el.style.borderColor = dcPanelTokens().accent; };
+    el.onmouseleave = () => { el.style.borderColor = dcPanelTokens().border; };
+    return { el };
+  }
+
+  // Build the bubble panel. Spec:
+  //   {title, thumb, dur, res, size, format,          // video info block
+  //    hint, sendLabel, onSendLink,                   // "send link" row
+  //    primaryLabel, onPrimary, onClose}              // action row
+  // plus api.addQuality({format,res,size,tip,send,onPick}) / api.addChip(...).
+  function dcPanel(spec) {
+    const s = spec || {};
+    const T = dcPanelTokens();
+    const items = [];
+    const chips = [];
+    let selected = null;
+    const panel = document.createElement("div");
+    panel.setAttribute("data-dc-panel", "1");
+    panel.style.cssText = [
+      "display:none", "position:relative", "width:300px", "max-width:96vw",
+      "box-sizing:border-box", "padding:0", "margin:0", "text-align:left",
+      "border:1px solid " + T.border, "border-radius:12px",
+      "background:" + T.bg, "color:" + T.text, "box-shadow:" + T.shadow,
+      "font:12px/1.35 system-ui,'Segoe UI',sans-serif", "z-index:2147483647",
+    ].join(";");
+    // Clicks inside the panel never reach the page (YouTube's own handlers
+    // would pause/close the player, and the document closer would fire).
+    panel.onclick = (ev) => { if (ev && ev.stopPropagation) ev.stopPropagation(); };
+
+    const arrow = document.createElement("div");
+    arrow.setAttribute("data-dc-p", "arrow");
+    arrow.setAttribute("data-dc-arrow", "top");
+    arrow.style.cssText = "position:absolute;top:-7px;right:11px;left:auto;width:14px;height:14px;"
+      + "background:" + T.bg + ";border:1px solid transparent;border-left-color:" + T.border
+      + ";border-top-color:" + T.border + ";border-radius:2px 0 0 0;transform:rotate(45deg);pointer-events:none;";
+    panel.appendChild(arrow);
+
+    const inner = document.createElement("div");
+    inner.style.cssText = "display:flex;flex-direction:column;border-radius:11px;overflow:hidden;";
+
+    // --- "Send video link to app" row
+    const sendRow = document.createElement("div");
+    sendRow.setAttribute("data-dc-p", "sendrow");
+    sendRow.style.cssText = "display:flex;align-items:center;gap:8px;box-sizing:border-box;margin:4px 8px 0;padding:10px 12px;border-radius:6px;";
+    const sendIcon = svgIcon(14, ICON_SEND, 2);
+    sendIcon.setAttribute("data-dc-p", "icon");
+    const sendTxt = document.createElement("div");
+    sendTxt.style.cssText = "flex:1;min-width:0;";
+    sendTxt.appendChild(dcText(s.sendLabel || "Send video link to app", "text", "font-size:11px;"));
+    sendTxt.appendChild(dcText(s.hint || "", "muted", "font-size:9px;margin-top:1px;line-height:1.35;"));
+    sendRow.appendChild(sendIcon);
+    sendRow.appendChild(sendTxt);
+    sendRow.appendChild(panelThemeToggle(panel));
+    sendRow.onmouseenter = () => { sendRow.style.background = (panel._dcT || dcPanelTokens()).hover; };
+    sendRow.onmouseleave = () => { sendRow.style.background = "transparent"; };
+    if (s.onSendLink) {
+      sendRow.style.cursor = "pointer";
+      sendRow.onclick = (ev) => {
+        if (ev && ev.stopPropagation) ev.stopPropagation();
+        hidePanels();
+        s.onSendLink();
+      };
+    }
+    inner.appendChild(sendRow);
+
+    // --- video info (thumb + title + resolution / size / container)
+    const info = document.createElement("div");
+    info.style.cssText = "display:flex;gap:10px;align-items:center;box-sizing:border-box;padding:10px 12px;";
+    const thumb = document.createElement("div");
+    thumb.setAttribute("data-dc-p", "thumb");
+    thumb.style.cssText = "position:relative;flex:0 0 80px;width:80px;height:48px;border-radius:6px;overflow:hidden;"
+      + "display:flex;align-items:center;justify-content:center;background:" + T.thumbBg + ";color:#fff;";
+    const play = svgIcon(14, ICON_PLAY, 0);
+    play.style.opacity = ".85";
+    if (s.thumb && /^https?:\/\//i.test(s.thumb)) {
+      const im = document.createElement("img");
+      im.src = s.thumb;
+      im.loading = "lazy";
+      im.style.cssText = "width:100%;height:100%;object-fit:cover;display:block;";
+      im.onload = () => { play.style.display = "none"; };
+      im.onerror = () => { im.remove(); };
+      thumb.appendChild(im);
+    }
+    thumb.appendChild(play);
+    if (s.dur) {
+      thumb.appendChild(dcText(s.dur, null,
+        "position:absolute;bottom:2px;right:4px;font-size:7px;color:#fff;background:rgba(0,0,0,.7);padding:1px 3px;border-radius:2px;line-height:1;"));
+    }
+    const det = document.createElement("div");
+    det.style.cssText = "flex:1;min-width:0;";
+    const titleEl = dcText(s.title, "text", "font-size:12px;font-weight:600;margin-bottom:4px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;");
+    titleEl.title = s.title || "";
+    const meta = document.createElement("div");
+    meta.style.cssText = "display:flex;align-items:center;gap:8px;flex-wrap:wrap;";
+    const resEl = dcText(s.res || "", "accent", "font-size:10px;font-weight:500;");
+    const sizeEl = dcText(s.size ? "• " + s.size : "", "muted", "font-size:10px;");
+    const fmtEl = dcText(s.format ? String(s.format).toUpperCase() : "", "chipmini",
+      "font-size:9px;padding:1px 5px;border-radius:3px;");
+    meta.appendChild(resEl);
+    meta.appendChild(sizeEl);
+    meta.appendChild(fmtEl);
+    det.appendChild(titleEl);
+    det.appendChild(meta);
+    info.appendChild(thumb);
+    info.appendChild(det);
+    inner.appendChild(info);
+
+    // --- scrollable middle: quality grid + other files
+    const scroller = document.createElement("div");
+    scroller.style.cssText = "max-height:min(58vh,420px);overflow-y:auto;overflow-x:hidden;";
+    const mkDivider = () => {
+      const d = document.createElement("div");
+      d.setAttribute("data-dc-p", "divider");
+      d.style.cssText = "height:1px;margin:0 12px;background:" + T.border + ";";
+      return d;
+    };
+    const gridDivider = mkDivider();
+    const gridSec = document.createElement("div");
+    gridSec.style.cssText = "padding:8px 12px;";
+    const gridHead = document.createElement("div");
+    gridHead.style.cssText = "display:flex;align-items:center;justify-content:space-between;margin-bottom:6px;";
+    const badge = dcText("", "badge", "font-size:9px;padding:2px 6px;border-radius:8px;");
+    gridHead.appendChild(dcText("Video Files", "muted", "font-size:10px;font-weight:600;letter-spacing:.5px;text-transform:uppercase;"));
+    gridHead.appendChild(badge);
+    const grid = document.createElement("div");
+    grid.style.cssText = "display:grid;grid-template-columns:1fr 1fr;gap:5px;";
+    gridSec.appendChild(gridHead);
+    gridSec.appendChild(grid);
+    scroller.appendChild(gridDivider);
+    scroller.appendChild(gridSec);
+
+    const chipsDivider = mkDivider();
+    const chipsSec = document.createElement("div");
+    chipsSec.style.cssText = "padding:8px 12px;";
+    const chipsHead = document.createElement("div");
+    chipsHead.style.cssText = "display:flex;align-items:center;justify-content:space-between;margin-bottom:6px;";
+    chipsHead.appendChild(dcText("Other Files", "muted", "font-size:10px;font-weight:600;letter-spacing:.5px;text-transform:uppercase;"));
+    const chipsWrap = document.createElement("div");
+    chipsWrap.style.cssText = "display:flex;gap:6px;flex-wrap:wrap;";
+    chipsSec.appendChild(chipsHead);
+    chipsSec.appendChild(chipsWrap);
+    scroller.appendChild(chipsDivider);
+    scroller.appendChild(chipsSec);
+    inner.appendChild(scroller);
+
+    // --- action row: Download / Cancel / X
+    const actions = document.createElement("div");
+    actions.setAttribute("data-dc-p", "borders");
+    actions.style.cssText = "display:flex;gap:6px;box-sizing:border-box;padding:8px 12px;border-top:1px solid " + T.border + ";";
+    const mkBtn = (label, role, on, icon) => {
+      const b = document.createElement("button");
+      b.type = "button";
+      b.setAttribute("data-dc-p", role);
+      b.style.cssText = "display:flex;align-items:center;justify-content:center;gap:4px;flex:1;box-sizing:border-box;"
+        + "padding:7px 12px;margin:0;border-radius:5px;border:1px solid;cursor:pointer;"
+        + "font:500 11px/1.2 system-ui,'Segoe UI',sans-serif;";
+      if (label) b.appendChild(dcText(label, null, "white-space:nowrap;"));
+      if (icon) b.appendChild(svgIcon(10, icon, 2.5));
+      b.onclick = (ev) => {
+        if (ev && ev.stopPropagation) ev.stopPropagation();
+        if (on) on();
+      };
+      return b;
+    };
+    const primary = mkBtn(s.primaryLabel || "Download", "btnp", () => {
+      hidePanels();
+      if (s.onPrimary) s.onPrimary();
+    }, ICON_DOWN);
+    const cancel = mkBtn("Cancel", "btn", () => {
+      hidePanels();
+      if (s.onClose) s.onClose();
+    }, null);
+    const close = mkBtn("", "btn", () => {
+      hidePanels();
+      if (s.onClose) s.onClose();
+    }, ICON_CLOSE);
+    close.style.flex = "0 0 36px";
+    close.title = "Close";
+    close.setAttribute("aria-label", "Close");
+    actions.appendChild(primary);
+    actions.appendChild(cancel);
+    actions.appendChild(close);
+    inner.appendChild(actions);
+
+    panel.appendChild(inner);
+
+    function select(it) {
+      if (selected && selected.el) selected.el.removeAttribute("data-dc-sel");
+      selected = it || null;
+      if (selected && selected.el) selected.el.setAttribute("data-dc-sel", "1");
+      paintDcPanel(panel);
+    }
+    function sync() {
+      badge.textContent = items.length === 1 ? "1 quality" : `${items.length} qualities`;
+      gridDivider.style.display = items.length ? "block" : "none";
+      gridSec.style.display = items.length ? "block" : "none";
+      chipsDivider.style.display = chips.length ? "block" : "none";
+      chipsSec.style.display = chips.length ? "block" : "none";
+      scroller.style.display = (items.length || chips.length) ? "block" : "none";
+    }
+    const api = {
+      panel,
+      grid,
+      items,
+      select,
+      selected: () => selected,
+      addQuality: (q) => {
+        const it = dcQualityItem(q);
+        it.q = q;
+        it.el.onclick = (ev) => {
+          if (ev && ev.stopPropagation) ev.stopPropagation();
+          select(it);
+          if (q.onPick) q.onPick();
+        };
+        grid.appendChild(it.el);
+        items.push(it);
+        // The highest quality is selected up front (like the mockup), so the
+        // primary button always has something to download.
+        if (!selected) {
+          select(it);
+          if (q.onPick) q.onPick();
+        }
+        sync();
+        return it;
+      },
+      addChip: (c) => {
+        const chip = dcFileChip(c);
+        chipsWrap.appendChild(chip.el);
+        chips.push(chip);
+        sync();
+        return chip;
+      },
+      setInfo: (o) => {
+        if (o.res != null) resEl.textContent = o.res;
+        if (o.size != null) sizeEl.textContent = o.size ? "• " + o.size : "";
+        if (o.format != null) fmtEl.textContent = String(o.format).toUpperCase();
+      },
+      setPrimaryLabel: (t) => { primary.firstChild.textContent = t; },
+      setHint: (t) => { sendTxt.lastChild.textContent = t; },
+      sync,
+      show: () => { panel.style.display = "block"; paintDcPanel(panel); },
+      hide: () => { panel.style.display = "none"; },
+    };
+    paintDcPanel(panel);
+    sync();
+    return api;
+  }
+
+  // Size enrichment for grid cells whose page JSON carried no contentLength:
+  // ask the background for a HEAD/Range measurement. Never for rows with an
+  // exact page-JSON size (they already print it) and never for "via app"
+  // rows (a watch-page byte count would be a bogus size).
   function enrichSizes(pairs) {
-    // pairs: [{btn, st, base}] — fill in "(12.4 MB)" once HEAD/Range answers.
-    // Rows carrying a page-JSON size (_size) already print it; never
-    // re-fetch those (googlevideo HEADs 403 and we'd just flicker).
     try {
-      const need = pairs.filter((p) => !(p.st._size > 0));
-      const urls = need.map((p) => p.st.url).filter(Boolean).slice(0, 12);
+      const need = (pairs || []).filter((p) => p && p.sizeEl && p.st
+        && !(p.st._size > 0) && !p.st.ciphered && /^https?:\/\//i.test(p.st.url || ""));
+      const urls = [...new Set(need.map((p) => p.st.url))].slice(0, 12);
       if (!urls.length) return;
       chrome.runtime.sendMessage({ type: "getSizes", urls, referer: location.href }, (res) => {
         if (chrome.runtime.lastError) return;
         if (!alive()) return;
         const sizes = (res && res.sizes) || {};
         for (const p of need) {
-          if (!p.btn.isConnected) continue;
           const n = sizes[p.st.url] || 0;
-          const s = fmtSize(n);
-          if (n > 0) p.st._size = n;
-          if (s) p.btn.textContent = `${p.base} (${s})`;
+          if (n > 0 && p.sizeEl.isConnected) {
+            p.st._size = n;
+            p.sizeEl.textContent = fmtSize(n);
+          }
         }
       });
     } catch (e) { /* sizes are best-effort */ }
@@ -639,111 +1031,131 @@
   // itag → quality/container for labeling sniffed live streams (page JSON
   // hides adaptive URLs until playback, but the player's traffic carries
   // itags — this rebuilds IDM-style "1080p · mp4" rows from them).
-  const ITAG_Q = {17:"144p",18:"360p",22:"720p",36:"240p",43:"360p",133:"240p",134:"360p",135:"480p",136:"720p",137:"1080p",160:"144p",242:"240p",243:"360p",244:"480p",247:"720p",248:"1080p",271:"1440p",272:"2160p",278:"144p",302:"720p60",303:"1080p60",308:"1440p60",313:"2160p",315:"2160p60",394:"144p",395:"240p",396:"360p",397:"480p",398:"720p",399:"1080p"};
-  const ITAG_A = {139:"low",140:"medium",141:"high",249:"low",250:"medium",251:"high",599:"low",600:"medium"};
+  const ITAG_Q = {17:"144p",18:"360p",22:"720p",36:"240p",43:"360p",133:"240p",134:"360p",135:"480p",136:"720p",137:"1080p",160:"144p",242:"240p",243:"360p",244:"480p",247:"720p",248:"1080p",271:"1440p",272:"2160p",278:"144p",298:"720p60",299:"1080p60",300:"1440p60",301:"2160p60",302:"720p60",303:"1080p60",308:"1440p60",313:"2160p",315:"2160p60",394:"144p",395:"240p",396:"360p",397:"480p",398:"720p",399:"1080p"};
+  const ITAG_A = {139:"48k",140:"128k",141:"256k",249:"50k",250:"70k",251:"160k",599:"32k",600:"64k",601:"128k"};
   const PROG_ITAG = new Set([17,18,22,36,43]);
-  function sniffLabel(m) {
-    let itag = 0;
+  function sniffItag(m) {
     try {
       const im = String(m.url || "").match(/[?&]itag=(\d+)/);
-      itag = im ? parseInt(im[1], 10) : 0;
-    } catch (e) {}
-    const cont = contOf(m.mime);
+      return im ? im[1] : "";
+    } catch (e) { return ""; }
+  }
+  // Frame size for the panel's resolution line ("1080p" → "1920×1080").
+  const RES_WH = {"4320p":"7680×4320","2160p":"3840×2160","1440p":"2560×1440","1080p":"1920×1080","720p":"1280×720","480p":"854×480","360p":"640×360","240p":"426×240","144p":"256×144"};
+  function resWH(label, w, h) {
+    if (w > 0 && h > 0) return `${w}×${h}`;
+    const m = String(label || "").match(/^(\d+)p/);
+    return (m && RES_WH[m[1] + "p"]) || String(label || "video");
+  }
+
+  // Sniffed live stream → panel cell parts (container + quality). Audio-only
+  // traffic becomes an "Other Files" chip instead of a video cell.
+  function sniffParts(m) {
+    const itag = parseInt(sniffItag(m), 10) || 0;
+    const cont = (contOf(m.mime) || "mp4").toUpperCase();
     if (itag && ITAG_Q[itag]) {
-      const av = PROG_ITAG.has(itag) ? "" : " (no audio)";
-      return { text: `⬇ ${ITAG_Q[itag]} · ${cont}${av}`, itag };
+      return { video: true, format: cont + (PROG_ITAG.has(itag) ? "" : " + audio"), res: resWH(ITAG_Q[itag], 0, 0) };
     }
-    if (itag && ITAG_A[itag]) {
-      return { text: `⬇ ${ITAG_A[itag]} · ${cont} (audio)`, itag };
-    }
-    const tag = /video/i.test(m.mime || "") ? "video" : /audio/i.test(m.mime || "") ? "audio" : "stream";
-    return { text: `⬇ playing ${tag} · ${cont}`, itag: 0 };
+    if (itag && ITAG_A[itag]) return { video: false, format: cont, res: ITAG_A[itag] };
+    return { video: /video/i.test(m.mime || ""), format: cont, res: "stream" };
   }
 
   // IDM-style network catch: merge background-sniffed playing streams
-  // (googlevideo range requests from the running player) into the YouTube
-  // menu. Needed because YouTube often embeds ZERO direct URLs for music/
-  // VEVO videos — the page JSON has formats but no `url` fields; only the
-  // live network traffic carries the deciphered stream URLs.
-  // Sniffed URLs carry the player's deciphered `n` parameter, so rows whose
-  // itag matches a sniffed stream get their URL SWAPPED to the fresh one
-  // (stale page URLs 403 in the app).
-  function appendSniffed(menu, known, pairs) {
+  // (googlevideo range requests from the running player) into the panel.
+  // Needed because YouTube often embeds ZERO direct URLs for music/VEVO
+  // videos — the page JSON has formats but no `url` fields; only the live
+  // traffic carries the deciphered stream URLs. Sniffed URLs carry the
+  // player's deciphered `n` parameter, so cells whose itag matches a sniffed
+  // stream get their URL SWAPPED to the fresh one (stale page URLs 403).
+  function appendSniffed(api, known, pairs, bestAudio, baseName) {
     try {
+      const clean = String(baseName || "video").replace(/\.mp4$/i, "");
       chrome.runtime.sendMessage({ type: "getMedia", pageUrl: location.href }, (res) => {
         if (chrome.runtime.lastError) return;
-        if (!alive() || !menu.isConnected) return;
-        const items = ((res && res.items) || [])
-          .filter((m) => m && /^https?:\/\//i.test(m.url) && !known.has(m.url));
+        if (!alive() || !api || !api.panel.isConnected) return;
+        const all = (res && res.items) || [];
+        const items = all.filter((m) => m && /^https?:\/\//i.test(m.url) && !known.has(m.url));
+        // Video-only traffic gets an audio track paired, so the app can merge
+        // it: the page's best audio when it has a direct URL, else the audio
+        // the sniffer just saw in the same playback session.
+        const sniffAudio = all.find((x) => x && /^audio\//i.test(x.mime || "") && /^https?:\/\//i.test(x.url || ""));
+        const pickAudio = (bestAudio && bestAudio.url)
+          ? { url: bestAudio.url, mime: bestAudio.mime }
+          : (sniffAudio ? { url: sniffAudio.url, mime: sniffAudio.mime } : null);
+        const pairOf = (m) => (pickAudio && pickAudio.url && pickAudio.url !== m.url) ? pickAudio : null;
         const byItag = {};
-        for (const m of ((res && res.items) || [])) {
+        for (const m of all) {
           try {
             const im = String(m.url || "").match(/[?&]itag=(\d+)/);
             if (im && !byItag[im[1]]) byItag[im[1]] = m;
           } catch (e) {}
         }
-        // Swap stale page URLs for fresh player-deciphered ones (same itag).
+        // Swap stale page URLs for fresh player-deciphered ones (same itag):
+        // the row stops being a "via app" hint and becomes a real download.
         const swapped = [];
+        const swappedItags = new Set();
         for (const p of pairs || []) {
           const tag = p.st && p.st.itag ? String(p.st.itag) : null;
           const fresh = tag && byItag[tag];
-          if (fresh && fresh.url !== p.st.url && p.btn.isConnected) {
+          if (fresh && fresh.url !== p.st.url && p.item && p.item.el.isConnected) {
             p.st.url = fresh.url;
-            p.btn.title = fresh.url.slice(0, 120);
+            p.st.ciphered = false;
+            const cont = (contOf(fresh.mime) || p.st.disp || "mp4").toUpperCase();
+            const fmt = cont + (p.st.kind === "v" ? " + audio" : "");
+            if (p.item.fmtEl) p.item.fmtEl.textContent = fmt;
+            if (p.item.q) p.item.q.format = fmt;
+            p.item.el.title = `${p.st.label} · ${cont} · fresh URL from the player`;
             known.add(fresh.url);
-            swapped.push({ btn: p.btn, st: p.st, base: p.base });
+            swappedItags.add(tag);
+            swapped.push(p);
           }
         }
         if (swapped.length) enrichSizes(swapped);
         if (!items.length) return;
-        // Rebuild (never duplicate): late playback can add streams after the
-        // first merge, so refresh the section instead of skipping it.
-        menu.querySelectorAll("[data-dc-sniff]").forEach((el) => el.remove());
-        const h = document.createElement("div");
-        h.setAttribute("data-dc-sniff", "1");
-        h.setAttribute("data-dc", "sec");
-        h.textContent = "Detected playing streams";
-        h.style.cssText = "padding:8px 8px 2px;font-size:11px;opacity:.6;text-transform:uppercase;letter-spacing:.06em;";
-        menu.appendChild(h);
-        const pairs = [];
+        // Late playback can add streams after the first merge: append the
+        // new ones as extra grid cells (same look as the page-JSON rows),
+        // never duplicating a row that is already listed — neither a cell
+        // that was just refreshed in place, nor one with the same label.
         items.slice(0, 8).forEach((m) => {
           known.add(m.url);
-          const lab = sniffLabel(m);
-          const base = lab.text;
-          const b = document.createElement("button");
-          b.setAttribute("data-dc", "item");
-          b.textContent = m.size > 0 ? `${base} (${fmtSize(m.size)})` : base;
-          b.title = m.url.slice(0, 120);
-          b.style.cssText = [
-            "display:block", "width:100%", "text-align:left", "margin:2px 0",
-            "padding:7px 10px", "border-radius:6px", "border:1px solid transparent",
-            "background:transparent", "color:#e6e6f0", "cursor:pointer", "font:13px system-ui,sans-serif",
-          ].join(";");
-          b.onmouseenter = () => { b.style.background = (menu._dcT || dcTokens()).itemHover; };
-          b.onmouseleave = () => { b.style.background = (menu._dcT || dcTokens()).itemBg; };
-          b.onclick = (ev) => {
-            ev.stopPropagation();
-            menu.style.display = "none";
-            sendDownload(m.url, undefined, m.mime, m.size || null);
-          };
-          menu.appendChild(b);
-          pairs.push({ btn: b, st: { url: m.url }, base });
+          const part = sniffParts(m);
+          const tag = sniffItag(m);
+          if (tag && swappedItags.has(tag)) return;
+          if (!part.video) {
+            api.addChip({
+              label: `♪ ${part.format} ${part.res}`,
+              tip: m.url.slice(0, 120),
+              send: () => sendDownload(m.url, `${clean} [audio]${mimeExt(m.mime)}`, m.mime, m.size || null),
+            });
+            return;
+          }
+          if (api.items.some((x) => x.q && x.q.format === part.format && x.q.res === part.res)) return;
+          if (tag && api.items.some((x) => x.q && x.q.st && String(x.q.st.itag) === tag)) return;
+          const qtag = ITAG_Q[parseInt(tag, 10)] || part.res;
+          const it = api.addQuality({
+            format: part.format,
+            res: part.res,
+            size: m.size > 0 ? fmtSize(m.size) : "",
+            tip: `${m.url.slice(0, 120)} — detected from the player`,
+            send: () => sendDownload(m.url, `${clean} [${qtag}].mp4`, m.mime, m.size || null, pairOf(m)),
+          });
+          enrichSizes([{ item: it, sizeEl: it.sizeEl, st: { url: m.url, _size: m.size || 0 } }]);
         });
-        enrichSizes(pairs);
-        try { paintDcMenu(menu); } catch (e) { /* theme is best-effort */ }
+        api.sync();
+        try { paintDcPanel(api.panel); } catch (e) { /* theme is best-effort */ }
       });
     } catch (e) { /* ignore */ }
   }
 
   function ensureButton(info) {
     const oldBtn = document.getElementById("dc-yt-btn");
-    const oldMenu = document.getElementById("dc-yt-menu");
+    const oldPanel = document.getElementById("dc-yt-panel");
     if (oldBtn && oldBtn.dataset.gen !== String(GEN)) {
       // Adopted DOM from an older live instance (e.g. re-injected after
       // an update): always rebuild so the handlers belong to this
       // (current) generation.
       oldBtn.remove();
-      if (oldMenu) oldMenu.remove();
+      if (oldPanel) oldPanel.remove();
     }
     // Rebuild whenever the content signature changes — not just the video
     // id. Expiries AND url sets are included so refreshed (re-issued) URLs
@@ -775,239 +1187,194 @@
       urlSig(info.streams), urlSig(info.videoOnly), urlSig(info.audio),
     ];
     const sig = sigParts.join("|");
-    // NOTE: oldBtn/oldMenu were already dropped above when they belonged
-    // to an older generation, so reaching here means same-generation DOM.
+    // NOTE: the old button/panel were already dropped above when they
+    // belonged to an older generation, so reaching here means same-generation
+    // DOM.
     if (oldBtn && oldBtn.isConnected) {
       if (oldBtn.dataset.sig === sig) {
         // Same content: keep everything, just re-anchor (the player
         // element can be recreated by SPA navigation).
-        placeInPlayer(oldBtn, oldMenu);
+        placeInPlayer(oldBtn, oldPanel);
         return;
       }
       oldBtn.remove();
-      if (oldMenu) oldMenu.remove();
+      if (oldPanel) oldPanel.remove();
     }
-    const btn = document.createElement("button");
+    const btn = circleButton(36, 18, "Send video to Download Craft");
     btn.id = "dc-yt-btn";
     btn.dataset.vid = info.videoId;
     btn.dataset.gen = String(GEN);
     btn.dataset.sig = sigParts.join("|");
-    labelButton(btn, "Download this video", 15);
-    btn.title = "Send video to Download Craft";
-    btn.style.cssText = [
-      "display:inline-flex", "align-items:center", "gap:7px", "white-space:nowrap",
-      "padding:6px 13px", "border-radius:999px", "border:1px solid rgba(255,255,255,.13)",
-      "background:rgba(12,12,16,.68)", "backdrop-filter:blur(10px)",
-      "color:#f2f2f7", "font:500 12px/1.4 system-ui,sans-serif", "letter-spacing:.02em",
-      "cursor:pointer", "box-shadow:0 2px 12px rgba(0,0,0,.35)", "z-index:2147483647",
-      "transition:background .15s ease,transform .15s ease",
-    ].join(";");
-    const menu = document.createElement("div");
-    menu.id = "dc-yt-menu";
-    menu.style.cssText = [
-      "display:none", "min-width:230px", "max-width:320px",
-      "background:rgba(16,17,23,.92)", "backdrop-filter:blur(12px)",
-      "border:1px solid rgba(255,255,255,.1)", "border-radius:12px",
-      "padding:6px", "box-shadow:0 8px 28px rgba(0,0,0,.5)",
-      "font:13px system-ui,sans-serif", "color:#e6e6f0", "z-index:2147483647",
-    ].join(";");
     const fname = safeFilename(info.title);
-    menu.innerHTML = "";
-    const head = document.createElement("div");
-    head.style.cssText = "display:flex;align-items:center;gap:8px;padding:4px 8px 8px;font-weight:600;";
-    if (info.thumb && /^https?:\/\//i.test(info.thumb)) {
-      const im = document.createElement("img");
-      im.src = info.thumb;
-      im.loading = "lazy";
-      im.style.cssText = "width:96px;height:54px;object-fit:cover;border-radius:6px;flex-shrink:0;";
-      im.onerror = () => { im.style.display = "none"; };
-      head.appendChild(im);
-    }
-    const ht = document.createElement("span");
-    ht.setAttribute("data-dc", "head");
-    ht.style.cssText = "white-space:nowrap;overflow:hidden;text-overflow:ellipsis;";
-    ht.textContent = info.title;
-    ht.title = info.title;
-    head.appendChild(ht);
-    { const __t = dcThemeToggle(menu); if (__t) head.appendChild(__t); }
-    menu.appendChild(head);
-    const mkItem = (label, tip, onClick) => {
-      const b = document.createElement("button");
-      b.setAttribute("data-dc", "item");
-      b.textContent = label;
-      if (tip) b.title = tip;
-      b.style.cssText = [
-        "display:block", "width:100%", "text-align:left", "margin:2px 0",
-        "padding:7px 10px", "border-radius:6px", "border:1px solid transparent",
-        "background:transparent", "color:#e6e6f0", "cursor:pointer", "font:13px system-ui,sans-serif",
-      ].join(";");
-      b.onmouseenter = () => { b.style.background = (menu._dcT || dcTokens()).itemHover; };
-      b.onmouseleave = () => { b.style.background = (menu._dcT || dcTokens()).itemBg; };
-      b.onclick = (ev) => {
-        ev.stopPropagation();
-        menu.style.display = "none";
-        onClick();
-      };
-      menu.appendChild(b);
-      return b;
-    };
-    // The app resolves the video itself (player API) — always offered,
-    // even when the page exposes no direct streams (ciphered videos).
-    mkItem("🎬 Send video link to app", "Download Craft finds the best stream itself", () => {
-      sendDownload(location.href, fname);
-    });
-    if (!info.streams.length && !(info.videoOnly || []).length && !(info.audio || []).length) {
-      // VEVO-type pages embed zero direct URLs: tell the user the fix is
-      // playback (the sniffer then merges live stream rows below).
-      const h = document.createElement("div");
-      h.setAttribute("data-dc", "hint");
-      h.textContent = "No direct links yet — press play, then reopen this menu for fresh qualities.";
-      h.style.cssText = "padding:8px;font-size:12px;opacity:.75;line-height:1.4;";
-      menu.appendChild(h);
-    }
-    const sizePairs = [];
-    // Video-only rows bundle the best audio track so the app can merge
-    // them to a single file (IDM's "MKV file" behavior).
-    const bestAudio = (info.audio || []).slice().sort((a, b) => (b.br || 0) - (a.br || 0))[0] || null;
-    const pairFor = (st) => (st.kind === "v" && bestAudio && bestAudio.url !== st.url)
-      ? { url: bestAudio.url, mime: bestAudio.mime }
-      : null;
-    const section = (head, list, nameFn) => {
-      if (!list.length) return;
-      const h = document.createElement("div");
-      h.setAttribute("data-dc", "sec");
-      h.textContent = head;
-      h.style.cssText = "padding:8px 8px 2px;font-size:11px;opacity:.6;text-transform:uppercase;letter-spacing:.06em;";
-      menu.appendChild(h);
-      list.forEach((st) => {
-        // IDM-style row: "<title>, MP4 file, quality 1080p HD 60 fps".
-        const m = String(st.label || "").match(/^(\d+)p(\d+)?$/);
-        const hh = m ? parseInt(m[1], 10) : 0;
-        const fps = m && m[2] ? parseInt(m[2], 10) : 0;
-        const hd = hh >= 720 ? " HD" : "";
-        const fr = fps >= 50 ? ` ${fps} fps` : "";
-        const qtext = hh > 0 ? `${hh}p${hd}${fr}` : st.label;
-        const cont = (st.disp || contOf(st.mime) || "mp4").toUpperCase();
-        const via = st.ciphered ? " (via app)" : "";
-        const shortT = info.title.length > 42 ? info.title.slice(0, 42) + "…" : info.title;
-        // Page-JSON sizes print immediately (no network round-trip), and
-        // page-JSON durations ride along to the Add dialog.
-        const presize = st._size > 0 ? ` (${fmtSize(st._size)})` : "";
-        const predur = st._dur > 0 ? `, ${fmtDurSec(st._dur)}` : "";
-        const base = `⬇ ${shortT}, ${cont} file, quality ${qtext}${via}${presize}${predur}`;
-        const b = mkItem(
-          base,
-          st.ciphered ? "The app deciphers this quality itself" : (st.url || "").slice(0, 120),
-          // Ciphered rows have no direct URL at build time: the sniffer
-          // swaps in the player's fresh deciphered URL by itag once you
-          // press play (see appendSniffed) — prefer it when present, else
-          // send the page + quality hint for server-side resolve.
-          // st._size rides along so the Add dialog shows it upfront.
-          st.ciphered
-            ? () => (st.url
-              ? sendDownload(st.url, nameFn(st), st.mime, st._size || null, pairFor(st), null, st._dur || null)
-              : sendDownload(location.href, nameFn(st), st.mime, st._size || null, pairFor(st), st.label, st._dur || null))
-            : () => sendDownload(st.url, nameFn(st), st.mime, st._size || null, pairFor(st), null, st._dur || null),
-        );
-        sizePairs.push({ btn: b, st, base });
-      });
-    };
     const tagged = (base, st) => {
       const clean = base.replace(/\.mp4$/i, "");
       if (st.kind === "v") return `${clean} [${st.label}].mp4`;
       if (st.kind === "a") return `${clean} [audio]${mimeExt(st.mime)}`;
-      return fname;
+      return base;
     };
-    section("Video + audio", info.streams, () => fname);
-    section("Video only (no audio)", info.videoOnly || [], (st) => tagged(fname, st));
-    section("Audio only", info.audio || [], (st) => tagged(fname, st));
-    // Full ladder fallback: when the page exposes almost nothing directly
-    // (ciphered embeds, music videos), still offer every standard quality
-    // like IDM does — the engine resolves each to the closest stream at or
-    // below it, so a click always downloads something sensible. Sizes come
-    // from the page JSON map (contentLength per quality), no network needed.
-    {
-      const haveQ = new Set([
-        ...(info.streams || []).map((s) => s.label),
-        ...((info.videoOnly || []).map((s) => s.label)),
-      ]);
-      const sizeByQ = {};
-      const durByQ = {};
-      for (const s of [...(info.streams || []), ...(info.videoOnly || [])]) {
-        if (s && s.label && s._size > 0 && !sizeByQ[s.label]) sizeByQ[s.label] = s._size;
-        if (s && s.label && s._dur > 0 && !durByQ[s.label]) durByQ[s.label] = s._dur;
+    // Video-only cells bundle the best audio track so the app merges them to
+    // a single file (IDM's "MKV file" behavior).
+    const bestAudio = (info.audio || []).slice().sort((a, b) => (b.br || 0) - (a.br || 0))[0] || null;
+    const pairFor = (st) => (st.kind === "v" && bestAudio && bestAudio.url !== st.url)
+      ? { url: bestAudio.url, mime: bestAudio.mime }
+      : null;
+    const sendStream = (st, name) => {
+      // Ciphered rows have no URL at build time: hand the page + quality hint
+      // over and the app deciphers that exact quality itself.
+      if (st.ciphered && !st.url) {
+        sendDownload(location.href, name, st.mime, st._size || null, pairFor(st), st.label, st._dur || null);
+      } else {
+        sendDownload(st.url || location.href, name, st.mime, st._size || null, pairFor(st), null, st._dur || null);
       }
-      // Plus every page-JSON size (formats with no URL at all still count).
+    };
+    // One cell per quality. The same height + container twice (a progressive
+    // row and its video-only twin) keeps the progressive one: it plays as-is.
+    const seenQ = new Set();
+    const entries = [];
+    const addEntry = (st, kind, viaApp) => {
+      const hh = parseInt((String(st.label || "").match(/^(\d+)/) || [0, 0])[1], 10) || 0;
+      const key = `${hh}|${String(st.disp || "").toLowerCase()}`;
+      if (!hh || seenQ.has(key)) return;
+      seenQ.add(key);
+      const cont = (st.disp || contOf(st.mime) || "mp4").toUpperCase();
+      const fps = (String(st.label || "").match(/^(\d+)p(\d+)$/) || [])[2];
+      entries.push({
+        h: hh,
+        size: st._size || 0,
+        dur: st._dur || 0,
+        st,
+        // Ciphered/"via app" rows have no container pairing of their own —
+        // the app decides, so no "+ audio" marker there.
+        format: cont + (viaApp ? " via app" : (kind === "v" ? " + audio" : "")),
+        res: resWH(st.label, st.w, st.h),
+        tip: `${st.label}${fps ? ` (${fps} fps)` : ""} · ${cont} · ${info.title}`
+          + (kind === "v" ? " — merged with the audio track when the download finishes" : "")
+          + (viaApp ? " — the app resolves this quality itself" : ""),
+        send: () => sendStream(st, tagged(fname, st)),
+      });
+    };
+    for (const st of (info.streams || [])) addEntry(st, "av", !!st.ciphered);
+    for (const st of (info.videoOnly || [])) addEntry(st, "v", !!st.ciphered);
+    // Full ladder fallback: when the page barely exposes direct rows
+    // (ciphered embeds, music videos), still offer every standard quality like
+    // IDM does — the app resolves each to the closest stream at or below it.
+    // Sizes come from the page-JSON map (contentLength per quality).
+    if (entries.length < 6) {
+      const sizeByQ = {};
       for (const [q, m] of Object.entries(info.sizes || {})) {
         if (!sizeByQ[q] && m && m.size > 0) sizeByQ[q] = m.size;
-        if (!durByQ[q] && m && m.dur > 0) durByQ[q] = m.dur;
       }
-      // Ladder asks plain "1080p" while the map may hold "1080p60".
+      for (const s of [...(info.streams || []), ...(info.videoOnly || [])]) {
+        if (s && s.label && s._size > 0 && !sizeByQ[s.label]) sizeByQ[s.label] = s._size;
+      }
       const sizeForQ = (q) => {
         if (sizeByQ[q]) return sizeByQ[q];
-        const k = Object.keys(sizeByQ).find((k) => k.startsWith(q));
+        const k = Object.keys(sizeByQ).find((x) => x.startsWith(q));
         return k ? sizeByQ[k] : 0;
       };
-      const durForQ = (q) => {
-        if (durByQ[q]) return durByQ[q];
-        const k = Object.keys(durByQ).find((k) => k.startsWith(q));
-        return k ? durByQ[k] : 0;
-      };
-      const ladder = ["1080p", "720p", "480p", "360p", "240p", "144p"].filter((q) => !haveQ.has(q) && ![...haveQ].some((h) => String(h).startsWith(q)));
-      if (ladder.length && (info.streams || []).length + (info.videoOnly || []).length < 6) {
-        const h = document.createElement("div");
-        h.setAttribute("data-dc", "sec");
-        h.textContent = "More qualities (via app)";
-        h.style.cssText = "padding:8px 8px 2px;font-size:11px;opacity:.6;text-transform:uppercase;letter-spacing:.06em;";
-        menu.appendChild(h);
-        const shortT = info.title.length > 42 ? info.title.slice(0, 42) + "…" : info.title;
-        ladder.forEach((q) => {
-          const hh = parseInt(q, 10);
-          const sz = sizeForQ(q);
-          const dz = durForQ(q);
-          const base = `⬇ ${shortT}, MP4 file, quality ${q}${hh >= 720 ? " HD" : ""} (via app)${sz > 0 ? ` (${fmtSize(sz)})` : ""}${dz > 0 ? `, ${fmtDurSec(dz)}` : ""}`;
-          mkItem(base, "The app resolves this quality itself", () => {
-            sendDownload(location.href, fname, "video/mp4", sz || null, pairFor({ kind: "av" }), q, dz || null);
-          });
-          // Deliberately NOT in sizePairs: sizing a watch page would print
-          // the HTML byte count as a bogus "(2.1 MB)" on the row.
+      const haveH = new Set(entries.map((e) => e.h));
+      for (const q of [1080, 720, 480, 360, 240, 144]) {
+        if (haveH.has(q)) continue;
+        const label = `${q}p`;
+        const sz = sizeForQ(label);
+        entries.push({
+          h: q,
+          size: sz,
+          dur: 0,
+          st: null,
+          format: "MP4 via app",
+          res: RES_WH[label],
+          tip: `${label} · MP4 · the app resolves this quality itself`,
+          send: () => sendDownload(location.href, fname, "video/mp4", sz || null, null, label, null),
         });
       }
     }
+    entries.sort((a, b) => (b.h - a.h) || (b.size - a.size));
+    // "Direct" means at least one row the browser already holds a real URL
+    // for — ciphered pages (VEVO) only carry qualities the app must resolve,
+    // so they get the mockup's "press play" hint instead.
+    const hasDirect = entries.some((e) => e.st && e.st.url);
+    const infoOf = (e) => ({
+      res: e ? e.res : "",
+      size: e && e.size > 0 ? fmtSize(e.size) : "",
+      format: e ? e.format.split(" ")[0] : "MP4",
+    });
+    let api = null;
+    api = dcPanel({
+      title: info.title,
+      thumb: info.thumb,
+      dur: entries[0] && entries[0].dur > 0 ? fmtDurSec(entries[0].dur) : "",
+      res: infoOf(entries[0]).res,
+      size: infoOf(entries[0]).size,
+      format: infoOf(entries[0]).format,
+      hint: hasDirect
+        ? "Pick a quality below, or send the link as-is."
+        : "No direct links yet — press play, then reopen for fresh qualities.",
+      onSendLink: () => sendDownload(location.href, fname),
+      primaryLabel: entries.length ? "Download" : "Send to app",
+      onPrimary: () => {
+        const it = api.selected();
+        if (it && it.q && it.q.send) it.q.send();
+        else sendDownload(location.href, fname);
+      },
+    });
+    api.panel.id = "dc-yt-panel";
+    const sizePairs = [];
+    entries.forEach((e) => {
+      const it = api.addQuality({
+        format: e.format,
+        res: e.res,
+        size: e.size > 0 ? fmtSize(e.size) : "",
+        tip: e.tip,
+        send: e.send,
+        onPick: () => api.setInfo(infoOf(e)),
+      });
+      if (e.st) sizePairs.push({ item: it, sizeEl: it.sizeEl, st: e.st });
+    });
+    // "Other Files": subtitle tracks and audio-only streams as chips.
+    for (const sb of (info.subs || [])) {
+      api.addChip({
+        label: `📄 VTT ${sb.label}`,
+        tip: sb.url.slice(0, 120),
+        send: () => sendDownload(sb.url, `${fname} [${sb.lang || sb.label}].vtt`, "text/vtt", null, null, null, null),
+      });
+    }
+    for (const st of (info.audio || [])) {
+      const kb = st.br > 0 ? Math.round(st.br / 1000) + "k" : st.label;
+      api.addChip({
+        label: `♪ ${(st.disp || "m4a").toUpperCase()} ${kb}`,
+        tip: `${st.label || "audio"}${st._size > 0 ? " · " + fmtSize(st._size) : ""} — audio-only track`,
+        send: () => sendDownload(st.url, tagged(fname, st), st.mime, st._size || null, null, null, st._dur || null),
+      });
+    }
+    api.sync();
     enrichSizes(sizePairs);
     markQueuedRows(sizePairs);
-    appendSniffed(menu, new Set([
+    appendSniffed(api, new Set([
       ...info.streams.map((s) => s.url),
       ...(info.videoOnly || []).map((s) => s.url),
       ...(info.audio || []).map((s) => s.url),
-    ]), sizePairs);
+    ]), sizePairs, bestAudio, fname);
     btn.onclick = (ev) => {
       ev.stopPropagation();
-      const show = menu.style.display === "none";
-      if (show) paintDcMenu(menu);
-      menu.style.display = show ? "block" : "none";
+      if (api.panel.style.display === "none") {
+        hidePanels();
+        api.show();
+      } else {
+        api.hide();
+      }
     };
-    btn.onmouseenter = () => { btn.style.background = "rgba(40,41,55,.85)"; };
-    btn.onmouseleave = () => { btn.style.background = "rgba(12,12,16,.68)"; };
-    // One delegated closer per generation (a per-rebuild listener leaked
-    // and stale closures fought the new menu).
-    if (!window.__dcDocClick) {
-      window.__dcDocClick = true;
-      document.addEventListener("click", () => {
-        document.querySelectorAll("#dc-yt-menu").forEach((m) => { m.style.display = "none"; });
-      });
-    }
-    placeInPlayer(btn, menu);
-    paintDcMenu(menu);
+    installDcCloser();
+    placeInPlayer(btn, api.panel);
   }
 
   function refreshYouTube() {
     const id = ytVideoId();
     const oldBtn = document.getElementById("dc-yt-btn");
-    const oldMenu = document.getElementById("dc-yt-menu");
+    const oldPanel = document.getElementById("dc-yt-panel");
     if (!id) {
       if (oldBtn) oldBtn.remove();
-      if (oldMenu) oldMenu.remove();
+      if (oldPanel) oldPanel.remove();
       try {
         chrome.storage.local.set({ downloadCraftVideos: [] });
       } catch (e) {
@@ -1020,13 +1387,13 @@
     // its player-API fallback — so the button always appears.
     // ytStreams() matches the CURRENT video id, so SPA autoplay can
     // never show the previous video's title/streams.
-    const info = ytStreams() || { videoId: id, title: document.title.replace(/ - YouTube$/, ""), thumb: `https://i.ytimg.com/vi/${id}/hqdefault.jpg`, streams: [], videoOnly: [], audio: [] };
+    const info = ytStreams() || { videoId: id, title: document.title.replace(/ - YouTube$/, ""), thumb: `https://i.ytimg.com/vi/${id}/hqdefault.jpg`, streams: [], videoOnly: [], audio: [], subs: [] };
     try {
       chrome.storage.local.set({
         downloadCraftVideos: [{
           videoId: info.videoId, title: info.title, thumb: info.thumb || "",
           streams: info.streams, videoOnly: info.videoOnly || [], audio: info.audio || [],
-          sizes: info.sizes || {},
+          sizes: info.sizes || {}, subs: info.subs || [],
           pageUrl: location.href,
         }],
         downloadCraftPage: location.href,
@@ -1075,20 +1442,13 @@
         // Skip tiny preview thumbnails.
         const r = v.getBoundingClientRect ? v.getBoundingClientRect() : null;
         if (r && (r.width < 120 || r.height < 70)) continue;
-        const pill = document.createElement("button");
-        labelButton(pill, "Download this video", 13);
-        pill.title = "Send to Download Craft";
+        const pill = circleButton(32, 16, "Send to Download Craft");
         pill.setAttribute("data-dc-pill", "1");
         pill.dataset.gen = String(GEN);
-        pill.style.cssText = [
-          "display:inline-flex", "align-items:center", "gap:6px", "white-space:nowrap",
-          "position:absolute", "top:8px", "right:8px", "z-index:2147483646",
-          "padding:4px 10px", "border-radius:999px",
-          "border:1px solid rgba(255,255,255,.15)",
-          "background:rgba(10,10,14,.78)", "color:#fff",
-          "font:500 11px/1.4 system-ui,sans-serif", "cursor:pointer",
-          "box-shadow:0 2px 10px rgba(0,0,0,.4)",
-        ].join(";");
+        pill.style.position = "absolute";
+        pill.style.top = "8px";
+        pill.style.right = "8px";
+        pill.style.zIndex = "2147483646";
         pill.onclick = (ev) => {
           ev.stopPropagation(); ev.preventDefault();
           // Facebook reels: open the IDM-style quality menu (title + HD/SD
@@ -1157,81 +1517,68 @@
     } catch (e) { return false; }
   }
 
-  // Facebook quality menu (IDM-style): title header + HD/SD rows with
-  // duration and measured sizes, so every reel offers a choice instead of
-  // one mystery "Facebook.mp4".
-  function openFbMenu(pill, rows, title, thumb) {
-    try { document.querySelectorAll("#dc-fb-menu").forEach((m) => m.remove()); } catch (e) {}
-    const menu = document.createElement("div");
-    menu.id = "dc-fb-menu";
-    menu.style.cssText = [
-      "position:absolute", "top:40px", "right:8px", "z-index:2147483647",
-      "min-width:250px", "max-width:340px",
-      "background:rgba(16,17,23,.94)", "backdrop-filter:blur(12px)",
-      "border:1px solid rgba(255,255,255,.1)", "border-radius:12px",
-      "padding:6px", "box-shadow:0 8px 28px rgba(0,0,0,.5)",
-      "font:13px system-ui,sans-serif", "color:#e6e6f0",
-    ].join(";");
-    const head = document.createElement("div");
-    head.style.cssText = "display:flex;align-items:center;gap:8px;padding:4px 8px 8px;font-weight:600;";
-    const headThumb = thumb || ((rows && rows[0] && rows[0].thumb) || "");
-    if (headThumb && /^https?:\/\//i.test(headThumb)) {
-      const im = document.createElement("img");
-      im.src = headThumb;
-      im.loading = "lazy";
-      im.style.cssText = "width:96px;height:54px;object-fit:cover;border-radius:6px;flex-shrink:0;";
-      im.onerror = () => { im.style.display = "none"; };
-      head.appendChild(im);
-    }
-    const ht = document.createElement("span");
-    ht.setAttribute("data-dc", "head");
-    ht.style.cssText = "white-space:nowrap;overflow:hidden;text-overflow:ellipsis;";
-    ht.textContent = title;
-    ht.title = title;
-    head.appendChild(ht);
-    { const __t = dcThemeToggle(menu); if (__t) head.appendChild(__t); }
-    menu.appendChild(head);
-    const sizePairs = [];
-    rows.forEach((st) => {
-      const b = document.createElement("button");
-      b.setAttribute("data-dc", "item");
-      b.textContent = st.label;
-      b.title = (st.url || "").slice(0, 120);
-      b.style.cssText = [
-        "display:block", "width:100%", "text-align:left", "margin:2px 0",
-        "padding:7px 10px", "border-radius:6px", "border:1px solid transparent",
-        "background:transparent", "color:#e6e6f0", "cursor:pointer", "font:13px system-ui,sans-serif",
-      ].join(";");
-      b.onmouseenter = () => { b.style.background = (menu._dcT || dcTokens()).itemHover; };
-      b.onmouseleave = () => { b.style.background = (menu._dcT || dcTokens()).itemBg; };
-      b.onclick = (ev) => {
-        ev.stopPropagation();
-        menu.remove();
-        sendDownload(st.url, st.fname, "video/mp4", st._size || null, null, null, st.dur || null);
-      };
-      menu.appendChild(b);
-      sizePairs.push({ btn: b, st, base: st.label });
+  // Facebook quality panel (IDM-style): the same circle + bubble as YouTube,
+  // with the reel's HD/SD rows (and any fresh sniffed stream) as quality
+  // cells, so every reel offers a choice instead of one mystery "Facebook.mp4".
+  function openFbMenu(pill, rows, title, thumb, audio) {
+    try { document.querySelectorAll("#dc-fb-panel").forEach((m) => m.remove()); } catch (e) {}
+    const first = (rows && rows[0]) || {};
+    const fname = first.fname || fbFilename(title);
+    let api = null;
+    api = dcPanel({
+      title,
+      thumb: thumb || first.thumb || "",
+      dur: first.dur > 0 ? fmtDurSec(first.dur) : "",
+      res: "",
+      size: "",
+      format: "MP4",
+      hint: "Pick a quality below, or send the link as-is.",
+      onSendLink: () => sendDownload(location.href, fname, null, null, null, null, first.dur || null),
+      onPrimary: () => {
+        const it = api.selected();
+        if (it && it.q && it.q.send) it.q.send();
+      },
     });
-    enrichSizes(sizePairs);
-    try {
-      (pill.parentElement || document.documentElement).appendChild(menu);
-    } catch (e) { /* ignore */ }
-    paintDcMenu(menu);
-    setTimeout(() => {
-      const closer = (ev) => {
-        if (menu.isConnected && !menu.contains(ev.target)) {
-          menu.remove();
-          document.removeEventListener("click", closer);
-        }
+    api.panel.id = "dc-fb-panel";
+    const sizePairs = [];
+    (rows || []).forEach((st) => {
+      const qm = String(st.label || "").match(/quality\s+(.+?)(?:,|$)/i);
+      const q = {
+        res: (qm && qm[1]) || "video",
+        size: st._size > 0 ? fmtSize(st._size) : "",
+        format: "MP4",
+        tip: `${(qm && qm[1]) || "video"} · MP4 · ${title}`,
+        send: () => sendDownload(st.url, st.fname, "video/mp4", st._size || null, null, null, st.dur || null),
       };
-      document.addEventListener("click", closer);
-    }, 0);
+      const it = api.addQuality({ ...q, onPick: () => api.setInfo(q) });
+      sizePairs.push({ item: it, sizeEl: it.sizeEl, st });
+    });
+    // "Other Files": audio-only streams the sniffer saw in this session.
+    for (const a of (audio || [])) {
+      const base = String(fname).replace(/\.mp4$/i, "");
+      api.addChip({
+        label: `♪ ${(mimeExt(a.mime) || ".m4a").replace(".", "").toUpperCase()}${a.size > 0 ? " " + fmtSize(a.size) : ""}`,
+        tip: `${a.mime || "audio"} — audio-only track`,
+        send: () => sendDownload(a.url, `${base} [audio]${mimeExt(a.mime) || ".m4a"}`, a.mime, a.size || null, null, null, first.dur || null),
+      });
+    }
+    api.sync();
+    enrichSizes(sizePairs);
+    api.panel.style.position = "absolute";
+    api.panel.style.top = "44px";
+    api.panel.style.right = "8px";
+    api.panel.style.display = "block";
+    try {
+      (pill.parentElement || document.documentElement).appendChild(api.panel);
+    } catch (e) { /* ignore */ }
+    paintDcPanel(api.panel);
   }
 
   function fbMenuRows(info, items) {
     // Dedupe page-JSON URLs against sniffed traffic, then rank HD first.
     const seen = new Set();
     const rows = [];
+    const audio = [];
     const fname = fbFilename(info.title);
     const dur = info.durSec > 0 ? `, ${info.durSec} sec` : "";
     const push = (url, quality) => {
@@ -1239,8 +1586,14 @@
       seen.add(url);
       rows.push({ url, fname, label: `⬇ ${info.title.slice(0, 40)}, MP4 file${dur}, quality ${quality}`, _size: 0, dur: info.durSec || null, thumb: info.thumb || "" });
     };
-    if (info.hd && info.hd !== info.sd) push(info.hd, fbQuality(info.w, info.h, true));
-    if (info.sd) push(info.sd, fbQuality(info.w, info.h, info.hd === info.sd));
+    // The page meta describes the reel currently on screen, so the HD and SD
+    // URL often resolve to the same "1080p HD" text — label the lower encode
+    // plainly instead of showing the same resolution twice.
+    const hdQ = fbQuality(info.w, info.h, true);
+    let sdQ = fbQuality(info.w, info.h, info.hd === info.sd);
+    if (info.hd && info.sd && info.hd !== info.sd && sdQ === hdQ) sdQ = "SD";
+    if (info.hd && info.hd !== info.sd) push(info.hd, hdQ);
+    if (info.sd) push(info.sd, sdQ);
     // Anything else the player actually fetched (fresh session URLs).
     // P4: when a playlist is on the tab, loose segments are its children
     // (ad slivers included) — offer the playlist, never the parts.
@@ -1252,11 +1605,18 @@
     const rest = (items || []).filter((m) => m && /^https?:\/\//i.test(m.url) && !seen.has(m.url)
       && !/m3u8|mpd|mpegurl|dash/i.test(m.url)
       && !(hasPlaylist && isSeg(m.url)));
-    rest.slice(0, 6).forEach((m) => {
+    const isAudio = (m) => /^audio\//i.test(m.mime || "") || /\.m4a(\?|#|$)/i.test(String(m.url || ""));
+    rest.filter((m) => !isAudio(m)).slice(0, 6).forEach((m) => {
       seen.add(m.url);
-      rows.push({ url: m.url, fname, label: `⬇ ${info.title.slice(0, 40)}, MP4 file${dur}, quality ${fbQuality(0, 0, false)}`, _size: m.size || 0, thumb: m.thumb || info.thumb || "" });
+      rows.push({ url: m.url, fname, label: `⬇ ${info.title.slice(0, 40)}, MP4 file${dur}, quality ${fbQuality(0, 0, false)}`, _size: m.size || 0, dur: info.durSec || null, thumb: m.thumb || info.thumb || "" });
     });
-    return rows;
+    // Audio-only traffic from the same playback session becomes an "Other
+    // Files" chip (same idea as YouTube's audio-only tracks).
+    rest.filter(isAudio).slice(0, 3).forEach((m) => {
+      seen.add(m.url);
+      audio.push({ url: m.url, mime: m.mime || "audio/mp4", size: m.size || 0 });
+    });
+    return { rows, audio };
   }
 
   function handleFbPill(pill) {
@@ -1269,13 +1629,15 @@
           return;
         }
         const items = (res && res.items) || [];
-        const rows = fbMenuRows(info, items);
+        const data = fbMenuRows(info, items);
+        const rows = data.rows;
+        const audio = data.audio;
         if (!rows.length) {
           sendDownload(location.href, fbFilename(info.title), null, null, null, null, info.durSec || null);
-        } else if (rows.length === 1) {
+        } else if (rows.length === 1 && !audio.length) {
           sendDownload(rows[0].url, rows[0].fname, "video/mp4", rows[0]._size || null, null, null, rows[0].dur || info.durSec || null);
         } else {
-          openFbMenu(pill, rows, info.title, info.thumb);
+          openFbMenu(pill, rows, info.title, info.thumb, audio);
         }
       });
     } catch (e) {
@@ -1360,6 +1722,7 @@
   collectLinks();
   ensureUniversalButtons();
   pullNetworkMedia();
+  installDcCloser();
   function spaRefresh() {
     if (__dcDead || !alive()) return;
     try { collectLinks(); } catch (e) { if (ctxInvalidated(e)) return markDead(); }

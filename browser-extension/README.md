@@ -28,15 +28,31 @@ again so the stable ID applies.)
 - Firefox: load `manifest-firefox.json` instead (rename it to
   `manifest.json` inside a copy of this folder).
 
-## YouTube videos (IDM-style button)
+## YouTube videos (in-page quality panel)
 
-On `youtube.com/watch`, `youtu.be/*`, and Shorts pages the extension adds
-a floating **⬇ Download Craft** button (bottom-right). Clicking it lists
-the video's direct progressive qualities (e.g. `720p · mp4`); picking one
-sends the stream URL to the app, which pops open the **Add download**
-dialog prefilled with the video title — confirm and it downloads like any
-other file. The same qualities also appear in the toolbar popup under the
-video title.
+On `youtube.com/watch`, `youtu.be/*`, and Shorts pages the extension adds a
+compact circular button at the player's top-right. Clicking it opens a
+message-bubble panel next to it with:
+
+- **Send video link to app** — sends the page URL itself (the app resolves
+  it), for when no direct stream URL is available.
+- **Video Files** — the direct qualities found on the page (`MP4 · 1080p`,
+  `WEBM · 1440p`, …) with sizes, the highest one pre-selected. Picking a
+  row and pressing **Download** sends that stream; when the source is
+  video-only the best audio track travels with it, so the app merges both.
+- **Other Files** — subtitle tracks (VTT, one chip per language) and
+  audio-only tracks (e.g. `♪ M4A 128k`).
+- A theme toggle (☀ / ☾) in the send row, plus **Download / Cancel / ✕**.
+
+The same button appears on **Facebook** reels (`facebook.com/reel/…`), where
+the panel lists the reel's HD/SD files with its caption, duration and any
+audio-only stream captured from the player.
+
+While a video plays, streams the player fetches are merged into the panel:
+a stale quality row flips from "via app" to a real download as soon as its
+deciphered URL shows up.
+
+The same qualities also appear in the toolbar popup under the video title.
 
 Why the extension and not pasting links? The page runs in your real
 browser session (real cookies/TLS), so YouTube serves it direct stream

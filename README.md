@@ -31,6 +31,20 @@ And when it lands, open it, open its folder, or just close the dialog:
   <img src="docs/screenshot-download-complete.png" alt="Download complete dialog with Open, Open with, Open folder" width="48%">
 </p>
 
+Settings is a full window of its own — iconed sections, and the browser
+helper under **Plugins**:
+
+<p align="center">
+  <img src="docs/screenshot-settings.png" alt="Settings window with Appearance, Download Engine, Plugins, Browser Integration, Categories & Rules and Updates" width="46%">
+</p>
+
+In the browser, the picker sits on the video itself: qualities with sizes,
+subtitle tracks and audio-only files, sent straight to the app:
+
+<p align="center">
+  <img src="docs/screenshot-extension-panel.png" alt="In-page download panel on YouTube with Video Files grid and subtitle/audio chips" width="38%">
+</p>
+
 ## Features
 
 - Segmented downloads (1–16 connections) with resume via HTTP Range.
@@ -43,7 +57,7 @@ And when it lands, open it, open its folder, or just close the dialog:
   (nothing / shutdown / sleep / hibernate), import/export URL lists.
 - YouTube and other yt-dlp-supported sites: the app fetches and keeps its
   own yt-dlp up to date, which is what makes 1080p+ and merged audio+video
-  work. Settings → YouTube shows the copy in use, its version, and the
+  work. Settings → Plugins shows the copy in use, its version, and the
   JavaScript runtime; "Re-download" refreshes it.
 - Clipboard URL detection, desktop notifications, system tray, antivirus hook.
 - Status sidebar with live counts, search, sortable/resizable

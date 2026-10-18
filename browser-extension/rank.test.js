@@ -65,45 +65,45 @@ describe("fmtDur", () => {
   });
 });
 
-describe("menuTokens", () => {
+describe("panelTokens", () => {
   it("covers dark and light with the same keys", () => {
-    const dark = DCRank.menuTokens("dark");
-    const light = DCRank.menuTokens("light");
+    const dark = DCRank.panelTokens("dark");
+    const light = DCRank.panelTokens("light");
     assert.deepEqual(Object.keys(dark).sort(), Object.keys(light).sort());
-    assert.equal(dark.mode, "dark");
     assert.equal(light.mode, "light");
+    assert.equal(dark.mode, "dark");
     assert.equal(light.bg, "#ffffff");
-    assert.ok(dark.bg !== light.bg);
+    assert.equal(dark.bg, "#0f172a");
+    assert.notEqual(dark.accent, light.accent);
     assert.ok(dark.toggle !== light.toggle);
-    // unknown mode falls back to dark (historic look)
-    assert.equal(DCRank.menuTokens().mode, "dark");
+    // unknown mode falls back to dark (the mockup's palette)
+    assert.equal(DCRank.panelTokens().mode, "dark");
   });
 });
 
-describe("menu paint", () => {
-  // Minimal fake DOM: style bag, role-tagged children, toggle button.
+describe("panel paint", () => {
+  // Minimal fake DOM: style bag + role-tagged children addressed by
+  // `data-dc-p` (the same query the real painter issues).
   function fakeEl(role) {
+    const attrs = {};
+    if (role) attrs["data-dc-p"] = role;
     return {
-      role,
       style: {},
       textContent: "",
-      title: "",
-      attrs: {},
+      attrs,
       setAttribute(k, v) { this.attrs[k] = v; },
-      onclick: null,
+      getAttribute(k) { return this.attrs[k] === undefined ? null : this.attrs[k]; },
+      querySelectorAll() { return []; },
     };
   }
-  function fakeMenu(kids) {
+  function fakePanel(kids) {
     return {
-      style: { display: "none" },
       _dcT: null,
+      style: {},
       kids,
       querySelectorAll(sel) {
-        const roles = sel.split(",").map((s) => {
-          const m = s.match(/\[data-dc="([^"]+)"\]/);
-          return m && m[1];
-        }).filter(Boolean);
-        return this.kids.filter((k) => roles.includes(k.attrs["data-dc"]));
+        if (sel === "[data-dc-p]") return this.kids.filter((k) => k.attrs["data-dc-p"]);
+        return [];
       },
     };
   }
@@ -142,35 +142,45 @@ describe("menu paint", () => {
     });
   });
 
-  it("paints a menu light without touching layout", () => {
+  it("paints a panel light without touching layout", () => {
     withGlobals({ theme: "light" }, () => {
-      const head = fakeEl(); head.attrs["data-dc"] = "head";
-      const sec = fakeEl(); sec.attrs["data-dc"] = "sec";
-      const item = fakeEl(); item.attrs["data-dc"] = "item";
-      const menu = fakeMenu([head, sec, item]);
-      DCRank.paintDcMenu(menu);
-      assert.equal(menu.style.background, "#ffffff");
-      assert.equal(menu.style.display, "none"); // layout untouched
-      assert.equal(head.style.color, "#202124");
-      assert.equal(sec.style.color, "#9aa0a6");
-      assert.equal(item.style.background, "#ffffff");
-      assert.equal(item.style.border, "1px solid #e1e3e6");
+      const txt = fakeEl("text");
+      const div = fakeEl("divider");
+      const item = fakeEl("item");
+      const panel = fakePanel([txt, div, item]);
+      panel.style.display = "none";
+      DCRank.paintDcPanel(panel);
+      assert.equal(panel.style.background, "#ffffff");
+      assert.equal(panel.style.display, "none"); // layout untouched
+      assert.equal(panel._dcT.mode, "light");
+      assert.equal(txt.style.color, "#0f172a");
+      assert.equal(div.style.background, "#e2e8f0");
+      assert.equal(item.style.background, "#f8fafc");
+      assert.equal(item.style.borderColor, "#e2e8f0");
     });
   });
 
-  it("toggle flips the theme and repaints", () => {
+  it("highlights the selected cell and flips the bubble arrow", () => {
     withGlobals({ theme: "dark" }, () => {
-      const menu = fakeMenu([]);
-      const btn = DCRank.dcThemeToggle(menu, globalThis.document);
-      assert.equal(btn.textContent, "");
-      btn.onclick({ stopPropagation() {} });
-      assert.equal(menu._dcT.mode, "light");
-      assert.equal(menu.style.background, "#ffffff");
-      // The toggle button itself gets the new glyph on repaint.
-      const t2 = fakeEl(); t2.attrs["data-dc"] = "toggle";
-      const menu2 = fakeMenu([t2]);
-      DCRank.paintDcMenu(menu2);
-      assert.equal(t2.textContent, DCRank.dcTokens().toggle);
+      const sel = fakeEl("item");
+      sel.attrs["data-dc-sel"] = "1";
+      const above = fakeEl("arrow");
+      above.attrs["data-dc-arrow"] = "bottom";
+      DCRank.paintDcPanel(fakePanel([sel, above]));
+      assert.equal(sel.style.borderColor, "#3b82f6");
+      assert.equal(sel.style.background, "rgba(59,130,246,.16)");
+      // Arrow below the panel: the two bottom borders draw the point.
+      assert.equal(above.style.borderRightColor, "#334155");
+      assert.equal(above.style.borderBottomColor, "#334155");
+      assert.equal(above.style.borderLeftColor, "transparent");
+    });
+  });
+
+  it("writes the toggle glyph for the active theme", () => {
+    withGlobals({ theme: "dark" }, () => {
+      const tog = fakeEl("toggle");
+      DCRank.paintDcPanel(fakePanel([tog]));
+      assert.equal(tog.textContent, "☀");
     });
   });
 });
