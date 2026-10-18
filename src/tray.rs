@@ -13,7 +13,7 @@
 //! `WS_EX_TOOLWINDOW` so it has no taskbar button. Un-traying restores the
 //! remembered placement and takes the foreground back.
 
-use std::sync::atomic::{AtomicBool, AtomicIsize, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI8, AtomicIsize, AtomicU64, Ordering};
 use std::sync::Mutex;
 
 /// True while the window is parked off-screen ("in the tray").
@@ -28,6 +28,9 @@ static QUITTING: AtomicBool = AtomicBool::new(false);
 static FRAMES: AtomicU64 = AtomicU64::new(0);
 /// Placement to restore on un-tray (position, size, maximized state).
 static PLACEMENT: Mutex<Option<win32::WindowPlacement>> = Mutex::new(None);
+/// Last title-bar theme requested with [`set_titlebar_dark`] (-1 = never set).
+/// Kept so the caption can be re-asserted after Windows resets the frame.
+static TITLEBAR_DARK: AtomicI8 = AtomicI8::new(-1);
 
 const TRAY_TIP: &str = "Download Craft";
 
@@ -91,6 +94,7 @@ pub fn start_keepalive() {
     }
     std::thread::spawn(|| {
         let mut seen = FRAMES.load(Ordering::Relaxed);
+        let mut ticks = 0u32;
         loop {
             std::thread::sleep(std::time::Duration::from_millis(500));
             let now = FRAMES.load(Ordering::Relaxed);
@@ -98,6 +102,14 @@ pub fn start_keepalive() {
                 nudge_paint();
             }
             seen = now;
+            // Windows re-derives the non-client frame from the system theme in
+            // a few situations (show after hide, composition changes). Re-send
+            // the caption colours every couple of seconds so an explicit light
+            // app on a dark desktop never falls back to a black title bar.
+            ticks += 1;
+            if ticks % 4 == 0 {
+                refresh_titlebar();
+            }
         }
     });
 }
@@ -192,6 +204,9 @@ pub fn show() {
             }
         }
         force_foreground(hwnd);
+        // Showing a hidden window can make DWM rebuild the frame with the OS
+        // theme; put our caption colours back before the user sees it.
+        refresh_titlebar();
     }
 }
 
@@ -227,6 +242,7 @@ pub fn restore() {
             }
         }
         win32::ShowWindow(hwnd, win32::SW_SHOWNOACTIVATE);
+        refresh_titlebar();
     }
 }
 
@@ -281,24 +297,132 @@ pub fn tooltip() -> &'static str {
 }
 
 /// Raise the window and take the foreground. Clicking the tray already gave
-/// us the user's intent, but Windows' foreground lock still applies, so attach
-/// to the current foreground thread for the switch (the classic recipe).
+/// us the user's intent, but Windows' foreground lock still applies, so we
+/// attach to both input queues for the switch, tap ALT to become the process
+/// that produced the last input, and bounce through topmost as a last resort.
+/// Without this the window came up *behind* whatever the user had in front.
 unsafe fn force_foreground(hwnd: isize) {
+    // A minimized window ignores every raise: restore first.
+    if win32::IsIconic(hwnd) != 0 {
+        win32::ShowWindow(hwnd, win32::SW_RESTORE);
+    }
     win32::ShowWindow(hwnd, win32::SW_SHOW);
     win32::BringWindowToTop(hwnd);
+
     let foreground = win32::GetForegroundWindow();
     let foreground_thread = if foreground != 0 {
         win32::GetWindowThreadProcessId(foreground, std::ptr::null_mut())
     } else {
         0
     };
+    let target_thread = win32::GetWindowThreadProcessId(hwnd, std::ptr::null_mut());
     let me = win32::GetCurrentThreadId();
-    let attached = foreground_thread != 0
+    // Borrow the current foreground queue (the classic recipe) and the
+    // window's own queue, so SetFocus/SetActiveWindow are legal as well.
+    let attached_fg = foreground_thread != 0
         && foreground_thread != me
         && win32::AttachThreadInput(me, foreground_thread, 1) != 0;
+    let attached_target = target_thread != 0
+        && target_thread != me
+        && win32::AttachThreadInput(me, target_thread, 1) != 0;
+
     win32::SetForegroundWindow(hwnd);
-    if attached {
+    win32::SetActiveWindow(hwnd);
+    win32::SetFocus(hwnd);
+
+    if attached_target {
+        win32::AttachThreadInput(me, target_thread, 0);
+    }
+    if attached_fg {
         win32::AttachThreadInput(me, foreground_thread, 0);
+    }
+
+    if win32::GetForegroundWindow() != hwnd {
+        // Still refused: the lock only yields to the process that produced
+        // the last input event. A synthetic ALT tap makes us that process,
+        // and a topmost bounce raises the window even if focus stays put.
+        win32::keybd_event(win32::VK_MENU as u8, 0, 0, 0);
+        win32::keybd_event(win32::VK_MENU as u8, 0, win32::KEYEVENTF_KEYUP, 0);
+        win32::SetForegroundWindow(hwnd);
+        if win32::GetForegroundWindow() != hwnd {
+            win32::SetWindowPos(
+                hwnd,
+                win32::HWND_TOPMOST,
+                0,
+                0,
+                0,
+                0,
+                win32::SWP_NOMOVE | win32::SWP_NOSIZE | win32::SWP_SHOWWINDOW,
+            );
+            win32::SetWindowPos(
+                hwnd,
+                win32::HWND_NOTOPMOST,
+                0,
+                0,
+                0,
+                0,
+                win32::SWP_NOMOVE | win32::SWP_NOSIZE,
+            );
+            win32::SetForegroundWindow(hwnd);
+        }
+    }
+}
+
+/// Paint the native title bar in the app's own theme. Windows derives the
+/// non-client colour from the *system* dark mode, so a light app on a dark
+/// desktop kept a black title bar (and a dark app on a light desktop a white
+/// one). `DWMWA_USE_IMMERSIVE_DARK_MODE` overrides that per window.
+pub fn set_titlebar_dark(dark: bool) {
+    TITLEBAR_DARK.store(i8::from(dark), Ordering::SeqCst);
+    apply_titlebar(dark, true);
+}
+
+/// Re-apply the last caption theme without touching the window geometry.
+pub fn refresh_titlebar() {
+    let state = TITLEBAR_DARK.load(Ordering::SeqCst);
+    if state >= 0 {
+        apply_titlebar(state != 0, false);
+    }
+}
+
+fn apply_titlebar(dark: bool, reframe: bool) {
+    let hwnd = HWND.load(Ordering::SeqCst);
+    if hwnd == 0 {
+        return;
+    }
+    unsafe {
+        let value: i32 = i32::from(dark);
+        // The documented switch: attribute 20 on Win10 20H1+, 19 on 1809-1909.
+        let value_ptr = &value as *const i32 as *const std::ffi::c_void;
+        let size = std::mem::size_of::<i32>() as u32;
+        if win32::DwmSetWindowAttribute(hwnd, 20, value_ptr, size) != 0 {
+            win32::DwmSetWindowAttribute(hwnd, 19, value_ptr, size);
+        }
+        // Older builds (and some 10/11 revisions) ignore the DWM attribute but
+        // honour these two, which is how winit itself themes the frame. Doing
+        // both keeps the caption correct across Windows versions.
+        let theme_name: Vec<u16> = if dark {
+            "DarkMode_Explorer\0".encode_utf16().collect()
+        } else {
+            vec![0]
+        };
+        win32::SetWindowTheme(hwnd, theme_name.as_ptr(), std::ptr::null());
+        win32::set_dark_colors(hwnd, dark);
+        if reframe {
+            // Repaint the non-client area so the switch is immediate.
+            win32::SetWindowPos(
+                hwnd,
+                0,
+                0,
+                0,
+                0,
+                0,
+                win32::SWP_NOMOVE
+                    | win32::SWP_NOSIZE
+                    | win32::SWP_NOZORDER
+                    | win32::SWP_FRAMECHANGED,
+            );
+        }
     }
 }
 
@@ -356,6 +480,55 @@ mod win32 {
         pub fn AttachThreadInput(attach: u32, attach_to: u32, attach_flag: i32) -> i32;
         pub fn InvalidateRect(hwnd: isize, rect: *const Rect, erase: i32) -> i32;
         pub fn RedrawWindow(hwnd: isize, rect: *const Rect, region: isize, flags: u32) -> i32;
+        pub fn IsIconic(hwnd: isize) -> i32;
+        pub fn SetActiveWindow(hwnd: isize) -> isize;
+        pub fn SetFocus(hwnd: isize) -> isize;
+        pub fn keybd_event(vk: u8, scan: u8, flags: u32, extra: usize);
+    }
+
+    #[link(name = "dwmapi")]
+    extern "system" {
+        pub fn DwmSetWindowAttribute(
+            hwnd: isize,
+            attribute: u32,
+            value: *const std::ffi::c_void,
+            size: u32,
+        ) -> i32;
+    }
+
+    #[link(name = "uxtheme")]
+    extern "system" {
+        pub fn SetWindowTheme(
+            hwnd: isize,
+            sub_app_name: *const u16,
+            sub_id_list: *const u16,
+        ) -> i32;
+        pub fn SetWindowCompositionAttribute(
+            hwnd: isize,
+            data: *mut WindowCompositionAttribData,
+        ) -> i32;
+    }
+
+    /// `WINDOWCOMPOSITIONATTRIBDATA` for the undocumented dark-colours switch
+    /// (`SetWindowCompositionAttribute`), which older Win10 builds honour even
+    /// when `DWMWA_USE_IMMERSIVE_DARK_MODE` is missing.
+    #[repr(C)]
+    pub struct WindowCompositionAttribData {
+        attrib: u32,
+        data: *mut std::ffi::c_void,
+        size: usize,
+    }
+
+    pub const WCA_USEDARKMODECOLORS: u32 = 26;
+
+    pub unsafe fn set_dark_colors(hwnd: isize, dark: bool) {
+        let mut value: i32 = i32::from(dark);
+        let mut data = WindowCompositionAttribData {
+            attrib: WCA_USEDARKMODECOLORS,
+            data: &mut value as *mut _ as *mut std::ffi::c_void,
+            size: std::mem::size_of::<i32>(),
+        };
+        SetWindowCompositionAttribute(hwnd, &mut data);
     }
 
     #[link(name = "kernel32")]
@@ -373,9 +546,17 @@ mod win32 {
     pub const WS_EX_TOOLWINDOW: i32 = 0x0000_0080;
     pub const WS_EX_APPWINDOW: i32 = 0x0004_0000;
     pub const SWP_NOSIZE: u32 = 0x0001;
+    pub const SWP_NOMOVE: u32 = 0x0002;
     pub const SWP_NOZORDER: u32 = 0x0004;
     pub const SWP_NOACTIVATE: u32 = 0x0010;
+    pub const SWP_FRAMECHANGED: u32 = 0x0020;
     pub const SWP_SHOWWINDOW: u32 = 0x0040;
+    /// Top of the z-order / back to normal for the foreground bounce.
+    pub const HWND_TOPMOST: isize = -1;
+    pub const HWND_NOTOPMOST: isize = -2;
+    /// Virtual key for ALT + `keybd_event` release flag.
+    pub const VK_MENU: i32 = 0x12;
+    pub const KEYEVENTF_KEYUP: u32 = 0x0002;
     /// `RedrawWindow`: the window itself (not `RDW_INTERNALPAINT`, which a
     /// parked window never turns into a paint) must be marked dirty.
     pub const RDW_INVALIDATE: u32 = 0x0001;

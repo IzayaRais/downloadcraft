@@ -15,6 +15,7 @@ use crate::app::pl;
 use crate::dm::*;
 use crate::fonts::{reg, semi};
 use crate::model::{claim_window, config_dir, format_bytes, DownloadItem};
+use std::time::{Duration, Instant};
 
 // ================= concept geometry =================
 // `complete_window.html` (measured in Chrome, border-box):
@@ -97,6 +98,10 @@ struct CompleteApp {
     /// `show_complete` preference).
     dont_show: bool,
     placed: bool,
+    /// Theme key last applied, so a switch in the main app repaints this
+    /// dialog while it stays open.
+    theme_seen: String,
+    theme_check: Instant,
 }
 
 impl CompleteApp {
@@ -379,6 +384,8 @@ pub fn run() -> eframe::Result<()> {
         // The checkbox mirrors the app-wide preference it flips.
         dont_show: !crate::model::ui_pref_bool("show_complete", true),
         placed: false,
+        theme_seen: String::new(),
+        theme_check: Instant::now(),
     };
 
     let mut viewport = egui::ViewportBuilder::default()
@@ -415,6 +422,17 @@ impl eframe::App for CompleteApp {
     }
 
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        // Follow theme switches made in the main app while this dialog is up
+        // (separate process: ui.json is the only channel).
+        if self.theme_check.elapsed() >= Duration::from_secs(1) {
+            self.theme_check = Instant::now();
+            let theme = crate::app::stored_theme();
+            let key = format!("{}:{}", theme, crate::app::theme_is_dark(ctx, &theme));
+            if key != self.theme_seen {
+                self.theme_seen = key;
+                crate::app::apply_theme(ctx, &theme);
+            }
+        }
         // Come to the front and sit in the middle of the work area: a dialog
         // spawned by a background app must not open behind it, and must not
         // hang over the taskbar.

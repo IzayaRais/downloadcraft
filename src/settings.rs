@@ -310,7 +310,17 @@ pub fn run() -> eframe::Result<()> {
 }
 
 impl eframe::App for SettingsApp {
-    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+    fn update(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
+        // Register the native handle once so the title bar can follow the
+        // theme (this is its own process, same helper as the main window).
+        {
+            use raw_window_handle::HasWindowHandle;
+            if let Ok(handle) = frame.window_handle() {
+                if let raw_window_handle::RawWindowHandle::Win32(w) = handle.as_raw() {
+                    crate::tray::set_hwnd(w.hwnd.get());
+                }
+            }
+        }
         let resolved = format!(
             "{}:{}",
             self.s.theme,
@@ -318,6 +328,7 @@ impl eframe::App for SettingsApp {
         );
         if self.theme_applied != resolved {
             crate::app::apply_theme(ctx, &self.s.theme);
+            crate::tray::set_titlebar_dark(crate::app::theme_is_dark(ctx, &self.s.theme));
             self.theme_applied = resolved;
         }
         if !self.centered && crate::model::center_window(ctx, egui::vec2(640.0, 520.0)) {

@@ -702,6 +702,11 @@ enum ButtonId {
     SClose,
     DResume,
     DClose,
+    DOpen,
+    DCopyAddr,
+    DCopyPage,
+    DMove,
+    DVerify,
     AbClose,
     TAdd,
     TDismiss,
@@ -745,9 +750,6 @@ enum SliderId {
     Retries,
     DefConns,
     QMax,
-    DetConns,
-    DetRetries,
-    DetTimeout,
 }
 
 /// Active manual slider drag.
@@ -893,6 +895,250 @@ fn mtext(
         .password(password)
         .desired_width(width);
     ui.add(te).rect
+}
+
+// ---------- compact file-properties dialog (file_properties.html) ----------
+//
+// One short page, no tabs: title bar (file icon + name + X), right-aligned
+// 70 px labels, a slim live progress line, and the concept's bottom bar.
+// Every control is painted here and dispatched through the manual hit
+// router, so the dialog inherits the app's theme in both light and dark.
+
+/// Concept width (`file_properties.html` `.dialog { width: 480px }`).
+const DP_W: f32 = 480.0;
+const DP_LABEL_W: f32 = 70.0;
+const DP_ROW_H: f32 = 16.0;
+
+/// Right-aligned 70 px field label: 10 px, muted (mock `.field-label`).
+fn dp_label(ui: &mut egui::Ui, text: &str) {
+    ui.allocate_ui_with_layout(
+        egui::vec2(DP_LABEL_W, DP_ROW_H),
+        egui::Layout::right_to_left(egui::Align::Center),
+        |ui| {
+            ui.add(egui::Label::new(
+                egui::RichText::new(text)
+                    .font(crate::fonts::reg(10.0))
+                    .color(pl().dim),
+            ));
+        },
+    );
+}
+
+/// One clipped value cell (mock `.field-value`).
+fn dp_value(ui: &mut egui::Ui, text: &str, color: egui::Color32, size: f32, width: f32) {
+    ui.allocate_ui_with_layout(
+        egui::vec2(width.max(24.0), DP_ROW_H),
+        egui::Layout::left_to_right(egui::Align::Center),
+        |ui| {
+            ui.add(
+                egui::Label::new(
+                    egui::RichText::new(text)
+                        .font(crate::fonts::reg(size))
+                        .color(color),
+                )
+                .truncate(),
+            );
+        },
+    );
+}
+
+/// 1 px divider (mock `.divider`).
+fn dp_rule(ui: &mut egui::Ui) {
+    let (r, _) = ui.allocate_exact_size(
+        egui::vec2(ui.available_width(), 1.0),
+        egui::Sense::hover(),
+    );
+    ui.painter().line_segment(
+        [r.left_center(), r.right_center()],
+        egui::Stroke::new(1.0, pl().modal_bd),
+    );
+}
+
+/// 20×20 copy affordance (mock `.copy-btn`).
+fn dp_icon(ui: &mut egui::Ui, man: &ManState, glyph: &str) -> egui::Rect {
+    let (rect, _) = ui.allocate_exact_size(egui::vec2(20.0, 20.0), egui::Sense::hover());
+    let hovered = man.hover(&rect);
+    let p = ui.painter();
+    if hovered {
+        p.rect_filled(rect, 4.0, pl().surface_lt);
+    }
+    p.text(
+        rect.center(),
+        egui::Align2::CENTER_CENTER,
+        glyph.to_string(),
+        egui::FontId::proportional(12.0),
+        if hovered { pl().primary } else { pl().dim },
+    );
+    rect
+}
+
+/// Small bordered button (mock `.btn-small`): 20 px tall, 10 px label.
+fn dp_small(ui: &mut egui::Ui, man: &ManState, label: &str, w: f32) -> egui::Rect {
+    let (rect, _) = ui.allocate_exact_size(egui::vec2(w, 20.0), egui::Sense::hover());
+    let hovered = man.hover(&rect);
+    let p = ui.painter();
+    p.rect_filled(rect, 5.0, if hovered { pl().surface_lt } else { pl().surface });
+    p.rect_stroke(
+        rect,
+        5.0,
+        egui::Stroke::new(1.0, pl().modal_bd),
+        egui::StrokeKind::Inside,
+    );
+    p.text(
+        rect.center(),
+        egui::Align2::CENTER_CENTER,
+        label.to_string(),
+        crate::fonts::reg(10.0),
+        if hovered { pl().txt } else { pl().dim },
+    );
+    rect
+}
+
+/// Bottom-bar button (mock `.btn`): 74×28, 6 px radius.
+fn dp_button(ui: &mut egui::Ui, man: &ManState, label: &str, primary: bool) -> egui::Rect {
+    let (rect, _) = ui.allocate_exact_size(egui::vec2(74.0, 28.0), egui::Sense::hover());
+    let hovered = man.hover(&rect);
+    let p = ui.painter();
+    if primary {
+        p.rect_filled(rect, 6.0, pl().primary);
+    } else {
+        p.rect_filled(rect, 6.0, if hovered { pl().surface_lt } else { pl().surface });
+        p.rect_stroke(
+            rect,
+            6.0,
+            egui::Stroke::new(1.0, pl().modal_bd),
+            egui::StrokeKind::Inside,
+        );
+    }
+    p.text(
+        rect.center(),
+        egui::Align2::CENTER_CENTER,
+        label.to_string(),
+        crate::fonts::reg(11.0),
+        if primary { egui::Color32::WHITE } else { pl().txt },
+    );
+    rect
+}
+
+/// Compact input (mock `.input`, or the mock's borderless `.auth-input` with
+/// an underline). Returns the hit rect for the manual focus router.
+fn dp_input(
+    ui: &mut egui::Ui,
+    id: &str,
+    text: &mut String,
+    hint: &str,
+    width: f32,
+    password: bool,
+    underline: bool,
+) -> egui::Rect {
+    let rect = ui
+        .scope(|ui| {
+            let v = ui.visuals_mut();
+            for w in [
+                &mut v.widgets.inactive,
+                &mut v.widgets.hovered,
+                &mut v.widgets.active,
+                &mut v.widgets.open,
+            ] {
+                w.corner_radius = egui::CornerRadius::same(5);
+            }
+            v.widgets.inactive.bg_stroke = egui::Stroke::new(
+                1.0,
+                if underline {
+                    egui::Color32::TRANSPARENT
+                } else {
+                    pl().modal_bd
+                },
+            );
+            v.widgets.hovered.bg_stroke = egui::Stroke::new(1.0, pl().primary);
+            v.widgets.active.bg_stroke = egui::Stroke::new(1.0, pl().primary);
+            ui.spacing_mut().interact_size.y = if underline { 18.0 } else { 22.0 };
+            let mut te = egui::TextEdit::singleline(text)
+                .id(egui::Id::new(id))
+                .hint_text(hint)
+                .password(password)
+                .font(crate::fonts::reg(11.0))
+                .background_color(if underline { pl().modal_bg } else { pl().surface })
+                .margin(egui::Margin::symmetric(
+                    if underline { 0 } else { 8 },
+                    if underline { 2 } else { 3 },
+                ))
+                .desired_width(width);
+            if underline {
+                te = te.frame(false);
+            }
+            ui.add(te).rect
+        })
+        .inner;
+    if underline {
+        ui.painter().line_segment(
+            [
+                egui::pos2(rect.min.x, rect.max.y + 1.0),
+                egui::pos2(rect.max.x, rect.max.y + 1.0),
+            ],
+            egui::Stroke::new(1.0, pl().modal_bd),
+        );
+    }
+    rect
+}
+
+/// Mock `.auth-label`: 46 px, right-aligned, 10 px muted.
+fn dp_auth_label(ui: &mut egui::Ui, text: &str) {
+    ui.allocate_ui_with_layout(
+        egui::vec2(46.0, 18.0),
+        egui::Layout::right_to_left(egui::Align::Center),
+        |ui| {
+            ui.add(egui::Label::new(
+                egui::RichText::new(text)
+                    .font(crate::fonts::reg(10.0))
+                    .color(pl().dim),
+            ));
+        },
+    );
+}
+
+/// "MP4 Video File", "ZIP Archive", ... for the mock's Type row.
+fn dp_type_label(filename: &str) -> String {
+    let ext = filename
+        .rsplit('.')
+        .next()
+        .unwrap_or("")
+        .to_ascii_uppercase();
+    let kind = match crate::model::category_of(filename) {
+        "Image" => "Image File",
+        "Music" => "Audio File",
+        "Video" => "Video File",
+        "Document" => "Document",
+        "Compressed" => "Archive",
+        "Apps" => "Application",
+        _ => "File",
+    };
+    if ext.is_empty() || ext == filename.to_ascii_uppercase() {
+        kind.to_string()
+    } else {
+        format!("{ext} {kind}")
+    }
+}
+
+/// A captured referer that is an HTML page (not a media/CDN file) fills the
+/// concept's "Web page" row; media URLs stay in "Referer".
+fn page_url_of(referer: &str) -> String {
+    let r = referer.trim();
+    if !(r.starts_with("http://") || r.starts_with("https://")) {
+        return String::new();
+    }
+    let path = r.split(['?', '#']).next().unwrap_or(r).to_ascii_lowercase();
+    let file = path.rsplit('/').next().unwrap_or("");
+    let ext = file.rsplit_once('.').map(|(_, e)| e).unwrap_or("");
+    const MEDIA: &[&str] = &[
+        "mp4", "mkv", "webm", "mov", "avi", "m4v", "mp3", "m4a", "aac", "ogg", "wav", "flac",
+        "m3u8", "mpd", "jpg", "jpeg", "png", "gif", "webp", "vtt", "srt",
+    ];
+    if MEDIA.contains(&ext) {
+        String::new()
+    } else {
+        r.to_string()
+    }
 }
 
 /// Small square icon button (paint only; input via manual routing).
@@ -1248,8 +1494,6 @@ enum HitKind {
     Slider(SliderId, f64, f64, bool), // id, min, max, log
     Field(&'static str),
     ComboAnchor,
-    DetTab(u8), // details Info/Settings tabs
-    DetParts,   // details Part-Info collapse toggle
 }
 
 /// Active manual divider drag: table column resize (window edges are the
@@ -1335,7 +1579,6 @@ pub struct CraftApp {
     placement_done: bool,
     tray: Option<tray_icon::TrayIcon>,
     details_id: Option<u64>,
-    details_tab: u8, // 0 info, 1 settings
     probing: bool,
     probe_size: Option<u64>,
     probe_name: Option<String>,
@@ -1406,7 +1649,6 @@ pub struct CraftApp {
     // Details-dialog checksum staging (validated live; see Details tab).
     det_sum: String,
     det_for: Option<u64>,
-    det_parts_open: bool,
     // Autofocus request for the Add dialog URL field.
     add_focus_req: bool,
     // Recent-folders menu (the path field's caret): open flag + caret rect, so
@@ -1480,7 +1722,6 @@ impl CraftApp {
             placement_done: false,
             tray: None,
             details_id: None,
-            details_tab: 0,
             probing: false,
             probe_size: None,
             probe_name: None,
@@ -1537,7 +1778,6 @@ impl CraftApp {
             add_quality: String::new(),
             det_sum: String::new(),
             det_for: None,
-            det_parts_open: true,
             add_focus_req: false,
             add_recent_open: false,
             add_caret: None,
@@ -2085,7 +2325,6 @@ impl CraftApp {
             RowAct::Pause => self.pause(id),
             RowAct::Details => {
                 self.details_id = Some(id);
-                self.details_tab = 0;
             }
             RowAct::Redownload => self.redownload(id),
             RowAct::Remove => self.remove(id),
@@ -3913,6 +4152,9 @@ impl eframe::App for CraftApp {
         let resolved = format!("{}:{}", self.theme, theme_is_dark(ctx, &self.theme));
         if self.theme_applied != resolved {
             apply_theme(ctx, &self.theme);
+            // The native title bar follows the app theme: Windows otherwise
+            // keeps it dark for as long as the OS itself is dark.
+            crate::tray::set_titlebar_dark(theme_is_dark(ctx, &self.theme));
             self.theme_applied = resolved;
         }
 
@@ -4183,20 +4425,7 @@ impl eframe::App for CraftApp {
                         false,
                     );
                     self.hits.push((HitKind::SideRow("Unfinished".to_string()), r));
-                    ui.add_space(8.0);
-                    side_section(ui, "MANAGE");
-                    nav(
-                        ui,
-                        &mut self.hits,
-                        &self.man,
-                        &cur,
-                        "Queues",
-                        MI_QUEUE,
-                        "Queues",
-                        None,
-                        false,
-                    );
-                    ui.add_space(4.0);
+                    ui.add_space(6.0);
                     ui.small(format!("{n_active} active · {n_all} total"));
                 });
             });
@@ -5300,447 +5529,402 @@ impl eframe::App for CraftApp {
                 Some(item) => {
                     let active = self.tasks.contains_key(&did);
                     let paused = matches!(item.status, Status::Paused);
-                    let (ranges, dones) = self
-                        .tasks
-                        .get(&did)
-                        .map(|t| {
-                            // never panic on a poisoned lock (engine task died holding it)
-                            let r = t
-                                .shared
-                                .part_total
-                                .lock()
-                                .map(|g| g.clone())
-                                .unwrap_or_default();
-                            let d = t
-                                .shared
-                                .part_done
-                                .lock()
-                                .map(|g| g.clone())
-                                .unwrap_or_default();
-                            (r, d)
-                        })
-                        .unwrap_or_default();
-                    let pct = (item.progress() * 100.0) as u32;
+                    let finished = matches!(item.status, Status::Completed);
+                    let pct = (item.progress() * 100.0).clamp(0.0, 100.0);
+                    // Editing buffers: `item` is this frame's snapshot, so the
+                    // inputs edit locals that are written back after the UI.
+                    if self.det_for != Some(did) {
+                        self.det_for = Some(did);
+                        self.det_sum = item.checksum_sha256.clone();
+                    }
+                    let mut desc = item.description.clone();
+                    let mut user = item.username.clone();
+                    let mut pass = item.password.clone();
+                    let mut sum = self.det_sum.clone();
+
+                    let det_w = modal_width(ctx, DP_W);
                     let mut open = true;
-                    let tab = self.details_tab;
-                    let title = if matches!(item.status, Status::Downloading | Status::Paused) {
-                        format!("{pct}%-{}", item.filename)
-                    } else {
-                        item.filename.clone()
-                    };
-                    let det_w = modal_width(ctx, 520.0);
-                    egui::Window::new(title)
+
+                    egui::Window::new("details_modal")
                         .id(egui::Id::new("details_modal"))
                         .order(egui::Order::Foreground)
                         .open(&mut open)
                         .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
                         .pivot(egui::Align2::CENTER_CENTER)
+                        .title_bar(false)
                         .collapsible(false)
                         .resizable(false)
                         .default_width(det_w)
                         .min_width(det_w.min(320.0))
                         .max_width(det_w)
                         .max_height((ctx.screen_rect().height() * 0.86).clamp(300.0, 900.0))
-                        .frame(modal_frame())
+                        .frame(
+                            egui::Frame::new()
+                                .fill(pl().modal_bg)
+                                .stroke(egui::Stroke::new(1.0_f32, pl().modal_bd))
+                                .corner_radius(12.0)
+                                .inner_margin(egui::Margin::ZERO),
+                        )
                         .show(ctx, |ui| {
-                            ui.horizontal(|ui| {
-                                for (t, label) in [(0u8, "Info"), (1u8, "Settings")] {
-                                    let g = ui.painter().layout_no_wrap(
-                                        label.to_string(),
-                                        egui::FontId::proportional(12.5),
-                                        if tab == t { pl().txt } else { pl().dim },
-                                    );
-                                    let (r, _) = ui.allocate_exact_size(
-                                        egui::vec2(g.size().x + 24.0, 26.0),
-                                        egui::Sense::hover(),
-                                    );
-                                    if tab == t {
-                                        ui.painter().rect_filled(r, 4.0, pl().surface_lt);
-                                    } else if self.man.hover(&r) {
-                                        ui.painter().rect_filled(r, 4.0, pl().hover_bg);
-                                    }
-                                    ui.painter().galley(
-                                        egui::pos2(
-                                            r.center().x - g.size().x / 2.0,
-                                            r.center().y - g.size().y / 2.0,
-                                        ),
-                                        g,
-                                        if tab == t { pl().txt } else { pl().dim },
-                                    );
-                                    self.hits.push((HitKind::DetTab(t), r));
-                                }
-                            });
-                            ui.separator();
-                            if tab == 0 {
-                                egui::Grid::new("dinfo")
-                                    .num_columns(2)
-                                    .spacing([24.0, 6.0])
-                                    .show(ui, |ui| {
-                                        let row = |ui: &mut egui::Ui, k: &str, v: String| {
-                                            ui.label(egui::RichText::new(k).color(pl().dim));
-                                            ui.label(egui::RichText::new(v).size(13.0));
-                                            ui.end_row();
-                                        };
-                                        row(ui, "Name:", item.filename.clone());
-                                        row(
+                            ui.set_width(det_w);
+                            // The dialog is a card: no window item spacing
+                            // between the header, the content and the bar.
+                            ui.spacing_mut().item_spacing.y = 0.0;
+                            // ---- title bar: file icon · name · close ----
+                            let (bar, _) = ui.allocate_exact_size(
+                                egui::vec2(det_w, 38.0),
+                                egui::Sense::hover(),
+                            );
+                            let p = ui.painter().clone();
+                            p.text(
+                                egui::pos2(bar.min.x + 22.0, bar.center().y),
+                                egui::Align2::CENTER_CENTER,
+                                file_icon(crate::model::category_of(&item.filename)).to_string(),
+                                egui::FontId::proportional(16.0),
+                                pl().primary,
+                            );
+                            let close_r = egui::Rect::from_center_size(
+                                egui::pos2(bar.max.x - 25.0, bar.center().y),
+                                egui::vec2(22.0, 22.0),
+                            );
+                            let close_hover = self.man.hover(&close_r);
+                            if close_hover {
+                                p.rect_filled(close_r, 6.0, pl().surface_lt);
+                            }
+                            p.text(
+                                close_r.center(),
+                                egui::Align2::CENTER_CENTER,
+                                "\u{e5cd}".to_string(),
+                                egui::FontId::proportional(14.0),
+                                if close_hover { pl().txt } else { pl().dim },
+                            );
+                            self.hits.push((HitKind::Btn(ButtonId::DClose), close_r));
+                            // Filename between icon and X, elided on overflow.
+                            let title_l = bar.min.x + 36.0;
+                            let title_w = (close_r.min.x - 8.0 - title_l).max(40.0);
+                            let mut job = egui::text::LayoutJob::simple_singleline(
+                                item.filename.clone(),
+                                crate::fonts::semi(12.0),
+                                pl().txt,
+                            );
+                            job.wrap = egui::text::TextWrapping {
+                                max_width: title_w,
+                                max_rows: 1,
+                                break_anywhere: true,
+                                overflow_character: Some('…'),
+                            };
+                            let galley = ui.painter().layout_job(job);
+                            ui.painter().galley(
+                                egui::pos2(title_l, bar.center().y - galley.size().y / 2.0),
+                                galley,
+                                pl().txt,
+                            );
+
+                            // ---- content (mock `.content`) ----
+                            egui::Frame::new()
+                                .inner_margin(egui::Margin {
+                                    left: 16,
+                                    right: 16,
+                                    top: 4,
+                                    bottom: 12,
+                                })
+                                .show(ui, |ui| {
+                                    ui.spacing_mut().item_spacing.y = 3.0;
+                                    let row_w = det_w - 32.0;
+                                    ui.set_width(row_w);
+
+                                    // Type
+                                    ui.horizontal(|ui| {
+                                        ui.spacing_mut().item_spacing.x = 10.0;
+                                        dp_label(ui, "Type:");
+                                        dp_value(
                                             ui,
-                                            "Status:",
-                                            match item.status {
-                                                Status::Queued => "Queued".to_string(),
-                                                Status::Downloading => match self.phases.get(&item.id) {
-                                                    // "Downloading" with a motionless 0% reads
-                                                    // as a hang: name the stage the helper is
-                                                    // in while nothing is on the wire yet.
-                                                    Some(p)
-                                                        if item.downloaded_bytes == 0
-                                                            && !p.is_empty()
-                                                            && p != "Downloading" =>
-                                                    {
-                                                        format!("Downloading — {p}")
-                                                    }
-                                                    _ => "Downloading".to_string(),
-                                                },
-                                                Status::Paused => "Paused".to_string(),
-                                                Status::Completed => "Finished".to_string(),
-                                                Status::Failed(_) => "Failed".to_string(),
-                                            },
+                                            &dp_type_label(&item.filename),
+                                            pl().txt,
+                                            11.0,
+                                            row_w - DP_LABEL_W - 10.0,
                                         );
-                                        row(
-                                            ui,
-                                            "Size:",
-                                            item.total_bytes
-                                                .map(format_bytes)
-                                                .unwrap_or_else(|| "?".into()),
-                                        );
-                                        row(ui, "Downloaded:", format_bytes(item.downloaded_bytes));
-                                        row(ui, "Speed:", format_speed(item.speed_bps));
-                                        row(
-                                            ui,
-                                            "Remaining Time:",
-                                            if format_eta(&item) == "-" {
-                                                "-".to_string()
-                                            } else {
-                                                format_eta(&item)
-                                            },
-                                        );
-                                        ui.label(egui::RichText::new("Resume Support:").color(pl().dim));
-                                        ui.label(
-                                            egui::RichText::new(if item.resumable {
-                                                "Yes"
-                                            } else {
-                                                "No"
-                                            })
-                                            .color(if item.resumable {
-                                                pl().success
-                                            } else {
-                                                pl().error
-                                            }),
-                                        );
-                                        ui.end_row();
-                                        ui.label(egui::RichText::new("Integrity (SHA-256):").color(pl().dim));
-                                        ui.label(
-                                            egui::RichText::new(if item.checksum_sha256.trim().is_empty() {
-                                                "not set".to_string()
-                                            } else {
-                                                format!("{}…", &item.checksum_sha256.chars().take(16).collect::<String>())
-                                            })
-                                            .size(13.0),
-                                        );
-                                        ui.end_row();
                                     });
-                                ui.add_space(8.0);
-                                status_bar_w(
-                                    ui,
-                                    ui.available_width(),
-                                    item.progress(),
-                                    pl().primary,
-                                    pl().secondary,
-                                );
-                                ui.add_space(8.0);
-                                // P5 speed history: raw quarter-second samples
-                                // as a mini area chart (EWMA readout above it).
-                                let hist: Vec<f64> = self
-                                    .speed_hist
-                                    .get(&did)
-                                    .map(|h| h.iter().copied().collect())
-                                    .unwrap_or_default();
-                                if hist.len() > 1 {
-                                    let peak = hist.iter().copied().fold(0.0_f64, f64::max).max(1.0);
-                                    ui.label(
-                                        egui::RichText::new(format!(
-                                            "Speed history (peak {}):",
-                                            format_speed(peak)
-                                        ))
-                                        .color(pl().dim),
-                                    );
-                                    let (grect, _) = ui.allocate_exact_size(
-                                        egui::vec2(ui.available_width(), 40.0),
-                                        egui::Sense::hover(),
-                                    );
-                                    let gp = ui.painter();
-                                    gp.rect_filled(grect, 4.0, pl().surface);
-                                    let n = hist.len();
-                                    let pts: Vec<egui::Pos2> = hist
-                                        .iter()
-                                        .enumerate()
-                                        .map(|(i, v)| {
-                                            let x = grect.min.x
-                                                + grect.width() * (i as f32 / (n.max(2) - 1) as f32);
-                                            let y = grect.max.y
-                                                - 3.0
-                                                - (grect.height() - 6.0)
-                                                    * (*v as f32 / peak as f32).clamp(0.0, 1.0);
-                                            egui::pos2(x, y)
-                                        })
-                                        .collect();
-                                    let mut poly = pts.clone();
-                                    poly.push(egui::pos2(grect.max.x, grect.max.y - 1.0));
-                                    poly.push(egui::pos2(grect.min.x, grect.max.y - 1.0));
-                                    gp.add(egui::Shape::convex_polygon(
-                                        poly,
-                                        egui::Color32::from_rgba_unmultiplied(124, 92, 252, 40),
-                                        egui::Stroke::new(0.0, egui::Color32::TRANSPARENT),
-                                    ));
-                                    gp.add(egui::Shape::line(pts, egui::Stroke::new(1.5, pl().primary)));
-                                    ui.add_space(8.0);
-                                }
-                                ui.horizontal(|ui| {
-                                    if active {
-                                        let r = mbutton(
-                                            ui,
-                                            &self.man,
-                                            if paused { "Resume" } else { "Pause" },
-                                            110.0,
-                                            32.0,
-                                            false,
-                                        );
-                                        self.hits.push((HitKind::Btn(ButtonId::DResume), r));
-                                    }
-                                    ui.with_layout(
-                                        egui::Layout::right_to_left(egui::Align::Center),
-                                        |ui| {
-                                            let r = mbutton(ui, &self.man, "Close", 110.0, 32.0, false);
-                                            self.hits.push((HitKind::Btn(ButtonId::DClose), r));
-                                        },
-                                    );
-                                });
-                                ui.add_space(4.0);
-                                // Part details (manual collapse toggle).
-                                let r = mbutton(ui, &self.man, if self.det_parts_open { "Hide Part Details" } else { "Show Part Details" }, 150.0, 28.0, false);
-                                self.hits.push((HitKind::DetParts, r));
-                                if self.det_parts_open {
-                                    if ranges.is_empty() {
-                                        ui.small("No part data yet.");
-                                    } else {
-                                        // colored strip
-                                        let total: u64 =
-                                            ranges.iter().map(|(s, e)| e.saturating_sub(*s) + 1).sum();
-                                        let w = ui.available_width();
-                                        let (rect, _) = ui.allocate_exact_size(
-                                            egui::vec2(w, 12.0),
+                                    // Status
+                                    let (status_txt, status_col) = match &item.status {
+                                        Status::Queued => ("Queued".to_string(), pl().dim),
+                                        Status::Downloading => (
+                                            if item.downloaded_bytes == 0 {
+                                                "Downloading — connecting…".to_string()
+                                            } else {
+                                                "Downloading".to_string()
+                                            },
+                                            pl().primary,
+                                        ),
+                                        Status::Paused => ("Paused".to_string(), pl().warning),
+                                        Status::Completed => ("Complete".to_string(), pl().success),
+                                        Status::Failed(_) => ("Failed".to_string(), pl().error),
+                                    };
+                                    ui.horizontal(|ui| {
+                                        ui.spacing_mut().item_spacing.x = 10.0;
+                                        dp_label(ui, "Status:");
+                                        dp_value(ui, &status_txt, status_col, 11.0, row_w - DP_LABEL_W - 10.0);
+                                    });
+                                    // Size
+                                    let size_txt = match item.total_bytes {
+                                        Some(t) if t > 0 => {
+                                            format!("{} ({} Bytes)", format_bytes(t), t)
+                                        }
+                                        _ => format!("{} downloaded", format_bytes(item.downloaded_bytes)),
+                                    };
+                                    ui.horizontal(|ui| {
+                                        ui.spacing_mut().item_spacing.x = 10.0;
+                                        dp_label(ui, "Size:");
+                                        dp_value(ui, &size_txt, pl().txt, 11.0, row_w - DP_LABEL_W - 10.0);
+                                    });
+
+                                    // Live progress for anything not finished:
+                                    // one slim bar (the concept has no room
+                                    // for a second dialog).
+                                    if !finished {
+                                        ui.add_space(2.0);
+                                        let (br, _) = ui.allocate_exact_size(
+                                            egui::vec2(row_w, 4.0),
                                             egui::Sense::hover(),
                                         );
-                                        let p = ui.painter();
-                                        p.rect_filled(rect, 5.0, pl().surface);
-                                        if total > 0 {
-                                            let mut x = rect.min.x;
-                                            for (i, (s, e)) in ranges.iter().enumerate() {
-                                                let part_len = e.saturating_sub(*s) + 1;
-                                                let seg_w = rect.width() * part_len as f32 / total as f32;
-                                                let done = dones.get(i).copied().unwrap_or(0);
-                                                let frac = (done as f64 / part_len.max(1) as f64)
-                                                    .clamp(0.0, 1.0);
-                                                let c = if frac >= 1.0 {
-                                                    pl().success
-                                                } else if active && done > 0 {
-                                                    pl().warning
-                                                } else {
-                                                    pl().track
-                                                };
-                                                let seg = egui::Rect::from_min_size(
-                                                    egui::pos2(x + 1.0, rect.min.y),
-                                                    egui::vec2((seg_w - 2.0).max(2.0), rect.height()),
-                                                );
-                                                p.rect_filled(seg, 3.0, c);
-                                                x += seg_w;
-                                            }
+                                        let pb = ui.painter();
+                                        pb.rect_filled(br, 2.0, pl().track);
+                                        let fill = br.width() * item.progress() as f32;
+                                        if fill > 0.5 {
+                                            pb.rect_filled(
+                                                egui::Rect::from_min_size(
+                                                    br.min,
+                                                    egui::vec2(fill, br.height()),
+                                                ),
+                                                2.0,
+                                                pl().primary,
+                                            );
                                         }
-                                        // per-part table (scrolls past ~8 rows so
-                                        // the dialog never outgrows the screen)
-                                        egui::ScrollArea::vertical().max_height(190.0).show(ui, |ui| {
-                                        egui::Grid::new("parts")
-                                            .num_columns(4)
-                                            .spacing([16.0, 4.0])
-                                            .striped(true)
-                                            .show(ui, |ui| {
-                                                ui.label(egui::RichText::new("#").color(pl().dim));
-                                                ui.label(egui::RichText::new("Status").color(pl().dim));
-                                                ui.label(
-                                                    egui::RichText::new("Downloaded").color(pl().dim),
-                                                );
-                                                ui.label(egui::RichText::new("Total").color(pl().dim));
-                                                ui.end_row();
-                                                for (i, (s, e)) in ranges.iter().enumerate() {
-                                                    let part_len = e.saturating_sub(*s) + 1;
-                                                    let done = dones.get(i).copied().unwrap_or(0);
-                                                    let st = if done >= part_len {
-                                                        "Complete"
-                                                    } else if active && done > 0 {
-                                                        "Receiving Data"
-                                                    } else if active {
-                                                        "Waiting"
-                                                    } else {
-                                                        "Paused"
-                                                    };
-                                                    ui.label(format!("{}", i + 1));
-                                                    ui.label(st);
-                                                    ui.label(format_bytes(done));
-                                                    ui.label(format_bytes(part_len));
-                                                    ui.end_row();
-                                                }
-                                            });
+                                        let eta = format_eta(&item);
+                                        let mut bits = vec![format!("{pct}%")];
+                                        if item.speed_bps > 1.0 {
+                                            bits.push(format_speed(item.speed_bps));
+                                        }
+                                        if eta != "-" {
+                                            bits.push(format!("{eta} left"));
+                                        }
+                                        dp_value(ui, &bits.join("  ·  "), pl().dim, 10.0, row_w);
+                                        ui.add_space(2.0);
+                                    }
+
+                                    // Save To + Move (finished files only: a
+                                    // partial file must stay where it resumes).
+                                    let dest = item.dest_path();
+                                    let exists = dest.exists();
+                                    ui.horizontal(|ui| {
+                                        ui.spacing_mut().item_spacing.x = 6.0;
+                                        dp_label(ui, "Save To:");
+                                        let text_w =
+                                            (ui.available_width() - if finished { 62.0 } else { 0.0 })
+                                                .max(60.0);
+                                        let shown = if exists {
+                                            dest.to_string_lossy().to_string()
+                                        } else if finished {
+                                            "The file has been moved.".to_string()
+                                        } else {
+                                            item.save_dir.clone()
+                                        };
+                                        dp_value(ui, &shown, pl().dim, 10.0, text_w);
+                                        if finished {
+                                            let r = dp_small(ui, &self.man, "Move", 56.0);
+                                            self.hits.push((HitKind::Btn(ButtonId::DMove), r));
+                                        }
+                                    });
+
+                                    // Address (media URL) + copy
+                                    ui.horizontal(|ui| {
+                                        ui.spacing_mut().item_spacing.x = 6.0;
+                                        dp_label(ui, "Address:");
+                                        let text_w = (ui.available_width() - 26.0).max(60.0);
+                                        dp_value(ui, &item.url, pl().primary, 10.0, text_w);
+                                        let r = dp_icon(ui, &self.man, MI_COPY);
+                                        self.hits.push((HitKind::Btn(ButtonId::DCopyAddr), r));
+                                    });
+
+                                    // Description (live note)
+                                    ui.horizontal(|ui| {
+                                        ui.spacing_mut().item_spacing.x = 6.0;
+                                        dp_label(ui, "Description:");
+                                        let w = ui.available_width();
+                                        let r = dp_input(ui, "det_desc", &mut desc, "Add a note", w, false, false);
+                                        self.hits.push((HitKind::Field("det_desc"), r));
+                                    });
+
+                                    // Web page (the captured page, when the
+                                    // referer is an HTML page) + copy
+                                    let web = page_url_of(&item.referer);
+                                    let refr = if item.referer.trim().is_empty()
+                                        || item.referer.trim() == web
+                                    {
+                                        String::new()
+                                    } else {
+                                        item.referer.trim().to_string()
+                                    };
+                                    if !web.is_empty() {
+                                        ui.horizontal(|ui| {
+                                            ui.spacing_mut().item_spacing.x = 6.0;
+                                            dp_label(ui, "Web page:");
+                                            let text_w = (ui.available_width() - 26.0).max(60.0);
+                                            dp_value(ui, &web, pl().primary, 10.0, text_w);
+                                            let r = dp_icon(ui, &self.man, MI_COPY);
+                                            self.hits.push((HitKind::Btn(ButtonId::DCopyPage), r));
                                         });
                                     }
-                                }
-                            } else {
-                                // Live-apply settings (no Apply button): edits
-                                // write straight through; network options take
-                                // effect on restart.
-                                if self.det_for != Some(did) {
-                                    self.det_for = Some(did);
-                                    self.det_sum = item.checksum_sha256.clone();
-                                }
-                                ui.label("Save folder:");
-                                ui.monospace(&item.save_dir);
-                                ui.label(
-                                    egui::RichText::new(format!(
-                                        "Connections: {}",
-                                        item.connections
-                                    ))
-                                    .color(pl().dim),
-                                );
-                                let r = mslider(
-                                    ui,
-                                    &self.man,
-                                    "",
-                                    1.0,
-                                    16.0,
-                                    self.slider_get(SliderId::DetConns),
-                                    false,
-                                );
-                                self.hits.push((
-                                    HitKind::Slider(SliderId::DetConns, 1.0, 16.0, false),
-                                    r,
-                                ));
-                                // P5 per-download overrides (0 = global).
-                                ui.label(
-                                    egui::RichText::new(format!(
-                                        "Retries: {}",
-                                        item.max_retries
-                                            .map(|n| n.to_string())
-                                            .unwrap_or_else(|| format!(
-                                                "global ({})",
-                                                self.max_retries
-                                            ))
-                                    ))
-                                    .color(pl().dim),
-                                );
-                                let r = mslider(
-                                    ui,
-                                    &self.man,
-                                    "",
-                                    0.0,
-                                    20.0,
-                                    self.slider_get(SliderId::DetRetries),
-                                    false,
-                                );
-                                self.hits.push((
-                                    HitKind::Slider(SliderId::DetRetries, 0.0, 20.0, false),
-                                    r,
-                                ));
-                                ui.label(
-                                    egui::RichText::new(format!(
-                                        "Timeout: {}",
-                                        item.timeout_secs
-                                            .map(|n| format!("{n}s"))
-                                            .unwrap_or_else(|| format!(
-                                                "global ({}s)",
-                                                self.timeout_secs
-                                            ))
-                                    ))
-                                    .color(pl().dim),
-                                );
-                                let r = mslider(
-                                    ui,
-                                    &self.man,
-                                    "",
-                                    0.0,
-                                    600.0,
-                                    self.slider_get(SliderId::DetTimeout),
-                                    false,
-                                );
-                                self.hits.push((
-                                    HitKind::Slider(SliderId::DetTimeout, 0.0, 600.0, false),
-                                    r,
-                                ));
-                                ui.small("Retries/timeout apply on restart (0 = global).");
-                                ui.label("Referer:");
-                                if let Some(d) =
-                                    self.downloads.iter_mut().find(|d| d.id == did)
-                                {
-                                    let r = mtext(ui, "det_ref", &mut d.referer, "", f32::INFINITY, false);
-                                    // (hit recorded after borrow ends)
-                                    let rr = r;
-                                    self.hits.push((HitKind::Field("det_ref"), rr));
-                                }
-                                ui.label("Cookie:");
-                                if let Some(d) =
-                                    self.downloads.iter_mut().find(|d| d.id == did)
-                                {
-                                    let r = mtext(ui, "det_cookie", &mut d.cookie, "", f32::INFINITY, false);
-                                    let rr = r;
-                                    self.hits.push((HitKind::Field("det_cookie"), rr));
-                                }
-                                ui.horizontal(|ui| {
-                                    ui.label("User:");
-                                    if let Some(d) =
-                                        self.downloads.iter_mut().find(|d| d.id == did)
-                                    {
-                                        let r = mtext(ui, "det_user", &mut d.username, "", 130.0, false);
-                                        let rr = r;
-                                        self.hits.push((HitKind::Field("det_user"), rr));
+                                    if !refr.is_empty() {
+                                        ui.horizontal(|ui| {
+                                            ui.spacing_mut().item_spacing.x = 10.0;
+                                            dp_label(ui, "Referer:");
+                                            dp_value(
+                                                ui,
+                                                &refr,
+                                                pl().dim,
+                                                10.0,
+                                                row_w - DP_LABEL_W - 10.0,
+                                            );
+                                        });
                                     }
-                                    ui.label("Pass:");
-                                    if let Some(d) =
-                                        self.downloads.iter_mut().find(|d| d.id == did)
-                                    {
-                                        let r = mtext(ui, "det_pass", &mut d.password, "", 130.0, true);
-                                        let rr = r;
-                                        self.hits.push((HitKind::Field("det_pass"), rr));
-                                    }
-                                });
-                                ui.small("Applies immediately (network options on restart).");
-                                ui.label("SHA-256 (optional, 64 hex):");
-                                let r = mtext(ui, "det_sum", &mut self.det_sum, "", f32::INFINITY, false);
-                                self.hits.push((HitKind::Field("det_sum"), r));
-                                // Commit a valid checksum live; invalid stays
-                                // local (never clobbers the stored one).
-                                let norm = crate::model::normalize_sha256(&self.det_sum);
-                                if norm.is_empty() || crate::model::is_valid_sha256(&norm) {
-                                    if let Some(d) =
-                                        self.downloads.iter_mut().find(|d| d.id == did)
-                                    {
-                                        if d.checksum_sha256 != norm {
-                                            d.checksum_sha256 = norm;
-                                            self.save_queue();
+
+                                    // Integrity: the README-documented SHA-256
+                                    // check keeps its home here (finished or
+                                    // already-set items only).
+                                    if finished || !item.checksum_sha256.trim().is_empty() {
+                                        ui.horizontal(|ui| {
+                                            ui.spacing_mut().item_spacing.x = 6.0;
+                                            dp_label(ui, "Integrity:");
+                                            let w = (ui.available_width()
+                                                - if finished { 66.0 } else { 0.0 })
+                                                .max(60.0);
+                                            let r = dp_input(
+                                                ui,
+                                                "det_sum",
+                                                &mut sum,
+                                                "SHA-256 (optional)",
+                                                w,
+                                                false,
+                                                false,
+                                            );
+                                            self.hits.push((HitKind::Field("det_sum"), r));
+                                            if finished {
+                                                let vr = dp_small(ui, &self.man, "Verify", 60.0);
+                                                self.hits
+                                                    .push((HitKind::Btn(ButtonId::DVerify), vr));
+                                            }
+                                        });
+                                        let norm = crate::model::normalize_sha256(&sum);
+                                        if !sum.trim().is_empty()
+                                            && !crate::model::is_valid_sha256(&norm)
+                                        {
+                                            dp_value(
+                                                ui,
+                                                "Invalid SHA-256 — 64 hex characters expected.",
+                                                pl().error,
+                                                10.0,
+                                                row_w,
+                                            );
                                         }
                                     }
-                                } else if !self.det_sum.trim().is_empty() {
-                                    ui.small("Invalid SHA-256 (want 64 hex chars) — not saved.");
-                                }
-                            }
+
+                                    ui.add_space(4.0);
+                                    dp_rule(ui);
+                                    ui.add_space(4.0);
+
+                                    // Login + Password on one row (mock `.auth-row`)
+                                    ui.horizontal(|ui| {
+                                        ui.spacing_mut().item_spacing.x = 8.0;
+                                        let field_w = ((row_w - 8.0) / 2.0 - 54.0).max(40.0);
+                                        dp_auth_label(ui, "Login");
+                                        let r = dp_input(
+                                            ui, "det_user", &mut user, "", field_w, false, true,
+                                        );
+                                        self.hits.push((HitKind::Field("det_user"), r));
+                                        dp_auth_label(ui, "Password");
+                                        let r = dp_input(
+                                            ui, "det_pass", &mut pass, "", field_w, true, true,
+                                        );
+                                        self.hits.push((HitKind::Field("det_pass"), r));
+                                    });
+                                });
+
+                            // ---- bottom bar (mock `.bottom-bar`) ----
+                            let (rule, _) = ui.allocate_exact_size(
+                                egui::vec2(det_w, 1.0),
+                                egui::Sense::hover(),
+                            );
+                            ui.painter().line_segment(
+                                [rule.left_center(), rule.right_center()],
+                                egui::Stroke::new(1.0, pl().modal_bd),
+                            );
+                            egui::Frame::new()
+                                .inner_margin(egui::Margin {
+                                    left: 16,
+                                    right: 16,
+                                    top: 10,
+                                    bottom: 10,
+                                })
+                                .show(ui, |ui| {
+                                    ui.horizontal(|ui| {
+                                        ui.spacing_mut().item_spacing.x = 8.0;
+                                        if active || paused {
+                                            let r = dp_button(
+                                                ui,
+                                                &self.man,
+                                                if paused { "Resume" } else { "Pause" },
+                                                false,
+                                            );
+                                            self.hits.push((HitKind::Btn(ButtonId::DResume), r));
+                                        }
+                                        ui.with_layout(
+                                            egui::Layout::right_to_left(egui::Align::Center),
+                                            |ui| {
+                                                ui.spacing_mut().item_spacing.x = 8.0;
+                                                let r =
+                                                    dp_button(ui, &self.man, "OK", true);
+                                                self.hits
+                                                    .push((HitKind::Btn(ButtonId::DClose), r));
+                                                let r =
+                                                    dp_button(ui, &self.man, "Open", false);
+                                                self.hits
+                                                    .push((HitKind::Btn(ButtonId::DOpen), r));
+                                            },
+                                        );
+                                    });
+                                });
                         });
-                    self.details_tab = tab;
+
+                    // Persist the live edits (one write per changed field).
+                    let mut dirty = false;
+                    if let Some(d) = self.downloads.iter_mut().find(|d| d.id == did) {
+                        if d.description != desc {
+                            d.description = desc;
+                            dirty = true;
+                        }
+                        if d.username != user {
+                            d.username = user;
+                            dirty = true;
+                        }
+                        if d.password != pass {
+                            d.password = pass;
+                            dirty = true;
+                        }
+                    }
+                    self.det_sum = sum;
+                    let norm = crate::model::normalize_sha256(&self.det_sum);
+                    if norm.is_empty() || crate::model::is_valid_sha256(&norm) {
+                        if let Some(d) = self.downloads.iter_mut().find(|d| d.id == did) {
+                            if d.checksum_sha256 != norm {
+                                d.checksum_sha256 = norm;
+                                dirty = true;
+                            }
+                        }
+                    }
+                    if dirty {
+                        self.save_queue();
+                    }
                     if !open {
                         self.details_id = None;
                         self.det_for = None;
@@ -5881,22 +6065,6 @@ impl CraftApp {
             SliderId::Retries => self.max_retries as f64,
             SliderId::DefConns => self.connections_default as f64,
             SliderId::QMax => self.max_concurrent as f64,
-            SliderId::DetConns => self
-                .details_id
-                .and_then(|did| self.downloads.iter().find(|d| d.id == did))
-                .map(|d| d.connections as f64)
-                .unwrap_or(8.0),
-            // 0 = follow the global setting (P5 per-download overrides).
-            SliderId::DetRetries => self
-                .details_id
-                .and_then(|did| self.downloads.iter().find(|d| d.id == did))
-                .map(|d| d.max_retries.unwrap_or(0) as f64)
-                .unwrap_or(0.0),
-            SliderId::DetTimeout => self
-                .details_id
-                .and_then(|did| self.downloads.iter().find(|d| d.id == did))
-                .map(|d| d.timeout_secs.unwrap_or(0) as f64)
-                .unwrap_or(0.0),
         }
     }
 
@@ -5910,31 +6078,6 @@ impl CraftApp {
             SliderId::QMax => {
                 self.max_concurrent = (v as usize).clamp(1, 16);
                 self.fill_next();
-            }
-            SliderId::DetConns => {
-                if let Some(did) = self.details_id {
-                    if let Some(d) = self.downloads.iter_mut().find(|d| d.id == did) {
-                        d.connections = (v as usize).clamp(1, 16);
-                    }
-                }
-            }
-            SliderId::DetRetries => {
-                if let Some(did) = self.details_id {
-                    if let Some(d) = self.downloads.iter_mut().find(|d| d.id == did) {
-                        let n = v.round() as u32;
-                        d.max_retries = if n == 0 { None } else { Some(n.clamp(1, 20)) };
-                        self.save_queue();
-                    }
-                }
-            }
-            SliderId::DetTimeout => {
-                if let Some(did) = self.details_id {
-                    if let Some(d) = self.downloads.iter_mut().find(|d| d.id == did) {
-                        let n = (v.round() as u64) / 5 * 5; // 5 s steps
-                        d.timeout_secs = if n == 0 { None } else { Some(n.clamp(5, 600)) };
-                        self.save_queue();
-                    }
-                }
             }
         }
     }
@@ -6214,7 +6357,103 @@ impl CraftApp {
                     }
                 }
             }
-            ButtonId::DClose => self.details_id = None,
+            ButtonId::DClose => {
+                self.save_queue();
+                self.details_id = None;
+                self.det_for = None;
+            }
+            ButtonId::DOpen => {
+                if let Some(did) = self.details_id {
+                    if let Some(d) = self.downloads.iter().find(|d| d.id == did) {
+                        let path = d.dest_path();
+                        // Finished file -> open it; gone/partial -> show the
+                        // folder it lives (or will live) in.
+                        open_path(&path, !path.exists());
+                    }
+                }
+            }
+            ButtonId::DCopyAddr => {
+                let url = self
+                    .details_id
+                    .and_then(|id| self.downloads.iter().find(|d| d.id == id))
+                    .map(|d| d.url.clone());
+                if let Some(url) = url {
+                    if let Ok(mut cb) = arboard::Clipboard::new() {
+                        let _ = cb.set_text(url);
+                    }
+                    self.push_log("Address copied to clipboard.");
+                }
+            }
+            ButtonId::DCopyPage => {
+                let url = self
+                    .details_id
+                    .and_then(|id| self.downloads.iter().find(|d| d.id == id))
+                    .map(|d| page_url_of(&d.referer))
+                    .filter(|u| !u.is_empty());
+                if let Some(url) = url {
+                    if let Ok(mut cb) = arboard::Clipboard::new() {
+                        let _ = cb.set_text(url);
+                    }
+                    self.push_log("Web page copied to clipboard.");
+                }
+            }
+            ButtonId::DMove => {
+                if let Some(did) = self.details_id {
+                    let info = self.downloads.iter().find(|d| d.id == did).map(|d| {
+                        (
+                            d.dest_path(),
+                            d.filename.clone(),
+                            d.save_dir.clone(),
+                            matches!(d.status, Status::Completed),
+                        )
+                    });
+                    if let Some((src, name, old_dir, finished)) = info {
+                        if !finished {
+                            self.push_log("Move: only finished files can be moved.");
+                        } else if !src.exists() {
+                            self.push_log("Move: the file is no longer at its saved location.");
+                        } else {
+                            let mut dlg = rfd::FileDialog::new().set_title("Move file to folder");
+                            if !old_dir.is_empty() {
+                                dlg = dlg.set_directory(&old_dir);
+                            }
+                            if let Some(dir) = dlg.pick_folder() {
+                                let dst = dir.join(&name);
+                                if dst == src {
+                                    // Same folder: nothing to move.
+                                } else if dst.exists() {
+                                    self.push_log("Move: a file with that name already exists there.");
+                                } else {
+                                    let moved = std::fs::rename(&src, &dst).or_else(|_| {
+                                        std::fs::copy(&src, &dst)
+                                            .and_then(|_| std::fs::remove_file(&src))
+                                    });
+                                    match moved {
+                                        Ok(_) => {
+                                            if let Some(d) =
+                                                self.downloads.iter_mut().find(|d| d.id == did)
+                                            {
+                                                d.save_dir = dir.to_string_lossy().to_string();
+                                            }
+                                            self.save_queue();
+                                            self.push_log(format!(
+                                                "Moved {name} to {}.",
+                                                dir.to_string_lossy()
+                                            ));
+                                        }
+                                        Err(e) => self.push_log(format!("Move failed: {e}")),
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            ButtonId::DVerify => {
+                if let Some(did) = self.details_id {
+                    self.verify_checksum(did);
+                }
+            }
             ButtonId::AbClose => self.show_about = false,
             ButtonId::TAdd => {
                 if let Some(url) = self.clipboard_toast.clone() {
@@ -6361,8 +6600,6 @@ impl CraftApp {
                     | HitKind::Slider(..)
                     | HitKind::Field(_)
                     | HitKind::ComboAnchor
-                    | HitKind::DetTab(_)
-                    | HitKind::DetParts
             );
             if modal_open && !dialog_kind {
                 continue;
@@ -6387,8 +6624,6 @@ impl CraftApp {
                     HitKind::Slider(..) => "slider".to_string(),
                     HitKind::Field(f) => format!("field:{f}"),
                     HitKind::ComboAnchor => "combo".to_string(),
-                    HitKind::DetTab(t) => format!("dettab:{t}"),
-                    HitKind::DetParts => "detparts".to_string(),
                 };
             }
             if clk || sec {
@@ -6584,16 +6819,6 @@ impl CraftApp {
                     if clk {
                         fired_menu = true;
                         self.finish_open = !self.finish_open;
-                    }
-                }
-                HitKind::DetTab(t) => {
-                    if clk {
-                        self.details_tab = t;
-                    }
-                }
-                HitKind::DetParts => {
-                    if clk {
-                        self.det_parts_open = !self.det_parts_open;
                     }
                 }
             }

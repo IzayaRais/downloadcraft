@@ -362,6 +362,56 @@
     }
   }
 
+  // ---------- naming ----------
+  // A direct media URL often carries the release name
+  // ("...Pooja.Meri.Jaan.2026.1080p.x264.AAC.Hin.BTs.VTL.mp4") while the page
+  // title is just "Video", "Watch online" or the site name; on other sites
+  // the reverse is true (hashed CDN names). Pick whichever one describes the
+  // file, never a bare "video.mp4".
+  function urlBasename(u) {
+    try {
+      const p = new URL(u, location.href).pathname;
+      const last = p.split("/").filter(Boolean).pop() || "";
+      try { return decodeURIComponent(last); } catch (e) { return last; }
+    } catch (e) { return ""; }
+  }
+  function pageTitle() {
+    let t = "";
+    try {
+      const og = document.querySelector('meta[property="og:title"]');
+      t = (og && og.getAttribute("content")) || "";
+    } catch (e) {}
+    if (!t) t = String(document.title || "");
+    t = t.trim();
+    // "Title - Site" / "Title | Site": the suffix is chrome, not the name.
+    t = t.replace(/\s+[-–—|]\s+[^-–—|]{1,40}$/, "").trim() || String(document.title || "").trim();
+    return t;
+  }
+  const GENERIC_TITLE = /^(video|videos|media|stream|player|watch|download|index|untitled|movie|online\s+video|full\s+video)$/i;
+  const BORING_STEM = /^(videoplayback|index|file|media|stream|download|video|play|master|chunk)$/i;
+  // Extensions the desktop side supplies from the MIME type: a title that
+  // already ends in one must not produce "name.mp4.mp4".
+  const MEDIA_EXT_RE = /\.(mp4|mkv|webm|mov|avi|m4v|mp3|m4a|aac|ogg|wav|flac|m3u8|mpd)$/i;
+  function mediaBase(mediaUrl) {
+    const title = pageTitle();
+    const file = urlBasename(mediaUrl || "");
+    const hasExt = /\.[a-z0-9]{2,5}$/i.test(file);
+    const stem = hasExt ? file.replace(/\.[a-z0-9]{2,5}$/i, "") : file;
+    const generic = !title || GENERIC_TITLE.test(title) || title.length < 4;
+    // A descriptive URL filename wins over a generic title, and over a title
+    // that is clearly shorter than the filename itself.
+    const descriptive = hasExt && stem.length >= 8 && !BORING_STEM.test(stem);
+    if (descriptive && (generic || stem.length > title.length + 8)) {
+      return stem.slice(0, 80);
+    }
+    const base = (title || stem || "video")
+      .replace(MEDIA_EXT_RE, "")
+      .replace(/[<>:"/\\|?*\u0000-\u001f]/g, "_")
+      .trim()
+      .replace(/\.+$/, "");
+    return (base || "video").slice(0, 80);
+  }
+
   // ---------- Facebook reels support (IDM-style quality rows) ----------
   // Facebook is an SPA: switching reels swaps /reel/<id> with no reload and
   // the player holds a blob: URL, so the real file URL only exists in
@@ -1460,7 +1510,7 @@
           }
           const direct = mediaUrlOf(v);
           if (direct) {
-            const base = (document.title || "video").replace(/[<>:"/\\|?*\u0000-\u001f]/g, "_").slice(0, 80);
+            const base = mediaBase(direct);
             const ext = /\.mp3|\.m4a|\.wav|\.ogg/i.test(direct) ? "" : ".mp4";
             let vdur = null;
             try {
@@ -1482,7 +1532,7 @@
                 const items = (res && res.items) || [];
                 const best = bestSniffed(items);
                 if (best) {
-                  const base = (document.title || "video").replace(/[<>:"/\\|?*\u0000-\u001f]/g, "_").slice(0, 80);
+                  const base = mediaBase(best.url);
                   sendDownload(best.url, base + ".mp4", best.mime, best.size || null);
                 } else {
                   sendDownload(location.href, undefined, null);

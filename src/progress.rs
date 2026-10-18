@@ -315,6 +315,10 @@ struct ProgressApp {
     /// The transfer finished and the "Download complete" dialog took over:
     /// this window closes itself.
     handoff: bool,
+    /// Theme key last applied: a switch in the main app repaints this window
+    /// while it stays open (separate process, so ui.json is the channel).
+    theme_seen: String,
+    theme_check: Instant,
 }
 
 impl ProgressApp {
@@ -409,6 +413,8 @@ pub fn run() -> eframe::Result<()> {
         parts_open: true,
         scroll: 0.0,
         handoff: false,
+        theme_seen: String::new(),
+        theme_check: Instant::now(),
     };
     app.refresh();
     let title = app
@@ -452,6 +458,18 @@ impl eframe::App for ProgressApp {
     }
 
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        // Theme switches made in the main app while this window is open: the
+        // process only read ui.json at start-up, so poll the resolved key
+        // (which also catches OS flips under "system").
+        if self.theme_check.elapsed() >= Duration::from_secs(1) {
+            self.theme_check = Instant::now();
+            let theme = crate::app::stored_theme();
+            let key = format!("{}:{}", theme, crate::app::theme_is_dark(ctx, &theme));
+            if key != self.theme_seen {
+                self.theme_seen = key;
+                crate::app::apply_theme(ctx, &theme);
+            }
+        }
         // Fast enough that the speed readout visibly moves while a transfer
         // runs: the app republishes progress.json about ten times a second.
         if self.last_poll.elapsed() >= Duration::from_millis(150) {
