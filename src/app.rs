@@ -3313,24 +3313,14 @@ impl CraftApp {
                 .unwrap_or(i64::MAX)
         };
         let mut keep: Vec<crate::native_host::InboxItem> = Vec::new();
-        let mut next: Option<(String, Option<String>, String, String, Option<u64>, Option<String>)> = None;
+        let mut next: Option<crate::native_host::InboxItem> = None;
         for i in items.into_iter() {
             if next.is_none()
                 && is_download_url(&i.url)
                 && !self.downloads.iter().any(|d| d.url == i.url)
                 && age_secs(&i.received_at) >= CONFIRM_GRACE_SECS
             {
-                next = Some((
-                    i.url.clone(),
-                    i.filename.clone(),
-                    i.referer
-                        .clone()
-                        .or_else(|| i.page_url.clone())
-                        .unwrap_or_default(),
-                    i.cookie.clone().unwrap_or_default(),
-                    i.size,
-                    i.quality.clone(),
-                ));
+                next = Some(i);
             } else if is_download_url(&i.url)
                 && !self.downloads.iter().any(|d| d.url == i.url)
             {
@@ -3352,18 +3342,31 @@ impl CraftApp {
                 Self::atomic_write(&path, json.as_bytes());
             }
         };
-        let Some((url, filename, referer, cookie, size, quality)) = next else {
+        let Some(item) = next else {
             // Nothing actionable now: keep young entries, drop the file only
             // when fully drained.
             write_keep(&keep);
             return false;
         };
-        write_keep(&keep);
         if self.show_add {
-            return false; // user is typing; retry on a later poll
+            // The user is typing in another Add dialog: keep this capture for
+            // a later poll. Dropping it here lost the download outright.
+            keep.insert(0, item);
+            write_keep(&keep);
+            return false;
         }
+        write_keep(&keep);
+        let url = item.url;
+        let referer = item
+            .referer
+            .or_else(|| item.page_url)
+            .unwrap_or_default();
+        let cookie = item.cookie.unwrap_or_default();
+        let size = item.size;
+        let quality = item.quality;
         self.add_url = url.clone();
-        self.add_file = filename
+        self.add_file = item
+            .filename
             .filter(|f| !f.trim().is_empty())
             .map(|f| crate::model::apply_rename_template(&self.rename_template, &f, &url))
             .unwrap_or_else(|| filename_from_url(&url));
@@ -3763,7 +3766,10 @@ fn build_tray() -> Option<tray_icon::TrayIcon> {
     menu.append_items(&[&show, &exit]).ok()?;
     tray_icon::TrayIconBuilder::new()
         .with_menu(Box::new(menu))
-        .with_tooltip("Download Craft")
+        // Left click must bring the app up, not open the menu (right click
+        // still opens it).
+        .with_menu_on_left_click(false)
+        .with_tooltip(crate::tray::tooltip())
         .with_icon(icon)
         .build()
         .ok()
@@ -3795,7 +3801,19 @@ const ETA_W: f32 = 100.0;
 const DATE_W: f32 = 110.0;
 
 impl eframe::App for CraftApp {
-    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+    fn update(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
+        // The tray helpers work on the native window (parking = visible but
+        // far off-screen, because a hidden window stops painting and eframe
+        // then stops running frames altogether).
+        {
+            use raw_window_handle::HasWindowHandle;
+            if let Ok(handle) = frame.window_handle() {
+                if let raw_window_handle::RawWindowHandle::Win32(w) = handle.as_raw() {
+                    crate::tray::set_hwnd(w.hwnd.get());
+                }
+            }
+        }
+
         // Open in the middle of the work area (Windows would cascade the
         // window). Positions the *outer* rectangle, so the title bar does not
         // push the visible card off centre, and never fights a maximized
@@ -3859,16 +3877,26 @@ impl eframe::App for CraftApp {
                 }
             }
             if self.poll_inbox() {
-                // Extension sent something: pop the app up with the
-                // prefilled Add dialog.
+                // Extension sent something: pop the app up with the prefilled
+                // Add dialog (out of the tray if that's where it lives).
+                crate::tray::show();
                 ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
                 ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
             }
         }
         // Repaint often while a transfer is live so the speed column and the
         // progress windows move in real time; idle, a few times a second is
-        // plenty (pointer input repaints immediately on its own).
-        let tick_ms = if self.tasks.is_empty() { 250 } else { 100 };
+        // plenty (pointer input repaints immediately on its own). Parked in
+        // the tray nobody watches the charts, so a slower tick keeps the
+        // app fully alive (inbox, completions, heartbeat) without burning
+        // frames on an invisible window.
+        let tick_ms = if crate::tray::is_parked() {
+            200
+        } else if self.tasks.is_empty() {
+            250
+        } else {
+            100
+        };
         ctx.request_repaint_after(std::time::Duration::from_millis(tick_ms));
 
         // theme (re-applied when the user switches it, and while "system"
@@ -3885,14 +3913,16 @@ impl eframe::App for CraftApp {
         }
         if !self.close_to_tray {
             self.tray = None;
+            // Turning the tray off must not leave the window parked off-screen.
+            crate::tray::restore();
         }
         while let Ok(ev) = tray_icon::menu::MenuEvent::receiver().try_recv() {
             if ev.id() == "tray-show" {
+                crate::tray::show();
                 ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
                 ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
             } else if ev.id() == "tray-exit" {
-                self.close_to_tray = false;
-                ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                crate::tray::request_quit();
             }
         }
         while let Ok(ev) = tray_icon::TrayIconEvent::receiver().try_recv() {
@@ -3902,11 +3932,22 @@ impl eframe::App for CraftApp {
                     button: tray_icon::MouseButton::Left,
                     button_state: tray_icon::MouseButtonState::Up,
                     ..
+                } | tray_icon::TrayIconEvent::DoubleClick {
+                    button: tray_icon::MouseButton::Left,
+                    ..
                 }
             ) {
+                crate::tray::show();
                 ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
                 ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
             }
+        }
+        // Tray's Exit asks for a clean shutdown from the frame loop (a parked
+        // window still runs frames, so this is reliable).
+        if crate::tray::take_quit() {
+            self.close_to_tray = false;
+            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+            return;
         }
         // close button => minimize to tray instead of quitting (only if tray lives)
         if self.close_to_tray
@@ -3914,7 +3955,10 @@ impl eframe::App for CraftApp {
             && ctx.input(|i| i.viewport().close_requested())
         {
             ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
-            ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
+            // Parking (not hiding) keeps the app running: hiding the window
+            // stops WM_PAINT, which stops eframe frames, which froze transfers
+            // and the browser inbox while "in the tray".
+            crate::tray::park();
             // Say where the window went the first time, or a vanish reads as a
             // crash (the tray icon is easy to miss). Once per run.
             static HID_HINT: std::sync::atomic::AtomicBool =
@@ -3922,9 +3966,17 @@ impl eframe::App for CraftApp {
             if !HID_HINT.swap(true, std::sync::atomic::Ordering::SeqCst) {
                 notify(
                     "Download Craft is still running",
-                    "Closed to the tray — right-click its icon to Exit.",
+                    "In the tray — left-click its icon to reopen, right-click for Exit.",
                 );
             }
+        } else if self.close_to_tray
+            && self.tray.is_some()
+            && ctx.input(|i| i.viewport().minimized) == Some(true)
+            && !crate::tray::is_parked()
+        {
+            // A minimized window doesn't paint either, and that freezes the
+            // same work; minimizing therefore also goes to the tray.
+            crate::tray::park();
         }
 
         // Native OS window chrome (title bar, min/max/close, drag, resize,

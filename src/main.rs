@@ -19,6 +19,7 @@ mod model;
 mod native_host;
 mod progress;
 mod settings;
+mod tray;
 
 use app::CraftApp;
 use clap::Parser;
