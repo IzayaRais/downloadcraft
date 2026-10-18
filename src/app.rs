@@ -3764,6 +3764,9 @@ fn build_tray() -> Option<tray_icon::TrayIcon> {
     let show = tray_icon::menu::MenuItem::with_id("tray-show", "Show Download Craft", true, None);
     let exit = tray_icon::menu::MenuItem::with_id("tray-exit", "Exit", true, None);
     menu.append_items(&[&show, &exit]).ok()?;
+    // Menu clicks are acted on as they arrive (see `tray::install_menu_handler`),
+    // so Show and Exit work even if the frame loop has gone to sleep.
+    crate::tray::install_menu_handler();
     tray_icon::TrayIconBuilder::new()
         .with_menu(Box::new(menu))
         // Left click must bring the app up, not open the menu (right click
@@ -3813,6 +3816,12 @@ impl eframe::App for CraftApp {
                 }
             }
         }
+        // Every frame is counted, and a watchdog thread restarts the loop if the
+        // frames stop: Windows hands out no `WM_PAINT` for a window it has
+        // nothing to draw for, which used to leave the parked app asleep and its
+        // tray menu dead (see `tray::start_keepalive`).
+        crate::tray::frame_tick();
+        crate::tray::start_keepalive();
 
         // Open in the middle of the work area (Windows would cascade the
         // window). Positions the *outer* rectangle, so the title bar does not
@@ -3913,9 +3922,15 @@ impl eframe::App for CraftApp {
         }
         if !self.close_to_tray {
             self.tray = None;
-            // Turning the tray off must not leave the window parked off-screen.
-            crate::tray::restore();
+            // Turning the tray off must not leave the window parked off-screen
+            // (but a quit in flight is on its way out: don't flash it back).
+            if !crate::tray::quitting() {
+                crate::tray::restore();
+            }
         }
+        // The menu itself is handled in `tray::install_menu_handler`, which acts
+        // on the click without waiting for a frame; this loop is the fallback
+        // for the case where that handler could not be installed.
         while let Ok(ev) = tray_icon::menu::MenuEvent::receiver().try_recv() {
             if ev.id() == "tray-show" {
                 crate::tray::show();
@@ -3942,10 +3957,13 @@ impl eframe::App for CraftApp {
                 ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
             }
         }
-        // Tray's Exit asks for a clean shutdown from the frame loop (a parked
-        // window still runs frames, so this is reliable).
+        // Tray's Exit asks for a clean shutdown; the menu handler starts it and
+        // nudges a paint, so this frame runs even if the loop had gone to sleep.
         if crate::tray::take_quit() {
             self.close_to_tray = false;
+            // Drop the icon *now*: the window can close before another frame
+            // runs, and an icon left behind lingers in the tray as a ghost.
+            self.tray = None;
             ctx.send_viewport_cmd(egui::ViewportCommand::Close);
             return;
         }

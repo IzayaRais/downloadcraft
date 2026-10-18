@@ -13,7 +13,7 @@
 //! `WS_EX_TOOLWINDOW` so it has no taskbar button. Un-traying restores the
 //! remembered placement and takes the foreground back.
 
-use std::sync::atomic::{AtomicBool, AtomicIsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicIsize, AtomicU64, Ordering};
 use std::sync::Mutex;
 
 /// True while the window is parked off-screen ("in the tray").
@@ -22,6 +22,10 @@ static PARKED: AtomicBool = AtomicBool::new(false);
 static HWND: AtomicIsize = AtomicIsize::new(0);
 /// Set by the tray's Exit item, consumed by the frame loop.
 static QUIT: AtomicBool = AtomicBool::new(false);
+/// Set once a quit is in flight: nothing may un-park the window on the way out.
+static QUITTING: AtomicBool = AtomicBool::new(false);
+/// Frame counter, bumped by every `update` (see [`start_keepalive`]).
+static FRAMES: AtomicU64 = AtomicU64::new(0);
 /// Placement to restore on un-tray (position, size, maximized state).
 static PLACEMENT: Mutex<Option<win32::WindowPlacement>> = Mutex::new(None);
 
@@ -37,9 +41,65 @@ pub fn is_parked() -> bool {
     PARKED.load(Ordering::SeqCst)
 }
 
+/// True once the tray's Exit has been chosen and the window is on its way out.
+pub fn quitting() -> bool {
+    QUITTING.load(Ordering::SeqCst)
+}
+
 /// True once, when the tray's Exit item was chosen.
 pub fn take_quit() -> bool {
     QUIT.swap(false, Ordering::SeqCst)
+}
+
+/// Count one frame and keep the paint pump armed.
+///
+/// eframe only runs `update` when the window paints, and Windows stops
+/// generating `WM_PAINT` on its own for a window the compositor has nothing to
+/// draw for: parked far off-screen (and, less often, fully covered by other
+/// windows). eframe's own redraw requests go through an internal-paint flag
+/// that such a window never turns into a paint. The app then looks alive - the
+/// window is visible, the tray icon answers right-clicks, the menu opens - while
+/// every frame-driven job is dead: progress reporting, the browser inbox, the
+/// liveness heartbeat and the tray menu items, whose "Show manager" and "Exit"
+/// simply did nothing. Marking the window dirty (see [`nudge_paint`]) produces a
+/// genuine `WM_PAINT`, which is exactly what the frame loop waits for.
+pub fn frame_tick() {
+    FRAMES.fetch_add(1, Ordering::Relaxed);
+}
+
+/// Force one real paint of the main window; safe from any thread.
+pub fn nudge_paint() {
+    let hwnd = HWND.load(Ordering::SeqCst);
+    if hwnd == 0 {
+        return;
+    }
+    unsafe {
+        win32::InvalidateRect(hwnd, std::ptr::null(), 0);
+        win32::RedrawWindow(hwnd, std::ptr::null(), 0, win32::RDW_INVALIDATE);
+    }
+}
+
+/// Watchdog for the frame loop: if no frame has run half a second after the
+/// last check, ask for a paint. A healthy app (its own repaint request runs
+/// every 100-250 ms) never gets nudged, so this costs nothing in the common
+/// case; a stalled one is restarted, which is what keeps tray actions - and
+/// everything else the frame loop does - working while parked.
+pub fn start_keepalive() {
+    static STARTED: AtomicBool = AtomicBool::new(false);
+    if STARTED.swap(true, Ordering::SeqCst) {
+        return;
+    }
+    std::thread::spawn(|| {
+        let mut seen = FRAMES.load(Ordering::Relaxed);
+        loop {
+            std::thread::sleep(std::time::Duration::from_millis(500));
+            let now = FRAMES.load(Ordering::Relaxed);
+            if now == seen {
+                nudge_paint();
+            }
+            seen = now;
+        }
+    });
 }
 
 /// Park the main window off-screen: still visible (so the frame loop keeps
@@ -171,8 +231,49 @@ pub fn restore() {
 }
 
 /// Ask the frame loop to quit cleanly (tray's Exit item).
+///
+/// The request is honoured from the menu click itself rather than from the
+/// frame loop, so Exit works even when the frame loop has gone to sleep, and
+/// a watchdog covers the one case where no paint can happen at all (a locked
+/// session): leaving a dead tray icon behind is worse than a forced exit.
 pub fn request_quit() {
+    QUITTING.store(true, Ordering::SeqCst);
     QUIT.store(true, Ordering::SeqCst);
+    nudge_paint(); // wake the frame loop now, not half a second from now
+    arm_quit_watchdog();
+}
+
+/// See [`request_quit`]. Five seconds is far longer than a clean shutdown
+/// needs; if the app is still here by then it never got a frame.
+fn arm_quit_watchdog() {
+    static ARMED: AtomicBool = AtomicBool::new(false);
+    if ARMED.swap(true, Ordering::SeqCst) {
+        return;
+    }
+    std::thread::spawn(|| {
+        std::thread::sleep(std::time::Duration::from_secs(5));
+        std::process::exit(0);
+    });
+}
+
+/// Act on the tray menu the moment it is clicked instead of waiting for the
+/// next frame (muda calls this handler from the menu's own message loop, which
+/// keeps running even when the frame loop does not). `Show` therefore brings
+/// the window back and `Exit` starts the shutdown regardless of frames; the
+/// frame loop keeps its own handling as the fallback.
+pub fn install_menu_handler() {
+    static DONE: AtomicBool = AtomicBool::new(false);
+    if DONE.swap(true, Ordering::SeqCst) {
+        return;
+    }
+    tray_icon::menu::MenuEvent::set_event_handler(Some(|ev: tray_icon::menu::MenuEvent| {
+        if ev.id() == "tray-show" {
+            show();
+            nudge_paint();
+        } else if ev.id() == "tray-exit" {
+            request_quit();
+        }
+    }));
 }
 
 pub fn tooltip() -> &'static str {
@@ -253,6 +354,8 @@ mod win32 {
         pub fn GetForegroundWindow() -> isize;
         pub fn GetWindowThreadProcessId(hwnd: isize, pid: *mut u32) -> u32;
         pub fn AttachThreadInput(attach: u32, attach_to: u32, attach_flag: i32) -> i32;
+        pub fn InvalidateRect(hwnd: isize, rect: *const Rect, erase: i32) -> i32;
+        pub fn RedrawWindow(hwnd: isize, rect: *const Rect, region: isize, flags: u32) -> i32;
     }
 
     #[link(name = "kernel32")]
@@ -273,6 +376,9 @@ mod win32 {
     pub const SWP_NOZORDER: u32 = 0x0004;
     pub const SWP_NOACTIVATE: u32 = 0x0010;
     pub const SWP_SHOWWINDOW: u32 = 0x0040;
+    /// `RedrawWindow`: the window itself (not `RDW_INTERNALPAINT`, which a
+    /// parked window never turns into a paint) must be marked dirty.
+    pub const RDW_INVALIDATE: u32 = 0x0001;
     /// Far outside any monitor: the window keeps painting, nobody sees it.
     pub const OFFSCREEN: i32 = -32000;
 }
