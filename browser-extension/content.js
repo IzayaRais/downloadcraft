@@ -7,7 +7,7 @@
   // Must match manifest version + background.js EXT_VER. The background
   // rejects messages from any other version with a "reload this tab"
   // error, so a stale script can never fail mysteriously.
-  const EXT_VER = "0.9.3";
+  const EXT_VER = "0.9.4";
   // Generation guard: when the worker re-injects this script (after an
   // update), older live instances must go quiet instead of fighting over
   // the button. The newest instance always wins.
