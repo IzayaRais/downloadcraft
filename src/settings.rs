@@ -644,7 +644,7 @@ fn icon_sq(ui: &mut Ui, glyph: &str, size: f32, radius: f32) -> Response {
         rect.center(),
         Align2::CENTER_CENTER,
         glyph,
-        FontId::proportional(size * 0.42),
+        crate::fonts::icon(size * 0.42),
         if resp.hovered() { t.text } else { t.text2 },
     );
     resp
@@ -665,7 +665,7 @@ fn rule_btn(ui: &mut Ui, glyph: &str, danger: bool) -> Response {
             rect.center(),
             Align2::CENTER_CENTER,
             glyph,
-            FontId::proportional(12.0),
+            crate::fonts::icon(12.0),
             if resp.hovered() { red } else { t.muted },
         );
     } else {
@@ -680,7 +680,7 @@ fn rule_btn(ui: &mut Ui, glyph: &str, danger: bool) -> Response {
             rect.center(),
             Align2::CENTER_CENTER,
             glyph,
-            FontId::proportional(12.0),
+            crate::fonts::icon(12.0),
             if resp.hovered() { t.text } else { t.text2 },
         );
     }
@@ -952,7 +952,7 @@ fn rail_item(ui: &mut Ui, glyph: &str, label: &str, active: bool) -> bool {
         egui::pos2(rect.left() + 10.0, rect.center().y),
         Align2::LEFT_CENTER,
         glyph,
-        FontId::proportional(14.0),
+        crate::fonts::icon(14.0),
         col,
     );
     p.text(
@@ -968,8 +968,9 @@ fn rail_item(ui: &mut Ui, glyph: &str, label: &str, active: bool) -> bool {
 // ===================== Plugins card pieces =====================
 
 /// Platform brands the helper understands. `follows_text` marks logos that
-/// are black/white by design (they invert with the theme); `letter` entries
-/// are drawn as a brand initial because Material Icons has no such logo.
+/// are black/white by design (they invert with the theme); plain ASCII glyphs
+/// ("X", "in", …) are drawn as brand initials because Material Icons has no
+/// such logo, and are never asked of the icon font (which would box them).
 const PLATFORMS: &[(&str, &str, Color32, bool)] = &[
     ("YouTube", "\u{f06a}", Color32::from_rgb(0xff, 0x00, 0x00), false), // smart_display
     ("Facebook", "\u{f234}", Color32::from_rgb(0x18, 0x77, 0xf2), false),
@@ -982,51 +983,80 @@ const PLATFORMS: &[(&str, &str, Color32, bool)] = &[
     ("Vimeo", "V", Color32::from_rgb(0x1a, 0xb7, 0xea), false),
     ("Snapchat", "\u{ea6e}", Color32::from_rgb(0xe3, 0xc4, 0x00), false),
     ("Dailymotion", "d", Color32::from_rgb(0x00, 0xb8, 0xa9), false),
+    ("LinkedIn", "in", Color32::from_rgb(0x0a, 0x66, 0xc2), false),
+    ("SoundCloud", "\u{e2bd}", Color32::from_rgb(0xff, 0x55, 0x00), false), // cloud
 ];
 
-/// Platform tiles (32×32 icon + 8 px name), wrapping like the concept. The
-/// rows keep the mockup's 8 px vertical gap (`.platform-grid { gap: 8px }`), so
-/// the names of one row never sit against the tiles of the next.
+/// Closing tile of the platform grid: the size of the extractor list, so the
+/// grid does not read as "these thirteen sites and nothing else".
+const MORE_SITES: &str = "1,000+";
+
+/// Platform tiles (32×32 icon + 8 px name), wrapping like the concept, closed by
+/// a "1,000+" tile that stands for the rest of the extractor list. The rows keep
+/// the mockup's 8 px vertical gap (`.platform-grid { gap: 8px }`), so the names
+/// of one row never sit against the tiles of the next.
 fn platform_grid(ui: &mut Ui) {
     let t = tok();
     let item_w = 44.0;
     let gap = 8.0;
     let avail = ui.available_width();
-    let per = (((avail + gap) / (item_w + gap)).floor() as usize)
-        .clamp(1, PLATFORMS.len());
-    let rows = PLATFORMS.len().div_ceil(per);
+    let tiles = PLATFORMS.len() + 1; // + the closing "1,000+" tile
+    let fits = (((avail + gap) / (item_w + gap)).floor() as usize).clamp(1, tiles);
+    // Prefer a column count that ends the grid flush (no ragged last row) when
+    // one exists without dropping below half the tiles that would fit.
+    let per = (fits.div_ceil(2)..=fits)
+        .rev()
+        .find(|k| tiles % k == 0)
+        .unwrap_or(fits);
+    let rows = tiles.div_ceil(per);
     // 32 px tile + 2 px + 8 px name = 44 px item, plus the concept's 8 px row
     // gap (the old 45 px stride left the rows touching).
     let row_h = 52.0;
     let (rect, _) =
         ui.allocate_exact_size(Vec2::new(avail, rows as f32 * row_h), Sense::hover());
     let p = ui.painter();
-    for (i, (name, glyph, brand, follows_text)) in PLATFORMS.iter().enumerate() {
+    for i in 0..tiles {
         let x = rect.left() + (i % per) as f32 * (item_w + gap);
         let y = rect.top() + (i / per) as f32 * row_h;
         let tile = Rect::from_min_size(egui::pos2(x + 6.0, y), Vec2::splat(32.0));
-        let col = if *follows_text { t.text } else { *brand };
+        let label_pos = egui::pos2(x + 22.0, y + 34.0);
+        // Closing tile: accent-washed, text only — the grid's "and 1,000+ more".
+        if i == PLATFORMS.len() {
+            p.rect_filled(tile, 8.0, wash(t.accent, 28));
+            p.text(
+                tile.center(),
+                Align2::CENTER_CENTER,
+                MORE_SITES,
+                reg(9.0),
+                t.accent,
+            );
+            p.text(
+                label_pos,
+                Align2::CENTER_TOP,
+                "More sites",
+                reg(8.0),
+                t.muted,
+            );
+            continue;
+        }
+        let (name, glyph, brand, follows_text) = PLATFORMS[i];
+        let col = if follows_text { t.text } else { brand };
         p.rect_filled(tile, 8.0, wash(col, 28));
-        let is_letter =
-            glyph.chars().count() == 1 && glyph.as_bytes()[0].is_ascii_alphabetic();
+        // Brand initials are ASCII ("X", "V", "d", "in"); everything else is a
+        // Material Icons codepoint. Asking the icon font for a letter would
+        // paint a .notdef box, so the two are never mixed up.
         p.text(
             tile.center(),
             Align2::CENTER_CENTER,
-            *glyph,
-            if is_letter {
-                semi(14.0)
+            glyph,
+            if glyph.is_ascii() {
+                semi(if glyph.len() > 1 { 11.5 } else { 14.0 })
             } else {
-                FontId::proportional(16.0)
+                crate::fonts::icon(16.0)
             },
             col,
         );
-        p.text(
-            egui::pos2(x + 22.0, y + 34.0),
-            Align2::CENTER_TOP,
-            *name,
-            reg(8.0),
-            t.muted,
-        );
+        p.text(label_pos, Align2::CENTER_TOP, name, reg(8.0), t.muted);
     }
 }
 
@@ -1036,7 +1066,7 @@ fn capabilities(ui: &mut Ui) {
         "YouTube: Videos, audio, playlists, channels",
         "Facebook: Public videos and Reels",
         "TikTok, Instagram, Vimeo, Reddit",
-        "X (Twitter), Twitch, and many more",
+        "X (Twitter), LinkedIn, and 1,000+ more",
         "Resolutions up to 1080p and 4K",
         "Subtitles and thumbnails",
     ];
@@ -1300,7 +1330,7 @@ impl SettingsApp {
                     icon.center(),
                     Align2::CENTER_CENTER,
                     "\u{e24d}", // insert_drive_file
-                    FontId::proportional(16.0),
+                    crate::fonts::icon(16.0),
                     t.accent,
                 );
                 p.text(
@@ -1334,14 +1364,16 @@ impl SettingsApp {
                             self.ytdlp_msg.clear();
                         }
                     });
-                    if busy {
-                        ui.add(egui::Spinner::new().size(14.0));
-                    }
                     if button(ui, "Show in folder", false).clicked() {
                         if let Some(dir) = crate::engine::ytdlp_bin_dir() {
                             let _ = std::fs::create_dir_all(&dir);
                             crate::app::open_path(&dir, false);
                         }
+                    }
+                    // The busy spinner trails the buttons instead of sitting
+                    // between them (where it read as a gap in the row).
+                    if busy {
+                        ui.add(egui::Spinner::new().size(14.0));
                     }
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         checkbox(

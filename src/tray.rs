@@ -13,7 +13,7 @@
 //! `WS_EX_TOOLWINDOW` so it has no taskbar button. Un-traying restores the
 //! remembered placement and takes the foreground back.
 
-use std::sync::atomic::{AtomicBool, AtomicI8, AtomicIsize, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicI8, AtomicIsize, AtomicU64, Ordering};
 use std::sync::Mutex;
 
 /// True while the window is parked off-screen ("in the tray").
@@ -31,8 +31,114 @@ static PLACEMENT: Mutex<Option<win32::WindowPlacement>> = Mutex::new(None);
 /// Last title-bar theme requested with [`set_titlebar_dark`] (-1 = never set).
 /// Kept so the caption can be re-asserted after Windows resets the frame.
 static TITLEBAR_DARK: AtomicI8 = AtomicI8::new(-1);
+/// Last caption colour requested with [`set_titlebar_color`], packed as a
+/// Win32 `COLORREF` (`0x00BBGGRR`); -1 = never set.
+static TITLEBAR_RGB: AtomicI32 = AtomicI32::new(-1);
+/// Set by another launch (or the show-event listener) to ask the *frame
+/// thread* to raise the window: only the thread that owns the window can win
+/// the foreground lock reliably, so the request is parked here until `update`.
+static SHOW_REQUESTED: AtomicBool = AtomicBool::new(false);
 
 const TRAY_TIP: &str = "Download Craft";
+/// Auto-reset event used to wake the running manager when the user launches
+/// the app again (Start menu, pinned shortcut, taskbar). A second process
+/// cannot raise another process' window reliably once it is parked, so it
+/// signals this event and the first instance restores itself.
+const SHOW_EVENT: &str = "Local\\DownloadCraft-Show";
+
+fn wide(s: &str) -> Vec<u16> {
+    s.encode_utf16().chain(std::iter::once(0)).collect()
+}
+
+/// Become the one running manager, or wake the instance that already is.
+/// Returns the held lock file for the lifetime of the process; `None` means
+/// this launch should exit after handing over to the running window.
+pub fn claim_main_instance() -> Option<std::fs::File> {
+    match crate::model::claim_window("main") {
+        Some(slot) => {
+            install_show_listener();
+            Some(slot)
+        }
+        None => {
+            signal_show();
+            None
+        }
+    }
+}
+
+/// Ask the frame thread to bring the window forward (safe from any thread).
+pub fn request_show() {
+    SHOW_REQUESTED.store(true, Ordering::SeqCst);
+    nudge_paint();
+}
+
+/// True once, when a raise was requested since the last call.
+pub fn take_show_request() -> bool {
+    SHOW_REQUESTED.swap(false, Ordering::SeqCst)
+}
+
+/// Listen for "show yourself" signals from later launches.
+fn install_show_listener() {
+    static STARTED: AtomicBool = AtomicBool::new(false);
+    if STARTED.swap(true, Ordering::SeqCst) {
+        return;
+    }
+    std::thread::spawn(|| {
+        let name = wide(SHOW_EVENT);
+        let ev = unsafe { win32::CreateEventW(std::ptr::null(), 0, 0, name.as_ptr()) };
+        if ev == 0 {
+            return;
+        }
+        loop {
+            let r = unsafe { win32::WaitForSingleObject(ev, 1000) };
+            if r == win32::WAIT_OBJECT_0 {
+                if !quitting() {
+                    // The frame thread does the actual raise.
+                    request_show();
+                }
+            } else if quitting() {
+                break;
+            }
+        }
+    });
+}
+
+/// Wake the running instance. Falls back to finding its window when it was
+/// started by an older build that has no event.
+fn signal_show() {
+    let name = wide(SHOW_EVENT);
+    unsafe {
+        let ev = win32::OpenEventW(win32::EVENT_MODIFY_STATE, 0, name.as_ptr());
+        if ev != 0 {
+            win32::SetEvent(ev);
+            return;
+        }
+        let title = wide(TRAY_TIP);
+        let hwnd = win32::FindWindowW(std::ptr::null(), title.as_ptr());
+        if hwnd != 0 {
+            raise_existing(hwnd);
+        }
+    }
+}
+
+/// Bring another process' window back on screen. A parked window sits at
+/// `OFFSCREEN`; move it somewhere visible first, then activate it.
+unsafe fn raise_existing(hwnd: isize) {
+    let mut r = win32::Rect::default();
+    if win32::GetWindowRect(hwnd, &mut r) != 0 && r.left <= win32::OFFSCREEN + 64 {
+        win32::ShowWindow(hwnd, win32::SW_RESTORE);
+        win32::SetWindowPos(
+            hwnd,
+            0,
+            140,
+            110,
+            0,
+            0,
+            win32::SWP_NOSIZE | win32::SWP_NOZORDER | win32::SWP_SHOWWINDOW,
+        );
+    }
+    force_foreground(hwnd);
+}
 
 pub fn set_hwnd(hwnd: isize) {
     if hwnd != 0 {
@@ -339,21 +445,69 @@ unsafe fn force_foreground(hwnd: isize) {
 
     if win32::GetForegroundWindow() != hwnd {
         // Still refused: the lock only yields to the process that produced
-        // the last input event. A synthetic ALT tap makes us that process,
-        // and a topmost bounce raises the window even if focus stays put.
+        // the last input event. A synthetic ALT tap makes us that process.
         win32::keybd_event(win32::VK_MENU as u8, 0, 0, 0);
         win32::keybd_event(win32::VK_MENU as u8, 0, win32::KEYEVENTF_KEYUP, 0);
         win32::SetForegroundWindow(hwnd);
-        if win32::GetForegroundWindow() != hwnd {
-            win32::SetWindowPos(
-                hwnd,
-                win32::HWND_TOPMOST,
-                0,
-                0,
-                0,
-                0,
-                win32::SWP_NOMOVE | win32::SWP_NOSIZE | win32::SWP_SHOWWINDOW,
-            );
+        // The shell's own activation path; works in some cases where
+        // SetForegroundWindow is ignored (taskbar/tray clicks).
+        win32::SwitchToThisWindow(hwnd, 1);
+    }
+    hold_above(hwnd);
+}
+
+/// Keep the raised window above other applications for a moment. Windows can
+/// grant the foreground for an instant and then hand it back to the app that
+/// was in front (Chrome does this constantly), which looked exactly like "my
+/// app opens behind everything". Topmost guarantees visibility; the hold ends
+/// once the window has *stayed* foreground for a moment, or after six
+/// seconds, and the drop never activates anything.
+unsafe fn hold_above(hwnd: isize) {
+    win32::SetWindowPos(
+        hwnd,
+        win32::HWND_TOPMOST,
+        0,
+        0,
+        0,
+        0,
+        win32::SWP_NOMOVE | win32::SWP_NOSIZE | win32::SWP_SHOWWINDOW,
+    );
+    std::thread::spawn(move || {
+        let mut ever_foreground = false;
+        let mut stable = 0u32;
+        let mut lost = 0u32;
+        for _ in 0..80 {
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            unsafe {
+                if win32::GetForegroundWindow() == hwnd {
+                    if ever_foreground && lost > 0 {
+                        // The user clicked back on us: done.
+                        break;
+                    }
+                    ever_foreground = true;
+                    lost = 0;
+                    stable += 1;
+                    if stable >= 20 {
+                        break;
+                    }
+                } else {
+                    stable = 0;
+                    if ever_foreground {
+                        // Something else took over (Chrome loves doing this
+                        // right after a raise). Stay on top briefly so the
+                        // window cannot simply vanish behind it again.
+                        lost += 1;
+                        if lost >= 30 {
+                            break;
+                        }
+                    } else {
+                        win32::SwitchToThisWindow(hwnd, 1);
+                        win32::SetForegroundWindow(hwnd);
+                    }
+                }
+            }
+        }
+        unsafe {
             win32::SetWindowPos(
                 hwnd,
                 win32::HWND_NOTOPMOST,
@@ -361,11 +515,10 @@ unsafe fn force_foreground(hwnd: isize) {
                 0,
                 0,
                 0,
-                win32::SWP_NOMOVE | win32::SWP_NOSIZE,
+                win32::SWP_NOMOVE | win32::SWP_NOSIZE | win32::SWP_NOACTIVATE,
             );
-            win32::SetForegroundWindow(hwnd);
         }
-    }
+    });
 }
 
 /// Paint the native title bar in the app's own theme. Windows derives the
@@ -375,6 +528,17 @@ unsafe fn force_foreground(hwnd: isize) {
 pub fn set_titlebar_dark(dark: bool) {
     TITLEBAR_DARK.store(i8::from(dark), Ordering::SeqCst);
     apply_titlebar(dark, true);
+}
+
+/// Paint the native title bar in an exact RGB colour (`DWMWA_CAPTION_COLOR`,
+/// Windows 11 / build 22000+; older builds ignore it and simply keep the
+/// themed caption). Passing the app's page background makes the caption and
+/// the window body read as one surface instead of two stacked strips.
+pub fn set_titlebar_color(rgb: (u8, u8, u8)) {
+    // COLORREF is 0x00BBGGRR, not the usual 0xRRGGBB.
+    let packed = i32::from(rgb.2) << 16 | i32::from(rgb.1) << 8 | i32::from(rgb.0);
+    TITLEBAR_RGB.store(packed, Ordering::SeqCst);
+    apply_caption_color();
 }
 
 /// Re-apply the last caption theme without touching the window geometry.
@@ -408,6 +572,9 @@ fn apply_titlebar(dark: bool, reframe: bool) {
         };
         win32::SetWindowTheme(hwnd, theme_name.as_ptr(), std::ptr::null());
         win32::set_dark_colors(hwnd, dark);
+        // The caption colour is a separate attribute: re-assert it here so a
+        // Windows-side frame reset does not bring back the default grey.
+        apply_caption_color_unsafe(hwnd, dark);
         if reframe {
             // Repaint the non-client area so the switch is immediate.
             win32::SetWindowPos(
@@ -424,6 +591,35 @@ fn apply_titlebar(dark: bool, reframe: bool) {
             );
         }
     }
+}
+
+fn apply_caption_color() {
+    let hwnd = HWND.load(Ordering::SeqCst);
+    if hwnd == 0 {
+        return;
+    }
+    let dark = TITLEBAR_DARK.load(Ordering::SeqCst) == 1;
+    unsafe { apply_caption_color_unsafe(hwnd, dark) };
+}
+
+/// `DWMWA_CAPTION_COLOR` (35) / `DWMWA_TEXT_COLOR` (36). Both are Windows 11
+/// additions: on anything older the calls fail and the themed caption from
+/// `DWMWA_USE_IMMERSIVE_DARK_MODE` stands, which is the best that build offers.
+unsafe fn apply_caption_color_unsafe(hwnd: isize, dark: bool) {
+    let packed = TITLEBAR_RGB.load(Ordering::SeqCst);
+    if packed < 0 {
+        return;
+    }
+    let size = std::mem::size_of::<u32>() as u32;
+    let caption = packed as u32;
+    win32::DwmSetWindowAttribute(
+        hwnd,
+        35,
+        &caption as *const u32 as *const std::ffi::c_void,
+        size,
+    );
+    let text: u32 = if dark { 0x00FF_FFFF } else { 0x0000_0000 };
+    win32::DwmSetWindowAttribute(hwnd, 36, &text as *const u32 as *const std::ffi::c_void, size);
 }
 
 #[cfg(windows)]
@@ -484,6 +680,9 @@ mod win32 {
         pub fn SetActiveWindow(hwnd: isize) -> isize;
         pub fn SetFocus(hwnd: isize) -> isize;
         pub fn keybd_event(vk: u8, scan: u8, flags: u32, extra: usize);
+        pub fn SwitchToThisWindow(hwnd: isize, alt_tab: i32);
+        pub fn GetWindowRect(hwnd: isize, rect: *mut Rect) -> i32;
+        pub fn FindWindowW(class_name: *const u16, window_name: *const u16) -> isize;
     }
 
     #[link(name = "dwmapi")]
@@ -534,6 +733,15 @@ mod win32 {
     #[link(name = "kernel32")]
     extern "system" {
         pub fn GetCurrentThreadId() -> u32;
+        pub fn CreateEventW(
+            attributes: *const std::ffi::c_void,
+            manual_reset: i32,
+            initial_state: i32,
+            name: *const u16,
+        ) -> isize;
+        pub fn OpenEventW(access: u32, inherit: i32, name: *const u16) -> isize;
+        pub fn SetEvent(event: isize) -> i32;
+        pub fn WaitForSingleObject(handle: isize, millis: u32) -> u32;
     }
 
     pub const SW_HIDE: i32 = 0;
@@ -562,4 +770,7 @@ mod win32 {
     pub const RDW_INVALIDATE: u32 = 0x0001;
     /// Far outside any monitor: the window keeps painting, nobody sees it.
     pub const OFFSCREEN: i32 = -32000;
+    /// `OpenEventW` access right and the "signalled" wait result.
+    pub const EVENT_MODIFY_STATE: u32 = 0x0002;
+    pub const WAIT_OBJECT_0: u32 = 0;
 }

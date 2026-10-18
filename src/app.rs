@@ -383,34 +383,51 @@ pub fn apply_widget_theme(ctx: &egui::Context) {
 // ---------- Material Icons codepoints (font bundled under assets/fonts) ----------
 pub(crate) const MI_SEARCH: &str = "\u{e8b6}";
 pub(crate) const MI_ADD_LINK: &str = "\u{e178}";
-pub(crate) const MI_DOWNLOAD: &str = "\u{f090}";
 pub(crate) const MI_PLAY: &str = "\u{e037}";
 pub(crate) const MI_STOP: &str = "\u{e047}";
-pub(crate) const MI_QUEUE: &str = "\u{e03d}";
-pub(crate) const MI_SETTINGS: &str = "\u{e8b8}";
-pub(crate) const MI_FOLDER: &str = "\u{e2c7}";
 pub(crate) const MI_IMAGE: &str = "\u{e3f4}";
 pub(crate) const MI_MUSIC: &str = "\u{e405}";
-pub(crate) const MI_MOVIE: &str = "\u{e02c}";
 pub(crate) const MI_GRID: &str = "\u{e9b0}";
+/// Nine dots in a 3×3 grid (sidebar "All"; the concept draws its dotted
+/// "everything" tile this way, and it keeps All distinct from Apps).
+pub(crate) const MI_APPS_DOTS: &str = "\u{e5c3}";
 pub(crate) const MI_DOC: &str = "\u{e873}";
 pub(crate) const MI_ARCHIVE: &str = "\u{e149}";
-pub(crate) const MI_FILE: &str = "\u{e24d}";
-pub(crate) const MI_AUDIO_FILE: &str = "\u{eb82}";
-pub(crate) const MI_VIDEO_FILE: &str = "\u{eb87}";
-pub(crate) const MI_APPS: &str = "\u{e5c3}";
-pub(crate) const MI_MENU: &str = "\u{e5d2}";
 pub(crate) const MI_CLOUD_DL: &str = "\u{e2c0}";
-pub(crate) const MI_PASTE: &str = "\u{e14f}";
-pub(crate) const MI_REFRESH: &str = "\u{e5d5}";
-pub(crate) const MI_CHECK: &str = "\u{e5ca}";
-pub(crate) const MI_FOLDER_OPEN: &str = "\u{e2c8}";
 pub(crate) const MI_PAUSE: &str = "\u{e034}";
 pub(crate) const MI_COPY: &str = "\u{e14d}";
-pub(crate) const MI_PALETTE: &str = "\u{e40a}";
 pub(crate) const MI_PUBLIC: &str = "\u{e80b}";
-pub(crate) const MI_UPDATE: &str = "\u{e923}";
-pub(crate) const MI_SPEED: &str = "\u{e9e4}";
+pub(crate) const MI_DELETE: &str = "\u{e872}";
+// ---- icons added for the main-window redesign (main_window.html) ----
+/// Plus (toolbar "Add URL").
+pub(crate) const MI_ADD: &str = "\u{e145}";
+/// Rounded rect with a play mark (sidebar "Videos", table Video rows).
+pub(crate) const MI_SLIDESHOW: &str = "\u{e41b}";
+/// Three shrinking rules (sidebar "Queued").
+pub(crate) const MI_FILTER: &str = "\u{e152}";
+/// Circle with an X (sidebar "Failed").
+pub(crate) const MI_CANCEL: &str = "\u{e5c9}";
+/// Circle with a clock (sidebar "Unfinished").
+pub(crate) const MI_SCHEDULE: &str = "\u{e8b5}";
+/// Circle with a tick (sidebar "Finished").
+pub(crate) const MI_CHECK_CIRCLE: &str = "\u{e86c}";
+/// Outlined circle with a play mark (toolbar "Resume").
+pub(crate) const MI_PLAY_CIRCLE: &str = "\u{e039}";
+/// Filled circle with pause bars (toolbar "Stop All").
+pub(crate) const MI_PAUSE_CIRCLE: &str = "\u{e035}";
+/// Outlined circle with pause bars (toolbar "Stop").
+pub(crate) const MI_STOP_CIRCLE: &str = "\u{e1a2}";
+/// Three equal rules (toolbar "Open Queue").
+pub(crate) const MI_REORDER: &str = "\u{e8fe}";
+/// Slider rules (toolbar "Settings").
+pub(crate) const MI_TUNE: &str = "\u{e429}";
+/// Page with a folded corner (table "Other"/unknown rows).
+pub(crate) const MI_INSERT_FILE: &str = "\u{e24d}";
+/// Collapsed / expanded affordances for the sidebar sections.
+pub(crate) const MI_CHEVRON_RIGHT: &str = "\u{e5cc}";
+pub(crate) const MI_EXPAND_MORE: &str = "\u{e5cf}";
+/// Arrow onto a tray (sidebar "Downloading").
+pub(crate) const MI_GET_APP: &str = "\u{e884}";
 
 /// Material Icons (Apache-2.0, Google) as fallback font for UI glyphs, plus
 /// the named Segoe UI families the Add-download dialog asks for.
@@ -425,25 +442,35 @@ pub fn setup_fonts(cc: &eframe::CreationContext<'_>) {
 fn file_icon(cat: &str) -> &'static str {
     match cat {
         "Image" => MI_IMAGE,
-        "Music" => MI_AUDIO_FILE,
-        "Video" => MI_VIDEO_FILE,
-        "Apps" => MI_APPS,
+        "Music" => MI_MUSIC,
+        "Video" => MI_SLIDESHOW,
+        "Apps" => MI_GRID,
         "Document" => MI_DOC,
         "Compressed" => MI_ARCHIVE,
-        _ => MI_FILE,
+        _ => MI_INSERT_FILE,
+    }
+}
+
+/// Per-category tint for the list's name-cell marks, taken from the concept
+/// (`main_window.html`): blue video, amber archive, green picture, purple
+/// music, red document, cyan app. Light enough to read on both themes.
+fn cat_color(cat: &str) -> egui::Color32 {
+    match cat {
+        "Video" => egui::Color32::from_rgb(0x3b, 0x82, 0xf6),
+        "Compressed" => egui::Color32::from_rgb(0xf5, 0x9e, 0x0b),
+        "Image" => egui::Color32::from_rgb(0x22, 0xc5, 0x5e),
+        "Music" => egui::Color32::from_rgb(0xa8, 0x55, 0xf7),
+        "Document" => egui::Color32::from_rgb(0xef, 0x44, 0x44),
+        "Apps" => egui::Color32::from_rgb(0x06, 0xb6, 0xd4),
+        _ => pl().dm_dim,
     }
 }
 
 fn mi(ui: &mut egui::Ui, glyph: &str, size: f32, color: egui::Color32) {
     // Hover-only on purpose: icon glyphs must never steal row clicks.
     ui.add(
-        egui::Label::new(
-            egui::RichText::new(glyph)
-                .size(size)
-                .color(color)
-                .family(egui::FontFamily::Proportional),
-        )
-        .sense(egui::Sense::hover()),
+        egui::Label::new(egui::RichText::new(glyph).color(color).font(crate::fonts::icon(size)))
+            .sense(egui::Sense::hover()),
     );
 }
 
@@ -535,10 +562,11 @@ fn win_lim_key(i: usize) -> &'static str {
     }
 }
 
-/// Full-width sidebar navigation row: icon + label left, count badge
-/// right, accent bar + highlight when selected. Manual-input version:
-/// reserves space, paints (hover from caller), returns the hit rect.
-/// The whole row is one click target.
+/// Full-width sidebar navigation row, following `main_window.html`:
+/// 6px/8px padding, 6px radius, 13px icon, 11px label left, pill count right.
+/// Selected rows take a raised fill and the accent colour (no bar); hovered
+/// rows take a softer wash. Manual-input version: reserves space, paints,
+/// returns the hit rect; the whole row is one click target.
 fn side_nav_row(
     ui: &mut egui::Ui,
     man: &ManState,
@@ -548,72 +576,100 @@ fn side_nav_row(
     count: Option<usize>,
     dot: bool,
 ) -> egui::Rect {
-    const H: f32 = 32.0;
+    const H: f32 = 24.0;
     let w = ui.available_width().max(40.0);
     let (rect, _) = ui.allocate_exact_size(egui::vec2(w, H), egui::Sense::hover());
     let p = ui.painter();
+    // Highlight inset by a pixel top and bottom: the rows sit flush (no item
+    // spacing) so the visual rhythm still reads as the concept's 2px gap.
+    let hl = rect.shrink2(egui::vec2(0.0, 1.0));
     if selected {
-        p.rect_filled(rect, 6.0, pl().surface_lt);
-        p.rect_filled(
-            egui::Rect::from_min_size(
-                rect.min + egui::vec2(0.0, 6.0),
-                egui::vec2(3.0, H - 12.0),
-            ),
-            1.5,
-            pl().primary,
-        );
+        p.rect_filled(hl, 6.0, pl().surface_lt);
     } else if man.hover(&rect) {
-        p.rect_filled(rect, 6.0, pl().hover_bg);
+        p.rect_filled(hl, 6.0, pl().hover_bg);
     }
-    let fg = if selected { pl().txt } else { pl().dim };
+    let fg = if selected { pl().primary } else { pl().dim };
     if dot {
         p.circle_filled(
-            egui::pos2(rect.min.x + 14.0, rect.center().y),
-            3.0,
+            egui::pos2(rect.min.x + 15.0, rect.center().y),
+            3.5,
             pl().success,
         );
     } else {
         p.text(
-            egui::pos2(rect.min.x + 14.0, rect.center().y),
+            egui::pos2(rect.min.x + 15.0, rect.center().y),
             egui::Align2::CENTER_CENTER,
             icon.to_string(),
-            egui::FontId::proportional(15.0),
+            crate::fonts::icon(14.0),
             fg,
         );
     }
     p.text(
-        egui::pos2(rect.min.x + 32.0, rect.center().y),
+        egui::pos2(rect.min.x + 30.0, rect.center().y),
         egui::Align2::LEFT_CENTER,
         label.to_string(),
-        egui::FontId::proportional(12.5),
+        egui::FontId::proportional(11.5),
         fg,
     );
     if let Some(n) = count {
-        let font = egui::FontId::proportional(11.0);
-        let galley = p.layout_no_wrap(n.to_string(), font, pl().dim);
-        let bw = galley.size().x + 14.0;
-        let bh = 18.0;
+        let (bg, tc) = if selected {
+            (pl().primary, egui::Color32::WHITE)
+        } else {
+            (pl().surface_lt, pl().dim)
+        };
+        // Lay the galley out in its own colour: `Painter::galley`'s colour
+        // argument is only a fallback, so a galley built in the accent colour
+        // would vanish on the accent-filled badge.
+        let font = egui::FontId::proportional(9.5);
+        let galley = p.layout_no_wrap(n.to_string(), font, tc);
+        let bw = (galley.size().x + 12.0).max(18.0);
+        let bh = 16.0;
         let br = egui::Rect::from_min_size(
-            egui::pos2(rect.max.x - bw - 8.0, rect.center().y - bh / 2.0),
+            egui::pos2(rect.max.x - bw - 6.0, rect.center().y - bh / 2.0),
             egui::vec2(bw, bh),
         );
-        p.rect_filled(br, bh / 2.0, pl().surface_lt);
+        p.rect_filled(br, bh / 2.0, bg);
         p.galley(
             egui::pos2(
                 br.center().x - galley.size().x / 2.0,
                 br.center().y - galley.size().y / 2.0,
             ),
             galley,
-            pl().dim,
+            tc,
         );
     }
     rect
 }
 
-/// Small caps section header for the sidebar.
-fn side_section(ui: &mut egui::Ui, title: &str) {
-    ui.label(egui::RichText::new(title).size(10.0).color(pl().dim).strong());
-    ui.add_space(2.0);
+/// Collapsible sidebar section header (`main_window.html` `.sidebar-section`):
+/// a chevron plus 9px upper-case letters, and a clickable row that folds the
+/// items below it away.
+fn side_section(
+    ui: &mut egui::Ui,
+    man: &ManState,
+    title: &str,
+    open: bool,
+) -> egui::Rect {
+    let w = ui.available_width().max(40.0);
+    let (rect, _) = ui.allocate_exact_size(egui::vec2(w, 20.0), egui::Sense::hover());
+    let p = ui.painter();
+    let hov = man.hover(&rect);
+    let c = if hov { pl().txt } else { pl().dim };
+    p.text(
+        egui::pos2(rect.min.x + 13.0, rect.center().y),
+        egui::Align2::CENTER_CENTER,
+        if open { MI_EXPAND_MORE } else { MI_CHEVRON_RIGHT }.to_string(),
+        crate::fonts::icon(13.0),
+        c,
+    );
+    p.text(
+        egui::pos2(rect.min.x + 24.0, rect.center().y),
+        egui::Align2::LEFT_CENTER,
+        title.to_uppercase(),
+        egui::FontId::proportional(9.5),
+        c,
+    );
+    rect
 }
 
 /// Small square icon button (Material glyph, guaranteed to render).
@@ -627,17 +683,26 @@ fn icon_btn(ui: &mut egui::Ui, glyph: &str, tip: &str) -> egui::Response {
     .on_hover_text(tip)
 }
 
-/// Small rounded status pill, painted into an explicit rect (no cursor use).
-fn status_pill_at(p: &egui::Painter, rect: egui::Rect, text: &str, color: egui::Color32) {
-    let font = egui::FontId::proportional(12.0);
-    let galley = p.layout_no_wrap(text.to_string(), font, color);
-    let h = galley.size().y + 6.0;
-    let pw = (galley.size().x + 20.0).min(rect.width()).max(20.0);
+/// Small rounded status badge, painted into an explicit rect (no cursor use).
+/// `right` anchors it to the cell's right edge, matching the concept's
+/// right-aligned Status column.
+fn status_pill_at(p: &egui::Painter, rect: egui::Rect, text: &str, color: egui::Color32, right: bool) {
+    let font = egui::FontId::proportional(10.5);
+    let avail = (rect.width() - 16.0).max(18.0);
+    let shown = truncate_to_width(p, text, font.clone(), color, avail);
+    let galley = p.layout_no_wrap(shown, font, color);
+    let h = (galley.size().y + 6.0).max(16.0);
+    let pw = (galley.size().x + 16.0).min(rect.width().max(20.0)).max(18.0);
+    let cx = if right {
+        rect.max.x - 8.0 - pw / 2.0
+    } else {
+        rect.center().x
+    };
     let pr = egui::Rect::from_min_size(
-        egui::pos2(rect.center().x - pw / 2.0, rect.center().y - h / 2.0),
+        egui::pos2(cx - pw / 2.0, rect.center().y - h / 2.0),
         egui::vec2(pw, h),
     );
-    let bg = egui::Color32::from_rgba_unmultiplied(color.r(), color.g(), color.b(), 28);
+    let bg = egui::Color32::from_rgba_unmultiplied(color.r(), color.g(), color.b(), 36);
     p.rect_filled(pr, pr.height() / 2.0, bg);
     p.galley(
         egui::pos2(
@@ -897,6 +962,19 @@ fn mtext(
     ui.add(te).rect
 }
 
+/// Frameless single-line field for use *inside* a caller-painted pill.
+///
+/// The manager's search sits in its own rounded pill, so the field must not
+/// draw a second inner box (that read as "a box inside the search box").
+fn mtext_bare(ui: &mut egui::Ui, id: &str, text: &mut String, hint: &str, width: f32) -> egui::Rect {
+    let te = egui::TextEdit::singleline(text)
+        .id(egui::Id::new(id))
+        .hint_text(hint)
+        .desired_width(width)
+        .frame(false);
+    ui.add(te).rect
+}
+
 // ---------- compact file-properties dialog (file_properties.html) ----------
 //
 // One short page, no tabs: title bar (file icon + name + X), right-aligned
@@ -966,7 +1044,7 @@ fn dp_icon(ui: &mut egui::Ui, man: &ManState, glyph: &str) -> egui::Rect {
         rect.center(),
         egui::Align2::CENTER_CENTER,
         glyph.to_string(),
-        egui::FontId::proportional(12.0),
+        crate::fonts::icon(12.0),
         if hovered { pl().primary } else { pl().dim },
     );
     rect
@@ -1151,7 +1229,7 @@ fn micon(ui: &mut egui::Ui, man: &ManState, glyph: &str) -> egui::Rect {
         rect.center(),
         egui::Align2::CENTER_CENTER,
         glyph.to_string(),
-        egui::FontId::proportional(16.0),
+        crate::fonts::icon(16.0),
         pl().dim,
     );
     rect
@@ -1177,23 +1255,28 @@ fn paint_progress(p: &egui::Painter, center_x: f32, top_y: f32, width: f32, frac
     }
 }
 
-/// Centered single-line text painted into an explicit rect (no cursor use).
-/// A plain Label ignores halign for single-line text, so center manually.
-fn centered_label_at(p: &egui::Painter, rect: egui::Rect, text: &str, size: f32, color: egui::Color32) {
-    let galley = p.layout_no_wrap(
-        text.to_string(),
-        egui::FontId::proportional(size),
-        color,
-    );
-    let gw = galley.size().x.min(rect.width());
-    p.galley(
-        egui::pos2(
-            rect.center().x - gw / 2.0,
-            rect.center().y - galley.size().y / 2.0,
-        ),
-        galley,
-        color,
-    );
+/// One-line cell text anchored to the cell's 8px padding edge — left for the
+/// Name column, right for Size / Status / Speed / Time / Date, as the concept
+/// does. Overflowing text is ellipsised so it never bleeds into the next
+/// column.
+fn cell_text(
+    p: &egui::Painter,
+    rect: egui::Rect,
+    text: &str,
+    size: f32,
+    color: egui::Color32,
+    right: bool,
+) {
+    use egui::Align2;
+    const PAD: f32 = 8.0;
+    let avail = (rect.width() - PAD * 2.0).max(12.0);
+    let shown = truncate_to_width(p, text, egui::FontId::proportional(size), color, avail);
+    let (pos, align) = if right {
+        (egui::pos2(rect.max.x - PAD, rect.center().y), Align2::RIGHT_CENTER)
+    } else {
+        (egui::pos2(rect.min.x + PAD, rect.center().y), Align2::LEFT_CENTER)
+    };
+    p.text(pos, align, shown, egui::FontId::proportional(size), color);
 }
 
 /// Truncate `text` with an ellipsis so it fits `max_w` (painter-measured).
@@ -1234,22 +1317,24 @@ fn truncate_to_width(
 /// Name cell painted with ZERO widgets (icon + filename + type via the
 /// painter only). egui labels always interact — even hover-only ones —
 /// which steals row hover/clicks from the text; painted text cannot.
+/// Layout follows `main_window.html` `.name-cell`: 20px tinted category mark,
+/// 11px title, 9px muted type underneath.
 fn name_cell(p: &egui::Painter, rect: egui::Rect, icon: &str, fname: &str, cat: &str) {
     p.text(
-        egui::pos2(rect.min.x + 13.0, rect.center().y),
+        egui::pos2(rect.min.x + 17.0, rect.center().y),
         egui::Align2::CENTER_CENTER,
         icon.to_owned(),
-        egui::FontId::proportional(16.0),
-        pl().txt,
+        crate::fonts::icon(17.0),
+        cat_color(cat),
     );
-    let tx = rect.min.x + 28.0;
-    let max_tw = (rect.max.x - 4.0 - tx).max(20.0);
-    let name = truncate_to_width(p, fname, egui::FontId::proportional(12.0), pl().txt, max_tw);
+    let tx = rect.min.x + 32.0;
+    let max_tw = (rect.max.x - 8.0 - tx).max(20.0);
+    let name = truncate_to_width(p, fname, egui::FontId::proportional(11.5), pl().txt, max_tw);
     p.text(
         egui::pos2(tx, rect.center().y - 8.0),
         egui::Align2::LEFT_CENTER,
         name,
-        egui::FontId::proportional(12.0),
+        egui::FontId::proportional(11.5),
         pl().txt,
     );
     p.text(
@@ -1277,9 +1362,9 @@ fn col_min(c: SortCol) -> f32 {
     match c {
         SortCol::Name => 160.0,
         SortCol::Size => 60.0,
-        SortCol::Status => 120.0,
-        SortCol::Speed => 60.0,
-        SortCol::Eta => 70.0,
+        SortCol::Status => 84.0,
+        SortCol::Speed => 56.0,
+        SortCol::Eta => 56.0,
         SortCol::Date => 80.0,
     }
 }
@@ -1288,14 +1373,21 @@ fn col_w_of(map: &std::collections::HashMap<SortCol, f32>, c: SortCol) -> f32 {
     map.get(&c).copied().unwrap_or(col_default(c))
 }
 
-/// Uniform toolbar metrics: every action button shares one height and is
-/// vertically centered, with a single gap between buttons.
-const TOOL_H: f32 = 52.0;
-const TOOL_GAP: f32 = 6.0;
+/// Uniform toolbar metrics: every action button shares one height.
+const TOOL_H: f32 = 46.0;
+/// Gap between toolbar buttons (`.toolbar { gap: 4px }`).
+const TOOL_GAP: f32 = 4.0;
 
-/// Toolbar button: icon above label, 88px wide, uniform height.
+/// Toolbar button: icon above label, content-sized width, uniform height.
 /// Manual-input version: reserves space, paints (hover from caller),
 /// returns the hit rect for the caller to record. Never reads responses.
+///
+/// The width follows the concept's `.tool-btn` (`padding: 6px 8px;
+/// min-width: 55px`): the label decides it, so the buttons stay packed
+/// together at the left of the bar instead of stretching across the card.
+///
+/// The only fill a button ever carries is the hover wash — no action is
+/// pre-highlighted, so nothing reads as permanently selected.
 fn tool_button(
     ui: &mut egui::Ui,
     man: &ManState,
@@ -1304,28 +1396,37 @@ fn tool_button(
     enabled: bool,
     tip: &str,
 ) -> egui::Rect {
-    let (rect, _) = ui.allocate_exact_size(egui::vec2(88.0, TOOL_H), egui::Sense::hover());
-    if enabled && man.hover(&rect) {
-        ui.painter().rect_filled(rect, 6.0, pl().surface_lt);
+    let label_w = ui
+        .painter()
+        .layout_no_wrap(label.to_owned(), egui::FontId::proportional(11.0), pl().txt)
+        .size()
+        .x;
+    let (rect, _) = ui.allocate_exact_size(
+        egui::vec2((label_w + 16.0).max(56.0), TOOL_H),
+        egui::Sense::hover(),
+    );
+    let hov = enabled && man.hover(&rect);
+    let p = ui.painter();
+    if hov {
+        p.rect_filled(rect, 6.0, pl().surface_lt);
     }
     let c = if enabled { pl().txt } else { pl().dim };
-    let p = ui.painter();
     // Icon and label share the height evenly so all buttons align.
     p.text(
-        egui::pos2(rect.center().x, rect.min.y + TOOL_H * 0.32),
+        egui::pos2(rect.center().x, rect.min.y + TOOL_H * 0.34),
         egui::Align2::CENTER_CENTER,
         icon.to_string(),
-        egui::FontId::proportional(17.0),
+        crate::fonts::icon(16.0),
         c,
     );
     p.text(
-        egui::pos2(rect.center().x, rect.min.y + TOOL_H * 0.74),
+        egui::pos2(rect.center().x, rect.min.y + TOOL_H * 0.72),
         egui::Align2::CENTER_CENTER,
         label.to_string(),
-        egui::FontId::proportional(12.0),
+        egui::FontId::proportional(11.0),
         c,
     );
-    if enabled && !tip.is_empty() && man.hover(&rect) {
+    if enabled && !tip.is_empty() && hov {
         egui::Tooltip::always_open(
             ui.ctx().clone(),
             ui.layer_id(),
@@ -1340,42 +1441,10 @@ fn tool_button(
     rect
 }
 
-/// Add-URL pill: same hit height as the other toolbar buttons, with the
-/// pill painted vertically centered, plus gradient download badge.
+/// Add-URL button: the same metrics and the same hover-only wash as the other
+/// toolbar buttons — nothing is pre-highlighted.
 fn add_url_button(ui: &mut egui::Ui, man: &ManState) -> egui::Rect {
-    let (hit, _) = ui.allocate_exact_size(egui::vec2(152.0, TOOL_H), egui::Sense::hover());
-    let rect = egui::Rect::from_center_size(hit.center(), egui::vec2(152.0, 32.0));
-    let p = ui.painter();
-    p.rect_filled(
-        rect,
-        6.0,
-        if man.hover(&hit) { pl().surface_lt } else { pl().surface },
-    );
-    p.text(
-        egui::pos2(rect.min.x + 26.0, rect.center().y),
-        egui::Align2::CENTER_CENTER,
-        MI_ADD_LINK.to_string(),
-        egui::FontId::proportional(16.0),
-        pl().txt,
-    );
-    p.text(
-        egui::pos2(rect.min.x + 40.0, rect.center().y),
-        egui::Align2::LEFT_CENTER,
-        "Add URL".to_string(),
-        egui::FontId::proportional(12.0),
-        pl().txt,
-    );
-    let c = egui::pos2(rect.max.x - 15.0, rect.center().y);
-    p.circle_filled(c, 10.0, pl().secondary);
-    p.circle_filled(c + egui::vec2(-2.0, -2.0), 8.0, pl().primary);
-    p.text(
-        c,
-        egui::Align2::CENTER_CENTER,
-        MI_DOWNLOAD.to_string(),
-        egui::FontId::proportional(11.0),
-        egui::Color32::WHITE,
-    );
-    hit
+    tool_button(ui, man, MI_ADD, "Add URL", true, "Add a download by URL")
 }
 
 fn status_bar_w(ui: &mut egui::Ui, w: f32, frac: f32, c0: egui::Color32, c1: egui::Color32) {
@@ -1472,6 +1541,12 @@ enum ToolId {
     Queues,
     Settings,
     Grabber,
+    /// Toolbar "Resume": resume the checked rows (all paused when none).
+    ResumeSel,
+    /// Toolbar "Stop": pause the checked rows (all active when none).
+    StopSel,
+    /// Toolbar "Delete": remove the checked rows (dimmed while none is checked).
+    Delete,
 }
 
 /// Manual hit-test targets. Layout records (kind, rect) every frame;
@@ -1483,6 +1558,8 @@ enum HitKind {
     MenuBtn(u8), // 0 File, 1 Tasks, 2 Tools, 3 View, 4 Help
     MenuItem(u8), // action code (1..14, 20..22, 30..33)
     SideRow(String),
+    /// Sidebar section header fold/unfold: 0 = Categories, 1 = Status.
+    SideToggle(u8),
     RowCheck(u64),
     Row(u64),
     HdrCol(SortCol),
@@ -1655,6 +1732,9 @@ pub struct CraftApp {
     // the outside-click test and the render agree.
     add_recent_open: bool,
     add_caret: Option<egui::Rect>,
+    /// Sidebar sections (`main_window.html`): Categories and Status fold away.
+    cats_open: bool,
+    status_open: bool,
 }
 
 impl CraftApp {
@@ -1781,6 +1861,8 @@ impl CraftApp {
             add_focus_req: false,
             add_recent_open: false,
             add_caret: None,
+            cats_open: true,
+            status_open: true,
         };
         app.load_queue();
         app.load_ui_state();
@@ -2320,15 +2402,52 @@ impl CraftApp {
     /// Row action dispatcher (driven by process_hits).
     fn do_row_act(&mut self, act: RowAct, id: u64) {
         self.diag_acts += 1;
+        // Rows the user checked: bulk actions act on all of them when the
+        // clicked row is part of the selection, so "remove several files"
+        // works from the right-click menu too.
+        let sel = self.selected_ids();
+        let bulk = sel.len() > 1 && sel.contains(&id);
         match act {
-            RowAct::Resume => self.resume(id),
-            RowAct::Pause => self.pause(id),
+            RowAct::Resume => {
+                if bulk {
+                    for i in sel {
+                        self.resume(i);
+                    }
+                } else {
+                    self.resume(id)
+                }
+            }
+            RowAct::Pause => {
+                if bulk {
+                    for i in sel {
+                        self.pause(i);
+                    }
+                } else {
+                    self.pause(id)
+                }
+            }
             RowAct::Details => {
                 self.details_id = Some(id);
             }
             RowAct::Redownload => self.redownload(id),
-            RowAct::Remove => self.remove(id),
-            RowAct::RemoveFile => self.remove_file(id),
+            RowAct::Remove => {
+                if bulk {
+                    for i in sel {
+                        self.remove(i);
+                    }
+                } else {
+                    self.remove(id)
+                }
+            }
+            RowAct::RemoveFile => {
+                if bulk {
+                    for i in sel {
+                        self.remove_file(i);
+                    }
+                } else {
+                    self.remove_file(id)
+                }
+            }
             RowAct::OpenFolder => {
                 if let Some(d) = self.downloads.iter().find(|d| d.id == id) {
                     open_path(&d.dest_path(), true);
@@ -4036,11 +4155,11 @@ fn clipboard_watch(tx: std::sync::mpsc::Sender<String>) {
 
 // Column widths.
 const CHECK_W: f32 = 32.0;
-const SIZE_W: f32 = 90.0;
-const STATUS_W: f32 = 130.0;
-const SPEED_W: f32 = 90.0;
-const ETA_W: f32 = 100.0;
-const DATE_W: f32 = 110.0;
+const SIZE_W: f32 = 96.0;
+const STATUS_W: f32 = 104.0;
+const SPEED_W: f32 = 74.0;
+const ETA_W: f32 = 74.0;
+const DATE_W: f32 = 104.0;
 
 impl eframe::App for CraftApp {
     fn update(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
@@ -4079,6 +4198,16 @@ impl eframe::App for CraftApp {
                 if crate::model::center_window(ctx, size) {
                     self.placement_done = true;
                 }
+            }
+        }
+        // Launched from the shell, a fresh window can still come up behind the
+        // app that was in front. Ask for the foreground once, after the window
+        // has its final size and position.
+        if self.placement_done && !crate::tray::is_parked() {
+            static STARTUP_RAISED: std::sync::atomic::AtomicBool =
+                std::sync::atomic::AtomicBool::new(false);
+            if !STARTUP_RAISED.swap(true, std::sync::atomic::Ordering::SeqCst) {
+                crate::tray::show();
             }
         }
         // Manual pointer routing: snapshot input, then match layout rects
@@ -4153,8 +4282,12 @@ impl eframe::App for CraftApp {
         if self.theme_applied != resolved {
             apply_theme(ctx, &self.theme);
             // The native title bar follows the app theme: Windows otherwise
-            // keeps it dark for as long as the OS itself is dark.
+            // keeps it dark for as long as the OS itself is dark. It also
+            // takes the page background, so the caption and the window body
+            // merge into one surface instead of two stacked strips.
             crate::tray::set_titlebar_dark(theme_is_dark(ctx, &self.theme));
+            let page = pl().bg;
+            crate::tray::set_titlebar_color((page.r(), page.g(), page.b()));
             self.theme_applied = resolved;
         }
 
@@ -4198,6 +4331,14 @@ impl eframe::App for CraftApp {
                 ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
                 ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
             }
+        }
+        // Another launch (Start menu, pinned shortcut) asked us to come
+        // forward. Only this thread can win the foreground lock, so the
+        // request sat in a flag until now instead of raising from the listener.
+        if crate::tray::take_show_request() && !crate::tray::quitting() {
+            crate::tray::show();
+            ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
+            ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
         }
         // Tray's Exit asks for a clean shutdown; the menu handler starts it and
         // nudges a paint, so this frame runs even if the loop had gone to sleep.
@@ -4243,13 +4384,37 @@ impl eframe::App for CraftApp {
         // snap, taskbar) — a custom-painted titlebar can never match it and
         // is the fastest way to look unprofessional.
 
+        // ---- per-frame counts, shared by the sidebar and the status bar ----
+        let n_all = self.downloads.len();
+        let mut n_done = 0usize;
+        let mut n_active = 0usize;
+        let mut n_paused = 0usize;
+        let mut n_failed = 0usize;
+        let mut n_queued = 0usize;
+        let mut cat_n: std::collections::HashMap<&str, usize> =
+            std::collections::HashMap::new();
+        for d in &self.downloads {
+            *cat_n.entry(d.category()).or_default() += 1;
+            match &d.status {
+                Status::Completed => n_done += 1,
+                Status::Downloading => n_active += 1,
+                Status::Paused => n_paused += 1,
+                Status::Failed(_) => n_failed += 1,
+                Status::Queued => n_queued += 1,
+            }
+        }
+        let n_incomplete = n_all - n_done;
+
         // ================= menu bar + search =================
-        // Flat desktop menu bar: manual text buttons (no backgrounds),
-        // dropdowns render at the end of update (topmost).
+        // Flat desktop menu bar in the concept's metrics
+        // (`main_window.html` .menu-bar / .search-box): text items on the left,
+        // a bordered search field with a trailing magnifier on the right, and
+        // one hairline closing the strip. Dropdowns render at the end of update
+        // (topmost).
         egui::TopBottomPanel::top("menubar")
             .frame(egui::Frame::new().fill(pl().bg).inner_margin(egui::Margin {
-                left: 8,
-                right: 8,
+                left: 14,
+                right: 14,
                 top: 4,
                 bottom: 4,
             }))
@@ -4261,11 +4426,11 @@ impl eframe::App for CraftApp {
                     {
                         let g = ui.painter().layout_no_wrap(
                             label.to_string(),
-                            egui::FontId::proportional(12.5),
+                            egui::FontId::proportional(11.5),
                             pl().txt,
                         );
                         let (rect, _) = ui.allocate_exact_size(
-                            egui::vec2(g.size().x + 20.0, 26.0),
+                            egui::vec2(g.size().x + 20.0, 24.0),
                             egui::Sense::hover(),
                         );
                         let hov = self.man.hover(&rect);
@@ -4279,213 +4444,305 @@ impl eframe::App for CraftApp {
                                 rect.center().y - g.size().y / 2.0,
                             ),
                             g,
-                            pl().txt,
+                            if hov || open { pl().txt } else { pl().dim },
                         );
                         self.hits.push((HitKind::MenuBtn(m as u8), rect));
                     }
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    egui::Frame::new()
-                        .fill(pl().surface)
-                        .corner_radius(18.0)
-                        .inner_margin(egui::Margin {
-                            left: 12,
-                            right: 12,
-                            top: 5,
-                            bottom: 5,
-                        })
-                        .show(ui, |ui| {
-                            ui.horizontal(|ui| {
-                                ui.spacing_mut().item_spacing.x = 6.0;
-                                mi(ui, MI_SEARCH, 16.0, pl().dim);
-                                let r = mtext(ui, "search", &mut self.search, "Search in the List", 210.0, false);
-                                self.hits.push((HitKind::Field("search"), r));
+                        // Search box: filled, 1px border, 6px radius, a single
+                        // box (no inner frame) with the magnifier on the
+                        // trailing edge — the concept's `.search-box`.
+                        egui::Frame::new()
+                            .fill(pl().surface)
+                            .stroke(egui::Stroke::new(1.0_f32, pl().card_bd))
+                            .corner_radius(6.0)
+                            .inner_margin(egui::Margin {
+                                left: 10,
+                                right: 10,
+                                top: 4,
+                                bottom: 4,
+                            })
+                            .show(ui, |ui| {
+                                ui.horizontal(|ui| {
+                                    ui.spacing_mut().item_spacing.x = 6.0;
+                                    // The menu bar lays its children out right
+                                    // to left, so the magnifier is added first
+                                    // to land on the pill's trailing edge —
+                                    // the concept's `.search-box` order
+                                    // (input, then `.search-icon`).
+                                    mi(ui, MI_SEARCH, 13.0, pl().dim);
+                                    let r = mtext_bare(
+                                        ui,
+                                        "search",
+                                        &mut self.search,
+                                        "Search in the List",
+                                        176.0,
+                                    );
+                                    self.hits.push((HitKind::Field("search"), r));
+                                });
                             });
-                        });
+                    });
+                });
+                // menu-bar bottom hairline (`.menu-bar { border-bottom }`)
+                let r = ui.max_rect();
+                ui.painter()
+                    .hline(r.x_range(), r.bottom() + 3.5, egui::Stroke::new(1.0_f32, pl().card_bd));
+            });
+        // Menu/dropdown actions run from process_hits (see do_menu_act).
+
+        // ================= bottom status bar =================
+        // The concept's `.status-bar`: session totals on the left, state on the
+        // right — a full-width strip under both cards. Declared before the
+        // side panel so it spans the whole window instead of only the
+        // workspace's column.
+        egui::TopBottomPanel::bottom("statusbar")
+            .frame(egui::Frame::new().fill(pl().bg).inner_margin(egui::Margin {
+                left: 14,
+                right: 14,
+                top: 3,
+                bottom: 3,
+            }))
+            .show(ctx, |ui| {
+                ui.horizontal(|ui| {
+                    // Session totals live in the sidebar's footer, inside its
+                    // card — the strip only carries live state ("Ready" / speed).
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        let total_speed: f64 =
+                            self.downloads.iter().map(|d| d.speed_bps).sum();
+                        let right = if total_speed > 0.0 {
+                            format!("{} · Ready", format_speed(total_speed))
+                        } else {
+                            "Ready".to_string()
+                        };
+                        ui.label(egui::RichText::new(right).size(10.5).color(pl().dim));
+                    });
                 });
             });
-        });
-        // Menu/dropdown actions run from process_hits (see do_menu_act).
 
 
         // ================= left sidebar (collapsible tree) =================
+        // The concept draws the sidebar as its own bordered card inset from the
+        // window edge (`.sidebar`): scrolling nav rows on top, a ruled footer
+        // pinned to the bottom.
         egui::SidePanel::left("cats")
             .resizable(false)
-            .exact_width(200.0)
+            .exact_width(198.0)
             .frame(
                 egui::Frame::new()
                     .fill(pl().bg)
-                    .inner_margin(egui::Margin::same(12)),
+                    .inner_margin(egui::Margin {
+                        left: 12,
+                        right: 6,
+                        top: 12,
+                        bottom: 12,
+                    }),
             )
             .show(ctx, |ui| {
-                // Status counts (computed once per frame; cheap for typical lists).
-                let n_all = self.downloads.len();
-                let mut n_done = 0usize;
-                let mut n_active = 0usize;
-                let mut n_paused = 0usize;
-                let mut n_failed = 0usize;
-                let mut n_queued = 0usize;
-                let mut cat_n: std::collections::HashMap<&str, usize> =
-                    std::collections::HashMap::new();
-                for d in &self.downloads {
-                    *cat_n.entry(d.category()).or_default() += 1;
-                    match &d.status {
-                        Status::Completed => n_done += 1,
-                        Status::Downloading => n_active += 1,
-                        Status::Paused => n_paused += 1,
-                        Status::Failed(_) => n_failed += 1,
-                        Status::Queued => n_queued += 1,
-                    }
-                }
-                let n_incomplete = n_all - n_done;
-                let cur = self.filter.clone();
-                // (filter key, icon, label, count, running-dot)
-                // Labels follow the AB-style sidebar; keys stay internal.
-                let cats: [(&str, &str, &str); 6] = [
-                    ("Image", MI_IMAGE, "Pictures"),
-                    ("Video", MI_MOVIE, "Videos"),
-                    ("Music", MI_MUSIC, "Music"),
-                    ("Document", MI_DOC, "Documents"),
-                    ("Compressed", MI_ARCHIVE, "Compressed"),
-                    ("Apps", MI_GRID, "Apps"),
-                ];
-                ui.add_space(8.0);
-                egui::ScrollArea::vertical().show(ui, |ui| {
-                    ui.spacing_mut().item_spacing.y = 2.0;
-                    // Manual rows: paint (+record hit); process_hits
-                    // applies selection. `cur` snapshot avoids borrow issues.
-                    let nav = |ui: &mut egui::Ui,
-                               hits: &mut Vec<(HitKind, egui::Rect)>,
-                               man: &ManState,
-                               cur: &str,
-                               key: &str,
-                               icon: &str,
-                               label: &str,
-                               n: Option<usize>,
-                               dot: bool| {
-                        let r = side_nav_row(ui, man, cur == key, icon, label, n, dot);
-                        hits.push((HitKind::SideRow(key.to_string()), r));
-                    };
-                    nav(
-                        ui,
-                        &mut self.hits,
-                        &self.man,
-                        &cur,
-                        "All",
-                        MI_FOLDER,
-                        "All",
-                        Some(n_all),
-                        false,
-                    );
-                    ui.add_space(6.0);
-                    side_section(ui, "CATEGORIES");
-                    for (key, icon, label) in cats {
-                        let n = cat_n.get(key).copied().unwrap_or(0);
-                        nav(
-                            ui,
-                            &mut self.hits,
-                            &self.man,
-                            &cur,
-                            key,
-                            icon,
-                            label,
-                            Some(n),
-                            false,
+                // The card is built from explicit heights below, so the
+                // style's 10px item spacing must not creep in between the
+                // scroll area and the pinned footer — that made the sidebar
+                // card 12px taller than the download-list card.
+                ui.spacing_mut().item_spacing.y = 0.0;
+                let card_h = ui.available_height();
+                let foot_h = 24.0;
+                let pad = 8.0;
+                let list_h = (card_h - pad * 2.0 - foot_h).max(80.0);
+                egui::Frame::new()
+                    .fill(pl().surface)
+                    .stroke(egui::Stroke::new(1.0_f32, pl().card_bd))
+                    .corner_radius(RADIUS)
+                    .inner_margin(egui::Margin::same(8))
+                    .show(ui, |ui| {
+                        ui.set_width(ui.available_width());
+                        let cur = self.filter.clone();
+                        let cats: [(&str, &str, &str); 6] = [
+                            ("Image", MI_IMAGE, "Pictures"),
+                            ("Video", MI_SLIDESHOW, "Videos"),
+                            ("Music", MI_MUSIC, "Music"),
+                            ("Document", MI_DOC, "Documents"),
+                            ("Compressed", MI_ARCHIVE, "Compressed"),
+                            ("Apps", MI_GRID, "Apps"),
+                        ];
+                        let statuses: [(&str, &str, &str, usize, bool); 5] = [
+                            ("Downloading", MI_GET_APP, "Downloading", n_active, n_active > 0),
+                            ("Queued", MI_FILTER, "Queued", n_queued, false),
+                            ("Paused", MI_PAUSE, "Paused", n_paused, false),
+                            ("Completed", MI_CHECK_CIRCLE, "Finished", n_done, false),
+                            ("Failed", MI_CANCEL, "Failed", n_failed, false),
+                        ];
+                        egui::ScrollArea::vertical()
+                            .id_salt("side_nav")
+                            .max_height(list_h)
+                            .auto_shrink([false, false])
+                            .show(ui, |ui| {
+                                // Flush rows: the 1px-in highlight inset gives
+                                // the concept's 2px gap without paying for it in
+                                // layout, so the whole tree fits in the card.
+                                ui.spacing_mut().item_spacing.y = 0.0;
+                                // Manual rows: paint (+record hit); process_hits
+                                // applies selection. `cur` snapshot avoids
+                                // borrow issues.
+                                let nav = |ui: &mut egui::Ui,
+                                           hits: &mut Vec<(HitKind, egui::Rect)>,
+                                           man: &ManState,
+                                           cur: &str,
+                                           key: &str,
+                                           icon: &str,
+                                           label: &str,
+                                           n: Option<usize>,
+                                           dot: bool| {
+                                    let r =
+                                        side_nav_row(ui, man, cur == key, icon, label, n, dot);
+                                    hits.push((HitKind::SideRow(key.to_string()), r));
+                                };
+                                nav(
+                                    ui,
+                                    &mut self.hits,
+                                    &self.man,
+                                    &cur,
+                                    "All",
+                                    MI_APPS_DOTS,
+                                    "All",
+                                    Some(n_all),
+                                    false,
+                                );
+                                ui.add_space(4.0);
+                                let hdr =
+                                    side_section(ui, &self.man, "Categories", self.cats_open);
+                                self.hits.push((HitKind::SideToggle(0), hdr));
+                                if self.cats_open {
+                                    for (key, icon, label) in cats {
+                                        let n = cat_n.get(key).copied().unwrap_or(0);
+                                        nav(
+                                            ui,
+                                            &mut self.hits,
+                                            &self.man,
+                                            &cur,
+                                            key,
+                                            icon,
+                                            label,
+                                            Some(n),
+                                            false,
+                                        );
+                                    }
+                                }
+                                ui.add_space(4.0);
+                                let hdr =
+                                    side_section(ui, &self.man, "Status", self.status_open);
+                                self.hits.push((HitKind::SideToggle(1), hdr));
+                                if self.status_open {
+                                    for (key, icon, label, n, dot) in statuses {
+                                        nav(
+                                            ui,
+                                            &mut self.hits,
+                                            &self.man,
+                                            &cur,
+                                            key,
+                                            icon,
+                                            label,
+                                            Some(n),
+                                            dot,
+                                        );
+                                    }
+                                    // Legacy "Unfinished" view kept reachable
+                                    // (same as Incomplete).
+                                    let r = side_nav_row(
+                                        ui,
+                                        &self.man,
+                                        cur == "Unfinished" || cur == "Incomplete",
+                                        MI_SCHEDULE,
+                                        "Unfinished",
+                                        Some(n_incomplete),
+                                        false,
+                                    );
+                                    self.hits
+                                        .push((HitKind::SideRow("Unfinished".to_string()), r));
+                                }
+                            });
+                        // ---- pinned footer (`.sidebar-footer`) ----
+                        let (fr, _) = ui.allocate_exact_size(
+                            egui::vec2(ui.available_width(), foot_h),
+                            egui::Sense::hover(),
                         );
-                    }
-                    ui.add_space(8.0);
-                    side_section(ui, "STATUS");
-                    let statuses: [(&str, &str, &str, usize, bool); 5] = [
-                        ("Downloading", MI_DOWNLOAD, "Downloading", n_active, n_active > 0),
-                        ("Queued", MI_QUEUE, "Queued", n_queued, false),
-                        ("Paused", MI_STOP, "Paused", n_paused, false),
-                        ("Completed", MI_CHECK, "Finished", n_done, false),
-                        ("Failed", MI_REFRESH, "Failed", n_failed, false),
-                    ];
-                    for (key, icon, label, n, dot) in statuses {
-                        nav(
-                            ui,
-                            &mut self.hits,
-                            &self.man,
-                            &cur,
-                            key,
-                            icon,
-                            label,
-                            Some(n),
-                            dot,
+                        ui.painter().hline(
+                            fr.x_range(),
+                            fr.top() + 0.5,
+                            egui::Stroke::new(1.0_f32, pl().card_bd),
                         );
-                    }
-                    // Legacy "Unfinished" view kept reachable (same as Incomplete).
-                    let r = side_nav_row(
-                        ui,
-                        &self.man,
-                        cur == "Unfinished" || cur == "Incomplete",
-                        MI_FOLDER,
-                        "Unfinished",
-                        Some(n_incomplete),
-                        false,
-                    );
-                    self.hits.push((HitKind::SideRow("Unfinished".to_string()), r));
-                    ui.add_space(6.0);
-                    ui.small(format!("{n_active} active · {n_all} total"));
-                });
+                        ui.painter().text(
+                            egui::pos2(fr.min.x, fr.center().y + 3.0),
+                            egui::Align2::LEFT_CENTER,
+                            format!("{n_active} active · {n_all} total"),
+                            egui::FontId::proportional(10.0),
+                            pl().dim,
+                        );
+                    });
             });
-
-        // ================= bottom status bar =================
-        egui::TopBottomPanel::bottom("statusbar").show(ctx, |ui| {
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                let total_speed: f64 = self.downloads.iter().map(|d| d.speed_bps).sum();
-                let active = self.tasks.len();
-                ui.horizontal(|ui| {
-                    ui.spacing_mut().item_spacing.x = 5.0;
-                    mi(ui, MI_CLOUD_DL, 15.0, pl().dim);
-                    ui.label(egui::RichText::new(if total_speed > 0.0 {
-                        format_speed(total_speed)
-                    } else {
-                        String::new()
-                    })
-                    .color(pl().dim));
-                    ui.add_space(10.0);
-                    mi(ui, MI_MENU, 15.0, pl().dim);
-                    ui.label(egui::RichText::new(format!("{active}")).color(pl().dim));
-                });
-            });
-        });
 
         // ================= main area (toolbar + list, beside the sidebar) =================
+        // The workspace is its own bordered card (`.content-area`), inset by the
+        // same 12px gutter as the sidebar card.
         egui::CentralPanel::default()
-            .frame(egui::Frame::new().fill(pl().central_bg).inner_margin(egui::Margin {
-                left: 16,
-                right: 16,
+            .frame(egui::Frame::new().fill(pl().bg).inner_margin(egui::Margin {
+                left: 6,
+                right: 12,
                 top: 12,
                 bottom: 12,
             }))
             .show(ctx, |ui| {
-                // toolbar: uniform-height buttons, one shared gap.
+                let avail = ui.available_size();
+                let (outer, _) = ui.allocate_exact_size(avail, egui::Sense::hover());
+                ui.painter().rect(
+                    outer,
+                    RADIUS,
+                    pl().central_bg,
+                    egui::Stroke::new(1.0_f32, pl().card_bd),
+                    egui::StrokeKind::Inside,
+                );
+                // Everything below lives inside the card's 1px border.
+                let mut card = ui.new_child(
+                    egui::UiBuilder::new()
+                        .max_rect(outer.shrink(1.0))
+                        .layout(egui::Layout::top_down(egui::Align::Min)),
+                );
+                let ui = &mut card;
+                // The card's vertical rhythm is entirely explicit (the toolbar,
+                // the header band and the rows each place themselves), so the
+                // style's 10px item spacing is switched off here — it used to
+                // add a phantom gap around the column header.
+                ui.spacing_mut().item_spacing.y = 0.0;
+                // ---- toolbar (`.toolbar`): icon over label, accent primary ----
                 // Manual routing: paint (+record hit); process_hits acts.
-                ui.horizontal(|ui| {
-                    ui.spacing_mut().item_spacing.x = TOOL_GAP;
+                ui.add_space(6.0);
+                let n_checked = self.selected_ids().len();
+                let mut tools: Vec<(ToolId, &str, &str, bool, &str)> = Vec::new();
+                tools.push((ToolId::ResumeSel, MI_PLAY_CIRCLE, "Resume", true, "Resume the selected downloads (all paused when none is checked)"));
+                tools.push((ToolId::StopSel, MI_STOP_CIRCLE, "Stop", true, "Pause the selected downloads (all active when none is checked)"));
+                tools.push((ToolId::StopAll, MI_PAUSE_CIRCLE, "Stop All", true, "Pause every active download now"));
+                tools.push((ToolId::Delete, MI_DELETE, "Delete", n_checked > 0, "Remove the checked rows from the list"));
+                tools.push((ToolId::StartQueue, MI_PLAY, "Start Queue", true, "Start queued downloads"));
+                tools.push((ToolId::StopQueue, MI_STOP, "Stop Queue", true, "Stop starting new downloads (active ones finish)"));
+                tools.push((ToolId::Queues, MI_REORDER, "Open Queue", true, "Queue status, scheduler and log"));
+                tools.push((ToolId::Grabber, MI_PUBLIC, "Site Grabber", true, "Collect file links from a web page"));
+                tools.push((ToolId::Settings, MI_TUNE, "Settings", true, "Open Settings in its own window"));
+                ui.horizontal_wrapped(|ui| {
+                    ui.add_space(10.0);
+                    ui.spacing_mut().item_spacing = egui::vec2(TOOL_GAP, 2.0);
                     let r = add_url_button(ui, &self.man);
                     self.hits.push((HitKind::Tool(ToolId::AddUrl), r));
-                    ui.add_space(10.0);
-                    let busy = !self.tasks.is_empty();
-                    let tools = [
-                        (ToolId::StartQueue, MI_PLAY, "Start Queue", true, "Start queued downloads"),
-                        (ToolId::StopQueue, MI_STOP, "Stop Queue", busy, "Stop starting new downloads (active ones finish)"),
-                        (ToolId::StopAll, MI_PAUSE, "Pause All", busy, "Pause every active download now"),
-                    ];
                     for (id, icon, label, enabled, tip) in tools {
                         let r = tool_button(ui, &self.man, icon, label, enabled, tip);
                         self.hits.push((HitKind::Tool(id), r));
                     }
-                    ui.add_space(10.0);
-                    let r = tool_button(ui, &self.man, MI_QUEUE, "Open Queues", true, "Queue status, scheduler and log");
-                    self.hits.push((HitKind::Tool(ToolId::Queues), r));
-                    let r = tool_button(ui, &self.man, MI_CLOUD_DL, "Site Grabber", true, "Collect file links from a web page");
-                    self.hits.push((HitKind::Tool(ToolId::Grabber), r));
-                    let r = tool_button(ui, &self.man, MI_SETTINGS, "Settings", true, "Open Settings in its own window");
-                    self.hits.push((HitKind::Tool(ToolId::Settings), r));
                 });
-                ui.add_space(8.0);
+                ui.add_space(6.0);
+                // toolbar hairline (`.toolbar { border-bottom }`)
+                let (tr, _) = ui.allocate_exact_size(
+                    egui::vec2(ui.available_width(), 1.0),
+                    egui::Sense::hover(),
+                );
+                ui.painter().rect_filled(tr, 0.0, pl().card_bd);
+                ui.add_space(5.0);
                 // clipboard toast: dismissible banner card, never loose text
                 if let Some(url) = self.clipboard_toast.clone() {
                     egui::Frame::new()
@@ -4527,13 +4784,20 @@ impl eframe::App for CraftApp {
                         });
                     ui.add_space(6.0);
                 }
+                // Bulk actions for the checked rows live in the toolbar itself
+                // (Delete sits next to Stop All): a bar that appeared only while
+                // something was checked pushed the whole list down by a row's
+                // worth of height, so it is gone.
                 let ids = self.visible_ids();
                 if ids.is_empty() {
                     ui.centered_and_justified(|ui| {
                         ui.vertical_centered(|ui| {
+                            ui.spacing_mut().item_spacing.y = 4.0;
                             ui.add_space(40.0);
                             ui.label(
-                                egui::RichText::new(MI_CLOUD_DL).size(48.0).color(pl().surface_lt),
+                                egui::RichText::new(MI_CLOUD_DL)
+                                    .font(crate::fonts::icon(48.0))
+                                    .color(pl().surface_lt),
                             );
                             ui.add_space(8.0);
                             ui.label(
@@ -4549,30 +4813,53 @@ impl eframe::App for CraftApp {
                 } else {
                     // ---- fully manual table: explicit geometry for header
                     // and rows + manual pointer routing (no egui hit-test) ----
-                    const ROW_H: f32 = 46.0;
-                    const HDR_H: f32 = 26.0;
-                    const GAP: f32 = 8.0;
+                    // Column metrics follow `main_window.html`: contiguous
+                    // columns (no gutters), Name left-aligned, every numeric
+                    // column right-aligned, and one rule under the header.
+                    const ROW_H: f32 = 34.0;
+                    const HDR_H: f32 = 22.0;
                     let cols = self.col_order.clone();
                     let avail_w = ui.available_width();
-                    let others_w: f32 = cols
+                    // The numeric columns keep their stored widths, but when the
+                    // window is too narrow for them plus a readable Name column
+                    // they give space back (down to their own minimums) instead
+                    // of pushing the last column off the card.
+                    let mut fixed: Vec<(SortCol, f32)> = cols
                         .iter()
                         .filter(|c| **c != SortCol::Name)
-                        .map(|c| col_w_of(&self.col_w, *c))
-                        .sum();
-                    let gaps_w = GAP * (cols.len().saturating_sub(1) as f32);
-                    let name_w = (avail_w - CHECK_W - others_w - gaps_w).max(160.0);
+                        .map(|c| (*c, col_w_of(&self.col_w, *c)))
+                        .collect();
+                    const NAME_MIN: f32 = 132.0;
+                    let mut fixed_sum: f32 = fixed.iter().map(|(_, w)| *w).sum();
+                    let mut name_w = avail_w - CHECK_W - fixed_sum;
+                    if name_w < NAME_MIN {
+                        let need = NAME_MIN - name_w;
+                        let slack: f32 =
+                            fixed.iter().map(|(c, w)| (w - col_min(*c)).max(0.0)).sum();
+                        if slack > 0.0 {
+                            let k = (need / slack).min(1.0);
+                            for (c, w) in fixed.iter_mut() {
+                                *w -= (*w - col_min(*c)).max(0.0) * k;
+                            }
+                            fixed_sum = fixed.iter().map(|(_, w)| *w).sum();
+                            name_w = avail_w - CHECK_W - fixed_sum;
+                        }
+                    }
                     let col_ws: Vec<f32> = cols
                         .iter()
                         .map(|c| {
                             if *c == SortCol::Name {
-                                name_w
+                                name_w.max(80.0)
                             } else {
-                                col_w_of(&self.col_w, *c)
+                                fixed
+                                    .iter()
+                                    .find(|(fc, _)| fc == c)
+                                    .map(|(_, w)| *w)
+                                    .unwrap_or_else(|| col_w_of(&self.col_w, *c))
                             }
                         })
                         .collect();
-                    let total_w: f32 =
-                        CHECK_W + col_ws.iter().sum::<f32>() + gaps_w;
+                    let total_w: f32 = CHECK_W + col_ws.iter().sum::<f32>();
                     // Select-all state, snapshotted before the header.
                     let all_sel = !ids.is_empty()
                         && ids.iter().all(|id| {
@@ -4582,67 +4869,70 @@ impl eframe::App for CraftApp {
                                 .map(|d| d.selected)
                                 .unwrap_or(false)
                         });
-                    // ---- header bar (fixed, scrolls horizontally with body) ----
-                    egui::Frame::new()
-                        .fill(pl().header_bg)
-                        .corner_radius(RADIUS)
-                        .show(ui, |ui| {
-                            ui.spacing_mut().item_spacing.x = 0.0;
-                            ui.horizontal(|ui| {
-                                let (cr, _) = ui.allocate_exact_size(
-                                    egui::vec2(CHECK_W, HDR_H),
-                                    egui::Sense::hover(),
+                    // ---- header row (fixed; the concept draws it sticky) ----
+                    ui.horizontal(|ui| {
+                        ui.spacing_mut().item_spacing.x = 0.0;
+                        let (cr, _) = ui.allocate_exact_size(
+                            egui::vec2(CHECK_W, HDR_H),
+                            egui::Sense::hover(),
+                        );
+                        paint_check(
+                            ui.painter(),
+                            egui::Rect::from_center_size(cr.center(), egui::vec2(13.0, 13.0)),
+                            all_sel,
+                            self.man.hover(&cr),
+                        );
+                        self.hits.push((HitKind::HdrCheck, cr));
+                        for (ci, col) in cols.iter().enumerate() {
+                            let w = col_ws[ci];
+                            let (r, _) = ui.allocate_exact_size(
+                                egui::vec2(w, HDR_H),
+                                egui::Sense::hover(),
+                            );
+                            let sorted = self.sort_col == *col;
+                            let arrow = if sorted {
+                                if self.sort_asc { " ▲" } else { " ▼" }
+                            } else {
+                                ""
+                            };
+                            let txt = format!("{}{}", col.title().to_uppercase(), arrow);
+                            let color = if self.man.hover(&r) || sorted {
+                                pl().txt
+                            } else {
+                                pl().dim
+                            };
+                            cell_text(ui.painter(), r, &txt, 9.5, color, *col != SortCol::Name);
+                            self.hits.push((HitKind::HdrCol(*col), r));
+                            if ci + 1 < cols.len() {
+                                // Divider grab strip on the column's right edge
+                                // (`.resizer`), a hairline until hovered.
+                                let zr = egui::Rect::from_min_size(
+                                    egui::pos2(r.max.x - 3.5, r.min.y),
+                                    egui::vec2(7.0, HDR_H),
                                 );
-                                paint_check(
-                                    ui.painter(),
-                                    egui::Rect::from_center_size(
-                                        cr.center(),
-                                        egui::vec2(14.0, 14.0),
-                                    ),
-                                    all_sel,
-                                    self.man.hover(&cr),
-                                );
-                                self.hits.push((HitKind::HdrCheck, cr));
-                                for (ci, col) in cols.iter().enumerate() {
-                                    let w = col_ws[ci];
-                                    let (r, _) = ui.allocate_exact_size(
-                                        egui::vec2(w, HDR_H),
-                                        egui::Sense::hover(),
-                                    );
-                                    let arrow = if self.sort_col == *col {
-                                        if self.sort_asc { " ▲" } else { " ▼" }
-                                    } else {
-                                        ""
-                                    };
-                                    let txt = format!("↕ {}{}", col.title(), arrow);
-                                    let g = ui.painter().layout_no_wrap(
-                                        txt,
-                                        egui::FontId::proportional(12.0),
-                                        pl().dim,
-                                    );
-                                    ui.painter().galley(
-                                        egui::pos2(
-                                            r.center().x - g.size().x / 2.0,
-                                            r.center().y - g.size().y / 2.0,
+                                if self.man.hover(&zr) {
+                                    ui.painter().rect_filled(
+                                        egui::Rect::from_min_size(
+                                            egui::pos2(r.max.x - 1.5, r.min.y + 6.0),
+                                            egui::vec2(3.0, HDR_H - 12.0),
                                         ),
-                                        g,
-                                        pl().dim,
+                                        1.5,
+                                        pl().primary,
                                     );
-                                    self.hits.push((HitKind::HdrCol(*col), r));
-                                    if ci + 1 < cols.len() {
-                                        let (zr, _) = ui.allocate_exact_size(
-                                            egui::vec2(GAP, HDR_H),
-                                            egui::Sense::hover(),
-                                        );
-                                        self.hits.push((HitKind::ResizeCol(*col), zr));
-                                    }
                                 }
-                            });
-                        });
+                                self.hits.push((HitKind::ResizeCol(*col), zr));
+                            }
+                        }
+                    });
+                    let (hr, _) = ui.allocate_exact_size(
+                        egui::vec2(ui.available_width(), 1.0),
+                        egui::Sense::hover(),
+                    );
+                    ui.painter().rect_filled(hr, 0.0, pl().card_bd);
                     // ---- body rows: manual geometry inside scroll content.
                     // Row screen rects come straight from layout, so manual
                     // hit-testing stays exact under scrolling ----
-                    let body_h = (ui.available_height() - 40.0).max(80.0);
+                    let body_h = (ui.available_height() - 4.0).max(80.0);
                     egui::ScrollArea::horizontal()
                         .id_salt("dl_h")
                         .auto_shrink([false, false])
@@ -4652,6 +4942,10 @@ impl eframe::App for CraftApp {
                                 .max_height(body_h)
                                 .auto_shrink([false, false])
                                 .show(ui, |ui| {
+                                    // Rows are flush: the list's rhythm comes
+                                    // from ROW_H plus the faint row rule, not
+                                    // from the style's 10px item spacing.
+                                    ui.spacing_mut().item_spacing.y = 0.0;
                                     for id in &ids {
                                         let id = *id;
                                         let (sel, fname, cat, size_s, prog, spd, eta, date, st, preparing) = {
@@ -4696,25 +4990,30 @@ impl eframe::App for CraftApp {
                                             egui::vec2(total_w, ROW_H),
                                             egui::Sense::hover(),
                                         );
+                                        let hl = rrect.shrink2(egui::vec2(2.0, 1.0));
                                         if sel {
-                                            ui.painter().rect_filled(
-                                                rrect.expand(2.0),
-                                                RADIUS,
-                                                pl().sel_bg,
-                                            );
+                                            ui.painter().rect_filled(hl, 6.0, pl().sel_bg);
                                             ui.painter().rect_stroke(
-                                                rrect.expand(2.0),
-                                                RADIUS,
+                                                hl,
+                                                6.0,
                                                 egui::Stroke::new(1.0_f32, pl().sel_bd),
                                                 egui::StrokeKind::Inside,
                                             );
                                         } else if self.man.hover(&rrect) {
-                                            ui.painter().rect_filled(
-                                                rrect.expand(2.0),
-                                                RADIUS,
-                                                pl().hover_bg,
-                                            );
+                                            ui.painter().rect_filled(hl, 6.0, pl().hover_bg);
                                         }
+                                        // `.downloads td { border-bottom: 1px
+                                        // solid rgba(30,41,59,.5) }` — with the
+                                        // rows flush, this faint rule is what
+                                        // keeps them readable.
+                                        ui.painter().hline(
+                                            rrect.x_range(),
+                                            rrect.max.y,
+                                            egui::Stroke::new(
+                                                1.0_f32,
+                                                pl().card_bd.gamma_multiply(0.55),
+                                            ),
+                                        );
                                         self.hits.push((HitKind::Row(id), rrect));
                                         // Manual select checkbox.
                                         let cb = egui::Rect::from_center_size(
@@ -4722,7 +5021,7 @@ impl eframe::App for CraftApp {
                                                 rrect.min.x + CHECK_W / 2.0,
                                                 rrect.center().y,
                                             ),
-                                            egui::vec2(14.0, 14.0),
+                                            egui::vec2(13.0, 13.0),
                                         );
                                         paint_check(
                                             ui.painter(),
@@ -4756,7 +5055,7 @@ impl eframe::App for CraftApp {
                                             );
                                         }
                                         SortCol::Size => {
-                                            centered_label_at(&p, crect, &size_s, 12.0, pl().txt);
+                                            cell_text(&p, crect, &size_s, 11.0, pl().dim, true);
                                         }
                                         SortCol::Status => match &st {
                                             Status::Downloading => {
@@ -4771,22 +5070,26 @@ impl eframe::App for CraftApp {
                                                 status_pill_at(
                                                     &p,
                                                     egui::Rect::from_min_size(
-                                                        crect.min,
-                                                        egui::vec2(w, 24.0),
+                                                        egui::pos2(
+                                                            crect.min.x,
+                                                            crect.center().y - 15.0,
+                                                        ),
+                                                        egui::vec2(w, 19.0),
                                                     ),
                                                     &pill,
                                                     pl().primary,
+                                                    true,
                                                 );
                                                 paint_progress(
                                                     &p,
                                                     crect.center().x,
-                                                    crect.min.y + 27.0,
-                                                    w,
+                                                    crect.center().y + 7.0,
+                                                    (w - 16.0).max(20.0),
                                                     prog,
                                                 );
                                             }
                                             Status::Queued => {
-                                                centered_label_at(&p, crect, "Added", 12.0, pl().txt);
+                                                cell_text(&p, crect, "Added", 10.5, pl().dim, true);
                                             }
                                             Status::Paused => {
                                                 status_pill_at(
@@ -4797,13 +5100,14 @@ impl eframe::App for CraftApp {
                                                         (prog * 100.0) as u32
                                                     ),
                                                     pl().warning,
+                                                    true,
                                                 );
                                             }
                                             Status::Completed => {
-                                                status_pill_at(&p, crect, "Finished", pl().success);
+                                                status_pill_at(&p, crect, "Finished", pl().success, true);
                                             }
                                             Status::Failed(_) => {
-                                                status_pill_at(&p, crect, "Failed", pl().error);
+                                                status_pill_at(&p, crect, "Failed", pl().error, true);
                                             }
                                         },
                                         SortCol::Speed => {
@@ -4812,21 +5116,18 @@ impl eframe::App for CraftApp {
                                             } else {
                                                 "-".to_string()
                                             };
-                                            centered_label_at(&p, crect, &spd_s, 12.0, pl().txt);
+                                            cell_text(&p, crect, &spd_s, 10.0, pl().dim, true);
                                         }
                                         SortCol::Eta => {
                                             let eta_s: &str =
-                                                if eta == "-" { "" } else { &eta };
-                                            centered_label_at(&p, crect, eta_s, 12.0, pl().dim);
+                                                if eta == "-" { "-" } else { &eta };
+                                            cell_text(&p, crect, eta_s, 10.0, pl().dim, true);
                                         }
                                         SortCol::Date => {
-                                            centered_label_at(&p, crect, &date, 12.0, pl().dim);
+                                            cell_text(&p, crect, &date, 10.0, pl().dim, true);
                                         }
                                     }
                                     x += w;
-                                    if ci + 1 < cols.len() {
-                                        x += GAP;
-                                    }
                                 }
                             }
                         });
@@ -5580,7 +5881,7 @@ impl eframe::App for CraftApp {
                                 egui::pos2(bar.min.x + 22.0, bar.center().y),
                                 egui::Align2::CENTER_CENTER,
                                 file_icon(crate::model::category_of(&item.filename)).to_string(),
-                                egui::FontId::proportional(16.0),
+                                crate::fonts::icon(16.0),
                                 pl().primary,
                             );
                             let close_r = egui::Rect::from_center_size(
@@ -5595,7 +5896,7 @@ impl eframe::App for CraftApp {
                                 close_r.center(),
                                 egui::Align2::CENTER_CENTER,
                                 "\u{e5cd}".to_string(),
-                                egui::FontId::proportional(14.0),
+                                crate::fonts::icon(14.0),
                                 if close_hover { pl().txt } else { pl().dim },
                             );
                             self.hits.push((HitKind::Btn(ButtonId::DClose), close_r));
@@ -6611,6 +6912,7 @@ impl CraftApp {
                 hover_dbg = match &kind {
                     HitKind::Tool(t) => format!("tool:{t:?}"),
                     HitKind::SideRow(k) => format!("side:{k}"),
+                    HitKind::SideToggle(n) => format!("sidetoggle:{n}"),
                     HitKind::Row(id) => format!("row:#{id}"),
                     HitKind::RowCheck(id) => format!("check:#{id}"),
                     HitKind::HdrCol(c) => format!("hdr:{}", c.key()),
@@ -6654,6 +6956,50 @@ impl CraftApp {
                                 self.grab_notice.clear();
                                 self.show_grabber = true;
                             }
+                            ToolId::ResumeSel => {
+                                // Resume what is checked; with nothing checked,
+                                // every paused row (so the button never sits
+                                // inert on a fresh window).
+                                let mut ids = self.selected_ids();
+                                if ids.is_empty() {
+                                    ids = self
+                                        .downloads
+                                        .iter()
+                                        .filter(|d| matches!(d.status, Status::Paused))
+                                        .map(|d| d.id)
+                                        .collect();
+                                }
+                                let n = ids.len();
+                                for id in ids {
+                                    self.resume(id);
+                                }
+                                if n > 0 {
+                                    self.push_log(format!("Resumed {n} download(s)."));
+                                }
+                            }
+                            ToolId::StopSel => {
+                                // Pause what is checked; with nothing checked,
+                                // every live transfer.
+                                let mut ids = self.selected_ids();
+                                if ids.is_empty() {
+                                    ids = self.tasks.keys().copied().collect();
+                                }
+                                let n = ids.len();
+                                for id in ids {
+                                    self.pause(id);
+                                }
+                                if n > 0 {
+                                    self.push_log(format!("Paused {n} download(s)."));
+                                }
+                            }
+                            ToolId::Delete => {
+                                let ids = self.selected_ids();
+                                let n = ids.len();
+                                for id in ids {
+                                    self.remove(id);
+                                }
+                                self.push_log(format!("Removed {n} selected download(s)."));
+                            }
                         }
                     }
                 }
@@ -6684,6 +7030,15 @@ impl CraftApp {
                         }
                     }
                 }
+                HitKind::SideToggle(n) => {
+                    if clk {
+                        if n == 0 {
+                            self.cats_open = !self.cats_open;
+                        } else {
+                            self.status_open = !self.status_open;
+                        }
+                    }
+                }
                 HitKind::RowCheck(id) => {
                     if clk {
                         if let Some(d) = self.downloads.iter_mut().find(|d| d.id == id) {
@@ -6694,8 +7049,19 @@ impl CraftApp {
                 HitKind::Row(id) => {
                     if sec {
                         fired_ctx = true;
-                        for d in self.downloads.iter_mut() {
-                            d.selected = d.id == id;
+                        // Keep a multi-selection intact when right-clicking a
+                        // row that is already checked; otherwise select just
+                        // the clicked row.
+                        let already = self
+                            .downloads
+                            .iter()
+                            .find(|d| d.id == id)
+                            .map(|d| d.selected)
+                            .unwrap_or(false);
+                        if !already {
+                            for d in self.downloads.iter_mut() {
+                                d.selected = d.id == id;
+                            }
                         }
                         if let Some(p) = self.man.pos() {
                             open_ctx = Some((id, p));

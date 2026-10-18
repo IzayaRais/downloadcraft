@@ -1933,15 +1933,118 @@ fn has_direct_ext(u: &str) -> bool {
         .any(|e| base.ends_with(e))
 }
 
+/// True for URLs that name a media file or playlist (used to sanity-check a
+/// URL pulled out of a player-wrapper query parameter).
+fn looks_media_url(u: &str) -> bool {
+    let base = u.split(['?', '#']).next().unwrap_or(u).to_ascii_lowercase();
+    [
+        ".m3u8", ".mpd", ".mp4", ".webm", ".mkv", ".mov", ".m4v", ".ts", ".m4s", ".mp3", ".m4a",
+        ".aac", ".flac", ".ogg", ".wav", ".avi",
+    ]
+    .iter()
+    .any(|e| base.ends_with(e))
+}
+
+/// Player wrapper pages carry the real stream in a query parameter
+/// (`/jwplayer/?source=https%3A%2F%2F...`). Return the inner http(s) URL so
+/// the playlist router and the download path see the media, not the shell.
+/// Loops a few times to unwind double-wrapped URLs; `None` when nothing
+/// changed.
+pub fn unwrap_player_url(url: &str) -> Option<String> {
+    let mut cur = url.to_string();
+    let mut changed = false;
+    for _ in 0..3 {
+        // Already a media file/playlist: nothing to unwrap.
+        if looks_media_url(&cur) {
+            break;
+        }
+        let Ok(u) = url::Url::parse(&cur) else { break };
+        let playerish = {
+            let low = cur.to_ascii_lowercase();
+            low.contains("player") || low.contains("embed") || low.contains("iframe")
+        };
+        let mut next: Option<String> = None;
+        for key in [
+            "source", "src", "file", "url", "video", "stream", "media", "link", "path",
+        ] {
+            let Some(v) = u
+                .query_pairs()
+                .find(|(k, _)| k.eq_ignore_ascii_case(key))
+                .map(|(_, v)| v.into_owned())
+            else {
+                continue;
+            };
+            let mut dec = v.clone();
+            if !dec.starts_with("http") {
+                dec = percent_decode_owned(&dec);
+            }
+            if !dec.starts_with("http") || dec == cur {
+                continue;
+            }
+            if looks_media_url(&dec) || playerish {
+                next = Some(dec);
+                break;
+            }
+        }
+        match next {
+            Some(n) => {
+                cur = n;
+                changed = true;
+            }
+            None => break,
+        }
+    }
+    if changed {
+        Some(cur)
+    } else {
+        None
+    }
+}
+
+/// Name stem of a media URL: the last path segment, or the folder above it
+/// when that segment is a generic playlist/segment name (`index.m3u8`,
+/// `master.mpd`, `seg1.ts`) — those folders hold the release name.
+fn url_name_stem(u: &str) -> String {
+    let path = u.split(['?', '#']).next().unwrap_or(u);
+    let segs: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
+    let Some(last_raw) = segs.last() else {
+        return String::new();
+    };
+    let last = percent_decode_owned(last_raw);
+    let stem = match last.rfind('.') {
+        Some(p) if last.len() - p <= 6 => last[..p].to_string(),
+        _ => last.clone(),
+    };
+    let low = stem.to_ascii_lowercase();
+    let boring = matches!(
+        low.as_str(),
+        "index" | "master" | "playlist" | "manifest" | "chunk" | "segment" | "video" | "media"
+            | "stream" | "file" | "init"
+    ) || (low.starts_with("seg") && low.len() <= 6);
+    if boring && segs.len() >= 2 {
+        return percent_decode_owned(segs[segs.len() - 2]);
+    }
+    stem
+}
+
 /// Generic page scan: og:video / contentUrl / twitter stream / bare media links.
 /// Covers YouTube-alternatives (Vimeo/FB/TikTok/Dailymotion-style pages expose
 /// the same og:video + ld+json VideoObject tags) plus bare file links.
-/// HLS (.m3u8) / DASH (.mpd) playlists are detected but NOT returned as
-/// downloadable files — the engine does segmented progressive HTTP only.
+/// HLS (.m3u8) / DASH (.mpd) playlists in the page body are NOT returned
+/// (the scan stays progressive), but a playlist wrapped in the page URL's
+/// query (?source=...) is unwrapped and returned for the segment router.
 fn resolve_generic(html: &str, page_url: &str) -> Option<(String, String)> {
     let title = meta_content(html, "og:title")
         .or_else(|| tag_text(html, "title"))
         .unwrap_or_else(|| "video".to_string());
+    // Player wrapper pages (jwplayer/?source=...): the real stream lives in
+    // the query, not the body. Prefer that, and name it from the release
+    // folder when the page title is the generic player shell.
+    if let Some(inner) = unwrap_player_url(page_url) {
+        let stem = url_name_stem(&inner);
+        let name = if stem.len() >= 8 { stem } else { title.clone() };
+        return Some((inner, name));
+    }
     for prop in [
         "og:video:url",
         "og:video",
@@ -2763,6 +2866,18 @@ pub async fn download(
         }
         shared.downloaded.store(0, Ordering::SeqCst);
     }
+    // Player wrapper pages ("/jwplayer/?source=<encoded media>"): the real
+    // stream is in the query. Unwrap before routing so the playlist router
+    // and the progressive path never see the HTML shell.
+    if let Some(inner) = unwrap_player_url(&url) {
+        url = inner;
+        let _ = tokio::fs::remove_file(dest.with_extension("dcpart")).await;
+        let _ = tokio::fs::remove_file(dest.with_extension("dcmeta")).await;
+        for i in 0..16 {
+            let _ = tokio::fs::remove_file(dest.with_extension(format!("dcpart{i}"))).await;
+        }
+        shared.downloaded.store(0, Ordering::SeqCst);
+    }
     // Route playlists before the progressive path so we never save a
     // playlist file as if it were the video.
     if url.to_ascii_lowercase().starts_with("ftp://") || url.to_ascii_lowercase().starts_with("ftps://") {
@@ -2980,6 +3095,19 @@ pub async fn download(
                         dest.set_file_name(&name);
                         mutex_guard(&shared.resolved_name).replace(name);
                     }
+                }
+                // A playlist reached through the resolver (player wrapper
+                // ?source=...) must go through the segment assembler, not the
+                // progressive path that would save the manifest text.
+                if is_playlist_url(&url) {
+                    drop(_job);
+                    let low = url.to_ascii_lowercase();
+                    if low.split(['?', '#']).next().unwrap_or("").ends_with(".mpd")
+                        || low.contains(".mpd")
+                    {
+                        return download_dash(&url, dest, connections, opts, shared).await;
+                    }
+                    return download_hls(&url, &dest, connections, &opts, &shared).await;
                 }
                 // Adaptive video+audio pair (1080p+ menu choice): merge via
                 // ffmpeg on completion instead of a small progressive file.
@@ -6229,6 +6357,28 @@ mod tests {
         let hit = resolve_youtube(html).expect("should resolve");
         assert_eq!(hit.0, "https://cdn/x/720.mp4");
         assert_eq!(hit.1, "My Vid.mp4");
+    }
+
+    #[test]
+    fn unwraps_player_wrapper_urls() {
+        // jwplayer/dooplay wrapper: the stream is the encoded source param.
+        let wrapped = "https://sunplex.net/jwplayer/?source=https%3A%2F%2Fstream.sunplex.net%2FMovies%2FNayyi%2520Navelli%2Findex.m3u8";
+        let inner = unwrap_player_url(wrapped).expect("should unwrap");
+        assert!(inner.starts_with("https://stream.sunplex.net/"));
+        assert!(inner.ends_with(".m3u8"));
+        // A plain URL without a media-ish query stays put.
+        assert!(unwrap_player_url("https://example.com/watch?v=abc").is_none());
+        assert!(unwrap_player_url("https://cdn.example/v.mp4").is_none());
+        // Release folder survives for a generic playlist name.
+        assert_eq!(
+            url_name_stem("https://stream.sunplex.net/Movies/Nayyi%20Navelli/index.m3u8"),
+            "Nayyi Navelli"
+        );
+        // …but a real filename is used as-is.
+        assert_eq!(
+            url_name_stem("https://cdn/x/Release.2026.1080p.mp4"),
+            "Release.2026.1080p"
+        );
     }
 
     #[test]

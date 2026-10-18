@@ -93,6 +93,14 @@ fn main() -> eframe::Result<()> {
         }
     }
 
+    // One manager window only. A second launch (Start menu, pinned shortcut,
+    // taskbar) wakes the running instance and raises it instead of opening a
+    // fresh window behind whatever the user is looking at.
+    let _instance = match tray::claim_main_instance() {
+        Some(slot) => slot,
+        None => return Ok(()),
+    };
+
     let rt = Arc::new(
         tokio::runtime::Builder::new_multi_thread()
             .enable_all()
@@ -100,7 +108,7 @@ fn main() -> eframe::Result<()> {
             .expect("tokio runtime"),
     );
     let mut viewport = egui::ViewportBuilder::default()
-        .with_inner_size([1050.0, 600.0])
+        .with_inner_size([920.0, 500.0])
         .with_min_inner_size([840.0, 480.0]);
     if let Ok(icon) = eframe::icon_data::from_png_bytes(include_bytes!("../assets/icon.png")) {
         viewport = viewport.with_icon(std::sync::Arc::new(icon));

@@ -55,13 +55,15 @@ subtitle tracks and audio-only files, sent straight to the app:
   on-demand "Verify checksum" for finished files.
 - Queue with concurrency limit, scheduler, retry-all-failed, finish actions
   (nothing / shutdown / sleep / hibernate), import/export URL lists.
-- YouTube and other yt-dlp-supported sites: the app fetches and keeps its
-  own yt-dlp up to date, which is what makes 1080p+ and merged audio+video
-  work. Settings → Plugins shows the copy in use, its version, and the
-  JavaScript runtime; "Re-download" refreshes it.
+- YouTube and 1,000+ other yt-dlp-supported sites: the app fetches and keeps
+  its own yt-dlp up to date, which is what makes 1080p+ and merged
+  audio+video work. Settings → Plugins shows the copy in use, its version and
+  the JavaScript runtime, with Re-download / Show in folder beside it; the
+  card's grid names the sites that come up most.
 - Clipboard URL detection, desktop notifications, system tray, antivirus hook.
-- Status sidebar with live counts, search, sortable/resizable
-  columns, per-segment progress view, and System / Dark / Light themes.
+- Status sidebar with live counts, search, sortable/resizable columns,
+  toolbar bulk actions (Resume / Stop / Stop All / Delete), a per-segment
+  progress view, and System / Dark / Light themes.
 - File names render in any script (Bangla, Arabic, CJK, …) instead of boxes.
 - CLI (`add/list/download/get/remove/redownload/clear/import/export/status`)
   and browser native-messaging host (Chrome/Edge/Firefox) sharing

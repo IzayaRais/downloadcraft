@@ -121,7 +121,9 @@ impl CompleteApp {
         self.title_bar(&ctx, ui, &p, o);
 
         // ---- file summary: 40px doc icon + two lines ----
-        dm_icon(&p, at(o, PAD_X, DOC_Y, DOC_S, DOC_S), DmIcon::Doc, DM_ACC, 2.2);
+        // Thin standard-weight outline: the 40px icon scales the 24-unit
+        // viewBox, so 2.2 units used to become a chunky 3.7px stroke.
+        dm_icon(&p, at(o, PAD_X, DOC_Y, DOC_S, DOC_S), DmIcon::Doc, DM_ACC, 1.35);
         p.text(
             egui::pos2(o.x + SUM_X, o.y + DOC_Y),
             egui::Align2::LEFT_TOP,

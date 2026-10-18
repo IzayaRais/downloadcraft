@@ -7,7 +7,7 @@
   // Must match manifest version + background.js EXT_VER. The background
   // rejects messages from any other version with a "reload this tab"
   // error, so a stale script can never fail mysteriously.
-  const EXT_VER = "0.9.4";
+  const EXT_VER = "0.9.5";
   // Generation guard: when the worker re-injects this script (after an
   // update), older live instances must go quiet instead of fighting over
   // the button. The newest instance always wins.
@@ -339,11 +339,21 @@
     // The extension keeps audio extensions for audio fallbacks.
     let sendUrl = stripFbSlice(url);
     if (/^blob:/i.test(url)) {
-      sendUrl = location.href;
+      sendUrl = stripFbSlice(location.href);
       if (!filename) {
         const base = String(document.title || "media").replace(/[<>:"/\\|?*\u0000-\u001f]/g, "_").trim().replace(/\.+$/, "") || "media";
         filename = base + mimeExt(mime);
       }
+    }
+    // A player-wrapper page ("/jwplayer/?source=<encoded media>") is HTML;
+    // the real stream is in the query. Unwrap it so we send the media, not
+    // the shell, and rename from the real URL (the release folder for HLS).
+    const inner = unwrapMediaUrl(sendUrl);
+    if (inner) {
+      sendUrl = stripFbSlice(inner);
+      const base = mediaBase(sendUrl);
+      const ext = mimeExt(mime) || outExtFor(sendUrl);
+      filename = base.toLowerCase().endsWith(ext.toLowerCase()) ? base : base + ext;
     }
     try {
       chrome.runtime.sendMessage({ type: "download", url: sendUrl, filename, ver: EXT_VER, pageUrl: location.href, referer: location.href, mime: mime || null, size: size || null, pairUrl: (pair && pair.url) || null, pairMime: (pair && pair.mime) || null, quality: quality || null, dur: dur || null }, (res) => {
@@ -368,14 +378,30 @@
   // title is just "Video", "Watch online" or the site name; on other sites
   // the reverse is true (hashed CDN names). Pick whichever one describes the
   // file, never a bare "video.mp4".
+  const URL_DECODE = (s) => { try { return decodeURIComponent(s); } catch (e) { return s; } };
   function urlBasename(u) {
     try {
       const p = new URL(u, location.href).pathname;
       const last = p.split("/").filter(Boolean).pop() || "";
-      try { return decodeURIComponent(last); } catch (e) { return last; }
+      return URL_DECODE(last);
     } catch (e) { return ""; }
   }
   function pageTitle() {
+    const clean = (t) =>
+      String(t || "")
+        .replace(/\s+[-–—|]\s+[^-–—|]{1,40}$/, "")
+        .trim();
+    // The player shell is often a same-origin iframe inside the real page
+    // (dooplay embeds /jwplayer/): prefer the top document's og:title so the
+    // download is named for the movie/release, not the player.
+    try {
+      if (window.top && window.top !== window && window.top.document) {
+        const td = window.top.document;
+        const og = td.querySelector('meta[property="og:title"]');
+        const t = clean((og && og.getAttribute("content")) || td.title);
+        if (t) return t;
+      }
+    } catch (e) { /* cross-origin parent: fall through */ }
     let t = "";
     try {
       const og = document.querySelector('meta[property="og:title"]');
@@ -384,23 +410,41 @@
     if (!t) t = String(document.title || "");
     t = t.trim();
     // "Title - Site" / "Title | Site": the suffix is chrome, not the name.
-    t = t.replace(/\s+[-–—|]\s+[^-–—|]{1,40}$/, "").trim() || String(document.title || "").trim();
+    t = clean(t) || String(document.title || "").trim();
     return t;
   }
   const GENERIC_TITLE = /^(video|videos|media|stream|player|watch|download|index|untitled|movie|online\s+video|full\s+video)$/i;
-  const BORING_STEM = /^(videoplayback|index|file|media|stream|download|video|play|master|chunk)$/i;
+  const BORING_STEM = /^(videoplayback|index|file|media|stream|download|video|play|master|playlist|manifest|chunk|segment|init|frag\d*)$/i;
   // Extensions the desktop side supplies from the MIME type: a title that
   // already ends in one must not produce "name.mp4.mp4".
-  const MEDIA_EXT_RE = /\.(mp4|mkv|webm|mov|avi|m4v|mp3|m4a|aac|ogg|wav|flac|m3u8|mpd)$/i;
+  const MEDIA_EXT_RE = /\.(mp4|mkv|webm|mov|avi|m4v|mp3|m4a|aac|ogg|wav|flac|m3u8|mpd|ts|m4s)$/i;
+  // URL -> name stem. When the last segment is a generic playlist/segment
+  // name (index.m3u8, master.mpd, seg1.ts) the release name is the folder
+  // above it, which is what the site (and IDM) use.
+  function urlStem(u) {
+    let segs = [];
+    try {
+      segs = new URL(u, location.href).pathname.split("/").filter(Boolean);
+    } catch (e) { return { stem: "", hasExt: false, fromFolder: false }; }
+    if (!segs.length) return { stem: "", hasExt: false, fromFolder: false };
+    const last = URL_DECODE(segs[segs.length - 1]);
+    const m = last.match(/\.([a-z0-9]{2,5})$/i);
+    const stem = m ? last.slice(0, -m[0].length) : last;
+    if (BORING_STEM.test(stem) && segs.length >= 2) {
+      return { stem: URL_DECODE(segs[segs.length - 2]), hasExt: false, fromFolder: true };
+    }
+    return { stem, hasExt: !!m, fromFolder: false };
+  }
   function mediaBase(mediaUrl) {
     const title = pageTitle();
-    const file = urlBasename(mediaUrl || "");
-    const hasExt = /\.[a-z0-9]{2,5}$/i.test(file);
-    const stem = hasExt ? file.replace(/\.[a-z0-9]{2,5}$/i, "") : file;
+    const info = urlStem(mediaUrl || "");
+    const stem = info.stem;
     const generic = !title || GENERIC_TITLE.test(title) || title.length < 4;
-    // A descriptive URL filename wins over a generic title, and over a title
-    // that is clearly shorter than the filename itself.
-    const descriptive = hasExt && stem.length >= 8 && !BORING_STEM.test(stem);
+    // A descriptive URL name wins over a generic title, and over a title
+    // that is clearly shorter than the name itself. Folder names behind a
+    // playlist qualify too (the release name, not a hashed CDN segment).
+    const descriptive =
+      stem.length >= 8 && !BORING_STEM.test(stem) && (info.hasExt || info.fromFolder);
     if (descriptive && (generic || stem.length > title.length + 8)) {
       return stem.slice(0, 80);
     }
@@ -410,6 +454,47 @@
       .trim()
       .replace(/\.+$/, "");
     return (base || "video").slice(0, 80);
+  }
+  // Media extension for a URL, mapped to what the engine will actually write
+  // (an HLS/DASH playlist assembles to MP4).
+  function outExtFor(u) {
+    const m = /\.([a-z0-9]{2,5})(?:\?|#|$)/i.exec(String(u || "").split("#")[0]);
+    const e = m ? "." + m[1].toLowerCase() : "";
+    if (e === ".m3u8" || e === ".mpd") return ".mp4";
+    return e;
+  }
+  // Player wrapper pages carry the real stream in a query parameter
+  // ("/jwplayer/?source=https%3A%2F%2F..."). Decode it so the download is the
+  // media, not the HTML shell. Also used by the desktop engine.
+  const UNWRAP_KEYS = ["source", "src", "file", "url", "video", "stream", "media", "link", "path"];
+  const MEDIA_HINT_RE = /\.(m3u8|mpd|mp4|webm|mkv|mov|m4v|ts|m4s|mp3|m4a|aac|flac|ogg|wav|avi)(\?|#|$)/i;
+  const PLAYER_HINT_RE = /(player|jwplayer|embed|iframe|watch|playlist)/i;
+  function unwrapMediaUrl(raw) {
+    try {
+      let cur = String(raw || "");
+      if (!cur) return "";
+      let changed = false;
+      for (let depth = 0; depth < 3; depth++) {
+        // Already a media file/playlist: nothing to unwrap.
+        if (MEDIA_HINT_RE.test(cur.split("#")[0])) break;
+        const u = new URL(cur, location.href);
+        let next = "";
+        for (const k of UNWRAP_KEYS) {
+          let v = u.searchParams.get(k);
+          if (!v) continue;
+          if (!/^https?:\/\//i.test(v)) v = URL_DECODE(v);
+          if (!/^https?:\/\//i.test(v) || v === cur) continue;
+          if (MEDIA_HINT_RE.test(v.split("#")[0]) || PLAYER_HINT_RE.test(cur)) {
+            next = v;
+            break;
+          }
+        }
+        if (!next) break;
+        cur = next;
+        changed = true;
+      }
+      return changed ? cur : "";
+    } catch (e) { return ""; }
   }
 
   // ---------- Facebook reels support (IDM-style quality rows) ----------
@@ -436,6 +521,32 @@
       const c = el && el.getAttribute("content");
       return c ? fbUnescape(c) : "";
     } catch (e) { return ""; }
+  }
+  // Thumbnails: Facebook reel pages often omit og:image, which left the
+  // sender panel showing the gradient placeholder. Try the player's own
+  // poster and the page JSON thumbnail keys first, then og:image.
+  function fbJsonUrlNear(html, key) {
+    const p = String(html || "").indexOf('"' + key + '"');
+    if (p < 0) return "";
+    const seg = String(html).slice(p, p + 500);
+    const m = seg.match(/https?:\\?\/\\?\/[^"\\\s]+/);
+    return m ? fbUnescape(m[0]) : "";
+  }
+  function fbThumb(html) {
+    const ok = (u) => /^https?:\/\//i.test(u || "");
+    try {
+      const vs = document.querySelectorAll("video");
+      for (const v of vs) {
+        const p = v.getAttribute("poster") || v.poster || "";
+        if (ok(p)) return p;
+      }
+    } catch (e) { /* ignore */ }
+    for (const k of ["preferred_thumbnail", "thumbnailImage", "thumbnail_src", "thumbnail", "image"]) {
+      const u = fbJsonUrlNear(html, k);
+      if (ok(u)) return u;
+    }
+    const og = fbMeta("og:image");
+    return ok(og) ? og : "";
   }
   function fbJsonUrls(html) {
     const out = {};
@@ -481,7 +592,7 @@
       title = String(document.title || "").replace(/\s*\|\s*Facebook\s*$/i, "").trim() || "facebook_video";
     }
     if (/^facebook$/i.test(title)) title = "facebook_video";
-    return { hd: urls.hd, sd: urls.sd, durSec, w, h, title: title.slice(0, 100), thumb: fbMeta("og:image") };
+    return { hd: urls.hd, sd: urls.sd, durSec, w, h, title: title.slice(0, 100), thumb: fbThumb(html) };
   }
   function fbQuality(w, h, isHd) {
     const q = Math.max(w || 0, h || 0);

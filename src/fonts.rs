@@ -17,10 +17,23 @@
 pub const FONT_UI: &str = "segoe";
 /// Named family holding Segoe UI Semibold (falls back to the app font).
 pub const FONT_SEMI: &str = "popup-semibold";
+/// Named family holding *only* Material Icons (see `install`).
+pub const FONT_ICON: &str = "icons";
 
 /// Segoe UI regular at `size`.
 pub fn reg(size: f32) -> egui::FontId {
     egui::FontId::new(size, egui::FontFamily::Name(FONT_UI.into()))
+}
+
+/// Material Icons glyph at `size`.
+///
+/// Icon codepoints sit in the Unicode Private Use Area, and the script
+/// fallbacks deliberately include Segoe UI Symbol — which also maps PUA points
+/// and therefore shadows the icon font. That is how U+E2C4 ("file_download")
+/// came out as a little phone instead of a download arrow. Icons must go
+/// through this family, where Material Icons is the only candidate.
+pub fn icon(size: f32) -> egui::FontId {
+    egui::FontId::new(size, egui::FontFamily::Name(FONT_ICON.into()))
 }
 
 /// Segoe UI Semibold at `size` — the concept's 500/600 weights.
@@ -190,5 +203,11 @@ pub fn install(cc: &eframe::CreationContext<'_>, primary: bool) {
     fonts
         .families
         .insert(egui::FontFamily::Name(FONT_SEMI.into()), semibold);
+    // Icon-only family: Material Icons and nothing else, so no system font can
+    // shadow a PUA icon codepoint (see `icon`).
+    fonts.families.insert(
+        egui::FontFamily::Name(FONT_ICON.into()),
+        vec!["material".to_owned()],
+    );
     cc.egui_ctx.set_fonts(fonts);
 }

@@ -317,6 +317,54 @@ pub fn dm_icon(p: &egui::Painter, r: egui::Rect, icon: DmIcon, color: egui::Colo
     }
 }
 
+/// The Add URL mark: a crisp vector version of the concept's diagonal chain
+/// link (two interlocking capsules). The raster source (a low-contrast
+/// screenshot) turned to mush when scaled to toolbar size, so this traces the
+/// same shape as paths with a bold stroke — solid at any scale, matching the
+/// reference mark's weight.
+///
+/// Kept for other surfaces; the main toolbar now uses the concept's plain
+/// plus (see `MI_ADD`) on its filled primary chip.
+#[allow(dead_code)]
+pub fn add_link(p: &egui::Painter, r: egui::Rect, color: egui::Color32, w: f32) {
+    let s = r.width().min(r.height()) / 24.0;
+    let st = egui::Stroke::new((w * s).max(1.0), color);
+    // Local capsule runs along +x; rotate -45° so the chain runs bottom-left
+    // to top-right like the reference mark.
+    let a = -std::f32::consts::FRAC_PI_4;
+    let (sa, ca) = a.sin_cos();
+    let place = |cx: f32, cy: f32, lx: f32, ly: f32| {
+        egui::pos2(
+            r.min.x + (cx + ca * lx - sa * ly) * s,
+            r.min.y + (cy + sa * lx + ca * ly) * s,
+        )
+    };
+    let link = |cx: f32, cy: f32| {
+        let hl = 5.7f32; // half-length of the capsule body
+        let rad = 2.7f32;
+        let straight = (hl - rad).max(0.0);
+        let mut local: Vec<(f32, f32)> = vec![(-straight, -rad), (straight, -rad)];
+        let arc = |ccx: f32, a0: f32, a1: f32, out: &mut Vec<(f32, f32)>| {
+            let n = 6;
+            for i in 0..=n {
+                let t = a0 + (a1 - a0) * i as f32 / n as f32;
+                out.push((ccx + rad * t.cos(), rad * t.sin()));
+            }
+        };
+        arc(straight, -std::f32::consts::FRAC_PI_2, std::f32::consts::FRAC_PI_2, &mut local);
+        local.push((-straight, rad));
+        arc(-straight, std::f32::consts::FRAC_PI_2, 3.0 * std::f32::consts::FRAC_PI_2, &mut local);
+        let pts: Vec<egui::Pos2> = local
+            .into_iter()
+            .map(|(lx, ly)| place(cx, cy, lx, ly))
+            .collect();
+        p.add(egui::Shape::closed_line(pts, st));
+    };
+    // Two interlocking links offset along the diagonal.
+    link(13.9, 8.1);
+    link(8.1, 13.9);
+}
+
 /// Concept icon button: hover wash plus glyph. Painting only — the caller owns
 /// the hit test and passes `hovered`.
 pub fn icon_btn(
