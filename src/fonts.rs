@@ -12,6 +12,12 @@
 //! name of a video titled in Bangla showed up as "Kalachan _ ▯▯▯▯▯▯ _ Tosiba".
 //! Fallbacks are consulted per glyph, so the app's own typography is untouched
 //! and only the characters it cannot draw are picked up from elsewhere.
+//!
+//! Fallbacks fix tofu, but they cannot fix *shaping*: epaint maps codepoints to
+//! glyphs one at a time, so Bengali matras landed after their consonant and the
+//! virama stayed visible instead of forming a conjunct. The Indic scripts
+//! (`shaped`) therefore take a second route: rustybuzz shapes the run, ab_glyph
+//! rasterises it and egui paints the result as a texture.
 
 /// Named family holding Segoe UI regular (falls back to the app font).
 pub const FONT_UI: &str = "segoe";
@@ -48,7 +54,7 @@ pub fn semi(size: f32) -> egui::FontId {
 /// Gurmukhi, Kannada, Malayalam, Odia, Sinhala, Tamil and Telugu. The rest
 /// cover the other scripts Windows ships fonts for.
 #[cfg(windows)]
-const SYSTEM_FONTS: &[(&str, &str, u32)] = &[
+pub(crate) const SYSTEM_FONTS: &[(&str, &str, u32)] = &[
     ("nirmala", "Nirmala.ttc", 0),
     ("leelawadee", "LeelawUI.ttf", 0),
     ("myanmar", "mmrtext.ttf", 0),
@@ -68,7 +74,7 @@ const SYSTEM_FONTS: &[(&str, &str, u32)] = &[];
 /// for (it embeds Windows resources, drives Explorer and the tray), but the
 /// lookup is written so a missing directory is simply a no-op.
 #[cfg(windows)]
-fn font_dirs() -> Vec<std::path::PathBuf> {
+pub(crate) fn font_dirs() -> Vec<std::path::PathBuf> {
     let mut dirs = Vec::new();
     // A per-user font (`%LOCALAPPDATA%\Microsoft\Windows\Fonts`) is where a
     // user-installed script font would land, and it is checked first so it can

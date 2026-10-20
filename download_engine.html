@@ -1,0 +1,380 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="dark">
+<head>
+<meta charset="UTF-8">
+<title>Download Craft — Download Engine</title>
+<style>
+  :root {
+    --bg: #ffffff; --bg-secondary: #f8fafc; --bg-input: #f1f5f9;
+    --bg-hover: #e2e8f0; --bg-active: #e0e7ff;
+    --text-primary: #0f172a; --text-secondary: #475569; --text-muted: #94a3b8;
+    --border: #e2e8f0; --border-soft: #eef2f7; --border-focus: #3b82f6;
+    --accent: #3b82f6; --accent-hover: #2563eb;
+    --shadow: 0 4px 24px rgba(0,0,0,0.08);
+    --tab-active-bg: #eef2ff; --tab-active-text: #3b82f6;
+    --btn-bg: #f1f5f9; --btn-text: #334155; --btn-border: #cbd5e1;
+    --success: #16a34a; --success-bg: #dcfce7; --danger: #ef4444;
+  }
+  [data-theme="dark"] {
+    --bg: #0f172a; --bg-secondary: #1e293b; --bg-input: #0f172a;
+    --bg-hover: #334155; --bg-active: #1e293b;
+    --text-primary: #f1f5f9; --text-secondary: #94a3b8; --text-muted: #64748b;
+    --border: #334155; --border-soft: #24334a; --border-focus: #3b82f6;
+    --accent: #3b82f6; --accent-hover: #60a5fa;
+    --shadow: 0 4px 24px rgba(0,0,0,0.4);
+    --tab-active-bg: #1e293b; --tab-active-text: #60a5fa;
+    --btn-bg: #1e293b; --btn-text: #94a3b8; --btn-border: #334155;
+    --success: #22c55e; --success-bg: #22c55e22; --danger: #ef4444;
+  }
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body { background: #0a0a1a; color: #e0e0f0; font-family: 'Segoe UI', sans-serif; padding: 40px; }
+  h1 { text-align: center; font-size: 20px; margin-bottom: 4px; color: #fff; }
+  .subtitle { text-align: center; color: #8888a8; margin-bottom: 20px; font-size: 11px; }
+  .theme-toggle { display: flex; justify-content: center; gap: 8px; margin-bottom: 20px; }
+  .theme-btn { padding: 6px 16px; border-radius: 16px; border: 1px solid var(--border); background: var(--bg-secondary); color: var(--text-secondary); font-size: 11px; cursor: pointer; transition: all 0.2s; }
+  .theme-btn.active { background: var(--accent); color: #fff; border-color: var(--accent); }
+
+  .window { background: var(--bg); border: 1px solid var(--border); border-radius: 10px; width: 660px; margin: 0 auto; box-shadow: var(--shadow); overflow: hidden; }
+  .title-bar { display: flex; align-items: center; gap: 8px; padding: 9px 13px; border-bottom: 1px solid var(--border); }
+  .title-bar .icon { width: 18px; height: 18px; }
+  .title-bar .title { font-size: 13px; font-weight: 500; color: var(--text-primary); }
+  .title-bar .spacer { flex: 1; }
+  .title-bar .win-btn { width: 26px; height: 26px; display: flex; align-items: center; justify-content: center; border-radius: 4px; cursor: pointer; color: var(--text-muted); }
+  .title-bar .win-btn:hover { background: var(--bg-hover); }
+
+  .body { display: flex; min-height: 392px; }
+  .sidebar { width: 168px; border-right: 1px solid var(--border); padding: 7px; display: flex; flex-direction: column; gap: 1px; flex-shrink: 0; }
+  .sidebar .tab { display: flex; align-items: center; gap: 8px; padding: 7px 9px; border-radius: 6px; font-size: 11.5px; color: var(--text-secondary); cursor: pointer; transition: all 0.15s; border: none; background: none; width: 100%; text-align: left; font-family: inherit; white-space: nowrap; }
+  .sidebar .tab:hover { background: var(--bg-hover); }
+  .sidebar .tab.active { background: var(--tab-active-bg); color: var(--tab-active-text); font-weight: 500; }
+  .sidebar .tab svg { width: 14px; height: 14px; flex-shrink: 0; }
+
+  .content { flex: 1; min-width: 0; padding: 13px 16px; overflow-y: auto; max-height: 468px; }
+  .content::-webkit-scrollbar { width: 6px; }
+  .content::-webkit-scrollbar-thumb { background: var(--border); border-radius: 3px; }
+  .content h2 { font-size: 15px; font-weight: 600; color: var(--text-primary); margin-bottom: 2px; }
+  .content .page-hint { font-size: 10px; color: var(--text-muted); margin-bottom: 10px; }
+  .tab-content { display: none; }
+  .tab-content.active { display: block; }
+
+  /* ---------- Cards ---------- */
+  .card { background: var(--bg-secondary); border: 1px solid var(--border); border-radius: 9px; margin-bottom: 6px; overflow: hidden; }
+  .card-head { display: flex; align-items: center; gap: 7px; padding: 6px 11px; user-select: none; }
+  .card.collapsible .card-head { cursor: pointer; }
+  .card.collapsible .card-head:hover { background: var(--bg-hover); }
+  .card-title { font-size: 11.5px; font-weight: 600; color: var(--text-primary); letter-spacing: 0.1px; }
+  .card-badge { font-size: 9px; color: var(--text-muted); background: var(--bg-input); border: 1px solid var(--border); border-radius: 20px; padding: 1px 6px; }
+  .card-chevron { width: 13px; height: 13px; color: var(--text-muted); margin-left: auto; transition: transform 0.2s; flex-shrink: 0; }
+  .card.collapsible .card-body { display: none; }
+  .card.collapsible.open .card-body { display: block; }
+  .card.collapsible.open .card-chevron { transform: rotate(180deg); }
+  .card-body { padding: 8px 11px 9px; border-top: 1px solid var(--border-soft); }
+
+  /* ---------- Fields (label left, control right) ---------- */
+  .field { display: grid; grid-template-columns: 138px minmax(0, 1fr); column-gap: 11px; row-gap: 4px; align-items: center; margin-bottom: 7px; }
+  .field:last-child { margin-bottom: 0; }
+  .field.has-hint { align-items: start; }
+  .field.has-hint > .field-label { padding-top: 7px; }
+  .field-label { font-size: 11px; color: var(--text-secondary); }
+  .field-control { min-width: 0; }
+  .field-hint { grid-column: 2; font-size: 9.5px; color: var(--text-muted); line-height: 1.45; }
+  .field-hint code { font-family: 'Consolas', monospace; background: var(--bg-input); border: 1px solid var(--border); border-radius: 4px; padding: 0 4px; font-size: 9px; color: var(--text-secondary); }
+
+  .input { width: 100%; background: var(--bg-input); border: 1px solid var(--border); border-radius: 6px; padding: 5px 9px; font-size: 11px; color: var(--text-primary); outline: none; font-family: inherit; transition: border-color 0.15s; }
+  .input:focus { border-color: var(--border-focus); }
+  .input::placeholder { color: var(--text-muted); }
+  .input.mono { font-family: 'Consolas', monospace; font-size: 10px; }
+  .input-row { display: flex; align-items: center; gap: 6px; }
+  .input-row .input { flex: 1; min-width: 0; }
+  .icon-btn { width: 28px; height: 28px; flex-shrink: 0; display: flex; align-items: center; justify-content: center; border-radius: 6px; border: 1px solid var(--btn-border); background: var(--btn-bg); color: var(--text-secondary); cursor: pointer; transition: all 0.15s; }
+  .icon-btn:hover { background: var(--bg-hover); color: var(--text-primary); }
+  .icon-btn svg { width: 14px; height: 14px; }
+
+  /* checkboxes */
+  .check-list { display: flex; flex-direction: column; gap: 1px; margin-top: 6px; }
+  .check-row { display: flex; align-items: center; gap: 8px; padding: 2px 0; cursor: pointer; user-select: none; font-size: 11.5px; color: var(--text-primary); }
+  .check-row:hover .cb { border-color: var(--accent); }
+  .cb { width: 14px; height: 14px; border-radius: 3.5px; border: 1.5px solid var(--btn-border); background: var(--bg-input); display: flex; align-items: center; justify-content: center; flex-shrink: 0; transition: all 0.15s; }
+  .cb svg { width: 9px; height: 9px; opacity: 0; color: #fff; transition: opacity 0.15s; }
+  .cb.on { background: var(--accent); border-color: var(--accent); }
+  .cb.on svg { opacity: 1; }
+
+  /* sliders */
+  .slider-row { display: flex; align-items: center; gap: 10px; }
+  input[type=range].slider {
+    -webkit-appearance: none; appearance: none; flex: 1; min-width: 0; height: 4px; border-radius: 3px; outline: none; cursor: pointer;
+    background: linear-gradient(to right, var(--accent) var(--fill, 0%), var(--border) var(--fill, 0%));
+  }
+  input[type=range].slider::-webkit-slider-thumb { -webkit-appearance: none; appearance: none; width: 14px; height: 14px; border-radius: 50%; background: var(--accent); border: 2px solid var(--bg); box-shadow: 0 1px 4px rgba(0,0,0,0.35); cursor: pointer; }
+  input[type=range].slider::-moz-range-thumb { width: 14px; height: 14px; border-radius: 50%; background: var(--accent); border: 2px solid var(--bg); cursor: pointer; }
+  .num { width: 52px; flex-shrink: 0; text-align: center; background: var(--bg-input); border: 1px solid var(--border); border-radius: 6px; padding: 5px 3px; font-size: 11px; color: var(--text-primary); outline: none; font-family: inherit; -moz-appearance: textfield; }
+  .num::-webkit-outer-spin-button, .num::-webkit-inner-spin-button { -webkit-appearance: none; margin: 0; }
+  .num:focus { border-color: var(--border-focus); }
+
+  /* segmented control */
+  .segmented { display: inline-flex; gap: 3px; background: var(--bg-input); border: 1px solid var(--border); border-radius: 8px; padding: 2px; }
+  .seg { border: none; background: transparent; color: var(--text-secondary); font-size: 10.5px; font-family: inherit; padding: 4px 12px; border-radius: 6px; cursor: pointer; transition: all 0.15s; white-space: nowrap; }
+  .seg:hover { color: var(--text-primary); }
+  .seg.active { background: var(--accent); color: #fff; font-weight: 500; box-shadow: 0 1px 3px rgba(0,0,0,0.25); }
+
+  /* speed windows */
+  .window-row { display: flex; align-items: center; gap: 7px; margin-bottom: 6px; }
+  .time-inp { width: 60px; text-align: center; background: var(--bg-input); border: 1px solid var(--border); border-radius: 6px; padding: 5px 4px; font-size: 11px; font-family: 'Consolas', monospace; color: var(--text-primary); outline: none; }
+  .time-inp:focus { border-color: var(--border-focus); }
+  .dash { color: var(--text-muted); font-size: 11px; }
+  .unit { font-size: 10px; color: var(--text-muted); }
+  .cap-num { width: 52px; text-align: center; background: var(--bg-input); border: 1px solid var(--border); border-radius: 6px; padding: 5px 3px; font-size: 11px; color: var(--text-primary); outline: none; font-family: inherit; -moz-appearance: textfield; }
+  .cap-num:focus { border-color: var(--border-focus); }
+  .del-btn { width: 24px; height: 24px; flex-shrink: 0; display: flex; align-items: center; justify-content: center; border-radius: 5px; border: none; background: transparent; color: var(--text-muted); cursor: pointer; transition: all 0.15s; }
+  .del-btn:hover { background: var(--bg-hover); color: var(--danger); }
+  .del-btn svg { width: 11px; height: 11px; }
+
+  /* buttons */
+  .btn { display: inline-flex; align-items: center; gap: 5px; padding: 5px 11px; border-radius: 6px; font-size: 11px; font-weight: 500; font-family: inherit; cursor: pointer; border: 1px solid var(--btn-border); background: var(--btn-bg); color: var(--btn-text); transition: all 0.15s; white-space: nowrap; flex-shrink: 0; }
+  .btn:hover { background: var(--bg-hover); color: var(--text-primary); }
+  .btn svg { width: 12px; height: 12px; }
+  .btn-primary { background: var(--accent); color: #fff; border-color: var(--accent); }
+  .btn-primary:hover { background: var(--accent-hover); border-color: var(--accent-hover); color: #fff; }
+  .btn-dashed { border-style: dashed; background: transparent; color: var(--text-secondary); }
+  .btn-dashed:hover { border-color: var(--accent); color: var(--accent-hover); background: transparent; }
+
+  .window-footer { display: flex; align-items: center; gap: 8px; padding: 9px 13px; border-top: 1px solid var(--border); background: var(--bg-secondary); }
+  .window-footer .spacer { flex: 1; }
+</style>
+</head>
+<body>
+
+<h1>Download Craft Settings</h1>
+<p class="subtitle">Download Engine page redesign — compact</p>
+
+<div class="theme-toggle">
+  <button class="theme-btn active" onclick="setTheme('dark')">Dark Mode</button>
+  <button class="theme-btn" onclick="setTheme('light')">Light Mode</button>
+</div>
+
+<div class="window">
+  <div class="title-bar">
+    <svg class="icon" viewBox="0 0 24 24" fill="none"><circle cx="12" cy="12" r="10" stroke="#3b82f6" stroke-width="2"/><path d="M8 12l3 3 5-6" stroke="#3b82f6" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg>
+    <span class="title">Download Craft Settings</span>
+    <span class="spacer"></span>
+    <div class="win-btn"><svg width="10" height="10" viewBox="0 0 24 24" fill="none"><path d="M5 12h14" stroke="currentColor" stroke-width="2" stroke-linecap="round"/></svg></div>
+    <div class="win-btn"><svg width="10" height="10" viewBox="0 0 24 24" fill="none"><rect x="5" y="5" width="14" height="14" rx="1" stroke="currentColor" stroke-width="2"/></svg></div>
+    <div class="win-btn"><svg width="10" height="10" viewBox="0 0 24 24" fill="none"><path d="M6 6l12 12M18 6L6 18" stroke="currentColor" stroke-width="2" stroke-linecap="round"/></svg></div>
+  </div>
+
+  <div class="body">
+    <div class="sidebar">
+      <button class="tab" onclick="switchTab(0)"><svg viewBox="0 0 24 24" fill="none"><path d="M4 8V6a2 2 0 012-2h2M16 4h2a2 2 0 012 2v2M20 16v2a2 2 0 01-2 2h-2M8 20H6a2 2 0 01-2-2v-2" stroke="currentColor" stroke-width="2" stroke-linecap="round"/><path d="M9 15a3 3 0 106 0 3 3 0 00-6 0z" stroke="currentColor" stroke-width="2"/></svg>Appearance</button>
+      <button class="tab active" onclick="switchTab(1)"><svg viewBox="0 0 24 24" fill="none"><path d="M13 2L4 14h7l-1 8 9-12h-7l1-8z" stroke="currentColor" stroke-width="2" stroke-linejoin="round"/></svg>Download Engine</button>
+      <button class="tab" onclick="switchTab(2)"><svg viewBox="0 0 24 24" fill="none"><rect x="3" y="3" width="8" height="8" rx="2" stroke="currentColor" stroke-width="2"/><rect x="13" y="3" width="8" height="8" rx="2" stroke="currentColor" stroke-width="2"/><rect x="3" y="13" width="8" height="8" rx="2" stroke="currentColor" stroke-width="2"/><rect x="13" y="13" width="8" height="8" rx="2" stroke="currentColor" stroke-width="2"/></svg>Plugins</button>
+      <button class="tab" onclick="switchTab(3)"><svg viewBox="0 0 24 24" fill="none"><circle cx="12" cy="12" r="9" stroke="currentColor" stroke-width="2"/><path d="M3.6 9h16.8M3.6 15h16.8M12 3a13 13 0 010 18M12 3a13 13 0 000 18" stroke="currentColor" stroke-width="2"/></svg>Browser Integration</button>
+      <button class="tab" onclick="switchTab(4)"><svg viewBox="0 0 24 24" fill="none"><path d="M4 4h6v6H4zM14 4h6v6h-6zM4 14h6v6H4zM14 14h6v6h-6z" stroke="currentColor" stroke-width="2" stroke-linejoin="round"/></svg>Categories &amp; Rules</button>
+      <button class="tab" onclick="switchTab(5)"><svg viewBox="0 0 24 24" fill="none"><path d="M21 12a9 9 0 11-3-6.7" stroke="currentColor" stroke-width="2" stroke-linecap="round"/><path d="M21 3v6h-6" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg>Updates</button>
+    </div>
+
+    <div class="content">
+      <div class="tab-content" id="tab0"><h2>Appearance</h2><p class="page-hint">Not part of this redesign preview.</p></div>
+
+      <!-- ============ DOWNLOAD ENGINE ============ -->
+      <div class="tab-content active" id="tab1">
+        <h2>Download Engine</h2>
+        <p class="page-hint">How downloads are saved, fetched, and finished.</p>
+
+        <!-- Storage -->
+        <div class="card collapsible open">
+          <div class="card-head" onclick="toggleCard(this)"><span class="card-title">Storage</span>
+            <svg class="card-chevron" viewBox="0 0 24 24" fill="none"><path d="M6 9l6 6 6-6" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg>
+          </div>
+          <div class="card-body">
+            <div class="field">
+              <label class="field-label">Save folder</label>
+              <div class="field-control input-row">
+                <input class="input mono" value="C:\Users\moham\Downloads">
+                <button class="icon-btn" title="Browse…"><svg viewBox="0 0 24 24" fill="none"><path d="M3 7l3-4h12l3 4v13H3V7z" stroke="currentColor" stroke-width="1.6" stroke-linejoin="round"/><path d="M3 7h18" stroke="currentColor" stroke-width="1.6"/></svg></button>
+              </div>
+            </div>
+            <div class="check-list">
+              <div class="check-row" onclick="toggleCb(this)"><span class="cb on"><svg viewBox="0 0 24 24" fill="none"><path d="M4 12l5 5L20 6" stroke="currentColor" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"/></svg></span>Sort into category subfolders</div>
+              <div class="check-row" onclick="toggleCb(this)"><span class="cb on"><svg viewBox="0 0 24 24" fill="none"><path d="M4 12l5 5L20 6" stroke="currentColor" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"/></svg></span>Show the “Download complete” dialog</div>
+            </div>
+          </div>
+        </div>
+
+        <!-- Performance -->
+        <div class="card collapsible open">
+          <div class="card-head" onclick="toggleCard(this)"><span class="card-title">Performance</span>
+            <svg class="card-chevron" viewBox="0 0 24 24" fill="none"><path d="M6 9l6 6 6-6" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg>
+          </div>
+          <div class="card-body">
+            <div class="field">
+              <label class="field-label">Default connections</label>
+              <div class="field-control slider-row">
+                <input type="range" class="slider" min="1" max="16" value="8" style="--fill:46.7%">
+                <input type="number" class="num" value="8" min="1" max="16">
+              </div>
+            </div>
+            <div class="field has-hint">
+              <label class="field-label">Speed limit KB/s</label>
+              <div class="field-control slider-row">
+                <input type="range" class="slider" min="0" max="10000" value="0" style="--fill:0%">
+                <input type="number" class="num" value="0" min="0" max="10000">
+              </div>
+              <div class="field-hint">0 = unlimited</div>
+            </div>
+          </div>
+        </div>
+
+        <!-- Network (collapsible) -->
+        <div class="card collapsible open">
+          <div class="card-head" onclick="toggleCard(this)"><span class="card-title">Network</span>
+            <svg class="card-chevron" viewBox="0 0 24 24" fill="none"><path d="M6 9l6 6 6-6" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg>
+          </div>
+          <div class="card-body">
+            <div class="field">
+              <label class="field-label">User-Agent</label>
+              <div class="field-control">
+                <input class="input mono" value="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36">
+              </div>
+            </div>
+            <div class="field">
+              <label class="field-label">Proxy</label>
+              <div class="field-control">
+                <input class="input mono" placeholder="http://host:port (empty = direct)">
+              </div>
+            </div>
+            <div class="field">
+              <label class="field-label">Timeout <span class="card-badge">sec</span></label>
+              <div class="field-control slider-row">
+                <input type="range" class="slider" min="5" max="300" value="60" style="--fill:18.6%">
+                <input type="number" class="num" value="60" min="5" max="300">
+              </div>
+            </div>
+            <div class="field">
+              <label class="field-label">Retries</label>
+              <div class="field-control slider-row">
+                <input type="range" class="slider" min="0" max="20" value="5" style="--fill:25%">
+                <input type="number" class="num" value="5" min="0" max="20">
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <!-- On completion (collapsible) -->
+        <div class="card collapsible open">
+          <div class="card-head" onclick="toggleCard(this)"><span class="card-title">On completion</span>
+            <svg class="card-chevron" viewBox="0 0 24 24" fill="none"><path d="M6 9l6 6 6-6" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg>
+          </div>
+          <div class="card-body">
+            <div class="field has-hint">
+              <label class="field-label">Antivirus command</label>
+              <div class="field-control">
+                <input class="input mono" value='"C:\Program Files\Defender\MpCmdRun.exe" -Scan -ScanType 3 -File (file)'>
+              </div>
+              <div class="field-hint"><code>(file)</code> is replaced with the downloaded file path.</div>
+            </div>
+            <div class="field">
+              <label class="field-label">When a download finishes</label>
+              <div class="field-control">
+                <div class="segmented">
+                  <button class="seg active">nothing</button>
+                  <button class="seg">shutdown</button>
+                  <button class="seg">sleep</button>
+                  <button class="seg">hibernate</button>
+                </div>
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <!-- Speed windows (collapsible) -->
+        <div class="card collapsible open">
+          <div class="card-head" onclick="toggleCard(this)"><span class="card-title">Speed windows</span>
+            <svg class="card-chevron" viewBox="0 0 24 24" fill="none"><path d="M6 9l6 6 6-6" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg>
+          </div>
+          <div class="card-body">
+            <div class="check-row" onclick="toggleCb(this)"><span class="cb on"><svg viewBox="0 0 24 24" fill="none"><path d="M4 12l5 5L20 6" stroke="currentColor" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"/></svg></span>Enable speed windows</div>
+            <div class="field-hint" style="margin:2px 0 8px;">While a window is active its cap overrides the global limit (0 = full speed).</div>
+            <div id="windowList">
+              <div class="window-row">
+                <input class="time-inp" value="02:00">
+                <span class="dash">—</span>
+                <input class="time-inp" value="06:00">
+                <input class="cap-num" value="0">
+                <span class="unit">KB/s</span>
+                <button class="del-btn" title="Remove window" onclick="this.closest('.window-row').remove()"><svg viewBox="0 0 24 24" fill="none"><path d="M6 6l12 12M18 6L6 18" stroke="currentColor" stroke-width="2" stroke-linecap="round"/></svg></button>
+              </div>
+            </div>
+            <button class="btn btn-dashed" onclick="addWindow()"><svg viewBox="0 0 24 24" fill="none"><path d="M12 5v14M5 12h14" stroke="currentColor" stroke-width="2" stroke-linecap="round"/></svg>Add window</button>
+          </div>
+        </div>
+      </div>
+
+      <div class="tab-content" id="tab2"><h2>Plugins</h2><p class="page-hint">Not part of this redesign preview.</p></div>
+      <div class="tab-content" id="tab3"><h2>Browser Integration</h2><p class="page-hint">Not part of this redesign preview.</p></div>
+      <div class="tab-content" id="tab4"><h2>Categories &amp; Rules</h2><p class="page-hint">Not part of this redesign preview.</p></div>
+      <div class="tab-content" id="tab5"><h2>Updates</h2><p class="page-hint">Not part of this redesign preview.</p></div>
+    </div>
+  </div>
+
+  <div class="window-footer">
+    <button class="btn">Save</button>
+    <div class="spacer"></div>
+    <button class="btn">Close</button>
+  </div>
+</div>
+
+<script>
+  function setTheme(t) {
+    document.documentElement.setAttribute('data-theme', t);
+    document.querySelectorAll('.theme-btn').forEach((b, i) => b.classList.toggle('active', (t === 'dark') === (i === 0)));
+    document.querySelectorAll('input[type=range].slider').forEach(paint);
+  }
+  function switchTab(i) {
+    document.querySelectorAll('.sidebar .tab').forEach((t, idx) => t.classList.toggle('active', idx === i));
+    document.querySelectorAll('.tab-content').forEach((c, idx) => c.classList.toggle('active', idx === i));
+    document.querySelectorAll('.tab-content .card.collapsible').forEach(c => c.classList.add('open'));
+    document.querySelectorAll('input[type=range].slider').forEach(paint);
+  }
+  function toggleCard(head) { head.closest('.card').classList.toggle('open'); }
+  function toggleCb(row) { row.querySelector('.cb').classList.toggle('on'); }
+
+  // slider fill + two-way binding with the number box
+  function paint(s) {
+    const pct = ((s.value - s.min) / (s.max - s.min)) * 100;
+    s.style.setProperty('--fill', pct + '%');
+  }
+  document.querySelectorAll('.slider-row').forEach(row => {
+    const range = row.querySelector('.slider');
+    const num = row.querySelector('.num');
+    paint(range);
+    range.addEventListener('input', () => { num.value = range.value; paint(range); });
+    num.addEventListener('input', () => {
+      const v = Math.min(+num.max || Infinity, Math.max(+num.min || 0, +num.value || 0));
+      range.value = v; paint(range);
+    });
+  });
+
+  // segmented controls
+  document.querySelectorAll('.segmented').forEach(seg => {
+    seg.querySelectorAll('.seg').forEach(b => b.addEventListener('click', () => {
+      seg.querySelectorAll('.seg').forEach(x => x.classList.remove('active'));
+      b.classList.add('active');
+    }));
+  });
+
+  // speed windows
+  function addWindow() {
+    const row = document.createElement('div');
+    row.className = 'window-row';
+    row.innerHTML = '<input class="time-inp" value="22:00">' +
+      '<span class="dash">—</span>' +
+      '<input class="time-inp" value="08:00">' +
+      '<input class="cap-num" value="500">' +
+      '<span class="unit">KB/s</span>' +
+      '<button class="del-btn" title="Remove window"><svg viewBox="0 0 24 24" fill="none"><path d="M6 6l12 12M18 6L6 18" stroke="currentColor" stroke-width="2" stroke-linecap="round"/></svg></button>';
+    row.querySelector('.del-btn').addEventListener('click', () => row.remove());
+    document.getElementById('windowList').appendChild(row);
+  }
+</script>
+</body>
+</html>

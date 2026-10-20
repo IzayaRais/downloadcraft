@@ -134,11 +134,20 @@ impl CompleteApp {
         p.text(
             egui::pos2(o.x + SUM_X, o.y + SUM_SUB_Y),
             egui::Align2::LEFT_TOP,
-            format!(
-                "Downloaded {} ({} Bytes)",
-                format_bytes(item.downloaded_bytes),
-                item.downloaded_bytes
-            ),
+            if item.resolution.is_empty() {
+                format!(
+                    "Downloaded {} ({} Bytes)",
+                    format_bytes(item.downloaded_bytes),
+                    item.downloaded_bytes
+                )
+            } else {
+                format!(
+                    "Downloaded {} ({} Bytes) · {}",
+                    format_bytes(item.downloaded_bytes),
+                    item.downloaded_bytes,
+                    item.resolution
+                )
+            },
             reg(11.0),
             pl().cg_dim,
         );
@@ -317,10 +326,12 @@ fn field(p: &egui::Painter, o: egui::Pos2, y: f32, label: &str, value: &str) {
         egui::StrokeKind::Inside,
     );
     let txt = elide_mid(p, value, reg(10.0), r.width() - 2.0 * BOX_PAD);
-    p.text(
+    // The value is a file name or path, so it is drawn shaped.
+    crate::shaped::draw(
+        p,
         egui::pos2(r.min.x + BOX_PAD, r.center().y),
         egui::Align2::LEFT_CENTER,
-        txt,
+        &txt,
         reg(10.0),
         pl().cg_box_txt,
     );

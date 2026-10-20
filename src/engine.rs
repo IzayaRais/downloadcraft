@@ -39,6 +39,11 @@ pub struct SharedState {
     /// audio track, a helper that could not be used, and so on. Never decides
     /// the status.
     pub note: std::sync::Mutex<Option<String>>,
+    /// Resolution of the video that actually got fetched — "1280×720" from the
+    /// helper's chosen format (yt-dlp info fields), or the finished file's own
+    /// frame size read back with ffprobe. Empty while unknown, so the UI can
+    /// show what really landed instead of the browser's guess.
+    pub resolution: std::sync::Mutex<String>,
 }
 
 impl SharedState {
@@ -58,6 +63,7 @@ impl SharedState {
             phase: std::sync::Mutex::new(String::new()),
             error: std::sync::Mutex::new(None),
             note: std::sync::Mutex::new(None),
+            resolution: std::sync::Mutex::new(String::new()),
         }
     }
 
@@ -96,6 +102,28 @@ impl SharedState {
                 *g = Some(e.into());
             }
         }
+    }
+
+    /// Record the real resolution of the fetched video ("1280×720"). Ignored
+    /// when empty so a late unknown never clobbers a known value.
+    pub fn set_resolution(&self, r: impl Into<String>) {
+        let r = r.into();
+        if r.is_empty() {
+            return;
+        }
+        if let Ok(mut g) = self.resolution.lock() {
+            if *g != r {
+                *g = r;
+            }
+        }
+    }
+
+    /// The recorded resolution, or an empty string.
+    pub fn resolution_now(&self) -> String {
+        self.resolution
+            .lock()
+            .map(|g| g.clone())
+            .unwrap_or_else(|e| e.into_inner().clone())
     }
 }
 
@@ -2033,9 +2061,110 @@ fn url_name_stem(u: &str) -> String {
 /// HLS (.m3u8) / DASH (.mpd) playlists in the page body are NOT returned
 /// (the scan stays progressive), but a playlist wrapped in the page URL's
 /// query (?source=...) is unwrapped and returned for the segment router.
+/// Site names and boilerplate that must never become a filename.
+fn is_placeholder_title(t: &str) -> bool {
+    let s = t
+        .trim()
+        .trim_matches(|c: char| c.is_whitespace() || matches!(c, '.' | '-' | '|' | '·'))
+        .to_ascii_lowercase();
+    if s.is_empty() {
+        return true;
+    }
+    if matches!(
+        s.as_str(),
+        "facebook"
+            | "video"
+            | "watch"
+            | "reel"
+            | "reels"
+            | "instagram"
+            | "login"
+            | "log in"
+            | "sign up"
+            | "untitled"
+            | "home"
+    ) {
+        return true;
+    }
+    s.starts_with("see posts, photos and more")
+        || s.starts_with("log in to facebook")
+        || s.starts_with("log into facebook")
+}
+
+/// Facebook/Instagram post pages ("/reel/...", "/watch/?v=...", "/videos/...")
+/// carry only the site name in og:title. The caption the user sees sits in
+/// og:description, and that is the name IDM saves the file as.
+fn is_social_post_page(u: &str) -> bool {
+    let low = u.to_ascii_lowercase();
+    let path = low.split(['?', '#']).next().unwrap_or(&low).to_string();
+    let fb = low.contains("facebook.com") || low.contains("fb.watch");
+    let ig = low.contains("instagram.com");
+    let in_fb = ["/reel", "/watch", "/videos", "/share/", "/r/", "/story"];
+    let in_ig = ["/reel", "/p/", "/tv", "/stories"];
+    (fb && in_fb.iter().any(|p| path.contains(p)))
+        || (ig && in_ig.iter().any(|p| path.contains(p)))
+}
+
+/// og:description is HTML-escaped and often carries site chrome; make it a
+/// plausible file name.
+fn clean_caption_text(s: &str) -> String {
+    let mut t = s
+        .replace("&amp;", "&")
+        .replace("&#039;", "'")
+        .replace("&#39;", "'")
+        .replace("&quot;", "\"")
+        .replace("&nbsp;", " ")
+        .replace(['\r', '\n', '\t'], " ");
+    // "(2) " unread badge in front of the page title
+    if let Some(rest) = t.strip_prefix('(') {
+        if let Some(close) = rest.find(')') {
+            if !rest[..close].is_empty() && rest[..close].chars().all(|c| c.is_ascii_digit()) {
+                t = rest[close + 1..].trim_start().to_string();
+            }
+        }
+    }
+    // Instagram: "12.3K likes, 45 comments - user on January 2: "the caption""
+    if matches!(t.chars().next(), Some(c) if c.is_ascii_digit())
+        && (t.contains(" likes,") || t.contains(" likes "))
+    {
+        if let Some(p) = t.rfind(": \"") {
+            let rest = t[p + 3..].trim_end().trim_end_matches('"').trim();
+            if rest.chars().count() >= 12 {
+                t = rest.to_string();
+            }
+        }
+    }
+    let mut t = t.split_whitespace().collect::<Vec<_>>().join(" ");
+    for tail in [" | Facebook", " - Facebook", " · Facebook"] {
+        if let Some(stripped) = t.strip_suffix(tail) {
+            t = stripped.trim().to_string();
+        }
+    }
+    for tail in ["See more", "See More"] {
+        if let Some(stripped) = t.strip_suffix(tail) {
+            t = stripped.trim().to_string();
+        }
+    }
+    t.trim_end_matches(['.', '…', ' ']).trim().to_string()
+}
+
+/// The caption of a social post page, when it is substantive enough to name a
+/// file (and is not the site's boilerplate description).
+fn social_post_caption(html: &str, page_url: &str) -> Option<String> {
+    if !is_social_post_page(page_url) {
+        return None;
+    }
+    let d = clean_caption_text(&meta_content(html, "og:description").unwrap_or_default());
+    if d.chars().count() < 12 || is_placeholder_title(&d) {
+        return None;
+    }
+    Some(d)
+}
+
 fn resolve_generic(html: &str, page_url: &str) -> Option<(String, String)> {
-    let title = meta_content(html, "og:title")
-        .or_else(|| tag_text(html, "title"))
+    let title = social_post_caption(html, page_url)
+        .or_else(|| meta_content(html, "og:title").filter(|t| !is_placeholder_title(t)))
+        .or_else(|| tag_text(html, "title").filter(|t| !is_placeholder_title(t)))
         .unwrap_or_else(|| "video".to_string());
     // Player wrapper pages (jwplayer/?source=...): the real stream lives in
     // the query, not the body. Prefer that, and name it from the release
@@ -3423,6 +3552,158 @@ pub fn ffmpeg_path() -> Option<std::path::PathBuf> {
     None
 }
 
+/// Locate `ffprobe` (the sibling of the ffmpeg on PATH, or one on PATH
+/// itself). `None` = not available, so the frame size is simply not read back.
+pub fn ffprobe_path() -> Option<std::path::PathBuf> {
+    let names: &[&str] = if cfg!(windows) {
+        &["ffprobe.exe", "ffprobe"]
+    } else {
+        &["ffprobe"]
+    };
+    // Winget/Gyan keep ffmpeg and ffprobe together: prefer the sibling of the
+    // ffmpeg the app already located, then fall back to a PATH search.
+    if let Some(dir) = ffmpeg_path().and_then(|p| p.parent().map(|d| d.to_path_buf())) {
+        for n in names {
+            let cand = dir.join(n);
+            if cand.is_file() {
+                return Some(cand);
+            }
+        }
+    }
+    let Ok(path_var) = std::env::var("PATH") else {
+        return None;
+    };
+    for dir in std::env::split_paths(&path_var) {
+        for n in names {
+            let cand = dir.join(n);
+            if cand.is_file() {
+                return Some(cand);
+            }
+        }
+    }
+    None
+}
+
+/// Codecs ffprobe reports for a *still* picture: a photo, a screenshot, the
+/// cover art in an audio file. A stream with one of these has a frame size but
+/// is not a video, whatever the file is called.
+fn is_still_image_codec(codec: &str) -> bool {
+    matches!(
+        codec.trim().to_ascii_lowercase().as_str(),
+        "mjpeg"
+            | "jpeg"
+            | "jpegls"
+            | "ljpeg"
+            | "png"
+            | "apng"
+            | "gif"
+            | "bmp"
+            | "webp"
+            | "tiff"
+            | "tif"
+            | "jpeg2000"
+            | "jp2"
+            | "ico"
+            | "targa"
+            | "dpx"
+            | "exr"
+            | "psd"
+            | "ppm"
+            | "pgm"
+            | "pbm"
+            | "pam"
+            | "xbm"
+            | "xpm"
+            | "hdr"
+    )
+}
+
+/// Whether a codec name from a media format means "this leg carries video".
+/// `none` is what yt-dlp prints for an audio-only or image format, and `NA` is
+/// what it prints when it cannot tell: neither is a video. A codec that *is* a
+/// still-image one is not a video either, even though ffprobe will happily
+/// decode it.
+fn is_video_codec(codec: &str) -> bool {
+    let c = codec.trim().to_ascii_lowercase();
+    !c.is_empty() && c != "na" && c != "none" && c != "unknown" && !is_still_image_codec(&c)
+}
+
+/// The finished file's own frame size, read back with ffprobe ("1280×720").
+/// This is the ground truth: it covers the paths yt-dlp's info fields cannot
+/// (a direct adaptive capture merged locally) and confirms the merged result.
+///
+/// `None` means "no frames to measure", which is not the same as "unknown".
+/// ffprobe decodes pictures as streams too, so a downloaded photo used to come
+/// back as its pixel size ("558×296") and the row announced a resolution for a
+/// file that has no video in it. The same happens for the cover art embedded in
+/// an MP3 (a stream flagged `attached_pic`). The probe therefore reads the
+/// codec and the frame count as well, and only a stream that is not an attached
+/// picture, not a still-image codec and not a single frame counts as video.
+pub async fn ffprobe_resolution(video: &std::path::Path) -> Option<String> {
+    let exe = ffprobe_path()?;
+    let mut cmd = tokio::process::Command::new(exe);
+    #[cfg(windows)]
+    {
+        // No console flash for the helper process.
+        const CREATE_NO_WINDOW: u32 = 0x08000000;
+        cmd.creation_flags(CREATE_NO_WINDOW);
+    }
+    cmd.args([
+        "-v",
+        "error",
+        "-select_streams",
+        "v:0",
+        "-show_entries",
+        "stream=codec_name,width,height,nb_frames:stream_disposition=attached_pic",
+        "-of",
+        "json",
+    ])
+    .arg(video)
+    .stdin(std::process::Stdio::null())
+    .stdout(std::process::Stdio::piped())
+    .stderr(std::process::Stdio::null());
+    let out = tokio::time::timeout(std::time::Duration::from_secs(20), cmd.output())
+        .await
+        .ok()?
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    resolution_from_ffprobe(&String::from_utf8_lossy(&out.stdout))
+}
+
+/// The decision half of [`ffprobe_resolution`]: read one ffprobe JSON answer
+/// (`-of json`) and return the frame size only when the stream really is video.
+/// Split out so the rule can be tested without an ffprobe on the machine.
+fn resolution_from_ffprobe(json: &str) -> Option<String> {
+    let v: serde_json::Value = serde_json::from_str(json).ok()?;
+    let s = v.get("streams")?.as_array()?.first()?;
+    // Cover art: a picture riding along in an audio file.
+    if s.get("disposition")
+        .and_then(|d| d.get("attached_pic"))
+        .and_then(|x| x.as_u64())
+        == Some(1)
+    {
+        return None;
+    }
+    if let Some(codec) = s.get("codec_name").and_then(|x| x.as_str()) {
+        if is_still_image_codec(codec) {
+            return None;
+        }
+    }
+    // One frame is a picture. (ffprobe omits `nb_frames` for many image
+    // codecs — the codec check above is what catches those.)
+    if s.get("nb_frames")
+        .and_then(|x| x.as_str())
+        .and_then(|x| x.trim().parse::<u64>().ok())
+        == Some(1)
+    {
+        return None;
+    }
+    let num = |k: &str| s.get(k).and_then(|x| x.as_f64());
+    resolution_label(num("width"), num("height"))
+}
+
 /// Mux downloaded video (+ optional audio) streams into one file without
 /// re-encoding (`-c copy`). Used for adaptive video-only + audio pairs and
 /// DASH representations — the same job IDM's merger does.
@@ -3509,6 +3790,53 @@ fn ytdlp_local_path() -> Option<std::path::PathBuf> {
     Some(base.join("download_craft").join("bin").join(YTDLP_BIN))
 }
 
+/// How the user wants yt-dlp sourced: a copy they picked, whatever is on
+/// PATH, or the copy this app fetches and keeps current.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum YtdlpSource {
+    Managed,
+    Path,
+    Custom,
+}
+
+impl Default for YtdlpSource {
+    fn default() -> Self {
+        // Matches `Settings::default()`: the app's own managed copy.
+        YtdlpSource::Managed
+    }
+}
+
+impl YtdlpSource {
+    fn from_settings() -> Self {
+        match crate::model::ui_pref_str("ytdlp_source", "").as_str() {
+            "managed" => YtdlpSource::Managed,
+            "path" => YtdlpSource::Path,
+            "custom" => YtdlpSource::Custom,
+            // Installs that predate the three-way choice only had the
+            // "Prefer PATH yt-dlp" checkbox. Without that flag written, the
+            // app's own copy is the default.
+            _ => {
+                if crate::model::ui_pref_bool("ytdlp_prefer_path", false) {
+                    YtdlpSource::Path
+                } else {
+                    YtdlpSource::Managed
+                }
+            }
+        }
+    }
+}
+
+/// The user's own yt-dlp, when they picked one *and* it is still on disk.
+fn ytdlp_custom_path() -> Option<std::path::PathBuf> {
+    let raw = crate::model::ui_pref_str("ytdlp_custom_path", "");
+    let raw = raw.trim();
+    if raw.is_empty() {
+        return None;
+    }
+    let p = std::path::PathBuf::from(raw);
+    p.is_file().then_some(p)
+}
+
 /// The JS runtime yt-dlp needs to solve YouTube's player challenges. Only
 /// deno is enabled by default, while node is far more commonly installed —
 /// without one, extraction fails outright on many videos with yt-dlp's
@@ -3557,11 +3885,22 @@ fn ytdlp_preferred(opts: &EngineOpts) -> bool {
 /// `Err` means nothing is available and the caller should stay with the
 /// built-in engine.
 async fn ensure_ytdlp(client: &reqwest::Client) -> Result<std::path::PathBuf> {
-    // Settings can pin the app to its own copy instead of whatever is on PATH.
-    if crate::model::ui_pref_bool("ytdlp_prefer_path", true) {
-        if let Some(p) = ytdlp_on_path() {
-            return Ok(p);
+    match YtdlpSource::from_settings() {
+        // A pick the user made themselves wins for as long as it is on disk;
+        // if it has since been deleted we fall through to a copy that works.
+        YtdlpSource::Custom => {
+            if let Some(p) = ytdlp_custom_path() {
+                return Ok(p);
+            }
         }
+        // Settings can pin the app to a PATH copy instead of its own.
+        YtdlpSource::Path => {
+            if let Some(p) = ytdlp_on_path() {
+                return Ok(p);
+            }
+        }
+        // "App's own copy": whatever else is on PATH is deliberately ignored.
+        YtdlpSource::Managed => {}
     }
     let dst = ytdlp_local_path().ok_or_else(|| anyhow!("no LOCALAPPDATA to keep yt-dlp in"))?;
     if dst.is_file() && !ytdlp_stale(&dst).await {
@@ -3619,10 +3958,33 @@ pub struct YtdlpInfo {
     pub stale: bool,
     /// A copy found on PATH (the app never touches that one).
     pub on_path: Option<std::path::PathBuf>,
-    /// Preference: use the PATH copy when there is one.
-    pub prefer_path: bool,
     /// JS runtime yt-dlp will be told about, if any.
     pub js_runtime: Option<String>,
+    /// The picked custom executable is set *and* still on disk.
+    pub custom_ok: bool,
+}
+
+/// What Settings shows about ffmpeg: yt-dlp needs it to merge separate video
+/// and audio streams, which is every YouTube quality above 360p.
+#[derive(Debug, Clone, Default)]
+pub struct FfmpegInfo {
+    pub path: Option<std::path::PathBuf>,
+    pub version: Option<String>,
+    pub size: Option<u64>,
+}
+
+impl FfmpegInfo {
+    /// A short line for the card's identity row.
+    pub fn meta(&self) -> String {
+        if self.path.is_none() {
+            return "not installed".to_string();
+        }
+        let mut bits = vec!["on PATH".to_string()];
+        if let Some(sz) = self.size {
+            bits.push(crate::model::format_bytes(sz));
+        }
+        bits.join(" · ")
+    }
 }
 
 /// Where the app keeps its own yt-dlp (the folder Settings can open).
@@ -3655,14 +4017,31 @@ fn ytdlp_version(exe: &std::path::Path) -> Option<String> {
 /// Snapshot for the Settings window. Blocking (it runs the helper to ask its
 /// version): call it from a worker thread.
 pub fn ytdlp_info() -> YtdlpInfo {
-    let prefer_path = crate::model::ui_pref_bool("ytdlp_prefer_path", true);
+    let source = YtdlpSource::from_settings();
     let on_path = ytdlp_on_path();
     let local = ytdlp_local_path();
+    let custom = ytdlp_custom_path();
     let managed_present = local.as_deref().map(|p| p.is_file()).unwrap_or(false);
-    let (path, managed) = match (&on_path, prefer_path) {
-        (Some(p), true) => (Some(p.clone()), false),
-        _ if managed_present => (local.clone(), true),
-        _ => (on_path.clone(), false),
+    // Same order `ensure_ytdlp` uses, so what Settings shows is what a
+    // YouTube download would really run.
+    let (path, managed) = match source {
+        YtdlpSource::Custom => match &custom {
+            Some(p) => (Some(p.clone()), false),
+            None if managed_present => (local.clone(), true),
+            None => (on_path.clone(), false),
+        },
+        YtdlpSource::Path => match &on_path {
+            Some(p) => (Some(p.clone()), false),
+            _ if managed_present => (local.clone(), true),
+            _ => (None, false),
+        },
+        YtdlpSource::Managed => {
+            if managed_present {
+                (local.clone(), true)
+            } else {
+                (on_path.clone(), false)
+            }
+        }
     };
     let meta = path.as_deref().and_then(|p| std::fs::metadata(p).ok());
     let stale = match (managed, local.as_deref()) {
@@ -3679,9 +4058,50 @@ pub fn ytdlp_info() -> YtdlpInfo {
         managed,
         stale,
         on_path,
-        prefer_path,
         js_runtime: js_runtime().map(str::to_string),
+        custom_ok: custom.is_some(),
     }
+}
+
+/// Where the app's own copy lives, for the "App's own copy" line in Settings.
+pub fn ytdlp_managed_path() -> Option<std::path::PathBuf> {
+    ytdlp_local_path()
+}
+
+/// ffmpeg, if there is one on PATH. Blocking (it runs `ffmpeg -version` to
+/// learn the version): call it from a worker thread.
+pub fn ffmpeg_info() -> FfmpegInfo {
+    let path = ffmpeg_path();
+    let version = path.as_deref().and_then(ffmpeg_version);
+    let size = path
+        .as_deref()
+        .and_then(|p| std::fs::metadata(p).ok())
+        .map(|m| m.len());
+    FfmpegInfo { path, version, size }
+}
+
+/// `ffmpeg -version` opens with "ffmpeg version 7.1-full_build-www.gyan.dev
+/// Copyright (c) …": the release build around the word "version".
+fn ffmpeg_version(exe: &std::path::Path) -> Option<String> {
+    let mut cmd = std::process::Command::new(exe);
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x08000000;
+        cmd.creation_flags(CREATE_NO_WINDOW);
+    }
+    let out = cmd.arg("-version").output().ok()?;
+    let text = String::from_utf8_lossy(&out.stdout);
+    let first = text.lines().next()?.trim();
+    let mut words = first.split_whitespace();
+    if words.next()? != "ffmpeg" {
+        return None;
+    }
+    if words.next()? != "version" {
+        return None;
+    }
+    let v = words.next()?.to_string();
+    (!v.is_empty()).then_some(v)
 }
 
 /// Replace the app's own copy of yt-dlp now — the Settings "Re-download"
@@ -3743,15 +4163,38 @@ async fn write_cookie_jar(cookie: &str, domain: &str) -> Option<std::path::PathB
     Some(path)
 }
 
-/// yt-dlp format expression for a menu preference: best video+audio at or
-/// below the asked height, mp4/m4a first so the merge stays a plain mp4.
-fn ytdlp_format(pref: &str) -> String {
-    match quality_cap(pref) {
-        Some(h) => format!(
-            "bv*[height<={h}][ext=mp4]+ba[ext=m4a]/bv*[height<={h}]+ba/b[height<={h}]/bv*+ba/b"
+/// yt-dlp format expression for a menu preference: the best video at or below
+/// the asked height plus the best audio, merged to mp4 by
+/// `--merge-output-format`.
+///
+/// **Quality comes before the container, deliberately.** Asking for
+/// `bv*[height<=720][ext=mp4]` first meant that on an upload whose 720p exists
+/// only as VP9 - which is most modern YouTube uploads - that tier had no match
+/// at 720p and yt-dlp took the best *mp4* stream instead: 360p. A "720p" pick
+/// quietly downloaded 360p. Remuxing VP9/AV1 into mp4 costs nothing and keeps
+/// the resolution the user asked for.
+///
+/// `can_merge` (is there an ffmpeg?) picks the strategy: with ffmpeg the
+/// adaptive video+audio legs are merged; without one, asking for a merge only
+/// makes yt-dlp write two unplayable files, so the cap moves to the best
+/// *muxed* format at or below it - the highest quality a single file can be.
+///
+/// The audio tier prefers m4a: the merge output is mp4, and Opus in mp4 is the
+/// one combination players still object to.
+fn ytdlp_format_with(pref: &str, can_merge: bool) -> String {
+    match (quality_cap(pref), can_merge) {
+        (Some(h), true) => format!(
+            "bv*[height<={h}]+ba[ext=m4a]/bv*[height<={h}]+ba/b[height<={h}]/bv*+ba/b"
         ),
-        None => "bv*[ext=mp4]+ba[ext=m4a]/bv*+ba/b".to_string(),
+        (Some(h), false) => format!("b[height<={h}]/b"),
+        (None, true) => "bv*+ba[ext=m4a]/bv*+ba/b".to_string(),
+        (None, false) => "b".to_string(),
     }
+}
+
+/// [`ytdlp_format_with`] with the merge capability of this machine.
+fn ytdlp_format(pref: &str) -> String {
+    ytdlp_format_with(pref, ffmpeg_path().is_some())
 }
 
 /// Hand a YouTube link to yt-dlp: it speaks the browser-only SABR protocol
@@ -3766,14 +4209,22 @@ fn ytdlp_format(pref: &str) -> String {
 /// ran at full speed: the line `@1024/NA` never matched `download:@`.
 const PROGRESS_MARK: &str = "dcp@";
 
-/// The `--progress-template` value: `bytes done | size | size estimate | rate`.
+/// The `--progress-template` value: `bytes done | size | size estimate | rate`
+/// plus the chosen format's own info fields (`height | width | format id |
+/// video codec`), so the app can report the resolution actually being fetched
+/// instead of the browser's guess.
+///
+/// The codec is part of it because a frame size is not a resolution: a photo
+/// post's format carries the picture's pixel size in the same fields a video
+/// uses, and an audio leg carries none at all. Only a leg with a real video
+/// codec has a resolution to report.
 ///
 /// `total_bytes` is `NA` until the response headers are in, and stays `NA`
 /// forever for some formats (DASH/HLS fragments), which is what the estimate
 /// covers.
 fn ytdlp_progress_template() -> String {
     format!(
-        "download:{PROGRESS_MARK}%(progress.downloaded_bytes)s|%(progress.total_bytes)s|%(progress.total_bytes_estimate)s|%(progress.speed)s"
+        "download:{PROGRESS_MARK}%(progress.downloaded_bytes)s|%(progress.total_bytes)s|%(progress.total_bytes_estimate)s|%(progress.speed)s|%(info.height)s|%(info.width)s|%(info.format_id)s|%(info.vcodec)s"
     )
 }
 
@@ -3784,6 +4235,14 @@ struct YtdlpProgress {
     total: Option<f64>,
     estimate: Option<f64>,
     speed: Option<f64>,
+    /// Frame height of the format being downloaded (NA for an audio-only leg).
+    height: Option<f64>,
+    /// Frame width, same caveat.
+    width: Option<f64>,
+    /// Whether this leg carries real video. False for an audio-only leg, for a
+    /// photo format (which has a frame size but no video) and when yt-dlp
+    /// cannot say. Only a video leg has a resolution to show.
+    video: bool,
 }
 
 /// Read a progress line, or `None` when this line is not one.
@@ -3793,12 +4252,38 @@ fn parse_progress_line(line: &str) -> Option<YtdlpProgress> {
     let at = line.find(PROGRESS_MARK)?;
     let mut field = line[at + PROGRESS_MARK.len()..].split('|');
     let num = |v: Option<&str>| v.map(str::trim).and_then(|v| v.parse::<f64>().ok());
-    Some(YtdlpProgress {
+    let p = YtdlpProgress {
         done: num(field.next()),
         total: num(field.next()),
         estimate: num(field.next()),
         speed: num(field.next()),
-    })
+        height: num(field.next()),
+        width: num(field.next()),
+        // The format id is not used by the row; the codec after it decides
+        // whether the frame size means anything.
+        video: field.next().is_some() && field.next().map(is_video_codec).unwrap_or(false),
+    };
+    Some(p)
+}
+
+/// "1280×720" when both sides are known, else "720p" from the height alone.
+/// `None` when neither is usable (audio-only leg, or `NA`).
+fn resolution_label(width: Option<f64>, height: Option<f64>) -> Option<String> {
+    let positive = |v: Option<f64>| v.filter(|n| *n >= 64.0 && *n <= 8640.0).map(|n| n as u64);
+    let w = positive(width);
+    let h = positive(height);
+    match (w, h) {
+        (Some(w), Some(h)) => Some(format!("{w}×{h}")),
+        (None, Some(h)) => Some(format!("{h}p")),
+        _ => None,
+    }
+}
+
+/// The height inside a [`resolution_label`] string ("1280×720" → 720,
+/// "720p" → 720, anything else → `None`).
+fn resolution_height(label: &str) -> Option<u64> {
+    let tail = label.rsplit_once('×').map(|(_, h)| h).unwrap_or(label);
+    tail.trim_end_matches('p').trim().parse::<u64>().ok()
 }
 
 /// Folds the progress lines of a *merged* helper download into the numbers the
@@ -3900,6 +4385,9 @@ async fn download_with_ytdlp(
         const CREATE_NO_WINDOW: u32 = 0x08000000;
         cmd.creation_flags(CREATE_NO_WINDOW);
     }
+    // One lookup decides both the selector and whether yt-dlp may ask for a
+    // merge at all (no ffmpeg = only a single muxed file can be delivered).
+    let merge_ffmpeg = ffmpeg_path();
     cmd.arg("--no-playlist")
         .arg("--no-warnings")
         .arg("--newline")
@@ -3914,10 +4402,10 @@ async fn download_with_ytdlp(
         .arg("--merge-output-format")
         .arg("mp4")
         .arg("-f")
-        .arg(ytdlp_format(&opts.quality_pref))
+        .arg(ytdlp_format_with(&opts.quality_pref, merge_ffmpeg.is_some()))
         .arg("-o")
         .arg(dest);
-    if let Some(ff) = ffmpeg_path() {
+    if let Some(ff) = &merge_ffmpeg {
         cmd.arg("--ffmpeg-location").arg(ff);
     }
     // Without a JS runtime yt-dlp cannot solve YouTube's player challenges:
@@ -3973,6 +4461,17 @@ async fn download_with_ytdlp(
             if p.done.is_some() || p.speed.is_some() {
                 progress.set_phase("Downloading");
             }
+            // The format yt-dlp picked names its own frame size, so the row can
+            // report the resolution that really arrived rather than the menu
+            // pick (a cap the video cannot meet, e.g. 720p on a 360p upload,
+            // would otherwise look like the choice was honoured). A frame size
+            // is not a resolution though: a photo post's format has one too,
+            // which is how a downloaded picture ended up claiming a resolution.
+            if p.video {
+                if let Some(r) = resolution_label(p.width, p.height) {
+                    progress.set_resolution(r);
+                }
+            }
             let (downloaded, total) = folded.step(&p);
             progress.downloaded.store(downloaded, Ordering::SeqCst);
             match total {
@@ -4021,11 +4520,20 @@ async fn download_with_ytdlp(
     let status = finish?;
     if !status.success() {
         // yt-dlp's own words are far more useful than an exit code.
-        let msg = if err_tail.trim().is_empty() {
+        let mut msg = if err_tail.trim().is_empty() {
             format!("yt-dlp exited with {status}")
         } else {
             format!("yt-dlp exited with {status}: {}", err_tail.trim())
         };
+        // Without ffmpeg the selector is restricted to a single muxed file, and
+        // many videos no longer publish one above 360p at all - yt-dlp then
+        // says only "Requested format is not available", which reads like a
+        // broken link. Say what actually helps.
+        if merge_ffmpeg.is_none() {
+            msg.push_str(
+                " (this video has no single-file format at the quality you asked for - install ffmpeg to merge video+audio: Settings \u{25b8} Plugins \u{25b8} ffmpeg)",
+            );
+        }
         return Err(anyhow!(msg));
     }
     // It can still land the file under a different container extension.
@@ -4054,6 +4562,21 @@ async fn download_with_ytdlp(
     shared.downloaded.store(len, Ordering::SeqCst);
     shared.total.store(len, Ordering::SeqCst);
     shared.has_total.store(true, Ordering::SeqCst);
+    // The file on disk is the ground truth: read its frame size back and, when
+    // the video could not meet the menu cap, say so instead of letting a
+    // 360p result pass for the 720p the user asked for.
+    if let Some(r) = ffprobe_resolution(&dest).await {
+        if let Some(asked) = quality_cap(&opts.quality_pref) {
+            if let Some(got) = resolution_height(&r) {
+                if got < asked {
+                    shared.set_note(format!(
+                        "the source tops out at {got}p here — {asked}p was requested but is not available for this video"
+                    ));
+                }
+            }
+        }
+        shared.set_resolution(r);
+    }
     Ok(())
 }
 
@@ -4324,6 +4847,20 @@ pub async fn download_adaptive(
     let final_len = tokio::fs::metadata(&dest).await.map(|m| m.len()).unwrap_or(0);
     shared.total.store(final_len, Ordering::SeqCst);
     shared.has_total.store(true, Ordering::SeqCst);
+    // Ground truth for the merged result (the captured leg may have been
+    // video-only, so nothing else names the frame size on this path).
+    if let Some(r) = ffprobe_resolution(&dest).await {
+        if let Some(asked) = quality_cap(&opts.quality_pref) {
+            if let Some(got) = resolution_height(&r) {
+                if got < asked {
+                    shared.set_note(format!(
+                        "the source tops out at {got}p here — {asked}p was requested but is not available for this video"
+                    ));
+                }
+            }
+        }
+        shared.set_resolution(r);
+    }
     if !opts.expected_sha256.trim().is_empty() {
         if let Err(e) = verify_checksum(&dest, &opts.expected_sha256).await {
             let _ = tokio::fs::remove_file(&dest).await;
@@ -6043,12 +6580,45 @@ mod tests {
         assert_eq!(p.total, Some(20480000.0));
         assert_eq!(p.estimate, None);
         assert!(p.speed.unwrap() > 300_000.0);
+        assert_eq!(p.height, None);
+        assert_eq!(p.width, None);
+        assert!(!p.video);
+        // Captured live: the template now also carries the chosen format's
+        // frame size and video codec, so the row can show the resolution that
+        // really arrived.
+        let q = parse_progress_line("dcp@731403|731403|NA|153588.99|720|1280|398+140|h264").unwrap();
+        assert_eq!(q.height, Some(720.0));
+        assert_eq!(q.width, Some(1280.0));
+        assert!(q.video);
+        assert_eq!(resolution_label(q.width, q.height).as_deref(), Some("1280×720"));
+        // A photo format carries the picture's pixel size in the very same
+        // fields, and yt-dlp prints `none` for its codec: that is not a video,
+        // so there is no resolution to report even though 1080×1080 is there.
+        let photo = parse_progress_line("dcp@5|10|NA|1|1080|1080|jpg|none").unwrap();
+        assert_eq!(photo.height, Some(1080.0));
+        assert!(!photo.video);
+        // An audio-only leg has no frame size: it must not invent one, and a
+        // width with no height is not a resolution either.
+        let a = parse_progress_line("dcp@5|10|NA|1|NA|NA|140|none").unwrap();
+        assert!(!a.video);
+        assert_eq!(resolution_label(a.width, a.height), None);
+        assert_eq!(resolution_label(Some(1280.0), None), None);
+        assert_eq!(resolution_label(None, Some(480.0)).as_deref(), Some("480p"));
+        // Garbage values are rejected, not surfaced as a bogus number.
+        assert_eq!(resolution_label(Some(0.0), Some(0.0)), None);
+        assert_eq!(resolution_label(Some(99999.0), Some(99999.0)), None);
+        assert_eq!(resolution_height("1280×720"), Some(720));
+        assert_eq!(resolution_height("720p"), Some(720));
+        assert_eq!(resolution_height("-"), None);
         // The marker has to be part of the *template*, since the type prefix
         // never reaches stdout.
         let tpl = ytdlp_progress_template();
         assert!(tpl.starts_with("download:"));
         assert!(tpl.contains(PROGRESS_MARK));
         assert!(tpl.contains("%(progress.downloaded_bytes)s"));
+        assert!(tpl.contains("%(info.height)s"));
+        assert!(tpl.contains("%(info.width)s"));
+        assert!(tpl.contains("%(info.vcodec)s"));
         // Other lines are ignored, a leading CR is tolerated, and `NA` fields
         // simply stay unknown instead of zeroing the counters.
         assert!(parse_progress_line("[download] Destination: x.mp4").is_none());
@@ -6056,6 +6626,50 @@ mod tests {
         let estimate_only = parse_progress_line("dcp@7|NA|900|NA").unwrap();
         assert_eq!(estimate_only.total, None);
         assert_eq!(estimate_only.estimate, Some(900.0));
+    }
+
+    #[test]
+    fn a_decoded_picture_is_not_a_video() {
+        // Live ffprobe answers (`-of json`). ffprobe decodes pictures as
+        // streams, so every one of these used to come back as a frame size —
+        // which is how a downloaded photo announced a resolution it has not
+        // got, and how an MP3's cover art became one.
+        let photo = r#"{"streams":[{"codec_name":"mjpeg","width":558,"height":296,"avg_frame_rate":"25/1","disposition":{"attached_pic":0}}]}"#;
+        assert_eq!(resolution_from_ffprobe(photo), None);
+        // Cover art inside an audio file: the stream is flagged.
+        let cover = r#"{"streams":[{"codec_name":"mjpeg","width":320,"height":240,"avg_frame_rate":"0/0","disposition":{"attached_pic":1}}]}"#;
+        assert_eq!(resolution_from_ffprobe(cover), None);
+        // A PNG screenshot: image codec and a single frame.
+        let shot = r#"{"streams":[{"codec_name":"png","width":1920,"height":1080,"nb_frames":"1","disposition":{"attached_pic":0}}]}"#;
+        assert_eq!(resolution_from_ffprobe(shot), None);
+        // An animated GIF has many frames; the codec is what rejects it.
+        let gif = r#"{"streams":[{"codec_name":"gif","width":480,"height":270,"nb_frames":"120","disposition":{"attached_pic":0}}]}"#;
+        assert_eq!(resolution_from_ffprobe(gif), None);
+        // A single frame is a picture, not a video.
+        let one = r#"{"streams":[{"codec_name":"h264","width":640,"height":360,"nb_frames":"1","disposition":{"attached_pic":0}}]}"#;
+        assert_eq!(resolution_from_ffprobe(one), None);
+        // A real video: live answer for a 640×360 H.264 MP4.
+        let clip = r#"{"streams":[{"codec_name":"h264","width":640,"height":360,"avg_frame_rate":"25/1","nb_frames":"50","disposition":{"attached_pic":0}}]}"#;
+        assert_eq!(resolution_from_ffprobe(clip).as_deref(), Some("640×360"));
+        // A file with no readable media (a ZIP) reports an empty answer.
+        assert_eq!(resolution_from_ffprobe("{}"), None);
+        assert_eq!(resolution_from_ffprobe(""), None);
+        // A width with no height is still not a resolution.
+        let half = r#"{"streams":[{"codec_name":"h264","width":640,"disposition":{"attached_pic":0}}]}"#;
+        assert_eq!(resolution_from_ffprobe(half), None);
+        // The codec rule on its own: audio-only, unreadable and picture codecs
+        // are not video; the ones a real stream uses are.
+        assert!(!is_video_codec("none"));
+        assert!(!is_video_codec("NA"));
+        assert!(!is_video_codec("unknown"));
+        assert!(!is_video_codec(""));
+        assert!(!is_video_codec("mjpeg"));
+        assert!(!is_video_codec("PNG"));
+        assert!(!is_video_codec("webp"));
+        assert!(is_video_codec("h264"));
+        assert!(is_video_codec("vp9"));
+        assert!(is_video_codec("av01"));
+        assert!(is_video_codec("hevc"));
     }
 
     #[test]
@@ -6393,6 +7007,37 @@ mod tests {
         )
         .expect("bare link");
         assert_eq!(bare.0, "https://cdn.example/files/a.mkv");
+    }
+
+    #[test]
+    fn social_captions_name_the_file() {
+        // Placeholder page names are never filenames.
+        assert!(is_placeholder_title("Facebook"));
+        assert!(is_placeholder_title("  facebook. "));
+        assert!(is_placeholder_title("See posts, photos and more on Facebook."));
+        assert!(!is_placeholder_title("Smrity's Home Diary"));
+
+        // A Facebook reel: og:title is only the site name, og:description is
+        // the caption — the name IDM saves the file under.
+        let reel = r#"<html><head><meta property="og:title" content="Facebook"><meta property="og:description" content="Ei caption ta file name hobe | Facebook"><meta property="og:video:url" content="https://video.xx.fbcdn.net/v/a.mp4"></head></html>"#;
+        let hit = resolve_generic(reel, "https://www.facebook.com/reel/123456").expect("reel");
+        assert_eq!(hit.0, "https://video.xx.fbcdn.net/v/a.mp4");
+        assert_eq!(hit.1, "Ei caption ta file name hobe.mp4");
+
+        // Instagram's og:description is a likes/comments preamble + caption.
+        let ig = r#"<meta property="og:description" content="12.3K likes, 45 comments - someone on January 2, 2026: &amp;quot;the reel caption here&amp;quot;"><meta property="og:video" content="https://cdn.example/r.mp4">"#;
+        let ig_hit = resolve_generic(ig, "https://www.instagram.com/reel/abc/").expect("ig");
+        assert_eq!(ig_hit.1, "the reel caption here.mp4");
+
+        // A plain page with a description keeps using its title.
+        let plain = r#"<meta property="og:title" content="Cool Clip"><meta property="og:description" content="Some marketing blurb for the clip"><meta property="og:video:url" content="https://cdn.example/v.mp4">"#;
+        let plain_hit = resolve_generic(plain, "https://example.com/p").expect("plain");
+        assert_eq!(plain_hit.1, "Cool Clip.mp4");
+
+        // No caption and a placeholder title: never "Facebook.mp4".
+        let bare = r#"<meta property="og:title" content="Facebook"><meta property="og:video:url" content="https://video.xx.fbcdn.net/v/b.mp4">"#;
+        let bare_hit = resolve_generic(bare, "https://www.facebook.com/watch/?v=9").expect("bare");
+        assert_eq!(bare_hit.1, "video.mp4");
     }
 
     #[test]
@@ -7272,10 +7917,33 @@ mod tests {
         assert_eq!(quality_cap("1080p60"), Some(1080));
         assert_eq!(quality_cap("720p"), Some(720));
         assert_eq!(quality_cap(" 480p "), Some(480));
+        // The Facebook panel's own labels ("720p HD") and the extension's
+        // ladder fallback ("1080p") must both parse to a cap, or the clicked
+        // row is silently ignored and yt-dlp downloads "best" instead.
+        assert_eq!(quality_cap("720p HD"), Some(720));
+        assert_eq!(quality_cap("1080p HD"), Some(1080));
         assert_eq!(quality_cap(""), None);
         assert_eq!(quality_cap("HD"), None);
+        assert_eq!(quality_cap("SD"), None);
         assert_eq!(quality_cap("100p"), None);
         assert_eq!(quality_cap("5000p"), None);
+        // The selector keeps the cap and the muxed fallback, so a working
+        // machine with ffmpeg still lands the merged 720p mp4 - and quality
+        // leads, so a 720p pick can never fall back to a 360p mp4 stream.
+        // (Live-checked against yt-dlp: 720p -> 398+140, 1080p -> 616+140,
+        // 480p -> 397+140, every one at the asked height.)
+        let f = ytdlp_format_with("720p", true);
+        assert!(f.starts_with("bv*[height<=720]+ba[ext=m4a]"), "{f}");
+        assert!(f.contains("b[height<=720]"), "{f}");
+        assert_eq!(ytdlp_format_with("720p", false), "b[height<=720]/b");
+        assert_eq!(ytdlp_format_with("", true), "bv*+ba[ext=m4a]/bv*+ba/b");
+        assert_eq!(ytdlp_format_with("", false), "b");
+        // Whatever this machine has, the string is one of the two strategies.
+        let live = ytdlp_format("720p");
+        assert!(
+            live.starts_with("bv*[height<=720]+ba[ext=m4a]") || live == "b[height<=720]/b",
+            "{live}"
+        );
         // No cap: higher always wins.
         assert!(better_stream(&None, 360, None));
         assert!(better_stream(&Some((360, String::new())), 720, None));

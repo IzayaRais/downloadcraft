@@ -1,6 +1,6 @@
 # Download Craft
 
-![Download Craft main window](Screenshot.png)
+![Download Craft main window](docs/screenshot-main-window.png)
 
 A lightweight, offline-first download manager for Windows, written in pure
 Rust with an `egui` GUI. Multi-connection segmented HTTP(S) downloads,
@@ -64,7 +64,9 @@ subtitle tracks and audio-only files, sent straight to the app:
 - Status sidebar with live counts, search, sortable/resizable columns,
   toolbar bulk actions (Resume / Stop / Stop All / Delete), a per-segment
   progress view, and System / Dark / Light themes.
-- File names render in any script (Bangla, Arabic, CJK, …) instead of boxes.
+- File names render in any script (Bangla, Arabic, CJK, …) instead of boxes;
+  the Indic scripts (Bengali, Devanagari, Tamil, …) are shaped properly —
+  conjuncts and matra reordering — not drawn one codepoint at a time.
 - CLI (`add/list/download/get/remove/redownload/clear/import/export/status`)
   and browser native-messaging host (Chrome/Edge/Firefox) sharing
   `%APPDATA%\download_craft\queue.json`.

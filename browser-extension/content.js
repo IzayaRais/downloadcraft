@@ -7,7 +7,12 @@
   // Must match manifest version + background.js EXT_VER. The background
   // rejects messages from any other version with a "reload this tab"
   // error, so a stale script can never fail mysteriously.
-  const EXT_VER = "0.9.5";
+  const EXT_VER = "0.9.6";
+  // Promise-style calls (the `await api.*` one below) go through this handle
+  // so one file serves both engines: Firefox exposes the promise-returning
+  // `browser` namespace, Chrome only has `chrome` (promise-capable under MV3).
+  // Callback-style calls keep using `chrome`, which Firefox also provides.
+  const api = (typeof browser !== "undefined" && browser.runtime) ? browser : chrome;
   // Generation guard: when the worker re-injects this script (after an
   // update), older live instances must go quiet instead of fighting over
   // the button. The newest instance always wins.
@@ -522,9 +527,11 @@
       return c ? fbUnescape(c) : "";
     } catch (e) { return ""; }
   }
-  // Thumbnails: Facebook reel pages often omit og:image, which left the
-  // sender panel showing the gradient placeholder. Try the player's own
-  // poster and the page JSON thumbnail keys first, then og:image.
+  // Thumbnails: a reel page often has no og:image, and after an SPA
+  // navigation the embedded JSON still describes the page that loaded first —
+  // that left the sender panel on the gradient placeholder. The live player
+  // is the reliable source, so candidates are collected with a source weight
+  // and ranked by fbPickThumb (pure, unit-tested).
   function fbJsonUrlNear(html, key) {
     const p = String(html || "").indexOf('"' + key + '"');
     if (p < 0) return "";
@@ -532,21 +539,103 @@
     const m = seg.match(/https?:\\?\/\\?\/[^"\\\s]+/);
     return m ? fbUnescape(m[0]) : "";
   }
-  function fbThumb(html) {
-    const ok = (u) => /^https?:\/\//i.test(u || "");
+  // Facebook's own UI sprites are never a video thumbnail, and neither are
+  // emoji images or SVGs.
+  function fbThumbOk(u) {
+    if (!/^https?:\/\//i.test(u || "")) return false;
+    return !/rsrc\.php|static\.xx\.fbcdn\.net|\/emoji\/|\.svg(\?|$)/i.test(u);
+  }
+  // c = {url, kind, dist, w, h}: kind is the source weight (poster 1 ...
+  // embedded JSON 0.4), dist the pixel distance from the player.
+  function fbThumbScore(c) {
+    if (!c || !fbThumbOk(c.url)) return -1e9;
+    let s = (Number(c.kind) || 0) * 100;
+    if (/fbcdn\.net|fbsbx\.com|cdninstagram\.com/i.test(c.url)) s += 25;
+    if (/\/(t15|t39|t45)[./]/i.test(c.url)) s += 18; // FB video thumbnails
+    const area = (Number(c.w) || 0) * (Number(c.h) || 0);
+    if (area > 0) s += Math.min(20, Math.log10(area) * 4);
+    if (c.dist != null) s -= Math.min(30, Number(c.dist) * 0.15);
+    return s;
+  }
+  function fbPickThumb(list) {
+    let best = "";
+    let bs = 0;
+    for (const c of (list || [])) {
+      const s = fbThumbScore(c);
+      if (s > bs) { bs = s; best = c.url; }
+    }
+    return best;
+  }
+  function fbRectDist(r, video) {
     try {
-      const vs = document.querySelectorAll("video");
-      for (const v of vs) {
+      if (!r || !video || !video.getBoundingClientRect) return null;
+      const v = video.getBoundingClientRect();
+      const dx = Math.max(0, v.left - r.right, r.left - v.right);
+      const dy = Math.max(0, v.top - r.bottom, r.top - v.bottom);
+      return Math.round(Math.hypot(dx, dy));
+    } catch (e) { return null; }
+  }
+  // Walk up from the player to the smallest box that still holds it, so the
+  // backdrop scan stays cheap (never the whole document).
+  function fbPlayerHull(video) {
+    try {
+      let el = video;
+      for (let i = 0; i < 8 && el && el.parentElement; i++) {
+        el = el.parentElement;
+        const r = el.getBoundingClientRect();
+        if (r.width > window.innerWidth * 0.92 || r.height > window.innerHeight * 0.98) break;
+      }
+      return el || document.body;
+    } catch (e) { return document.body; }
+  }
+  function fbThumbCandidates(html, video, current) {
+    const out = [];
+    const seen = new Set();
+    const add = (url, kind, dist, w, h) => {
+      if (!fbThumbOk(url) || seen.has(url)) return;
+      seen.add(url);
+      out.push({ url, kind, dist: dist == null ? null : dist, w: w || 0, h: h || 0 });
+    };
+    // 1. The player's own poster.
+    try {
+      for (const v of document.querySelectorAll("video")) {
         const p = v.getAttribute("poster") || v.poster || "";
-        if (ok(p)) return p;
+        add(p, 1, v === video ? 0 : fbRectDist(v.getBoundingClientRect(), video), 0, 0);
       }
     } catch (e) { /* ignore */ }
+    // 2. Images and CSS backdrops beside the player (Facebook paints the reel
+    //    poster as a background-image on a div when there is no <img>).
+    try {
+      const hull = fbPlayerHull(video);
+      const els = hull.querySelectorAll("img[src], img[data-src], div, span");
+      const max = Math.min(els.length, 400);
+      for (let i = 0; i < max; i++) {
+        const el = els[i];
+        const r = el.getBoundingClientRect ? el.getBoundingClientRect() : null;
+        if (!r || r.width < 80 || r.height < 60) continue;
+        const dist = fbRectDist(r, video);
+        if (el.tagName === "IMG") {
+          const u = el.currentSrc || el.src || el.getAttribute("data-src") || "";
+          add(u, 0.8, dist, el.naturalWidth || r.width, el.naturalHeight || r.height);
+          continue;
+        }
+        const cs = window.getComputedStyle ? window.getComputedStyle(el) : null;
+        const m = String((cs && cs.backgroundImage) || (el.getAttribute("style") || ""))
+          .match(/url\(["']?(https?:\/\/[^"')]+)/i);
+        if (m) add(m[1], 0.8, dist, r.width, r.height);
+      }
+    } catch (e) { /* ignore */ }
+    // 3. Page metas, then 4. whatever the embedded JSON happens to hold. Both
+    //    describe the page that loaded first, so only while it is still this
+    //    page: after a reel swap they are the previous reel's poster.
+    if (!current) return out;
+    add(fbMeta("og:image:secure_url"), 0.6, null, 0, 0);
+    add(fbMeta("og:image"), 0.6, null, 0, 0);
+    add(fbMeta("twitter:image"), 0.5, null, 0, 0);
     for (const k of ["preferred_thumbnail", "thumbnailImage", "thumbnail_src", "thumbnail", "image"]) {
-      const u = fbJsonUrlNear(html, k);
-      if (ok(u)) return u;
+      add(fbJsonUrlNear(html, k), 0.4, null, 0, 0);
     }
-    const og = fbMeta("og:image");
-    return ok(og) ? og : "";
+    return out;
   }
   function fbJsonUrls(html) {
     const out = {};
@@ -571,42 +660,367 @@
     }
     return 0;
   }
+  // Captions: IDM names the download after the reel's description, so the
+  // caption matters as much as the file URL. Same staleness problem as the
+  // thumbnail — prefer the live DOM and rank by source weight, so a meta left
+  // over from the first page load never beats what is on screen now.
+  function fbCleanCaption(s) {
+    let t = String(s == null ? "" : s);
+    try { t = t.normalize("NFC"); } catch (e) { /* ignore */ }
+    t = t.replace(/\r?\n/g, " ").replace(/\s+/g, " ").trim();
+    t = t.replace(/^\(\d+\)\s*/, "");
+    t = t.replace(/\s*[|·]\s*Facebook\s*$/i, "").replace(/\s+on Facebook\b.*$/i, "").trim();
+    return t;
+  }
+  // Site chrome, audio lines and counters are not a caption.
+  function fbCaptionUsable(t) {
+    if (!t || t.length < 12) return false;
+    const low = t.toLowerCase();
+    if (/^(facebook|watch|reels|video|log ?in|sign ?up|see more|more)$/.test(low)) return false;
+    if (/^(see posts, photos and more|log in to facebook|content not available|this content isn)/.test(low)) return false;
+    if (/^♪/.test(t) || /original audio$/i.test(t)) return false;
+    if (/(^|\s)[·•]\s*follow(ed|ing)?$/i.test(t)) return false;
+    if (/^\d[\d.,\s]*[km]?$/i.test(t)) return false;
+    return true;
+  }
+  // c = {text, kind}: the strongest source wins, then the longer text.
+  function fbPickCaption(list) {
+    let best = "";
+    let bs = 0;
+    for (const c of (list || [])) {
+      const t = fbCleanCaption(c && c.text);
+      if (!fbCaptionUsable(t)) continue;
+      const s = (Number(c && c.kind) || 0) * 100 + Math.min(t.length, 200);
+      if (s > bs) { bs = s; best = t; }
+    }
+    return best.slice(0, 200);
+  }
+  // Every "message":{"text":"..."} value: the story message is the caption on
+  // a fresh load, but comments match too, so keep several and let the ranker
+  // choose.
+  function fbJsonTexts(html, max) {
+    const out = [];
+    const s = String(html || "");
+    const ws = (k) => { while (k < s.length && /\s/.test(s[k])) k++; return k; };
+    let i = 0;
+    while (out.length < (max || 6)) {
+      const p = s.indexOf('"message"', i);
+      if (p < 0) break;
+      let j = ws(p + 9);
+      if (s[j] === ":") j = ws(j + 1);
+      if (s[j] === "{" && s.startsWith('"text"', j + 1)) {
+        j = ws(j + 7);
+        if (s[j] === ":") j = ws(j + 1);
+        if (s[j] === '"') {
+          j++;
+          let raw = "";
+          while (j < s.length) {
+            const ch = s[j];
+            if (ch === "\\") { raw += ch + (s[j + 1] || ""); j += 2; continue; }
+            if (ch === '"') break;
+            raw += ch;
+            j++;
+          }
+          out.push(fbUnescape(raw));
+          i = j + 1;
+          continue;
+        }
+      }
+      i = p + 9;
+    }
+    return out;
+  }
+  // The caption Facebook is rendering right now: the longest real sentence
+  // near the player (author line, audio line and counters lose).
+  function fbDomCaption(video) {
+    try {
+      const sel = 'div[dir="auto"], span[dir="auto"], h1, h2, h3';
+      const nodes = document.querySelectorAll(sel);
+      const v = video && video.getBoundingClientRect ? video.getBoundingClientRect() : null;
+      let best = "";
+      let bs = 0;
+      for (const n of nodes) {
+        if (n.querySelector && n.querySelector(sel)) continue; // leaf texts only
+        const t = fbCleanCaption(n.textContent);
+        if (!fbCaptionUsable(t)) continue;
+        const r = n.getBoundingClientRect ? n.getBoundingClientRect() : null;
+        if (!r || r.width < 60 || r.height < 10) continue;
+        let s = Math.min(t.length, 180);
+        if (v) {
+          const d = fbRectDist(r, video);
+          if (d != null) s -= Math.min(60, d * 0.2);
+        }
+        if (s > bs) { bs = s; best = t; }
+      }
+      return best;
+    } catch (e) { return ""; }
+  }
+  function fbCaptionCandidates(html, video, current) {
+    const out = [];
+    const add = (text, kind) => { if (text) out.push({ text, kind }); };
+    add(fbDomCaption(video), 1); // what the user is looking at
+    // The metas/title/JSON come from the page that loaded: after a reel swap
+    // they would name the new file after the reel the user left.
+    if (current) {
+      add(fbMeta("og:description"), 0.9);
+      add(fbMeta("og:title"), 0.7);
+      for (const t of fbJsonTexts(html, 6)) add(t, 0.55);
+      add(document.title, 0.3);
+    }
+    return out;
+  }
+  // The reel on screen changes with no page load: /reel/<id> swaps through the
+  // history API while Facebook keeps the same <video> node, and the page's
+  // embedded JSON and the tab's sniffed requests both still describe the reel
+  // the user scrolled past. Everything below is therefore keyed on the current
+  // reel: a key from the URL (or from the player, for feeds whose URL has no
+  // id), a generation counter, and the moment the current reel started. That is
+  // what stops the previous reel's playable_url - and its sniffed video/audio
+  // legs - from being sent as "the" download.
+  let fbReelKey = "";
+  let fbReelGen = 0;
+  let fbReelAt = 0;
+  // The page's own JSON/meta describe the page that loaded FIRST, so they are
+  // only trustworthy while the document itself has not navigated since.
+  let fbPageUrl = (typeof location !== "undefined" && location && location.href) || "";
+
+  function fbReelKeyOf(href) {
+    const s = String(href || "");
+    const m = s.match(/\/reel\/(\d+)/i)
+      || s.match(/\/videos\/(?:[^/?#]+\/)?(\d+)/i)
+      || s.match(/[?&]v=(\d+)/i);
+    return m ? m[1] : "";
+  }
+
+  // Which <video> is the user actually looking at? Facebook keeps the previous
+  // and next reels mounted and preloaded, so document.querySelector("video") is
+  // usually NOT the one on screen - that is how a scrolled-past reel's caption,
+  // poster and dimensions ended up in the panel.
+  function fbPickVideo(list, vw, vh) {
+    let best = null;
+    let bs = -1;
+    const width = Number(vw) > 0 ? Number(vw) : 0;
+    const height = Number(vh) > 0 ? Number(vh) : 0;
+    for (const v of Array.from(list || [])) {
+      let r = null;
+      try { r = v && v.getBoundingClientRect ? v.getBoundingClientRect() : null; } catch (e) { r = null; }
+      if (!r) continue;
+      const visW = Math.min(r.right, width) - Math.max(r.left, 0);
+      const visH = Math.min(r.bottom, height) - Math.max(r.top, 0);
+      if (!(visW > 40 && visH > 40)) continue;
+      let s = visW * visH;
+      try { if (v.paused === false) s += 1e7; } catch (e) { /* ignore */ }
+      try { if (v.videoWidth > 0) s += 1e5; } catch (e) { /* ignore */ }
+      if (s > bs) { bs = s; best = v; }
+    }
+    return best;
+  }
+
+  function fbActiveVideo() {
+    try {
+      return fbPickVideo(
+        document.querySelectorAll("video"),
+        (window && window.innerWidth) || 0,
+        (window && window.innerHeight) || 0
+      );
+    } catch (e) { return null; }
+  }
+
+  // Preloaded neighbours differ in poster/blob src, so this changes when the
+  // reel does even on pages whose URL does not.
+  function fbVideoKey(v) {
+    try {
+      if (!v) return "";
+      const p = v.getAttribute("poster") || v.poster || "";
+      const s = v.currentSrc || v.src || "";
+      return `${p}|${String(s).slice(0, 120)}`;
+    } catch (e) { return ""; }
+  }
+
+  // Called before anything is read so the generation is current. A no-op when
+  // the reel has not changed.
+  function fbSyncReel() {
+    try {
+      const key = fbReelKeyOf(location.href) || fbVideoKey(fbActiveVideo());
+      if (key && key !== fbReelKey) {
+        fbReelKey = key;
+        fbReelGen++;
+        fbReelAt = Date.now();
+      }
+      return fbReelKey;
+    } catch (e) { return fbReelKey; }
+  }
+
+  // The embedded JSON and the metas describe the first load: once the reel
+  // changes they name the reel the user came from.
+  function fbJsonIsCurrent() {
+    try { return !!fbPageUrl && location.href === fbPageUrl; } catch (e) { return false; }
+  }
+
+  // A DASH audio leg arrives as a plain .mp4, so the sniffer's content type is
+  // the only reliable signal for it. Getting this wrong offered an audio-only
+  // stream as a video row, which saved "with audio and no video".
+  function fbAudioItem(m) {
+    const mime = String((m && m.mime) || "").toLowerCase();
+    if (mime.indexOf("audio/") === 0) return true;
+    if (mime.indexOf("video/") === 0) return false;
+    return /\.(m4a|mp3|aac|ogg|opus|weba)(\?|#|$)/i.test(String((m && m.url) || ""));
+  }
+
+  // What the player fetched for the reel on screen, newest first. The tab's
+  // list keeps every reel of the session, so recency is what keeps the current
+  // reel ahead of the one before it; `since` additionally drops traffic that
+  // predates the current reel when that moment is known. Never returns empty
+  // because of `since`: an empty list would send the page URL instead of the
+  // reel's own media.
+  function fbReelMedia(items, since) {
+    const list = (Array.isArray(items) ? items : [])
+      .filter((m) => m && /^https?:\/\//i.test(m.url || ""));
+    const fresh = Number(since) > 0
+      ? list.filter((m) => !m.seenAt || Number(m.seenAt) >= Number(since))
+      : [];
+    const use = fresh.length ? fresh : list;
+    return use.slice().sort((a, b) => (Number(b.seenAt) || 0) - (Number(a.seenAt) || 0));
+  }
+
   function fbInfo() {
+    fbSyncReel();
     let html = "";
     try { html = document.documentElement.innerHTML.slice(0, 1500000); } catch (e) {}
-    const urls = fbJsonUrls(html);
-    // Duration: ms-style keys dominate FB JSON; fall back to plain seconds.
-    let durMs = fbJsonNum(html, ["playable_duration_in_ms", "duration_in_ms", "length_in_ms"]);
-    let durSec = durMs > 0 ? Math.round(durMs / 1000)
-      : Math.round(fbJsonNum(html, ["videoDuration", "video_length", "duration", "length_in_seconds"]) || 0);
-    if (!(durSec > 0 && durSec < 36000)) durSec = 0;
-    // Dimensions: meta first (current reel), JSON fallbacks.
-    let w = parseInt((document.querySelector('meta[property="og:video:width"]') || {}).content, 10) || 0;
-    let h = parseInt((document.querySelector('meta[property="og:video:height"]') || {}).content, 10) || 0;
-    if (!(w > 0)) w = Math.round(fbJsonNum(html, ["original_width", "video_width", "width"]) || 0);
-    if (!(h > 0)) h = Math.round(fbJsonNum(html, ["original_height", "video_height", "height"]) || 0);
-    // Title: caption first, then page title. Never "Facebook".
-    let title = fbMeta("og:description") || fbMeta("og:title") || "";
-    title = title.replace(/\s*\|\s*Facebook\s*$/i, "").replace(/\s+on Facebook.*$/i, "").trim();
-    if (!title || /^facebook$/i.test(title)) {
-      title = String(document.title || "").replace(/\s*\|\s*Facebook\s*$/i, "").trim() || "facebook_video";
+    // The reel on screen, not the first <video> the document happens to hold:
+    // Facebook keeps the neighbours mounted and preloaded.
+    const video = fbActiveVideo() || document.querySelector("video");
+    // Only while the page still describes itself (see fbJsonIsCurrent).
+    const current = fbJsonIsCurrent();
+    const urls = current ? fbJsonUrls(html) : { hd: "", sd: "" };
+    // Duration: the live player describes the reel on screen; the embedded
+    // JSON is the fallback for a page that has not navigated.
+    let durSec = 0;
+    try {
+      const d = video && video.duration;
+      if (Number.isFinite(d) && d > 0 && d < 36000) durSec = Math.round(d);
+    } catch (e) { durSec = 0; }
+    if (!durSec && current) {
+      const durMs = fbJsonNum(html, ["playable_duration_in_ms", "duration_in_ms", "length_in_ms"]);
+      durSec = durMs > 0 ? Math.round(durMs / 1000)
+        : Math.round(fbJsonNum(html, ["videoDuration", "video_length", "duration", "length_in_seconds"]) || 0);
+      if (!(durSec > 0 && durSec < 36000)) durSec = 0;
     }
-    if (/^facebook$/i.test(title)) title = "facebook_video";
-    return { hd: urls.hd, sd: urls.sd, durSec, w, h, title: title.slice(0, 100), thumb: fbThumb(html) };
+    // Dimensions: the live player first (it is the reel on screen, and it is
+    // what labels the quality), then the metas/JSON while they are still about
+    // this page.
+    let w = 0;
+    let h = 0;
+    try { w = Math.round(video && video.videoWidth) || 0; h = Math.round(video && video.videoHeight) || 0; } catch (e) { w = 0; h = 0; }
+    if (current) {
+      if (!(w > 0)) w = parseInt((document.querySelector('meta[property="og:video:width"]') || {}).content, 10) || 0;
+      if (!(h > 0)) h = parseInt((document.querySelector('meta[property="og:video:height"]') || {}).content, 10) || 0;
+      if (!(w > 0)) w = Math.round(fbJsonNum(html, ["original_width", "video_width", "width"]) || 0);
+      if (!(h > 0)) h = Math.round(fbJsonNum(html, ["original_height", "video_height", "height"]) || 0);
+    }
+    // Title: the reel description — that is what names the saved file.
+    const title = fbPickCaption(fbCaptionCandidates(html, video, current)) || "facebook_video";
+    return {
+      hd: urls.hd,
+      sd: urls.sd,
+      durSec,
+      w,
+      h,
+      title,
+      current,
+      since: fbReelAt,
+      key: fbReelKey,
+      thumb: fbPickThumb(fbThumbCandidates(html, video, current)),
+    };
   }
   function fbQuality(w, h, isHd) {
-    const q = Math.max(w || 0, h || 0);
+    // The label counts lines, so a portrait reel (1080x1920) and a landscape
+    // one (1920x1080) are both 1080p — take the shorter side.
+    const q = w > 0 && h > 0 ? Math.min(w, h) : Math.max(w || 0, h || 0);
     if (q >= 1080) return "1080p HD";
     if (q >= 720) return "720p HD";
     if (q >= 480) return "480p";
     if (q > 0) return `${q}p`;
     return isHd ? "HD" : "SD";
   }
+  // The numeric cap the desktop app needs from a panel label: "720p HD" →
+  // "720p" (yt-dlp then picks the best stream at or below it). "HD"/"SD"
+  // carry no number, so the app falls back to best rather than guessing.
+  function fbQualityCap(q) {
+    const m = String(q || "").match(/(\d{3,4})p/);
+    return m ? `${m[1]}p` : "";
+  }
   function fbFilename(title) {
     const s = String(title || "facebook_video").replace(/[<>:"/\\|?*\u0000-\u001f]/g, "_").trim();
     const base = (s.replace(/\.+$/, "") || "facebook_video").slice(0, 80);
     return base.endsWith(".mp4") ? base : base + ".mp4";
   }
+  // The rows the reels panel offers. The page's own HD/SD encodes lead while
+  // they still describe this page; after a scroll they are dropped and the band
+  // captured legs of the reel on screen lead instead. Audio legs become chips
+  // and one of them pairs a video-only leg.
+  function fbMenuRows(info, items) {
+    const seen = new Set();
+    const rows = [];
+    const audio = [];
+    const fname = fbFilename(info.title);
+    const dur = info.durSec > 0 ? `, ${info.durSec} sec` : "";
+    const push = (url, quality, fromJson, size, thumb) => {
+      if (!url || !/^https?:\/\//i.test(url) || seen.has(url)) return;
+      seen.add(url);
+      rows.push({
+        url,
+        fname,
+        q: fbQualityCap(quality),
+        label: `⬇ ${info.title.slice(0, 40)}, MP4 file${dur}, quality ${quality}`,
+        _size: size || 0,
+        dur: info.durSec || null,
+        thumb: thumb || info.thumb || "",
+        fromJson: !!fromJson,
+      });
+    };
+    // P4: when a playlist is on the tab, loose segments are its children
+    // (ad slivers included) — offer the playlist, never the parts.
+    const R = (typeof DCRank !== "undefined") ? DCRank : null;
+    const isPlaylist = (u) => R ? R.kindOf({ url: u }) === "playlist" : /m3u8|mpd|mpegurl|dash/i.test(String(u));
+    const isSeg = (u) => R ? R.kindOf({ url: u }) === "segment" : /(\.ts|\.m4s|\.cmfv|\.cmfa)(\?|#|$)/i.test(String(u).split("?")[0]);
+    const hasPlaylist = (Array.isArray(items) ? items : []).some((m) => m && isPlaylist(m.url));
+    const live = fbReelMedia(items, info.since).filter((m) => !isPlaylist(m.url));
+    const liveVideo = live.filter((m) => !fbAudioItem(m) && !(hasPlaylist && isSeg(m.url)));
+    const liveAudio = live.filter((m) => fbAudioItem(m) && !isSeg(m.url));
+    const liveQ = fbQuality(info.w, info.h, true);
+    // The metas/JSON always describe the reel that was on screen when the page
+    // loaded, so after a scroll they name the reel the user came from and must
+    // not be offered at all. While the page still describes itself they are the
+    // page's own HD/SD encodes, which stay ahead of the captured legs.
+    if (info.current) {
+      // The HD and SD URL often resolve to the same "1080p HD" text — label the
+      // lower encode plainly instead of showing the same resolution twice.
+      const hdQ = fbQuality(info.w, info.h, true);
+      let sdQ = fbQuality(info.w, info.h, info.hd === info.sd);
+      if (info.hd && info.sd && info.hd !== info.sd && sdQ === hdQ) sdQ = "SD";
+      if (info.hd && info.hd !== info.sd) push(info.hd, hdQ, true);
+      if (info.sd) push(info.sd, sdQ, true);
+    }
+    // This used to be pushed *after* the page JSON, so a scrolled-past reel's
+    // URL took the first row - the "it downloads the previous video" report.
+    for (const m of liveVideo.slice(0, 4)) push(m.url, liveQ, false, m.size, m.thumb);
+    // Audio-only traffic from the same playback session becomes an "Other
+    // Files" chip (same idea as YouTube's audio-only tracks).
+    for (const m of liveAudio.slice(0, 3)) {
+      audio.push({ url: m.url, mime: m.mime || "audio/mp4", size: m.size || 0 });
+    }
+    // Facebook serves its higher qualities as a video-only DASH leg plus a
+    // separate audio leg: a captured video row would otherwise save silently.
+    // Hand the newest audio leg of the same reel along so the app merges them
+    // (it already merges the page URL it keeps alongside the row).
+    const pair = liveVideo.length && liveAudio.length
+      ? { url: liveAudio[0].url, mime: liveAudio[0].mime || "audio/mp4" }
+      : null;
+    return { rows, audio, pair };
+  }
+
+  // ---------- end Facebook reels support ----------
   // Pick the best directly-downloadable candidate the background sniffer
   // caught for this page: prefer real video/mp4 over playlists, biggest
   // known size first. Facebook reels render as blob: players, so this is
@@ -721,6 +1135,48 @@
     }
     if (btn.parentElement !== document.documentElement) document.documentElement.appendChild(btn);
     return false;
+  }
+
+  // The Facebook pill lives inside the player box, which is only as wide as
+  // the video: a 300px panel anchored in there gets clipped on the left once
+  // the reel column is narrower than the panel (narrow/vertical reels). Anchor
+  // the panel to the page instead, clamped into the viewport, and keep the
+  // arrow pointing at the pill.
+  function placeFbPanel(pill, panel) {
+    if (!pill || !panel) return;
+    const host = document.body || document.documentElement;
+    if (panel.parentElement !== host) host.appendChild(panel);
+    let pr;
+    try { pr = pill.getBoundingClientRect(); } catch (e) { pr = null; }
+    if (!pr) return;
+    const de = document.documentElement;
+    const vw = window.innerWidth || de.clientWidth || 360;
+    const vh = window.innerHeight || de.clientHeight || 640;
+    const ox = window.pageXOffset || de.scrollLeft || 0;
+    const oy = window.pageYOffset || de.scrollTop || 0;
+    // 300px is the design width; shrink on very narrow viewports so both
+    // edges stay on screen.
+    const w = Math.max(240, Math.min(300, vw - 16));
+    let left = Math.round(pr.right - w); // right edges aligned with the pill
+    left = Math.min(Math.max(8, left), Math.max(8, vw - w - 8));
+    // ~300px tall; if the pill sits low, lift the panel so it still fits.
+    const est = 300;
+    let top = Math.round(pr.bottom + 6);
+    if (top + est > vh - 8) top = Math.max(8, vh - 8 - est);
+    panel.style.position = "absolute";
+    panel.style.width = w + "px";
+    panel.style.left = left + ox + "px";
+    panel.style.top = top + oy + "px";
+    panel.style.right = "auto";
+    panel.style.bottom = "auto";
+    panel.style.zIndex = "2147483647";
+    const arrow = panel.querySelector('[data-dc-p="arrow"]');
+    if (arrow) {
+      // Centre the arrow over the pill, then keep it inside the panel's radius.
+      const at = pr.left + pr.width / 2 - left - 7;
+      arrow.style.left = Math.round(Math.min(Math.max(12, at), w - 26)) + "px";
+      arrow.style.right = "auto";
+    }
   }
 
   // Presence pre-check: qualities already in the app queue get a "✓ Queued"
@@ -1385,7 +1841,10 @@
       if (st.ciphered && !st.url) {
         sendDownload(location.href, name, st.mime, st._size || null, pairFor(st), st.label, st._dur || null);
       } else {
-        sendDownload(st.url || location.href, name, st.mime, st._size || null, pairFor(st), null, st._dur || null);
+        // A direct row already carries the exact stream, but the quality hint
+        // travels with it too: if the app ever has to re-resolve the page (a
+        // stale signed URL), it must not silently fall back to "best".
+        sendDownload(st.url || location.href, name, st.mime, st._size || null, pairFor(st), st.label, st._dur || null);
       }
     };
     // One cell per quality. The same height + container twice (a progressive
@@ -1399,9 +1858,16 @@
       seenQ.add(key);
       const cont = (st.disp || contOf(st.mime) || "mp4").toUpperCase();
       const fps = (String(st.label || "").match(/^(\d+)p(\d+)$/) || [])[2];
+      // A video-only cell is downloaded together with the paired audio leg, so
+      // its shown size has to include that leg or the row's number never
+      // matches the merged file the app reports (the complaint that started
+      // this: the panel's size and the progress window's size disagreed).
+      const audioSz = (kind === "v" && !viaApp && bestAudio && bestAudio._size > 0)
+        ? bestAudio._size
+        : 0;
       entries.push({
         h: hh,
-        size: st._size || 0,
+        size: (st._size || 0) + audioSz,
         dur: st._dur || 0,
         st,
         // Ciphered/"via app" rows have no container pairing of their own —
@@ -1681,7 +2147,7 @@
   // Facebook quality panel (IDM-style): the same circle + bubble as YouTube,
   // with the reel's HD/SD rows (and any fresh sniffed stream) as quality
   // cells, so every reel offers a choice instead of one mystery "Facebook.mp4".
-  function openFbMenu(pill, rows, title, thumb, audio) {
+  function openFbMenu(pill, rows, title, thumb, audio, pair) {
     try { document.querySelectorAll("#dc-fb-panel").forEach((m) => m.remove()); } catch (e) {}
     const first = (rows && rows[0]) || {};
     const fname = first.fname || fbFilename(title);
@@ -1709,7 +2175,7 @@
         size: st._size > 0 ? fmtSize(st._size) : "",
         format: "MP4",
         tip: `${(qm && qm[1]) || "video"} · MP4 · ${title}`,
-        send: () => sendDownload(st.url, st.fname, "video/mp4", st._size || null, null, null, st.dur || null),
+        send: () => sendDownload(st.url, st.fname, "video/mp4", st._size || null, (pair && !st.fromJson) ? pair : null, st.q || null, st.dur || null),
       };
       const it = api.addQuality({ ...q, onPick: () => api.setInfo(q) });
       sizePairs.push({ item: it, sizeEl: it.sizeEl, st });
@@ -1725,59 +2191,11 @@
     }
     api.sync();
     enrichSizes(sizePairs);
-    api.panel.style.position = "absolute";
-    api.panel.style.top = "44px";
-    api.panel.style.right = "8px";
     api.panel.style.display = "block";
-    try {
-      (pill.parentElement || document.documentElement).appendChild(api.panel);
-    } catch (e) { /* ignore */ }
+    // Page-anchored, viewport-clamped: the player box clips a panel that is
+    // wider than the reel column (see placeFbPanel).
+    placeFbPanel(pill, api.panel);
     paintDcPanel(api.panel);
-  }
-
-  function fbMenuRows(info, items) {
-    // Dedupe page-JSON URLs against sniffed traffic, then rank HD first.
-    const seen = new Set();
-    const rows = [];
-    const audio = [];
-    const fname = fbFilename(info.title);
-    const dur = info.durSec > 0 ? `, ${info.durSec} sec` : "";
-    const push = (url, quality) => {
-      if (!url || !/^https?:\/\//i.test(url) || seen.has(url)) return;
-      seen.add(url);
-      rows.push({ url, fname, label: `⬇ ${info.title.slice(0, 40)}, MP4 file${dur}, quality ${quality}`, _size: 0, dur: info.durSec || null, thumb: info.thumb || "" });
-    };
-    // The page meta describes the reel currently on screen, so the HD and SD
-    // URL often resolve to the same "1080p HD" text — label the lower encode
-    // plainly instead of showing the same resolution twice.
-    const hdQ = fbQuality(info.w, info.h, true);
-    let sdQ = fbQuality(info.w, info.h, info.hd === info.sd);
-    if (info.hd && info.sd && info.hd !== info.sd && sdQ === hdQ) sdQ = "SD";
-    if (info.hd && info.hd !== info.sd) push(info.hd, hdQ);
-    if (info.sd) push(info.sd, sdQ);
-    // Anything else the player actually fetched (fresh session URLs).
-    // P4: when a playlist is on the tab, loose segments are its children
-    // (ad slivers included) — offer the playlist, never the parts.
-    const R = (typeof DCRank !== "undefined") ? DCRank : null;
-    const hasPlaylist = (items || []).some((m) => m && (
-      (R ? R.kindOf(m) === "playlist" : /m3u8|mpd|mpegurl|dash/i.test(String(m.url || "")))
-    ));
-    const isSeg = (u) => R ? R.kindOf({ url: u }) === "segment" : /(\.ts|\.m4s|\.cmfv|\.cmfa)(\?|#|$)/i.test(String(u).split("?")[0]);
-    const rest = (items || []).filter((m) => m && /^https?:\/\//i.test(m.url) && !seen.has(m.url)
-      && !/m3u8|mpd|mpegurl|dash/i.test(m.url)
-      && !(hasPlaylist && isSeg(m.url)));
-    const isAudio = (m) => /^audio\//i.test(m.mime || "") || /\.m4a(\?|#|$)/i.test(String(m.url || ""));
-    rest.filter((m) => !isAudio(m)).slice(0, 6).forEach((m) => {
-      seen.add(m.url);
-      rows.push({ url: m.url, fname, label: `⬇ ${info.title.slice(0, 40)}, MP4 file${dur}, quality ${fbQuality(0, 0, false)}`, _size: m.size || 0, dur: info.durSec || null, thumb: m.thumb || info.thumb || "" });
-    });
-    // Audio-only traffic from the same playback session becomes an "Other
-    // Files" chip (same idea as YouTube's audio-only tracks).
-    rest.filter(isAudio).slice(0, 3).forEach((m) => {
-      seen.add(m.url);
-      audio.push({ url: m.url, mime: m.mime || "audio/mp4", size: m.size || 0 });
-    });
-    return { rows, audio };
   }
 
   function handleFbPill(pill) {
@@ -1796,9 +2214,10 @@
         if (!rows.length) {
           sendDownload(location.href, fbFilename(info.title), null, null, null, null, info.durSec || null);
         } else if (rows.length === 1 && !audio.length) {
-          sendDownload(rows[0].url, rows[0].fname, "video/mp4", rows[0]._size || null, null, null, rows[0].dur || info.durSec || null);
+          const r0 = rows[0];
+          sendDownload(r0.url, r0.fname, "video/mp4", r0._size || null, (data.pair && !r0.fromJson) ? data.pair : null, r0.q || null, r0.dur || info.durSec || null);
         } else {
-          openFbMenu(pill, rows, info.title, info.thumb, audio);
+          openFbMenu(pill, rows, info.title, info.thumb, audio, data.pair);
         }
       });
     } catch (e) {
@@ -1813,6 +2232,18 @@
         if (!alive()) return;
         const items = (res && res.items) || [];
         if (!items.length) return;
+        // On Facebook the tab's list spans every reel of the session, so the
+        // streams offered for storage are narrowed to the reel on screen -
+        // otherwise the popup keeps offering the reel the user scrolled away
+        // from.
+        let use = items;
+        try {
+          if (isFacebookPage()) {
+            fbSyncReel();
+            use = fbReelMedia(items, fbReelAt);
+          }
+        } catch (e) { use = items; }
+        if (!use.length) return;
         try {
           chrome.storage.local.get(["downloadCraftLinks"], (cur) => {
             const have = new Set(((cur && cur.downloadCraftLinks) || []).map((l) => l.url));
@@ -1822,7 +2253,7 @@
               const pp = pv && pv.getAttribute("poster");
               if (/^https?:\/\//i.test(pp || "")) pageThumb = pp;
             } catch (e) { /* ignore */ }
-            const add = items
+            const add = use
               .filter((m) => !have.has(m.url))
               .map((m) => ({ url: m.url, text: `Stream (${m.mime || "media"})`, thumb: m.thumb || pageThumb }));
             if (add.length) {
@@ -1850,7 +2281,7 @@
         } catch (e) { /* best effort */ }
         let net = [];
         try {
-          const r = await chrome.runtime.sendMessage({ type: "getMedia", pageUrl: location.href });
+          const r = await api.runtime.sendMessage({ type: "getMedia", pageUrl: location.href });
           net = (r && r.items) || [];
         } catch (e) { /* ignore */ }
         let cur = {};
@@ -1886,6 +2317,10 @@
   installDcCloser();
   function spaRefresh() {
     if (__dcDead || !alive()) return;
+    // A reel swap is an SPA navigation inside the same document: mark the reel
+    // as current right away so everything captured before it counts as the reel
+    // the user scrolled away from.
+    try { if (isFacebookPage()) fbSyncReel(); } catch (e) { /* best effort */ }
     try { collectLinks(); } catch (e) { if (ctxInvalidated(e)) return markDead(); }
     try { ensureUniversalButtons(); } catch (e) { if (ctxInvalidated(e)) return markDead(); }
     try { pullNetworkMedia(); } catch (e) { if (ctxInvalidated(e)) return markDead(); }
@@ -1937,11 +2372,18 @@
   });
   let lastUrl = location.href;
   let lastTitle = document.title;
+  let lastReel = "";
+  try { if (isFacebookPage()) lastReel = fbSyncReel(); } catch (e) { lastReel = ""; }
   const watcher = setInterval(() => {
     if (__dcDead || !alive()) { clearInterval(watcher); return; } // superseded: stop
-    if (location.href !== lastUrl || document.title !== lastTitle) {
+    // The reels feed also changes the player without changing the URL (the
+    // overlay keeps "/"), so the reel key is part of the change test.
+    let reel = "";
+    try { if (isFacebookPage()) reel = fbSyncReel(); } catch (e) { reel = ""; }
+    if (location.href !== lastUrl || document.title !== lastTitle || reel !== lastReel) {
       lastUrl = location.href;
       lastTitle = document.title;
+      lastReel = reel;
       // Drop pills bound to the previous reel's <video> node so the new
       // reel gets a fresh pill even when Facebook reuses the DOM node.
       try {

@@ -205,6 +205,19 @@ pub fn pl() -> Palette {
     PAL.with(|c| c.get())
 }
 
+/// Linear blend between two colours (`t` = 0 keeps `a`, 1 gives `b`). The
+/// restyled dialogs use it for the card's softer hairlines and raised fills.
+fn mix(a: egui::Color32, b: egui::Color32, t: f32) -> egui::Color32 {
+    let t = t.clamp(0.0, 1.0);
+    let f = |x: u8, y: u8| (x as f32 + (y as f32 - x as f32) * t).round() as u8;
+    egui::Color32::from_rgb(f(a.r(), b.r()), f(a.g(), b.g()), f(a.b(), b.b()))
+}
+
+/// Translucent wash of `c` (tinted fills, hovers, chips).
+fn wash(c: egui::Color32, a: u8) -> egui::Color32 {
+    egui::Color32::from_rgba_unmultiplied(c.r(), c.g(), c.b(), a)
+}
+
 fn visuals_dark(p: &Palette) -> egui::Visuals {
     let mut v = egui::Visuals::dark();
     v.window_fill = p.surface;
@@ -869,6 +882,70 @@ fn mbutton(
     rect
 }
 
+/// `.btn` of the restyled dialogs: 34 px tall, 8 px radius, optional leading
+/// Material icon. Painted only — the caller records the hit rect.
+fn about_btn(
+    p: &egui::Painter,
+    man: &ManState,
+    x: f32,
+    y: f32,
+    label: &str,
+    glyph: Option<&str>,
+    primary: bool,
+) -> egui::Rect {
+    let pal = pl();
+    let gap = 7.0;
+    let f_btn = egui::FontId::proportional(12.0);
+    let fg0 = if primary { egui::Color32::WHITE } else { pal.dim };
+    let iw = glyph.map_or(0.0, |g| {
+        p.layout_no_wrap(g.to_owned(), crate::fonts::icon(13.0), fg0)
+            .size()
+            .x
+            + gap
+    });
+    let tw = p.layout_no_wrap(label.to_owned(), f_btn.clone(), fg0).size().x;
+    let rect = egui::Rect::from_min_size(egui::pos2(x, y), egui::vec2(15.0 + iw + tw + 15.0, 34.0));
+    let hov = man.hover(&rect);
+    let fg = if !primary && hov { pal.txt } else { fg0 };
+    if primary {
+        let fill = if hov {
+            mix(pal.primary, egui::Color32::WHITE, 0.18)
+        } else {
+            pal.primary
+        };
+        p.rect_filled(rect, 8.0, fill);
+    } else {
+        p.rect(
+            rect,
+            8.0,
+            if hov {
+                pal.dm_hover
+            } else {
+                mix(pal.modal_bg, pal.surface_lt, 0.45)
+            },
+            egui::Stroke::new(1.0, mix(pal.modal_bg, pal.modal_bd, 0.6)),
+            egui::StrokeKind::Inside,
+        );
+    }
+    let mut cx = rect.center().x - (iw + tw) / 2.0;
+    if let Some(g) = glyph {
+        let ig = p.layout_no_wrap(g.to_owned(), crate::fonts::icon(13.0), fg);
+        p.galley(
+            egui::pos2(cx, rect.center().y - ig.size().y / 2.0),
+            ig,
+            fg,
+        );
+        cx += iw;
+    }
+    let tg = p.layout_no_wrap(label.to_owned(), f_btn, fg);
+    p.galley(
+        egui::pos2(cx, rect.center().y - tg.size().y / 2.0),
+        tg,
+        fg,
+    );
+    rect
+}
+
 /// Manual checkbox row: box + label, full width. Paint only.
 fn mcheck(ui: &mut egui::Ui, man: &ManState, label: &str, checked: bool) -> egui::Rect {
     let w = ui.available_width().max(80.0);
@@ -1276,42 +1353,38 @@ fn cell_text(
     } else {
         (egui::pos2(rect.min.x + PAD, rect.center().y), Align2::LEFT_CENTER)
     };
-    p.text(pos, align, shown, egui::FontId::proportional(size), color);
+    crate::shaped::draw(p, pos, align, &shown, egui::FontId::proportional(size), color);
 }
 
 /// Truncate `text` with an ellipsis so it fits `max_w` (painter-measured).
+///
+/// Widths come from `shaped` so the measurement matches what is drawn for the
+/// scripts egui cannot shape itself, and the cut lands on grapheme boundaries:
+/// slicing a Bengali consonant away from its matra leaves a dangling mark.
 fn truncate_to_width(
     p: &egui::Painter,
     text: &str,
     font: egui::FontId,
-    color: egui::Color32,
+    _color: egui::Color32,
     max_w: f32,
 ) -> String {
-    if p
-        .layout_no_wrap(text.to_owned(), font.clone(), color)
-        .size()
-        .x
-        <= max_w
-    {
+    use unicode_segmentation::UnicodeSegmentation;
+    if crate::shaped::width(p, text, &font) <= max_w {
         return text.to_owned();
     }
-    let chars: Vec<char> = text.chars().collect();
+    let parts: Vec<&str> = text.graphemes(true).collect();
     let mut lo = 0usize;
-    let mut hi = chars.len();
+    let mut hi = parts.len();
     while lo < hi {
         let mid = (lo + hi + 1) / 2;
-        let s: String = chars[..mid].iter().collect();
-        let w = p
-            .layout_no_wrap(s.clone() + "…", font.clone(), color)
-            .size()
-            .x;
+        let w = crate::shaped::width(p, &(parts[..mid].concat() + "…"), &font);
         if w <= max_w {
             lo = mid;
         } else {
             hi = mid - 1;
         }
     }
-    chars[..lo].iter().collect::<String>() + "…"
+    parts[..lo].concat() + "…"
 }
 
 /// Name cell painted with ZERO widgets (icon + filename + type via the
@@ -1330,10 +1403,12 @@ fn name_cell(p: &egui::Painter, rect: egui::Rect, icon: &str, fname: &str, cat: 
     let tx = rect.min.x + 32.0;
     let max_tw = (rect.max.x - 8.0 - tx).max(20.0);
     let name = truncate_to_width(p, fname, egui::FontId::proportional(11.5), pl().txt, max_tw);
-    p.text(
+    // The file name may be in any script, so it is drawn shaped.
+    crate::shaped::draw(
+        p,
         egui::pos2(tx, rect.center().y - 8.0),
         egui::Align2::LEFT_CENTER,
-        name,
+        &name,
         egui::FontId::proportional(11.5),
         pl().txt,
     );
@@ -1946,6 +2021,14 @@ impl CraftApp {
             if let Some(t) = total {
                 downloaded = downloaded.min(t);
             }
+            let resolution = {
+                let live = task.shared.resolution_now();
+                if live.is_empty() {
+                    row.map(|d| d.resolution.clone()).unwrap_or_default()
+                } else {
+                    live
+                }
+            };
             items.insert(
                 id.to_string(),
                 serde_json::json!({
@@ -1954,6 +2037,7 @@ impl CraftApp {
                     "speed": speed,
                     "resumable": task.shared.resumable.load(Ordering::SeqCst),
                     "phase": self.phases.get(id).cloned().unwrap_or_default(),
+                    "resolution": resolution,
                     "parts": parts,
                 }),
             );
@@ -3318,6 +3402,13 @@ impl CraftApp {
                     }
                 }
                 d.resumable = resumable;
+                // The resolution that is actually arriving, straight from the
+                // helper's chosen format / the merged file. Blank once the
+                // helper has not named it yet, so the row keeps the last known.
+                let res = task.shared.resolution_now();
+                if !res.is_empty() && d.resolution != res {
+                    d.resolution = res;
+                }
                 let el = task.last_sample.elapsed().as_secs_f64();
                 if el >= 0.25 {
                     // Speed from the MONOTONIC displayed value (never the raw
@@ -3383,6 +3474,13 @@ impl CraftApp {
                 if let Some(d) = self.downloads.iter_mut().find(|d| d.id == id) {
                     d.downloaded_bytes = dl;
                     d.resumable = was_resumable;
+                    // Last chance to record what really landed (the final
+                    // ffprobe on a merged file happens just before the engine
+                    // returns, after the last live poll).
+                    let res = task.shared.resolution_now();
+                    if !res.is_empty() {
+                        d.resolution = res;
+                    }
                     if has_total {
                         d.total_bytes = Some(total);
                     }
@@ -5901,23 +5999,23 @@ impl eframe::App for CraftApp {
                             );
                             self.hits.push((HitKind::Btn(ButtonId::DClose), close_r));
                             // Filename between icon and X, elided on overflow.
+                            // Drawn through the shaper so a Bangla caption name
+                            // keeps its conjuncts and matra order.
                             let title_l = bar.min.x + 36.0;
                             let title_w = (close_r.min.x - 8.0 - title_l).max(40.0);
-                            let mut job = egui::text::LayoutJob::simple_singleline(
-                                item.filename.clone(),
+                            let shown = truncate_to_width(
+                                &p,
+                                &item.filename,
                                 crate::fonts::semi(12.0),
                                 pl().txt,
+                                title_w,
                             );
-                            job.wrap = egui::text::TextWrapping {
-                                max_width: title_w,
-                                max_rows: 1,
-                                break_anywhere: true,
-                                overflow_character: Some('…'),
-                            };
-                            let galley = ui.painter().layout_job(job);
-                            ui.painter().galley(
-                                egui::pos2(title_l, bar.center().y - galley.size().y / 2.0),
-                                galley,
+                            crate::shaped::draw(
+                                &p,
+                                egui::pos2(title_l, bar.center().y),
+                                egui::Align2::LEFT_CENTER,
+                                &shown,
+                                crate::fonts::semi(12.0),
                                 pl().txt,
                             );
 
@@ -6235,64 +6333,375 @@ impl eframe::App for CraftApp {
         }
 
         if self.show_about {
-            let ab_w = modal_width(ctx, 400.0);
+            // About concept: a fixed 480 px card — centered header, brand row,
+            // copy, credit box, update buttons, and a bordered footer. The whole
+            // card is painted from its origin so the concept's pixel geometry
+            // survives; hits go on the manual table like every other modal.
+            let p = pl();
+            let ab_w = modal_width(ctx, 480.0);
+            let pad = 26.0;
+            let body_w = (ab_w - pad * 2.0).max(120.0);
+            let soft = mix(p.modal_bg, p.modal_bd, 0.45);
+            let accent = p.primary;
+            let dark = p.txt.r() > 128;
+            let accent_hi = if dark {
+                mix(p.primary, egui::Color32::WHITE, 0.18)
+            } else {
+                mix(p.primary, egui::Color32::BLACK, 0.12)
+            };
+            let green = p.success;
+            let header_h = 46.0;
+            let footer_h = 58.0;
+            let btn_h = 34.0;
+
+            let f_title = egui::FontId::proportional(13.0);
+            let f_name = crate::fonts::semi(18.0);
+            let f_tag = crate::fonts::semi(9.0);
+            let f_body = egui::FontId::proportional(12.0);
+            let f_small = egui::FontId::proportional(10.5);
+            let f_ver = egui::FontId::proportional(11.0);
+            let f_ver_b = crate::fonts::semi(11.0);
+            let mono = egui::FontId::monospace(10.0);
+
+            // Galleys are measured before the window opens so the card's height
+            // is known exactly (the concept is a pixel layout, not a flow one).
+            let lay = |t: &str, f: egui::FontId, c: egui::Color32, w: f32| {
+                ctx.fonts(|fo| fo.layout(t.to_owned(), f, c, w))
+            };
+            let para = |spans: &[(&str, egui::Color32)]| {
+                let mut job = egui::text::LayoutJob::default();
+                job.wrap.max_width = body_w;
+                for (t, c) in spans {
+                    job.append(
+                        t,
+                        0.0,
+                        egui::text::TextFormat {
+                            font_id: f_body.clone(),
+                            color: *c,
+                            line_height: Some(19.8),
+                            ..Default::default()
+                        },
+                    );
+                }
+                ctx.fonts(|fo| fo.layout_job(job))
+            };
+            let desc1 = para(&[
+                ("A lightweight download manager written in ", p.dim),
+                ("Rust + egui", p.txt),
+                (
+                    ". MIT licensed — free for open-source, closed-source, and commercial use.",
+                    p.dim,
+                ),
+            ]);
+            let desc2 = para(&[(
+                "Multi-connection segmented downloads, queue, scheduler, browser extension host.",
+                p.dim,
+            )]);
+            let desc3 = para(&[("Interface design inspired by modern download managers.", p.dim)]);
+            let credit = {
+                let mut job = egui::text::LayoutJob::default();
+                job.wrap.max_width = body_w - 13.0 - 14.0 - 9.0 - 13.0;
+                job.append(
+                    "Icons: Material Icons font (Apache-2.0, © Google). See ",
+                    0.0,
+                    egui::text::TextFormat {
+                        font_id: f_small.clone(),
+                        color: p.dm_lbl,
+                        line_height: Some(16.3),
+                        ..Default::default()
+                    },
+                );
+                job.append(
+                    " NOTICE.md ",
+                    0.0,
+                    egui::text::TextFormat {
+                        font_id: mono.clone(),
+                        color: p.dm_dim,
+                        background: p.dm_card,
+                        line_height: Some(16.3),
+                        ..Default::default()
+                    },
+                );
+                job.append(
+                    ".",
+                    0.0,
+                    egui::text::TextFormat {
+                        font_id: f_small.clone(),
+                        color: p.dm_lbl,
+                        line_height: Some(16.3),
+                        ..Default::default()
+                    },
+                );
+                ctx.fonts(|fo| fo.layout_job(job))
+            };
+            let g_name = lay("Download Craft", f_name.clone(), p.txt, body_w);
+            let g_ver = {
+                let mut job = egui::text::LayoutJob::default();
+                job.wrap.max_width = body_w;
+                for (t, f, c) in [
+                    ("Version ", f_ver.clone(), p.dim),
+                    (env!("CARGO_PKG_VERSION"), f_ver_b.clone(), accent_hi),
+                    (" — check this to confirm your build.", f_ver.clone(), p.dim),
+                ] {
+                    job.append(
+                        t,
+                        0.0,
+                        egui::text::TextFormat {
+                            font_id: f,
+                            color: c,
+                            ..Default::default()
+                        },
+                    );
+                }
+                ctx.fonts(|fo| fo.layout_job(job))
+            };
+            let status_g = if self.update_status.trim().is_empty() {
+                None
+            } else {
+                Some(lay(&self.update_status, f_small.clone(), p.dim, body_w))
+            };
+            let hint_g = if self.update_asset.is_some() {
+                Some(lay(
+                    "Portable .zip lands in your downloads — unzip over the app folder to upgrade.",
+                    f_small.clone(),
+                    p.dm_lbl,
+                    body_w,
+                ))
+            } else {
+                None
+            };
+
+            let brand_h = g_name.size().y.max(46.0) + 4.0 + g_ver.size().y;
+            let credit_h = credit.size().y.max(14.0) + 18.0;
+            let mut body_h = 18.0 + brand_h + 16.0 + 1.0 + 14.0;
+            body_h += desc1.size().y + 10.0 + desc2.size().y + 10.0 + desc3.size().y + 14.0;
+            body_h += credit_h + 14.0 + btn_h;
+            if let Some(g) = &status_g {
+                body_h += 8.0 + g.size().y;
+            }
+            if let Some(g) = &hint_g {
+                body_h += 8.0 + g.size().y;
+            }
+            body_h += 16.0;
+            // Natural height: the layout is absolute, so clamping it would push
+            // the footer over the copy. It is sized to fit the app's smallest
+            // window (840x480) instead.
+            let ab_h = header_h + body_h + footer_h;
+
+            let mut open = true;
             egui::Window::new("About")
                 .id(egui::Id::new("about_modal"))
                 .order(egui::Order::Foreground)
-                .open(&mut self.show_about)
+                .open(&mut open)
+                .title_bar(false)
                 .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
                 .pivot(egui::Align2::CENTER_CENTER)
                 .collapsible(false)
                 .resizable(false)
-                .default_width(ab_w)
-                .min_width(ab_w.min(320.0))
-                .max_width(ab_w)
-                .max_height((ctx.screen_rect().height() * 0.86).clamp(280.0, 900.0))
-                .frame(modal_frame())
+                .fixed_size(egui::vec2(ab_w, ab_h))
+                .frame(egui::Frame::new().inner_margin(egui::Margin::ZERO))
                 .show(ctx, |ui| {
-                ui.heading("Download Craft");
-                ui.small(format!("Version {} — check this to confirm your build.", env!("CARGO_PKG_VERSION")));
-                ui.label("A lightweight download manager written in Rust + egui. MIT licensed — free for open-source, closed-source, and commercial use.");
-                ui.small("Multi-connection segmented downloads, queue, scheduler, browser extension host.");
-                ui.separator();
-                ui.small("Interface design inspired by modern download managers.");
-                ui.small("Icons: Material Icons font (Apache-2.0, © Google). See NOTICE.md.");
-                // P5 portable updater: check is opt-in, the asset downloads
-                // as a normal queued file (never a silent self-replace —
-                // Windows locks the running exe).
-                ui.separator();
-                ui.horizontal(|ui| {
-                    let r = mbutton(
-                        ui,
+                    // Painting alone leaves the window's used rect empty, which
+                    // would anchor a zero-sized area at the screen centre. Claim
+                    // the card so the anchor/pivot place it exactly.
+                    ui.set_min_size(egui::vec2(ab_w, ab_h));
+                    let card = ui.max_rect();
+                    let pf = ui.painter().clone();
+                    // ---- card: faint top-lit gradient, 1 px border ----
+                    crate::dm::dm_gradient(
+                        &pf,
+                        card,
+                        14.0,
+                        mix(p.modal_bg, p.primary, 0.05),
+                        p.modal_bg,
+                    );
+                    pf.rect_stroke(
+                        card,
+                        14.0,
+                        egui::Stroke::new(1.0, p.modal_bd),
+                        egui::StrokeKind::Inside,
+                    );
+                    pf.hline(
+                        card.x_range(),
+                        card.top() + 0.5,
+                        egui::Stroke::new(1.0, wash(accent, 110)),
+                    );
+
+                    // ---- header: centered title + close ----
+                    let head = egui::Rect::from_min_size(card.min, egui::vec2(ab_w, header_h));
+                    pf.hline(
+                        card.x_range(),
+                        head.bottom() - 0.5,
+                        egui::Stroke::new(1.0, soft),
+                    );
+                    let title_g = pf.layout_no_wrap("About".to_owned(), f_title.clone(), p.txt);
+                    pf.galley(
+                        egui::pos2(
+                            head.center().x - title_g.size().x / 2.0,
+                            head.center().y - title_g.size().y / 2.0,
+                        ),
+                        title_g,
+                        p.txt,
+                    );
+                    let xr = egui::Rect::from_center_size(
+                        egui::pos2(head.right() - 24.0, head.center().y),
+                        egui::vec2(28.0, 28.0),
+                    );
+                    let xh = self.man.hover(&xr);
+                    if xh {
+                        pf.rect_filled(xr, 7.0, p.dm_hover);
+                    }
+                    pf.text(
+                        xr.center(),
+                        egui::Align2::CENTER_CENTER,
+                        "\u{e5cd}".to_string(),
+                        crate::fonts::icon(12.0),
+                        if xh { p.txt } else { p.dm_lbl },
+                    );
+                    self.hits.push((HitKind::Btn(ButtonId::AbClose), xr));
+
+                    // ---- body ----
+                    let bx = card.left() + pad;
+                    let mut y = head.bottom() + 18.0;
+                    // brand tile
+                    let tile = egui::Rect::from_min_size(egui::pos2(bx, y), egui::vec2(46.0, 46.0));
+                    pf.rect(
+                        tile,
+                        12.0,
+                        wash(accent, 26),
+                        egui::Stroke::new(1.0, wash(accent, 72)),
+                        egui::StrokeKind::Inside,
+                    );
+                    pf.text(
+                        tile.center(),
+                        egui::Align2::CENTER_CENTER,
+                        "\u{e92d}".to_string(),
+                        crate::fonts::icon(26.0),
+                        accent,
+                    );
+                    // name + MIT tag, version under it
+                    let tx = tile.right() + 14.0;
+                    let block_h = g_name.size().y + 4.0 + g_ver.size().y;
+                    let ty = tile.center().y - block_h / 2.0;
+                    pf.galley(egui::pos2(tx, ty), g_name.clone(), p.txt);
+                    let tag_g = pf.layout_no_wrap("MIT".to_owned(), f_tag.clone(), green);
+                    let tag = egui::Rect::from_min_size(
+                        egui::pos2(
+                            tx + g_name.size().x + 8.0,
+                            ty + g_name.size().y / 2.0 - 8.5,
+                        ),
+                        egui::vec2(tag_g.size().x + 16.0, 17.0),
+                    );
+                    pf.rect(
+                        tag,
+                        8.5,
+                        wash(green, 30),
+                        egui::Stroke::new(1.0, wash(green, 64)),
+                        egui::StrokeKind::Inside,
+                    );
+                    pf.galley(tag.center() - tag_g.size() / 2.0, tag_g, green);
+                    pf.galley(
+                        egui::pos2(tx, ty + g_name.size().y + 4.0),
+                        g_ver.clone(),
+                        p.dim,
+                    );
+                    y += brand_h + 16.0;
+                    // divider
+                    pf.hline(bx..=card.right() - pad, y, egui::Stroke::new(1.0, soft));
+                    y += 1.0 + 14.0;
+                    // copy
+                    for g in [&desc1, &desc2, &desc3] {
+                        pf.galley(egui::pos2(bx, y), g.clone(), p.dim);
+                        y += g.size().y + 10.0;
+                    }
+                    y += 4.0; // the last paragraph's 14 px margin
+                    // credit box
+                    let cb = egui::Rect::from_min_size(egui::pos2(bx, y), egui::vec2(body_w, credit_h));
+                    pf.rect(
+                        cb,
+                        9.0,
+                        mix(p.modal_bg, p.surface_lt, 0.30),
+                        egui::Stroke::new(1.0, soft),
+                        egui::StrokeKind::Inside,
+                    );
+                    pf.text(
+                        egui::pos2(bx + 13.0 + 7.0, y + 9.0 + 7.0),
+                        egui::Align2::CENTER_CENTER,
+                        "\u{e88e}".to_string(),
+                        crate::fonts::icon(14.0),
+                        p.dm_lbl,
+                    );
+                    pf.galley(egui::pos2(bx + 13.0 + 14.0 + 9.0, y + 9.0), credit.clone(), p.dm_lbl);
+                    y += credit_h + 14.0;
+                    // ---- update buttons (opt-in; the asset queues like any
+                    // other file, never a silent self-replace) ----
+                    let b1 = about_btn(
+                        &pf,
                         &self.man,
-                        if self.update_busy { "Checking…" } else { "Check for updates" },
-                        150.0,
-                        32.0,
+                        bx,
+                        y,
+                        if self.update_busy {
+                            "Checking…"
+                        } else {
+                            "Check for updates"
+                        },
+                        Some("\u{e5d5}"),
                         false,
                     );
-                    self.hits.push((HitKind::Btn(ButtonId::UpdCheck), r));
+                    self.hits.push((HitKind::Btn(ButtonId::UpdCheck), b1));
                     if self.update_asset.is_some() && !self.update_busy {
-                        let r = mbutton(ui, &self.man, "Download update", 150.0, 32.0, true);
-                        self.hits.push((HitKind::Btn(ButtonId::UpdDownload), r));
+                        let b2 = about_btn(
+                            &pf,
+                            &self.man,
+                            b1.right() + 8.0,
+                            y,
+                            "Download update",
+                            Some("\u{e171}"),
+                            true,
+                        );
+                        self.hits.push((HitKind::Btn(ButtonId::UpdDownload), b2));
                     }
-                });
-                if !self.update_status.trim().is_empty() {
-                    ui.small(self.update_status.clone());
-                }
-                if self.update_asset.is_some() {
-                    ui.small("Portable .zip lands in your downloads — unzip over the app folder to upgrade.");
-                }
-                ui.add_space(6.0);
-                ui.horizontal(|ui| {
-                    ui.with_layout(
-                        egui::Layout::right_to_left(egui::Align::Center),
-                        |ui| {
-                            let r = mbutton(ui, &self.man, "Close", 110.0, 36.0, false);
-                            self.hits.push((HitKind::Btn(ButtonId::AbClose), r));
-                        },
+                    y += btn_h;
+                    if let Some(g) = &status_g {
+                        y += 8.0;
+                        pf.galley(egui::pos2(bx, y), g.clone(), p.dim);
+                        y += g.size().y;
+                    }
+                    if let Some(g) = &hint_g {
+                        y += 8.0;
+                        pf.galley(egui::pos2(bx, y), g.clone(), p.dm_lbl);
+                    }
+
+                    // ---- footer ----
+                    let foot = egui::Rect::from_min_max(
+                        egui::pos2(card.left(), card.bottom() - footer_h),
+                        card.max,
                     );
+                    pf.rect_filled(foot, 0.0, mix(p.modal_bg, egui::Color32::BLACK, 0.12));
+                    pf.hline(
+                        card.x_range(),
+                        foot.top() + 0.5,
+                        egui::Stroke::new(1.0, soft),
+                    );
+                    let cw = {
+                        let g = pf.layout_no_wrap("Close".to_owned(), f_body.clone(), egui::Color32::WHITE);
+                        30.0 + g.size().x
+                    };
+                    let close_r = egui::Rect::from_min_size(
+                        egui::pos2(card.right() - pad - cw, foot.center().y - btn_h / 2.0),
+                        egui::vec2(cw, btn_h),
+                    );
+                    about_btn(
+                        &pf,
+                        &self.man,
+                        close_r.left(),
+                        close_r.top(),
+                        "Close",
+                        None,
+                        true,
+                    );
+                    self.hits.push((HitKind::Btn(ButtonId::AbClose), close_r));
                 });
-            });
         }
 
         // ================= manual popups (topmost) + input processing ====

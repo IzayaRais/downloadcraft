@@ -1,5 +1,10 @@
 const $ = (id) => document.getElementById(id);
 
+// Promise-style calls (`await api.*` below) work in both engines: Firefox
+// exposes the promise-returning `browser` namespace, Chrome only `chrome`
+// (promise-capable under MV3). Callback-style calls keep using `chrome`.
+const api = (typeof browser !== "undefined" && browser.runtime) ? browser : chrome;
+
 chrome.runtime.sendMessage({ type: "getState" }, (res) => {
   if (chrome.runtime.lastError || !res) {
     $("status").textContent = "Extension background unreachable — reload the extension.";
@@ -307,7 +312,7 @@ function renderLinks(list, links, net, pageUrl, pageTitle) {
 // never another tab's leftovers); fall back to the stored snapshot.
 async function activeTab() {
   try {
-    const tabs = await chrome.tabs.query({ active: true, currentWindow: true });
+    const tabs = await api.tabs.query({ active: true, currentWindow: true });
     return (tabs && tabs[0]) || null;
   } catch (e) {
     return null;
@@ -321,7 +326,7 @@ async function activeTab() {
   const tabUrl = (tab && tab.url && /^https?:\/\//i.test(tab.url)) ? tab.url : null;
   if (tab && tab.id !== undefined) {
     try {
-      const peek = await chrome.tabs.sendMessage(tab.id, { type: "peekState" });
+      const peek = await api.tabs.sendMessage(tab.id, { type: "peekState" });
       if (peek && (peek.videos || peek.links || peek.net)) {
         renderVideos(box, peek.videos, peek.page || tabUrl);
         renderLinks(list, peek.links, peek.net, peek.page || tabUrl, peek.title || "");

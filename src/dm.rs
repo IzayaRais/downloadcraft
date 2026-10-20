@@ -68,6 +68,14 @@ pub fn dm_box(p: &egui::Painter, r: egui::Rect) {
 /// draws its values dim, but a real input reads better in the design's own
 /// content colour; unknown text stays `pl().dm_dim` as the hint). `text_r` bounds
 /// the editor so in-box icon buttons keep their room. Returns the box rect.
+///
+/// epaint lays text out one codepoint at a time, so a Bengali file name shows
+/// every matra after its consonant and keeps the virama visible - the letters
+/// read as broken even though the font is there. When the value needs the
+/// shaper the editor is left with what only it can do (caret, selection, IME,
+/// clipboard, keyboard) and its own glyphs are made invisible; the run is
+/// painted from `shaped` on top, in the text origin egui uses (top-left of the
+/// inner rect, no margin).
 pub fn dm_field(
     ui: &mut egui::Ui,
     key: &str,
@@ -83,21 +91,38 @@ pub fn dm_field(
         egui::pos2(text_r.max(rect.min.x + 40.0), rect.max.y - 1.0),
     );
     let line = egui::Rect::from_center_size(inner.center(), egui::vec2(inner.width(), 18.0));
+    let font = crate::fonts::reg(11.0);
+    // A password never needs shaping, and masking a shaped run is not a thing.
+    let shape = !password && crate::shaped::needs_shaping(buf);
     let te = egui::TextEdit::singleline(buf)
         .id(egui::Id::new(key))
         .hint_text(hint)
         .password(password)
         .frame(false)
         .margin(egui::Margin::ZERO)
-        .font(crate::fonts::reg(11.0))
+        .font(font.clone())
         .desired_width(line.width());
     ui.scope(|ui| {
         let v = ui.visuals_mut();
-        v.override_text_color = Some(pl().dm_txt);
+        v.override_text_color = Some(if shape {
+            egui::Color32::TRANSPARENT
+        } else {
+            pl().dm_txt
+        });
         v.weak_text_color = Some(pl().dm_dim);
         v.selection.bg_fill = egui::Color32::from_rgba_premultiplied(59, 130, 246, 90);
         ui.put(line, te);
     });
+    if shape {
+        crate::shaped::draw(
+            &ui.painter().with_clip_rect(line.intersect(ui.clip_rect())),
+            line.min,
+            egui::Align2::LEFT_TOP,
+            buf,
+            font,
+            pl().dm_txt,
+        );
+    }
     rect
 }
 
@@ -567,28 +592,28 @@ pub fn elide_left(s: &str, max: usize) -> String {
 
 /// Single line that measures no wider than `max_w`, elided in the middle so a
 /// long filename keeps both its head and its extension visible.
+///
+/// Widths come from `shaped`, so the decision matches what actually gets drawn
+/// for scripts egui cannot shape itself, and the cut lands on grapheme
+/// boundaries: slicing inside a Bengali cluster (a consonant plus its matra, or
+/// a consonant plus virama) would leave a dangling mark on screen.
 pub fn elide_mid(
     p: &egui::Painter,
     s: &str,
     font: egui::FontId,
     max_w: f32,
 ) -> String {
-    let width = |t: &str| {
-        p.layout_no_wrap(t.to_string(), font.clone(), egui::Color32::WHITE)
-            .size()
-            .x
-    };
+    use unicode_segmentation::UnicodeSegmentation;
+    let width = |t: &str| crate::shaped::width(p, t, &font);
     if width(s) <= max_w {
         return s.to_string();
     }
-    let chars: Vec<char> = s.chars().collect();
-    let mut keep = chars.len().saturating_sub(1);
+    let parts: Vec<&str> = s.graphemes(true).collect();
+    let mut keep = parts.len().saturating_sub(1);
     while keep > 3 {
         let head = keep.div_ceil(2);
         let tail = keep - head;
-        let cut: String = chars[..head].iter().collect::<String>()
-            + "…"
-            + &chars[chars.len() - tail..].iter().collect::<String>();
+        let cut: String = parts[..head].concat() + "…" + &parts[parts.len() - tail..].concat();
         if width(&cut) <= max_w {
             return cut;
         }

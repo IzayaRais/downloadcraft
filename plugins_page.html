@@ -1,0 +1,344 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="dark">
+<head>
+<meta charset="UTF-8">
+<title>Download Craft — Plugins</title>
+<style>
+  :root {
+    --bg: #ffffff; --bg-secondary: #f8fafc; --bg-input: #f1f5f9;
+    --bg-hover: #e2e8f0; --bg-active: #e0e7ff;
+    --text-primary: #0f172a; --text-secondary: #475569; --text-muted: #94a3b8;
+    --border: #e2e8f0; --border-soft: #eef2f7; --border-focus: #3b82f6;
+    --accent: #3b82f6; --accent-hover: #2563eb;
+    --shadow: 0 4px 24px rgba(0,0,0,0.08);
+    --tab-active-bg: #eef2ff; --tab-active-text: #3b82f6;
+    --btn-bg: #f1f5f9; --btn-text: #334155; --btn-border: #cbd5e1;
+    --success: #16a34a; --success-bg: #dcfce7;
+  }
+  [data-theme="dark"] {
+    --bg: #0f172a; --bg-secondary: #1e293b; --bg-input: #0f172a;
+    --bg-hover: #334155; --bg-active: #1e293b;
+    --text-primary: #f1f5f9; --text-secondary: #94a3b8; --text-muted: #64748b;
+    --border: #334155; --border-soft: #24334a; --border-focus: #3b82f6;
+    --accent: #3b82f6; --accent-hover: #60a5fa;
+    --shadow: 0 4px 24px rgba(0,0,0,0.4);
+    --tab-active-bg: #1e293b; --tab-active-text: #60a5fa;
+    --btn-bg: #1e293b; --btn-text: #94a3b8; --btn-border: #334155;
+    --success: #22c55e; --success-bg: #22c55e22;
+  }
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body { background: #0a0a1a; color: #e0e0f0; font-family: 'Segoe UI', sans-serif; padding: 40px; }
+  h1 { text-align: center; font-size: 20px; margin-bottom: 4px; color: #fff; }
+  .subtitle { text-align: center; color: #8888a8; margin-bottom: 20px; font-size: 11px; }
+  .theme-toggle { display: flex; justify-content: center; gap: 8px; margin-bottom: 20px; }
+  .theme-btn { padding: 6px 16px; border-radius: 16px; border: 1px solid var(--border); background: var(--bg-secondary); color: var(--text-secondary); font-size: 11px; cursor: pointer; transition: all 0.2s; }
+  .theme-btn.active { background: var(--accent); color: #fff; border-color: var(--accent); }
+
+  .window { background: var(--bg); border: 1px solid var(--border); border-radius: 10px; width: 660px; margin: 0 auto; box-shadow: var(--shadow); overflow: hidden; }
+  .title-bar { display: flex; align-items: center; gap: 8px; padding: 10px 14px; border-bottom: 1px solid var(--border); }
+  .title-bar .icon { width: 18px; height: 18px; }
+  .title-bar .title { font-size: 13px; font-weight: 500; color: var(--text-primary); }
+  .title-bar .spacer { flex: 1; }
+  .title-bar .win-btn { width: 28px; height: 28px; display: flex; align-items: center; justify-content: center; border-radius: 4px; cursor: pointer; color: var(--text-muted); }
+  .title-bar .win-btn:hover { background: var(--bg-hover); }
+
+  .body { display: flex; min-height: 430px; }
+  .sidebar { width: 160px; border-right: 1px solid var(--border); padding: 8px; display: flex; flex-direction: column; gap: 2px; flex-shrink: 0; }
+  .sidebar .tab { display: flex; align-items: center; gap: 8px; padding: 8px 10px; border-radius: 6px; font-size: 12px; color: var(--text-secondary); cursor: pointer; transition: all 0.15s; border: none; background: none; width: 100%; text-align: left; font-family: inherit; }
+  .sidebar .tab:hover { background: var(--bg-hover); }
+  .sidebar .tab.active { background: var(--tab-active-bg); color: var(--tab-active-text); font-weight: 500; }
+  .sidebar .tab svg { width: 14px; height: 14px; flex-shrink: 0; }
+
+  .content { flex: 1; min-width: 0; padding: 16px 20px; overflow-y: auto; max-height: 470px; }
+  .content::-webkit-scrollbar { width: 6px; }
+  .content::-webkit-scrollbar-thumb { background: var(--border); border-radius: 3px; }
+  .content h2 { font-size: 16px; font-weight: 600; color: var(--text-primary); margin-bottom: 4px; }
+  .content .page-hint { font-size: 10px; color: var(--text-muted); margin-bottom: 14px; }
+  .tab-content { display: none; }
+  .tab-content.active { display: block; }
+
+  /* ---------- Plugin card ---------- */
+  .plugin-card {
+    background: var(--bg-secondary); border: 1px solid var(--border);
+    border-radius: 12px; margin-bottom: 10px; overflow: hidden;
+    transition: border-color 0.15s, box-shadow 0.15s;
+  }
+  .plugin-card.open { border-color: rgba(59,130,246,0.35); box-shadow: 0 0 0 1px rgba(59,130,246,0.10); }
+
+  /* single identity row: logo · name · version | date · size · chevron */
+  .plugin-head { display: flex; align-items: center; gap: 11px; padding: 11px 13px; cursor: pointer; user-select: none; }
+  .plugin-head:hover { background: var(--bg-hover); }
+  .plugin-logo { width: 34px; height: 34px; border-radius: 9px; display: flex; align-items: center; justify-content: center; flex-shrink: 0; }
+  .plugin-logo svg { width: 17px; height: 17px; }
+  .plugin-name { font-size: 13px; font-weight: 600; color: var(--text-primary); white-space: nowrap; }
+  .plugin-ver {
+    font-family: 'Consolas', monospace; font-size: 9px; font-weight: 600;
+    color: var(--accent); background: var(--tab-active-bg);
+    border: 1px solid var(--border); border-radius: 20px;
+    padding: 2px 8px; white-space: nowrap; flex-shrink: 0;
+  }
+  .plugin-meta { margin-left: auto; display: flex; align-items: center; gap: 7px; font-size: 10px; color: var(--text-muted); white-space: nowrap; }
+  .plugin-meta .sep { width: 3px; height: 3px; border-radius: 50%; background: currentColor; opacity: 0.55; }
+  .plugin-chevron { width: 16px; height: 16px; color: var(--text-muted); flex-shrink: 0; transition: transform 0.2s; }
+  .plugin-card.open .plugin-chevron { transform: rotate(180deg); }
+
+  .plugin-body { display: none; padding: 12px 13px 13px; border-top: 1px solid var(--border-soft); }
+  .plugin-card.open .plugin-body { display: block; }
+
+  .p-section { margin-bottom: 13px; }
+  .p-section:last-child { margin-bottom: 0; }
+  .p-label { font-size: 9px; font-weight: 600; text-transform: uppercase; letter-spacing: 0.5px; color: var(--text-muted); margin-bottom: 7px; }
+
+  /* platform grid */
+  .platform-grid { display: grid; grid-template-columns: repeat(7, 1fr); gap: 6px 4px; }
+  .platform-item { display: flex; flex-direction: column; align-items: center; gap: 3px; }
+  .platform-icon { width: 30px; height: 30px; border-radius: 8px; display: flex; align-items: center; justify-content: center; }
+  .platform-icon svg { width: 16px; height: 16px; }
+  .platform-name { font-size: 8px; color: var(--text-muted); text-align: center; line-height: 1.1; }
+
+  /* feature list */
+  .feat-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 4px 14px; }
+  .feat { display: flex; align-items: flex-start; gap: 6px; font-size: 10px; color: var(--text-secondary); line-height: 1.35; }
+  .feat svg { width: 10px; height: 10px; flex-shrink: 0; margin-top: 2px; color: var(--success); }
+
+  /* location chooser (replaces the old "Prefer PATH" checkbox) */
+  .loc-group { display: flex; flex-direction: column; gap: 6px; }
+  .loc-opt {
+    display: flex; align-items: flex-start; gap: 9px; padding: 8px 10px;
+    border: 1px solid var(--border); border-radius: 8px; background: var(--bg);
+    cursor: pointer; transition: border-color 0.15s, background 0.15s;
+  }
+  .loc-opt:hover { border-color: var(--border-focus); }
+  .loc-opt.active { border-color: var(--accent); background: var(--tab-active-bg); }
+  .loc-opt input { display: none; }
+  .loc-radio { width: 14px; height: 14px; border-radius: 50%; border: 1.5px solid var(--btn-border); flex-shrink: 0; margin-top: 1px; position: relative; transition: border-color 0.15s; }
+  .loc-opt.active .loc-radio { border-color: var(--accent); }
+  .loc-radio::after { content: ""; position: absolute; inset: 2.5px; border-radius: 50%; background: var(--accent); transform: scale(0); transition: transform 0.15s; }
+  .loc-opt.active .loc-radio::after { transform: scale(1); }
+  .loc-main { display: flex; flex-direction: column; gap: 2px; min-width: 0; flex: 1; }
+  .loc-title { display: flex; align-items: center; gap: 7px; font-size: 11px; font-weight: 500; color: var(--text-primary); }
+  .loc-sub { font-size: 9px; color: var(--text-muted); word-break: break-all; line-height: 1.4; }
+  .loc-sub.mono { font-family: 'Consolas', monospace; font-size: 9px; }
+  .pill-rec { font-size: 8px; font-weight: 600; text-transform: uppercase; letter-spacing: 0.4px; color: var(--success); background: var(--success-bg); border-radius: 20px; padding: 1px 6px; }
+  .loc-browse { align-self: center; flex-shrink: 0; }
+
+  .loc-status { display: flex; align-items: center; gap: 6px; margin-top: 8px; font-size: 10px; color: var(--text-secondary); }
+  .loc-status .dot { width: 6px; height: 6px; border-radius: 50%; background: var(--success); flex-shrink: 0; box-shadow: 0 0 0 3px var(--success-bg); }
+
+  /* actions */
+  .plugin-actions { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; margin-top: 13px; padding-top: 12px; border-top: 1px solid var(--border-soft); }
+  .plugin-actions .spacer { flex: 1; }
+  .runtime-note { font-size: 9px; color: var(--text-muted); display: flex; align-items: center; gap: 5px; margin-left: auto; white-space: nowrap; }
+  .runtime-note code { font-family: 'Consolas', monospace; background: var(--bg-input); border: 1px solid var(--border); border-radius: 4px; padding: 1px 5px; font-size: 9px; color: var(--text-secondary); }
+
+  /* buttons */
+  .btn { display: inline-flex; align-items: center; gap: 6px; padding: 6px 14px; border-radius: 6px; font-size: 11px; font-weight: 500; font-family: inherit; cursor: pointer; border: 1px solid var(--btn-border); background: var(--btn-bg); color: var(--btn-text); transition: all 0.15s; white-space: nowrap; flex-shrink: 0; }
+  .btn:hover { background: var(--bg-hover); color: var(--text-primary); }
+  .btn svg { width: 12px; height: 12px; }
+  .btn-primary { background: var(--accent); color: #fff; border-color: var(--accent); }
+  .btn-primary:hover { background: var(--accent-hover); border-color: var(--accent-hover); color: #fff; }
+  .btn-mini { padding: 4px 10px; font-size: 10px; border-radius: 5px; }
+  .btn-ghost { background: transparent; border-color: transparent; color: var(--text-muted); padding: 6px 8px; }
+  .btn-ghost:hover { background: var(--bg-hover); color: var(--text-primary); }
+
+  .empty-note { display: flex; align-items: center; gap: 8px; font-size: 9.5px; color: var(--text-muted); padding: 2px 2px 0; }
+  .empty-note svg { width: 12px; height: 12px; flex-shrink: 0; }
+
+  .window-footer { display: flex; align-items: center; gap: 8px; padding: 12px 16px; border-top: 1px solid var(--border); background: var(--bg-secondary); }
+  .window-footer .spacer { flex: 1; }
+</style>
+</head>
+<body>
+
+<h1>Download Craft Settings</h1>
+<p class="subtitle">Plugins page redesign</p>
+
+<div class="theme-toggle">
+  <button class="theme-btn active" onclick="setTheme('dark')">Dark Mode</button>
+  <button class="theme-btn" onclick="setTheme('light')">Light Mode</button>
+</div>
+
+<div class="window">
+  <div class="title-bar">
+    <svg class="icon" viewBox="0 0 24 24" fill="none"><circle cx="12" cy="12" r="10" stroke="#3b82f6" stroke-width="2"/><path d="M8 12l3 3 5-6" stroke="#3b82f6" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg>
+    <span class="title">Download Craft Settings</span>
+    <span class="spacer"></span>
+    <div class="win-btn"><svg width="10" height="10" viewBox="0 0 24 24" fill="none"><path d="M5 12h14" stroke="currentColor" stroke-width="2" stroke-linecap="round"/></svg></div>
+    <div class="win-btn"><svg width="10" height="10" viewBox="0 0 24 24" fill="none"><rect x="5" y="5" width="14" height="14" rx="1" stroke="currentColor" stroke-width="2"/></svg></div>
+    <div class="win-btn"><svg width="10" height="10" viewBox="0 0 24 24" fill="none"><path d="M6 6l12 12M18 6L6 18" stroke="currentColor" stroke-width="2" stroke-linecap="round"/></svg></div>
+  </div>
+
+  <div class="body">
+    <div class="sidebar">
+      <button class="tab" onclick="switchTab(0)"><svg viewBox="0 0 24 24" fill="none"><path d="M4 8V6a2 2 0 012-2h2M16 4h2a2 2 0 012 2v2M20 16v2a2 2 0 01-2 2h-2M8 20H6a2 2 0 01-2-2v-2" stroke="currentColor" stroke-width="2" stroke-linecap="round"/><path d="M9 15a3 3 0 106 0 3 3 0 00-6 0z" stroke="currentColor" stroke-width="2"/></svg>Appearance</button>
+      <button class="tab" onclick="switchTab(1)"><svg viewBox="0 0 24 24" fill="none"><path d="M13 2L4 14h7l-1 8 9-12h-7l1-8z" stroke="currentColor" stroke-width="2" stroke-linejoin="round"/></svg>Download Engine</button>
+      <button class="tab active" onclick="switchTab(2)"><svg viewBox="0 0 24 24" fill="none"><rect x="3" y="3" width="8" height="8" rx="2" stroke="currentColor" stroke-width="2"/><rect x="13" y="3" width="8" height="8" rx="2" stroke="currentColor" stroke-width="2"/><rect x="3" y="13" width="8" height="8" rx="2" stroke="currentColor" stroke-width="2"/><rect x="13" y="13" width="8" height="8" rx="2" stroke="currentColor" stroke-width="2"/></svg>Plugins</button>
+      <button class="tab" onclick="switchTab(3)"><svg viewBox="0 0 24 24" fill="none"><circle cx="12" cy="12" r="9" stroke="currentColor" stroke-width="2"/><path d="M3.6 9h16.8M3.6 15h16.8M12 3a13 13 0 010 18M12 3a13 13 0 000 18" stroke="currentColor" stroke-width="2"/></svg>Browser Integration</button>
+      <button class="tab" onclick="switchTab(4)"><svg viewBox="0 0 24 24" fill="none"><path d="M4 4h6v6H4zM14 4h6v6h-6zM4 14h6v6H4zM14 14h6v6h-6z" stroke="currentColor" stroke-width="2" stroke-linejoin="round"/></svg>Categories &amp; Rules</button>
+      <button class="tab" onclick="switchTab(5)"><svg viewBox="0 0 24 24" fill="none"><path d="M21 12a9 9 0 11-3-6.7" stroke="currentColor" stroke-width="2" stroke-linecap="round"/><path d="M21 3v6h-6" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg>Updates</button>
+    </div>
+
+    <div class="content">
+      <!-- other tabs (unchanged) -->
+      <div class="tab-content" id="tab0"><h2>Appearance</h2><p class="page-hint">Not part of this redesign preview.</p></div>
+      <div class="tab-content" id="tab1"><h2>Download Engine</h2><p class="page-hint">Not part of this redesign preview.</p></div>
+
+      <!-- ============ PLUGINS ============ -->
+      <div class="tab-content active" id="tab2">
+        <h2>Plugins</h2>
+        <p class="page-hint">Each plugin is its own card. Name, version and date sit on one row.</p>
+
+        <!-- Plugins install as their own cards, header row stays identical -->
+        <div class="plugin-card open">
+          <div class="plugin-head">
+            <div class="plugin-logo" style="background:#3b82f622;border:1px solid rgba(59,130,246,0.25);">
+              <svg viewBox="0 0 24 24" fill="none"><path d="M10 2L14 2L18 6L18 22L2 22L2 6Z" stroke="#3b82f6" stroke-width="2" stroke-linejoin="round"/><path d="M10 2L10 6L14 6" stroke="#3b82f6" stroke-width="1.5" stroke-linejoin="round"/></svg>
+            </div>
+            <span class="plugin-name">yt-dlp</span>
+            <span class="plugin-ver">v2026.08.19</span>
+            <span class="plugin-meta">2026-08-19 <span class="sep"></span> 17.01 MB</span>
+            <svg class="plugin-chevron" viewBox="0 0 24 24" fill="none"><path d="M6 9l6 6 6-6" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg>
+          </div>
+
+          <div class="plugin-body">
+            <div class="p-section">
+              <div class="p-label">Supported sites</div>
+              <div class="platform-grid">
+                <div class="platform-item"><div class="platform-icon" style="background:#ff000020;"><svg viewBox="0 0 24 24" fill="none"><rect x="2" y="5" width="20" height="14" rx="5" fill="#ff0000" opacity="0.9"/><path d="M10 9l5 3-5 3z" fill="#fff"/></svg></div><span class="platform-name">YouTube</span></div>
+                <div class="platform-item"><div class="platform-icon" style="background:#1877f220;"><svg viewBox="0 0 24 24" fill="none"><path d="M13 22v-8h3l.5-4H13V7.5c0-1 .5-1.5 1.5-1.5H17V2.5C16.4 2.4 15.2 2 14 2c-3 0-5 2-5 5v3H6v4h3v8h4z" fill="#1877f2"/></svg></div><span class="platform-name">Facebook</span></div>
+                <div class="platform-item"><div class="platform-icon" style="background:#00000020;"><svg viewBox="0 0 24 24" fill="none"><path d="M16.5 3c.4 2.5 1.8 4 4.5 4.5v3c-1.7 0-3.2-.5-4.5-1.5v6.5c0 3.5-2.5 6-6 6s-6-2.5-6-6 2.5-6 6-6c.3 0 .7 0 1 .1v3.2c-.3-.1-.7-.2-1-.2-1.7 0-3 1.3-3 3s1.3 3 3 3 3-1.3 3-3V3h4z" fill="#e6e6e6"/></svg></div><span class="platform-name">TikTok</span></div>
+                <div class="platform-item"><div class="platform-icon" style="background:#e1306c20;"><svg viewBox="0 0 24 24" fill="none"><rect x="2" y="2" width="20" height="20" rx="5" stroke="#e1306c" stroke-width="2"/><circle cx="12" cy="12" r="5" stroke="#e1306c" stroke-width="2"/><circle cx="17.5" cy="6.5" r="1.5" fill="#e1306c"/></svg></div><span class="platform-name">Instagram</span></div>
+                <div class="platform-item"><div class="platform-icon" style="background:#00000020;"><svg viewBox="0 0 24 24" fill="none"><path d="M4 4l7.2 9.3L4.4 20h2.5l5.5-5.5L16.8 20H20l-7.5-9.7L19.3 4h-2.5l-5 5L7.2 4H4z" fill="#e6e6e6"/></svg></div><span class="platform-name">X/Twitter</span></div>
+                <div class="platform-item"><div class="platform-icon" style="background:#9146ff20;"><svg viewBox="0 0 24 24" fill="none"><path d="M4 2L2 6v14h5v3l4-3h3l6-6V2H4zm16 9l-3 3h-4l-3 3v-3H6V4h14v7z" fill="#9146ff"/><path d="M15 7h2v5h-2zM11 7h2v5h-2z" fill="#9146ff"/></svg></div><span class="platform-name">Twitch</span></div>
+                <div class="platform-item"><div class="platform-icon" style="background:#ff450020;"><svg viewBox="0 0 24 24" fill="none"><circle cx="12" cy="12" r="10" stroke="#ff4500" stroke-width="2"/><path d="M12 7v5l3 3" stroke="#ff4500" stroke-width="2" stroke-linecap="round"/><circle cx="12" cy="12" r="2" fill="#ff4500"/></svg></div><span class="platform-name">Reddit</span></div>
+                <div class="platform-item"><div class="platform-icon" style="background:#5865f220;"><svg viewBox="0 0 24 24" fill="none"><path d="M4 4c8 0 12 4 12 12-8 0-12-4-12-12z" fill="#5865f2"/><path d="M8 14c1 1 2.5 1.5 4 1.5s3-.5 4-1.5" stroke="#fff" stroke-width="1.5" stroke-linecap="round"/></svg></div><span class="platform-name">Discord</span></div>
+                <div class="platform-item"><div class="platform-icon" style="background:#00f2ea20;"><svg viewBox="0 0 24 24" fill="none"><circle cx="12" cy="12" r="10" stroke="#00f2ea" stroke-width="1.5"/><circle cx="12" cy="12" r="10" stroke="#ff0050" stroke-width="1.5" stroke-dasharray="60" stroke-dashoffset="20"/><circle cx="12" cy="12" r="4" fill="#fff"/></svg></div><span class="platform-name">Vimeo</span></div>
+                <div class="platform-item"><div class="platform-icon" style="background:#fffc0020;"><svg viewBox="0 0 24 24" fill="none"><path d="M12 2C6.5 2 2 6.5 2 12s4.5 10 10 10 10-4.5 10-10S17.5 2 12 2zm-2 14.5v-9l6 4.5-6 4.5z" fill="#fffc00"/></svg></div><span class="platform-name">Snapchat</span></div>
+                <div class="platform-item"><div class="platform-icon" style="background:#0affef20;"><svg viewBox="0 0 24 24" fill="none"><path d="M12 2L2 7l10 5 10-5-10-5zM2 17l10 5 10-5M2 12l10 5 10-5" stroke="#0affef" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg></div><span class="platform-name">Dailymotion</span></div>
+                <div class="platform-item"><div class="platform-icon" style="background:#0a66c220;"><svg viewBox="0 0 24 24" fill="none"><rect x="2" y="2" width="20" height="20" rx="4" fill="#0a66c2"/><circle cx="7.5" cy="7.8" r="1.4" fill="#fff"/><rect x="6.3" y="10.4" width="2.4" height="7.3" fill="#fff"/><path d="M11 10.4h2.3v1c.4-.7 1.3-1.2 2.4-1.2 2 0 3 1.2 3 3.4v4.1h-2.4v-3.7c0-1-.4-1.6-1.3-1.6-.9 0-1.6.6-1.6 1.8v3.5H11z" fill="#fff"/></svg></div><span class="platform-name">LinkedIn</span></div>
+                <div class="platform-item"><div class="platform-icon" style="background:#ff550020;"><svg viewBox="0 0 24 24" fill="none"><path d="M2.5 15.5v3M5 13.5v5M7.5 12v6.5M10 10.5v8" stroke="#ff5500" stroke-width="1.7" stroke-linecap="round"/><path d="M12 18.5h5.2a3.2 3.2 0 000-6.4c-.35 0-.68.06-1 .16A4.6 4.6 0 0012 8.5z" fill="#ff5500"/></svg></div><span class="platform-name">SoundCloud</span></div>
+                <div class="platform-item"><div class="platform-icon" style="background:transparent;border:1px dashed var(--btn-border);"><svg viewBox="0 0 24 24" fill="none"><path d="M12 8v8M8 12h8" stroke="currentColor" stroke-width="2" stroke-linecap="round" style="color:var(--text-muted);"/></svg></div><span class="platform-name">1,000+<br>more</span></div>
+              </div>
+            </div>
+
+            <div class="p-section">
+              <div class="p-label">Capabilities</div>
+              <div class="feat-grid">
+                <div class="feat"><svg viewBox="0 0 24 24" fill="none"><path d="M4 12l5 5L20 6" stroke="currentColor" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"/></svg>YouTube: videos, audio, playlists, channels</div>
+                <div class="feat"><svg viewBox="0 0 24 24" fill="none"><path d="M4 12l5 5L20 6" stroke="currentColor" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"/></svg>Facebook: public videos and Reels</div>
+                <div class="feat"><svg viewBox="0 0 24 24" fill="none"><path d="M4 12l5 5L20 6" stroke="currentColor" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"/></svg>TikTok, Instagram, Vimeo, Reddit</div>
+                <div class="feat"><svg viewBox="0 0 24 24" fill="none"><path d="M4 12l5 5L20 6" stroke="currentColor" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"/></svg>X (Twitter), LinkedIn, and 1,000+ more</div>
+                <div class="feat"><svg viewBox="0 0 24 24" fill="none"><path d="M4 12l5 5L20 6" stroke="currentColor" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"/></svg>Resolutions up to 1080p and 4K</div>
+                <div class="feat"><svg viewBox="0 0 24 24" fill="none"><path d="M4 12l5 5L20 6" stroke="currentColor" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"/></svg>Subtitles and thumbnails</div>
+              </div>
+            </div>
+
+            <div class="p-section">
+              <div class="p-label">yt-dlp location</div>
+              <div class="loc-group">
+                <label class="loc-opt active">
+                  <input type="radio" name="ytdlp-loc" checked>
+                  <span class="loc-radio"></span>
+                  <span class="loc-main">
+                    <span class="loc-title">App's own copy <span class="pill-rec">Recommended</span></span>
+                    <span class="loc-sub mono">C:\Users\moham\AppData\Local\download_craft\bin\yt-dlp.exe</span>
+                  </span>
+                </label>
+                <label class="loc-opt">
+                  <input type="radio" name="ytdlp-loc">
+                  <span class="loc-radio"></span>
+                  <span class="loc-main">
+                    <span class="loc-title">System PATH</span>
+                    <span class="loc-sub">Use the <b>yt-dlp</b> found on your system PATH (pip, winget, scoop, manual install)</span>
+                  </span>
+                </label>
+                <label class="loc-opt">
+                  <input type="radio" name="ytdlp-loc">
+                  <span class="loc-radio"></span>
+                  <span class="loc-main">
+                    <span class="loc-title">Custom path</span>
+                    <span class="loc-sub">Point the plugin at any yt-dlp executable you choose</span>
+                  </span>
+                  <button type="button" class="btn btn-mini loc-browse">Browse…</button>
+                </label>
+              </div>
+              <div class="loc-status"><span class="dot"></span> Active: App's own copy — yt-dlp 2026.08.19 detected</div>
+            </div>
+
+            <div class="plugin-actions">
+              <button class="btn btn-primary"><svg viewBox="0 0 24 24" fill="none"><path d="M20 12a8 8 0 11-2.34-5.66" stroke="currentColor" stroke-width="2" stroke-linecap="round"/><path d="M20 4v4h-4" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg>Re-download</button>
+              <button class="btn"><svg viewBox="0 0 24 24" fill="none"><path d="M3 7l3-4h12l3 4v13H3V7z" stroke="currentColor" stroke-width="1.6" stroke-linejoin="round"/><path d="M3 7h18" stroke="currentColor" stroke-width="1.6"/></svg>Show in folder</button>
+              <div class="spacer"></div>
+              <span class="runtime-note">Runtime <code>node</code> — solves YouTube's player challenge</span>
+            </div>
+          </div>
+        </div>
+
+        <!-- second plugin card: same header row, collapsed by default (sample) -->
+        <div class="plugin-card">
+          <div class="plugin-head">
+            <div class="plugin-logo" style="background:#22c55e22;border:1px solid rgba(34,197,94,0.25);">
+              <svg viewBox="0 0 24 24" fill="none"><rect x="2" y="4" width="20" height="16" rx="3" stroke="#22c55e" stroke-width="2"/><path d="M8 4v16M2 9h6M2 15h6M8 12l12-8v16L8 12z" stroke="#22c55e" stroke-width="1.4" stroke-linejoin="round"/></svg>
+            </div>
+            <span class="plugin-name">ffmpeg</span>
+            <span class="plugin-ver">v7.1</span>
+            <span class="plugin-meta">2026-06-15 <span class="sep"></span> 78.2 MB</span>
+            <svg class="plugin-chevron" viewBox="0 0 24 24" fill="none"><path d="M6 9l6 6 6-6" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg>
+          </div>
+          <div class="plugin-body">
+            <div class="p-section">
+              <div class="p-label">Capabilities</div>
+              <div class="feat-grid">
+                <div class="feat"><svg viewBox="0 0 24 24" fill="none"><path d="M4 12l5 5L20 6" stroke="currentColor" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"/></svg>Merges separate video + audio streams</div>
+                <div class="feat"><svg viewBox="0 0 24 24" fill="none"><path d="M4 12l5 5L20 6" stroke="currentColor" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"/></svg>Remux and convert containers</div>
+                <div class="feat"><svg viewBox="0 0 24 24" fill="none"><path d="M4 12l5 5L20 6" stroke="currentColor" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"/></svg>Required by yt-dlp for 1080p+ and 4K</div>
+                <div class="feat"><svg viewBox="0 0 24 24" fill="none"><path d="M4 12l5 5L20 6" stroke="currentColor" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"/></svg>Embed subtitles and thumbnails</div>
+              </div>
+            </div>
+            <div class="plugin-actions">
+              <button class="btn btn-primary">Re-download</button>
+              <button class="btn">Show in folder</button>
+            </div>
+          </div>
+        </div>
+
+        <div class="empty-note">
+          <svg viewBox="0 0 24 24" fill="none"><circle cx="12" cy="12" r="9" stroke="currentColor" stroke-width="2"/><path d="M12 11v5" stroke="currentColor" stroke-width="2" stroke-linecap="round"/><circle cx="12" cy="7.8" r="1.1" fill="currentColor"/></svg>
+          More plugins will appear here as they are added. Each plugin gets its own card with info, actions, and options.
+        </div>
+      </div>
+
+      <div class="tab-content" id="tab3"><h2>Browser Integration</h2><p class="page-hint">Not part of this redesign preview.</p></div>
+      <div class="tab-content" id="tab4"><h2>Categories &amp; Rules</h2><p class="page-hint">Not part of this redesign preview.</p></div>
+      <div class="tab-content" id="tab5"><h2>Updates</h2><p class="page-hint">Not part of this redesign preview.</p></div>
+    </div>
+  </div>
+
+  <div class="window-footer">
+    <button class="btn">Save</button>
+    <div class="spacer"></div>
+    <button class="btn">Close</button>
+  </div>
+</div>
+
+<script>
+  function setTheme(t) {
+    document.documentElement.setAttribute('data-theme', t);
+    document.querySelectorAll('.theme-btn').forEach((b, i) => b.classList.toggle('active', (t === 'dark') === (i === 0)));
+  }
+  function switchTab(i) {
+    document.querySelectorAll('.sidebar .tab').forEach((t, idx) => t.classList.toggle('active', idx === i));
+    document.querySelectorAll('.tab-content').forEach((c, idx) => c.classList.toggle('active', idx === i));
+  }
+  document.querySelectorAll('.plugin-head').forEach(h => {
+    h.addEventListener('click', () => h.closest('.plugin-card').classList.toggle('open'));
+  });
+  document.querySelectorAll('.loc-opt input').forEach(inp => {
+    inp.addEventListener('change', () => {
+      document.querySelectorAll('.loc-opt').forEach(o => o.classList.remove('active'));
+      inp.closest('.loc-opt').classList.add('active');
+    });
+  });
+</script>
+</body>
+</html>

@@ -31,10 +31,13 @@ struct Incoming {
     /// the dialog prefers this over probing.
     #[serde(default)]
     size: Option<u64>,
-    /// Adaptive pair audio URL (video-only + audio merge).
-    #[serde(default)]
+    /// Adaptive pair audio URL (video-only + audio merge). The extension
+    /// sends these in camelCase (`pairUrl`/`pairMime`) like `pageUrl`, so
+    /// without the aliases the pair was silently dropped and the merge never
+    /// happened.
+    #[serde(default, alias = "pairUrl")]
     pub pair_url: Option<String>,
-    #[serde(default)]
+    #[serde(default, alias = "pairMime")]
     pub pair_mime: Option<String>,
     /// Batch presence check (`{"type":"query"}`): which of these URLs are
     /// already queued. Answered from queue.json without side effects.
@@ -276,8 +279,21 @@ fn spawn_confirm(msg: &Incoming) {
     #[cfg(windows)]
     {
         use std::os::windows::process::CommandExt;
-        // DETACHED_PROCESS: the dialog must survive our own exit.
-        cmd.creation_flags(0x00000008);
+        const DETACHED_PROCESS: u32 = 0x0000_0008;
+        const CREATE_BREAKAWAY_FROM_JOB: u32 = 0x0100_0000;
+        // DETACHED_PROCESS so the dialog outlives this short-lived host, and
+        // BREAKAWAY_FROM_JOB because Firefox runs native hosts inside a job
+        // object it kills when the host exits: children inherit that job, so a
+        // plain detached dialog was being torn down the moment Firefox closed
+        // our stdin (verified live — Chrome does not use such a job, which is
+        // why only Firefox looked like it did nothing). A job that forbids
+        // breaking away makes the spawn fail, and a plain detached dialog
+        // still beats no dialog at all.
+        cmd.creation_flags(DETACHED_PROCESS | CREATE_BREAKAWAY_FROM_JOB);
+        if cmd.spawn().is_ok() {
+            return;
+        }
+        cmd.creation_flags(DETACHED_PROCESS);
     }
     let _ = cmd.spawn();
 }

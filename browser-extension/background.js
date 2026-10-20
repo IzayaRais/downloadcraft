@@ -11,7 +11,14 @@ let lastFallbackError = "";
 // Must match manifest version + content.js EXT_VER. Tabs running an older
 // content script are rejected with a "reload the tab" error instead of
 // failing mysteriously (their extension APIs are gone after a reload).
-const EXT_VER = "0.9.5";
+const EXT_VER = "0.9.6";
+
+// Promise-style calls (the `await api.*` ones below) go through this handle so
+// one file serves both engines: Firefox exposes the promise-returning
+// `browser` namespace, while Chrome only has `chrome` (promise-capable under
+// MV3). Callback-style calls keep using `chrome`, which Firefox also provides
+// as its callback flavour of the same APIs.
+const api = (typeof browser !== "undefined" && browser.runtime) ? browser : chrome;
 
 // Shared ranking (P4): playlist/segment/file kinds, scores, duplicate
 // collapse. Service workers support importScripts; if it ever fails the
@@ -33,7 +40,7 @@ function freshSeen(url, filename) {
 }
 
 async function settings() {
-  const s = await chrome.storage.local.get({
+  const s = await api.storage.local.get({
     autoCapture: true,
     minSizeKB: 100,
     blockHosts: "",
@@ -59,7 +66,7 @@ function hostBlocked(url, blockHosts) {
 async function cookiesFor(url) {
   try {
     if (!chrome.cookies || !chrome.cookies.getAll) return null;
-    const list = await chrome.cookies.getAll({ url });
+    const list = await api.cookies.getAll({ url });
     if (!list || !list.length) return null;
     const pairs = list
       .filter((c) => c && c.name)
@@ -109,7 +116,7 @@ async function sendToHost(url, filename, extra) {
         } catch (e) { /* host parse failed: no cookies */ }
       }
     }
-    const res = await chrome.runtime.sendNativeMessage(HOST, {
+    const res = await api.runtime.sendNativeMessage(HOST, {
       type: "download",
       url,
       filename: filename || null,
@@ -125,7 +132,10 @@ async function sendToHost(url, filename, extra) {
     });
     return !!res && (res.type === "ok" || res.type === "pong");
   } catch (e) {
+    // Console-visible: this is the first thing to look at when clicks seem to
+    // do nothing (browser console: "No such native application", etc.).
     lastHostError = (e && e.message) || String(e);
+    console.error("[download-craft] native host '" + HOST + "' failed:", lastHostError);
     return false;
   }
 }
@@ -190,8 +200,8 @@ function noteMedia(tabId, entry) {
   // Badge counts downloadable candidates, never playlist children.
   const badgeN = list.filter((e) => !e.child).length;
   try {
-    chrome.action.setBadgeText({ text: String(badgeN), tabId }).catch(() => {});
-    chrome.action.setBadgeBackgroundColor({ color: "#1F6FEB", tabId }).catch(() => {});
+    api.action.setBadgeText({ text: String(badgeN), tabId }).catch(() => {});
+    api.action.setBadgeBackgroundColor({ color: "#1F6FEB", tabId }).catch(() => {});
   } catch (e) { /* ignore */ }
 }
 
@@ -214,7 +224,7 @@ function forgetTab(tabId) {
       if (!tabs.size) seenTabs.delete(ck);
     }
   } catch (e) { /* ignore */ }
-  try { chrome.action.setBadgeText({ text: "", tabId }).catch(() => {}); } catch (e) {}
+  try { api.action.setBadgeText({ text: "", tabId }).catch(() => {}); } catch (e) {}
 }
 
 try {
@@ -287,11 +297,11 @@ try {
 } catch (e) { /* ignore */ }
 
 function setBadge() {
-  chrome.action
+  api.action
     .setBadgeText({ text: hostOk ? "" : "!" })
     .catch(() => {});
   if (!hostOk) {
-    chrome.action
+    api.action
       .setBadgeBackgroundColor({ color: "#C42B1C" })
       .catch(() => {});
   }
@@ -301,19 +311,26 @@ function setBadge() {
 sendToHostPing();
 async function sendToHostPing() {
   try {
-    const res = await chrome.runtime.sendNativeMessage(HOST, { type: "ping" });
+    const res = await api.runtime.sendNativeMessage(HOST, { type: "ping" });
     hostOk = !!res && res.type === "pong";
     if (!hostOk) lastHostError = "ping answered, but no pong (old host version?)";
+    console.log(
+      "[download-craft] native host '" + HOST + "': " +
+        (hostOk ? "connected" : "unexpected reply: " + lastHostError)
+    );
   } catch (e) {
     hostOk = false;
     lastHostError = (e && e.message) || String(e);
+    console.error(
+      "[download-craft] native host '" + HOST + "' unreachable:", lastHostError
+    );
   }
   setBadge();
 }
 
 chrome.runtime.onInstalled.addListener(() => {
   // removeAll first: re-installs otherwise fail with duplicate-id.
-  chrome.contextMenus.removeAll().then(() => {
+  api.contextMenus.removeAll().then(() => {
     chrome.contextMenus.create({
       id: "send-to-download-craft",
       title: "Download with Download Craft",
@@ -329,11 +346,11 @@ chrome.runtime.onInstalled.addListener(() => {
 
 async function refreshOpenTabs() {
   try {
-    const tabs = await chrome.tabs.query({});
+    const tabs = await api.tabs.query({});
     for (const t of tabs) {
       if (t.id === undefined) continue;
       try {
-        await chrome.scripting.executeScript({
+        await api.scripting.executeScript({
           target: { tabId: t.id },
           files: ["content.js"],
         });
@@ -372,7 +389,7 @@ chrome.downloads.onCreated.addListener(async (item) => {
   const known = item.fileSize || item.totalBytes || 0;
   if (minB > 0 && known > 0 && known < minB) return;
   try {
-    await chrome.downloads.cancel(item.id);
+    await api.downloads.cancel(item.id);
   } catch (e) {
     // Already finished (fast download): cancelling is impossible, and
     // re-sending would deliver a SECOND copy — leave the browser's file.
@@ -382,7 +399,7 @@ chrome.downloads.onCreated.addListener(async (item) => {
   // Erase the browser entry only once the app confirmed receipt.
   if (ok) {
     try {
-      await chrome.downloads.erase({ id: item.id });
+      await api.downloads.erase({ id: item.id });
     } catch (e) {
       /* already gone */
     }
@@ -417,7 +434,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         try {
           if (sender && sender.tab && sender.tab.id !== undefined &&
               chrome.scripting && chrome.scripting.executeScript) {
-            await chrome.scripting.executeScript({
+            await api.scripting.executeScript({
               target: { tabId: sender.tab.id },
               files: ["content.js"],
             });
@@ -468,7 +485,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
           .filter((u) => typeof u === "string" && /^https?:\/\//i.test(u))
           .slice(0, 25);
         if (!urls.length) return { queued: [] };
-        const res = await chrome.runtime.sendNativeMessage(HOST, { type: "query", urls });
+        const res = await api.runtime.sendNativeMessage(HOST, { type: "query", urls });
         if (res && res.type === "queued" && Array.isArray(res.urls)) {
           return { queued: res.urls };
         }
@@ -564,7 +581,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       return { autoCapture: !!cfg.autoCapture, minSizeKB: cfg.minSizeKB, blockHosts: cfg.blockHosts, hostOk, hostError: lastHostError || null, fallbackError: lastFallbackError || null };
     }
     if (msg.type === "setAuto" && typeof msg.value === "boolean") {
-      await chrome.storage.local.set({ autoCapture: msg.value });
+      await api.storage.local.set({ autoCapture: msg.value });
       return { ok: true };
     }
     if (msg.type === "setFilters") {
@@ -583,7 +600,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         ok = true;
       }
       if (!ok) return { ok: false, error: "nothing valid to save" };
-      await chrome.storage.local.set(patch);
+      await api.storage.local.set(patch);
       return { ok: true };
     }
     return { ok: false };

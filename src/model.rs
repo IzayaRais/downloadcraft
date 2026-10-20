@@ -175,6 +175,11 @@ pub struct DownloadItem {
     /// choice can only be honored server-side at resolve time).
     #[serde(default)]
     pub quality_pref: String,
+    /// The resolution that actually landed on disk ("1280×720"), read from the
+    /// helper's chosen format or the finished file with ffprobe. Empty =
+    /// unknown. Display only — never decides status.
+    #[serde(default)]
+    pub resolution: String,
     /// Media duration in seconds from the extension (best-effort, P4).
     /// Display/metadata only — never affects engine behavior.
     #[serde(default)]
@@ -218,6 +223,7 @@ impl DownloadItem {
             pair_mime: String::new(),
             overwrite_existing: false,
             quality_pref: String::new(),
+            resolution: String::new(),
             duration_secs: 0,
             max_retries: None,
             timeout_secs: None,
@@ -555,6 +561,16 @@ pub fn ui_pref_bool(key: &str, default: bool) -> bool {
         .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
         .and_then(|v| v.get(key).and_then(|x| x.as_bool()))
         .unwrap_or(default)
+}
+
+/// Read a string preference out of ui.json with a default, for the helper
+/// logic that runs outside the app window (which helper executable to use).
+pub fn ui_pref_str(key: &str, default: &str) -> String {
+    config_dir()
+        .and_then(|p| std::fs::read_to_string(p.join("ui.json")).ok())
+        .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
+        .and_then(|v| v.get(key).and_then(|x| x.as_str()).map(str::to_string))
+        .unwrap_or_else(|| default.to_string())
 }
 
 /// Merge one boolean into ui.json, leaving every other key alone. The main app
@@ -906,6 +922,7 @@ fn append_to_queue_at(path: &std::path::Path, item: &mut DownloadItem) -> Append
         }
         items[pos].overwrite_existing = item.overwrite_existing;
         items[pos].total_bytes = item.total_bytes;
+        items[pos].resolution = String::new();
         if !same_url {
             // Different bytes (or a slice of them): never resume old parts.
             items[pos].downloaded_bytes = 0;

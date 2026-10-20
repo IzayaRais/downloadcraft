@@ -49,6 +49,9 @@ struct Snap {
     /// Stage the transfer is in while it is not moving bytes (yt-dlp's
     /// "Getting info"/"Merging"); empty for the built-in engine.
     phase: String,
+    /// The resolution the fetched stream really has ("1280×720"), straight
+    /// from the helper's chosen format. Empty while unknown.
+    resolution: String,
     parts: Vec<(u64, u64, u64)>, // (start, end, done)
 }
 
@@ -72,6 +75,11 @@ fn read_snap(id: u64) -> Snap {
     out.resumable = e.get("resumable").and_then(|x| x.as_bool()).unwrap_or(false);
     out.phase = e
         .get("phase")
+        .and_then(|x| x.as_str())
+        .unwrap_or("")
+        .to_string();
+    out.resolution = e
+        .get("resolution")
         .and_then(|x| x.as_str())
         .unwrap_or("")
         .to_string();
@@ -183,18 +191,18 @@ fn fmt_eta(left: u64, speed: f64) -> String {
 //   card     522 wide (520 content + 2x1px border), 403 + 25n tall
 //   header   1..45     mark 20 at (17,13), title 14/500 at x=45, controls 14
 //   tabs     45..82    trough (17,53,488,29), three 161.33x25 segments
-//   info     82..293   seven 13px rows at y=98 step 27, right edge 503
-//   progress 293..313  track (19,293,484,8), r4, accent gradient fill
-//   parts    313..     rule, Part Info row (h16 at y=324), strip (y=348,h10),
-//                      table header (y=366,h23), rows at y=389 step 25, pad 14
+//   info     82..320   eight 13px rows at y=98 step 27, right edge 503
+//   progress 320..340  track (19,320,484,8), r4, accent gradient fill
+//   parts    340..     rule, Part Info row (h16 at y=351), strip (y=375,h10),
+//                      table header (y=393,h23), rows at y=416 step 25, pad 14
 
 /// Concept card width, border-box.
 const PG_W: f32 = 522.0;
 /// Card height with no part list: title + tabs + info + progress + rule.
-const PG_MIN_H: f32 = 314.0;
+const PG_MIN_H: f32 = 341.0;
 /// Card height with the part list collapsed but its header row still shown
 /// (the chevron and the Pause/Close actions must stay reachable).
-const PG_PART_HEAD_H: f32 = 349.0;
+const PG_PART_HEAD_H: f32 = 376.0;
 /// Dead state (the item left the queue): title + notice + Close.
 const PG_DEAD_H: f32 = 163.0;
 
@@ -224,18 +232,18 @@ const INFO_Y: f32 = 98.0;
 const ROW_STEP: f32 = 27.0;
 const ROW_H: f32 = 17.0;
 
-const PROG_Y: f32 = 293.0;
+const PROG_Y: f32 = 320.0;
 const PROG_W: f32 = 484.0;
 const PROG_H: f32 = 8.0;
 
-const PART_Y: f32 = 313.0;
-const HEAD_Y: f32 = 324.0;
+const PART_Y: f32 = 340.0;
+const HEAD_Y: f32 = 351.0;
 const HEAD_H: f32 = 16.0;
-const STRIP_Y: f32 = 348.0;
+const STRIP_Y: f32 = 375.0;
 const STRIP_H: f32 = 10.0;
-const TBL_HDR_Y: f32 = 366.0;
+const TBL_HDR_Y: f32 = 393.0;
 const TBL_HDR_H: f32 = 23.0;
-const TBL_Y: f32 = 389.0;
+const TBL_Y: f32 = 416.0;
 const TBL_STEP: f32 = 25.0;
 const TBL_PAD: f32 = 5.0;
 const FOOT_PAD: f32 = 14.0;
@@ -244,9 +252,9 @@ const COL_NUM_W: f32 = 24.0;
 const COL_DL_X: f32 = IN_R - 170.0;
 const COL_TOT_X: f32 = IN_R - 80.0;
 
-/// Card height with `n` part rows — 553 at the concept's six samples.
+/// Card height with `n` part rows — 580 at the concept's six samples.
 fn card_h(n: usize) -> f32 {
-    403.0 + TBL_STEP * n as f32
+    430.0 + TBL_STEP * n as f32
 }
 
 /// The concept's three tabs, in its order.
@@ -271,27 +279,27 @@ fn info_row(
     col: egui::Color32,
     font: egui::FontId,
 ) {
-    let y = o.y + INFO_Y + ROW_STEP * i as f32;
-    let lw = p
-        .layout_no_wrap(label.to_string(), reg(13.0), pl().dm_lbl)
-        .size()
-        .x;
-    p.text(
-        egui::pos2(o.x + PAD_X, y),
-        egui::Align2::LEFT_TOP,
-        label.to_string(),
-        reg(13.0),
-        pl().dm_lbl,
-    );
-    let v = elide_mid(p, &value, font.clone(), IN_R - PAD_X - lw - 12.0);
-    p.text(
-        egui::pos2(o.x + IN_R, y),
-        egui::Align2::RIGHT_TOP,
-        v,
-        font,
-        col,
-    );
-}
+        let y = o.y + INFO_Y + ROW_STEP * i as f32;
+        let lw = crate::shaped::width(p, label, &reg(13.0));
+        crate::shaped::draw(
+            p,
+            egui::pos2(o.x + PAD_X, y),
+            egui::Align2::LEFT_TOP,
+            label,
+            reg(13.0),
+            pl().dm_lbl,
+        );
+        // The value can be a filename in any script, so it is drawn shaped.
+        let v = elide_mid(p, &value, font.clone(), IN_R - PAD_X - lw - 12.0);
+        crate::shaped::draw(
+            p,
+            egui::pos2(o.x + IN_R, y),
+            egui::Align2::RIGHT_TOP,
+            &v,
+            font,
+            col,
+        );
+    }
 
 struct ProgressApp {
     id: u64,
@@ -536,10 +544,12 @@ impl ProgressApp {
             egui::StrokeKind::Inside,
         );
         dm_mark(&p, at(o, MARK_X, MARK_Y, MARK_S, MARK_S));
-        p.text(
+        // The title carries the item's name, so it goes through the shaper too.
+        crate::shaped::draw(
+            &p,
             egui::pos2(o.x + TITLE_X, o.y + HDR_CY),
             egui::Align2::LEFT_CENTER,
-            title.to_string(),
+            title,
             semi(14.0),
             pl().dm_txt,
         );
@@ -701,7 +711,10 @@ impl ProgressApp {
         Some(format!("Downloading — {}", self.snap.phase))
     }
 
-    /// Concept Info tab: the seven detail rows.
+    /// Concept Info tab: the detail rows, laid out in order. The resolution row
+    /// is the one that comes and goes: a ZIP, a PDF or a photo has no frame
+    /// size, and a "Resolution: -" row on a file that has no frames at all
+    /// reads as a bug rather than as information.
     fn body_info(&mut self, ui: &mut egui::Ui, o: egui::Pos2, item: &DownloadItem, downloading: bool) {
         let p = ui.painter().clone();
         let status_col = match &item.status {
@@ -710,24 +723,37 @@ impl ProgressApp {
             Status::Paused | Status::Queued => DM_YEL,
             _ => pl().dm_txt,
         };
-        info_row(&p, o, 0, "Name:", item.filename.clone(), pl().dm_txt, reg(13.0));
+        // Rows are placed by their position, so the ones below a skipped row
+        // move up instead of leaving a hole.
+        let mut i = 0usize;
+        let mut row = |label: &str, value: String, col: egui::Color32, font: egui::FontId| {
+            let at = i;
+            i += 1;
+            info_row(&p, o, at, label, value, col, font);
+        };
+        row("Name:", item.filename.clone(), pl().dm_txt, reg(13.0));
         // A helper in a stage that moves no bytes yet (YouTube's player
         // challenge, a merge) is named here: "Downloading" with 0 of "-" and
         // no speed reads as a hang, and this can last ten seconds.
         let stage = self.stage_text();
-        info_row(
-            &p,
-            o,
-            1,
+        row(
             "Status:",
             stage.unwrap_or_else(|| item.status.label()),
             status_col,
             reg(13.0),
         );
-        info_row(
-            &p,
-            o,
-            2,
+        // Live value while a video is arriving, the recorded one otherwise.
+        // Empty means the file has no frames (or none ffprobe could read), and
+        // then the row is left out entirely.
+        let resolution = if !self.snap.resolution.is_empty() {
+            self.snap.resolution.clone()
+        } else {
+            item.resolution.clone()
+        };
+        if !resolution.is_empty() {
+            row("Resolution:", resolution, pl().dm_txt, reg(13.0));
+        }
+        row(
             "Size:",
             item.total_bytes
                 .map(format_bytes)
@@ -735,19 +761,13 @@ impl ProgressApp {
             pl().dm_txt,
             reg(13.0),
         );
-        info_row(
-            &p,
-            o,
-            3,
+        row(
             "Downloaded:",
             format_bytes(item.downloaded_bytes),
             pl().dm_txt,
             reg(13.0),
         );
-        info_row(
-            &p,
-            o,
-            4,
+        row(
             "Speed:",
             if downloading && item.speed_bps > 0.0 {
                 format!("{}/s", format_bytes(item.speed_bps as u64))
@@ -757,10 +777,7 @@ impl ProgressApp {
             pl().dm_txt,
             reg(13.0),
         );
-        info_row(
-            &p,
-            o,
-            5,
+        row(
             "Remaining Time:",
             match item.total_bytes {
                 Some(t) => fmt_eta(t.saturating_sub(item.downloaded_bytes), item.speed_bps),
@@ -770,10 +787,7 @@ impl ProgressApp {
             reg(13.0),
         );
         let res = item.resumable || self.snap.resumable;
-        info_row(
-            &p,
-            o,
-            6,
+        row(
             "Resume Support:",
             if res { "Yes".into() } else { "No".into() },
             if res { DM_OK } else { pl().dm_lbl },
