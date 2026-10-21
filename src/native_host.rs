@@ -48,9 +48,11 @@ struct Incoming {
     #[serde(default)]
     pub quality: Option<String>,
     /// Media duration in seconds (page player / JSON, best-effort).
-    /// Display-only: shown in the confirm dialog next to the size.
+    /// Shown in the confirm dialog and checked against the completed file.
     #[serde(default)]
     pub dur: Option<u64>,
+    #[serde(default, alias = "audioExpected")]
+    pub audio_expected: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -82,6 +84,7 @@ fn queued_urls(urls: &[String]) -> Vec<String> {
         return Vec::new();
     }
     let _guard = crate::model::fs_lock("queue");
+    if !_guard.owned() { return Vec::new(); }
     let items: Vec<crate::model::DownloadItem> = crate::model::config_dir()
         .and_then(|d| std::fs::read_to_string(d.join("queue.json")).ok())
         .and_then(|s| serde_json::from_str(&s).ok())
@@ -121,9 +124,11 @@ pub struct InboxItem {
     #[serde(default)]
     pub quality: Option<String>,
     /// Media duration in seconds (page player / JSON, best-effort).
-    /// Display-only: shown in the confirm dialog next to the size.
+    /// Shown in the confirm dialog and checked against the completed file.
     #[serde(default)]
     pub dur: Option<u64>,
+    #[serde(default, alias = "audioExpected")]
+    pub audio_expected: bool,
 }
 
 pub fn inbox_path() -> Option<std::path::PathBuf> {
@@ -185,6 +190,7 @@ fn queue_download(msg: &Incoming) -> Result<bool, String> {
         std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
     }
     let _guard = crate::model::fs_lock("inbox");
+    if !_guard.owned() { return Err("Download inbox is busy; retry shortly".into()); }
     // Never destroy pending captures on an unreadable inbox.
     let data = std::fs::read_to_string(&path).ok();
     let mut items: Vec<InboxItem> = match data {
@@ -211,6 +217,7 @@ fn queue_download(msg: &Incoming) -> Result<bool, String> {
         urls: None,
         quality: msg.quality.clone().filter(|s| !s.trim().is_empty()),
         dur: msg.dur.filter(|s| *s > 0),
+        audio_expected: msg.audio_expected,
     };
     // Same URL re-captured: refresh metadata instead of ignoring it (the
     // filename/referer/cookie may be corrected this time).
@@ -229,9 +236,7 @@ fn queue_download(msg: &Incoming) -> Result<bool, String> {
         items.truncate(MAX_INBOX);
     }
     let json = serde_json::to_string_pretty(&items).map_err(|e| e.to_string())?;
-    let tmp = path.with_extension("tmp");
-    std::fs::write(&tmp, json).map_err(|e| e.to_string())?;
-    std::fs::rename(&tmp, &path).map_err(|e| e.to_string())?;
+    crate::model::atomic_write(&path,json.as_bytes()).map_err(|e|e.to_string())?;
     Ok(is_new)
 }
 
@@ -242,7 +247,7 @@ fn spawn_confirm(msg: &Incoming) {
     if !(url.starts_with("http://") || url.starts_with("https://")) {
         return;
     }
-    let Ok(exe) = std::env::current_exe() else {
+    let Ok(exe) = crate::platform::launch_path() else {
         return;
     };
     let mut cmd = std::process::Command::new(exe);
@@ -255,9 +260,7 @@ fn spawn_confirm(msg: &Incoming) {
     } else if let Some(r) = msg.referer.clone().filter(|s| !s.trim().is_empty()) {
         cmd.arg("--referer").arg(r);
     }
-    if let Some(c) = msg.cookie.clone().filter(|s| !s.trim().is_empty()) {
-        cmd.arg("--cookie").arg(c);
-    }
+    // The dialog claims credentials from the owner-only inbox.
     if let Some(m) = msg.mime.clone().filter(|s| !s.trim().is_empty()) {
         cmd.arg("--mime").arg(m);
     }
@@ -273,6 +276,7 @@ fn spawn_confirm(msg: &Incoming) {
     if let Some(q) = msg.quality.clone().filter(|s| !s.trim().is_empty()) {
         cmd.arg("--quality").arg(q);
     }
+    if msg.audio_expected { cmd.arg("--expect-audio"); }
     if let Some(d) = msg.dur.filter(|s| *s > 0) {
         cmd.arg("--dur").arg(d.to_string());
     }
@@ -363,4 +367,20 @@ pub fn run() -> eframe::Result<()> {
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod media_tests {
+    use super::*;
+    #[test]
+    fn player_expectations_survive_browser_and_inbox_formats() {
+        let msg: Incoming = serde_json::from_str(r#"{"type":"download","url":"https://cdn.example.org/video.mp4","dur":2700,"audioExpected":true}"#).unwrap();
+        assert_eq!(msg.dur, Some(2700));
+        assert!(msg.audio_expected);
+        let stored: InboxItem = serde_json::from_str(r#"{"url":"https://cdn.example.org/video.mp4","filename":null,"received_at":"now","dur":2700,"audio_expected":true}"#).unwrap();
+        assert_eq!(stored.dur, Some(2700));
+        assert!(stored.audio_expected);
+        let old: Incoming = serde_json::from_str(r#"{"type":"download","url":"https://cdn.example.org/video.mp4"}"#).unwrap();
+        assert!(!old.audio_expected);
+    }
 }

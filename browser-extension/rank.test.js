@@ -184,3 +184,29 @@ describe("panel paint", () => {
     });
   });
 });
+
+const VIMEO_FRAGMENT = "https://vod-adaptive-ak.vimeocdn.com/exp=1~hmac=example/v2/range/prot/cmFuZ2U9MzkzODcxMi00OTgyMzgx/avf/video.mp4?pathsig=example&range=3938712-4982381";
+describe("Vimeo range captures", () => {
+  it("classifies signed MP4 range URLs as fragments without rewriting them", () => {
+    assert.equal(DCRank.kindOf({ url: VIMEO_FRAGMENT }), "segment");
+    assert.equal(DCRank.canonicalUrl(VIMEO_FRAGMENT), VIMEO_FRAGMENT);
+    assert.equal(DCRank.isVimeoFragment(VIMEO_FRAGMENT.split("?")[0]), true);
+    assert.equal(DCRank.isVimeoFragment("https://vod.vimeocdn.com/video.mp4?range=0-99"), true);
+  });
+  it("chooses a manifest over a Vimeo MP4 fragment", () => {
+    const fragment = { url: VIMEO_FRAGMENT, mime: "video/mp4", size: 1043670 };
+    const manifest = { url: "https://vod.vimeocdn.com/master.mpd" };
+    const pool = [fragment, manifest].filter(m => DCRank.scoreMedia(m, {hasPlaylist:true}) >= 0);
+    assert.deepEqual(pool, [manifest]);
+    assert.equal(DCRank.kindOf({ url: "https://vod.vimeocdn.com/full.mp4" }), "file");
+    assert.equal(DCRank.isVimeoFragment("https://vimeocdn.com.evil.test/v2/range/a.mp4"), false);
+  });
+  it("accepts exact video pages and preserves unlisted access parameters", () => {
+    for (const page of ["https://player.vimeo.com/video/123?h=secret&app_id=1", "https://vimeo.com/123/secret"]) {
+      assert.equal(DCRank.vimeoVideoPage(page), page);
+    }
+    for (const page of ["https://vimeo.com/", "https://vimeo.com/user123", "https://player.vimeo.com.evil.test/video/123", "ftp://vimeo.com/123"]) {
+      assert.equal(DCRank.vimeoVideoPage(page), null);
+    }
+  });
+});

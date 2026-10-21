@@ -774,3 +774,6 @@ mod win32 {
     pub const EVENT_MODIFY_STATE: u32 = 0x0002;
     pub const WAIT_OBJECT_0: u32 = 0;
 }
+
+/// Windows already uses the native HWND; portable builds retain the egui context.
+pub fn set_context(_: &egui::Context) {}

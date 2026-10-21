@@ -26,7 +26,7 @@ fn ui_prefs() -> (String, usize, String, bool) {
         .unwrap_or_else(|| {
             dirs::download_dir()
                 .map(|p| p.to_string_lossy().to_string())
-                .unwrap_or_else(|| "C:\\Downloads".to_string())
+                .unwrap_or_else(|| crate::model::default_download_dir().to_string_lossy().into_owned())
         });
     let conns = v
         .get("connections_default")
@@ -121,6 +121,7 @@ fn send_cmd(action: &str) {
         return;
     };
     let _guard = crate::model::fs_lock("cmd");
+    if !_guard.owned() { return; }
     let mut v: serde_json::Value = std::fs::read_to_string(&p)
         .ok()
         .and_then(|s| serde_json::from_str(&s).ok())
@@ -140,7 +141,7 @@ fn send_cmd(action: &str) {
 }
 
 fn launch_main() {
-    let Ok(exe) = std::env::current_exe() else {
+    let Ok(exe) = crate::platform::launch_path() else {
         return;
     };
     let mut cmd = std::process::Command::new(exe);

@@ -7,7 +7,7 @@
   // Must match manifest version + background.js EXT_VER. The background
   // rejects messages from any other version with a "reload this tab"
   // error, so a stale script can never fail mysteriously.
-  const EXT_VER = "0.9.6";
+  const EXT_VER = "0.9.6.1";
   // Promise-style calls (the `await api.*` one below) go through this handle
   // so one file serves both engines: Firefox exposes the promise-returning
   // `browser` namespace, Chrome only has `chrome` (promise-capable under MV3).
@@ -326,7 +326,19 @@
     } catch (e) { return url; }
   }
 
+  function playerHasAudio(v) {
+    return !!(v && (v.mozHasAudio === true || Number(v.webkitAudioDecodedByteCount) > 0
+      || (v.audioTracks && v.audioTracks.length > 0)));
+  }
+
   function sendDownload(url, filename, mime, size, pair, quality, dur) {
+    // Use only the matching video or an unambiguous sole video. Subtitle,
+    // audio-only and ordinary file links do not borrow video expectations.
+    const evidence = typeof DCRank !== "undefined"
+      ? DCRank.playerEvidence(document.querySelectorAll("video"), url, mime, location.href, dur)
+      : {dur: Number.isFinite(Number(dur)) && Number(dur) > 0 ? Math.round(Number(dur)) : null, audioExpected:false};
+    dur = evidence.dur;
+    const audioExpected = evidence.audioExpected;
     // A tab running a stale script (extension reloaded without a tab
     // reload) has no extension APIs left — fail loudly, not mysteriously.
     try {
@@ -361,7 +373,7 @@
       filename = base.toLowerCase().endsWith(ext.toLowerCase()) ? base : base + ext;
     }
     try {
-      chrome.runtime.sendMessage({ type: "download", url: sendUrl, filename, ver: EXT_VER, pageUrl: location.href, referer: location.href, mime: mime || null, size: size || null, pairUrl: (pair && pair.url) || null, pairMime: (pair && pair.mime) || null, quality: quality || null, dur: dur || null }, (res) => {
+      chrome.runtime.sendMessage({ type: "download", url: sendUrl, filename, ver: EXT_VER, pageUrl: location.href, referer: location.href, mime: mime || null, size: size || null, pairUrl: (pair && pair.url) || null, pairMime: (pair && pair.mime) || null, quality: quality || null, dur: dur || null, audioExpected }, (res) => {
       if (chrome.runtime.lastError) {
         if (ctxInvalidated(chrome.runtime.lastError)) markDead();
         toast("Download Craft: " + chrome.runtime.lastError.message);
@@ -1081,6 +1093,109 @@
     return base.endsWith(".mp4") ? base : base + ".mp4";
   }
 
+  // A browser-session preference, shared through the worker (not website storage).
+  let barPosition = null;
+  let positionRevision = 0;
+  let activeBarDrag = null;
+  function validBarPosition(p) {
+    return p && Number.isFinite(p.x) && Number.isFinite(p.y) && p.x >= 0 && p.x <= 1 && p.y >= 0 && p.y <= 1;
+  }
+  function applySavedBarPosition(host) {
+    if (!barPosition) return false;
+    const fullscreen=document.fullscreenElement;
+    const parent=fullscreen || document.documentElement;
+    if(host.parentNode!==parent)parent.appendChild(host);
+    const width=Math.max(0,Math.min(240,window.innerWidth-16));
+    host.style.position="fixed";host.style.width=width+"px";
+    host.style.right="auto";host.style.bottom="auto";
+    host.style.left=(8+barPosition.x*Math.max(0,window.innerWidth-width-16))+"px";
+    host.style.top=(8+barPosition.y*Math.max(0,window.innerHeight-44))+"px";
+    return true;
+  }
+  function positionDraggedPanel(host,panel) {
+    if(!panel || !barPosition)return;
+    const parent=document.fullscreenElement || document.documentElement;
+    if(panel.parentNode!==parent)parent.appendChild(panel);
+    const r=host.getBoundingClientRect();
+    const width=Math.min(300,Math.max(0,window.innerWidth-16));
+    panel.style.position="fixed";panel.style.width=width+"px";
+    panel.style.left=Math.max(8,Math.min(window.innerWidth-width-8,r.right-width))+"px";
+    panel.style.right="auto";panel.style.bottom="auto";
+    const above=Math.max(0,r.top-14),below=Math.max(0,window.innerHeight-r.bottom-14);
+    const naturalHeight=panel.scrollHeight || panel.offsetHeight || 300;
+    const up=naturalHeight>below && above>below;
+    const available=up?above:below;
+    panel.style.boxSizing="border-box";panel.style.maxHeight=available+"px";
+    panel.style.overflowY="auto";panel.style.zIndex="2147483646";
+    const height=Math.min(naturalHeight,available);
+    panel.style.top=(up?Math.max(8,r.top-height-6):r.bottom+6)+"px";
+    const arrow=panel.querySelector('[data-dc-p="arrow"]');if(arrow)arrow.style.display="none";
+  }
+  function rememberBarPosition() {
+    try { chrome.runtime.sendMessage({type:"setVideoBarPosition",position:barPosition},()=>{void chrome.runtime.lastError;}); } catch(e) { /* keep page-local drag usable */ }
+  }
+  function loadBarPosition() {
+    const revision=positionRevision;
+    try { chrome.runtime.sendMessage({type:"getVideoBarPosition"},res=>{
+      if(chrome.runtime.lastError || !alive() || revision!==positionRevision)return;
+      barPosition=validBarPosition(res && res.position) ? res.position : null;
+      syncDismissControls();
+    }); } catch(e) { /* default placement remains available */ }
+  }
+  function installBarDrag(host,main,grip) {
+    let drag=null,suppressClick=false;
+    host.addEventListener("click",ev=>{
+      if(suppressClick){suppressClick=false;ev.preventDefault();ev.stopImmediatePropagation();}
+    },true);
+    const update=(left,top)=>{
+      const width=Math.min(240,window.innerWidth-16);
+      barPosition={x:Math.max(0,Math.min(1,(left-8)/Math.max(1,window.innerWidth-width-16))),
+        y:Math.max(0,Math.min(1,(top-8)/Math.max(1,window.innerHeight-44)))};
+      positionRevision++;applySavedBarPosition(host);
+    };
+    for(const control of [main,grip]) {
+      control.style.touchAction="none";
+      control.addEventListener("pointerdown",ev=>{
+        if(ev.button!==0 || ev.isPrimary===false)return;
+        const r=host.getBoundingClientRect();
+        drag={id:ev.pointerId,x:ev.clientX,y:ev.clientY,left:r.left,top:r.top,moved:false,previous:barPosition};
+        suppressClick=false;activeBarDrag=host;
+        // Move before capture; moving a captured node can lose pointer capture.
+        const parent=document.fullscreenElement || document.documentElement;
+        if(host.parentNode!==parent)parent.appendChild(host);
+        host.style.position="fixed";host.style.left=r.left+"px";host.style.top=r.top+"px";
+        host.style.right="auto";host.style.bottom="auto";
+        control.setPointerCapture(ev.pointerId);ev.stopPropagation();
+      });
+      control.addEventListener("pointermove",ev=>{
+        if(!drag || ev.pointerId!==drag.id)return;
+        const dx=ev.clientX-drag.x,dy=ev.clientY-drag.y;
+        if(!drag.moved && Math.hypot(dx,dy)<5)return;
+        if(!drag.moved)hidePanels();
+        drag.moved=true;ev.preventDefault();ev.stopPropagation();update(drag.left+dx,drag.top+dy);
+      });
+      const finish=(ev,cancel)=>{
+        if(!drag || ev.pointerId!==drag.id)return;
+        const moved=drag.moved,previous=drag.previous;
+        drag=null;activeBarDrag=null;
+        if(control.hasPointerCapture(ev.pointerId))control.releasePointerCapture(ev.pointerId);
+        if(cancel){barPosition=previous;positionRevision++;syncDismissControls();}
+        else if(moved){suppressClick=true;setTimeout(()=>{suppressClick=false;},0);rememberBarPosition();ev.preventDefault();ev.stopPropagation();}
+      };
+      control.addEventListener("pointerup",ev=>finish(ev,false));
+      control.addEventListener("pointercancel",ev=>finish(ev,true));
+      control.addEventListener("lostpointercapture",ev=>finish(ev,true));
+    }
+    grip.addEventListener("click",ev=>{ev.preventDefault();ev.stopPropagation();});
+    grip.addEventListener("keydown",ev=>{
+      const delta={ArrowLeft:[-1,0],ArrowRight:[1,0],ArrowUp:[0,-1],ArrowDown:[0,1]}[ev.key];
+      if(!delta)return;
+      ev.preventDefault();ev.stopPropagation();hidePanels();
+      const r=host.getBoundingClientRect(),step=ev.shiftKey?24:8;
+      update(r.left+delta[0]*step,r.top+delta[1]*step);rememberBarPosition();
+    });
+  }
+
   // IDM-style: the circle lives ON the video player (top-right corner),
   // falling back to a fixed viewport corner when no player is found. The
   // bubble's arrow always points back at the circle (up when the panel sits
@@ -1104,6 +1219,7 @@
       a.style.borderRightColor = top ? "transparent" : T.border;
       a.style.borderBottomColor = top ? "transparent" : T.border;
     };
+    if(applySavedBarPosition(btn)){positionDraggedPanel(btn,panel);return true;}
     const player = document.getElementById("movie_player");
     if (player) {
       btn.style.position = "absolute";
@@ -1222,7 +1338,7 @@
   }
 
   // ---------- In-page floating panel (extension_popup.html design) ----------
-  // The trigger is always a circle; the panel is a message bubble with an
+  // The trigger is a compact download bar; the panel is a message bubble with an
   // arrow, a "send link" row, video info, a 2-column quality grid, "Other
   // Files" chips and a Download / Cancel / X action row. Every rule is set
   // inline (a page's own CSS can never leak in), and each element carries a
@@ -1233,8 +1349,6 @@
   const ICON_SEND = "M22 2L11 13M22 2l-7 20-4-9-9-4 20-7z";
   const ICON_CLOSE = "M6 6l12 12M18 6L6 18";
   const ICON_PLAY = "M8 5.5v13l11-6.5-11-6.5z";
-  const CIRCLED_BG = "#3b82f6";
-  const CIRCLED_HOVER = "#60a5fa";
 
   // Transparent-background inline SVG (no web_accessible_resources, crisp at
   // every UI scale). `currentColor` lets the caller theme it with `color`.
@@ -1262,23 +1376,52 @@
     return svg;
   }
 
-  // The circle trigger (mock: "always a circle"), shared by the YouTube
-  // button and the universal pill so both look identical.
-  function circleButton(px, iconPx, title) {
-    const b = document.createElement("button");
-    b.type = "button";
-    b.title = title;
-    b.style.cssText = [
-      "display:flex", "align-items:center", "justify-content:center",
-      "width:" + px + "px", "height:" + px + "px", "padding:0", "margin:0",
-      "border:none", "border-radius:50%", "background:" + CIRCLED_BG, "color:#fff",
-      "cursor:pointer", "box-shadow:0 2px 12px rgba(0,0,0,.4)",
-      "z-index:2147483647", "transition:background .15s ease,transform .15s ease",
-    ].join(";");
-    b.appendChild(svgIcon(iconPx, ICON_DOWN, 2.5));
-    b.onmouseenter = () => { b.style.background = CIRCLED_HOVER; b.style.transform = "scale(1.06)"; };
-    b.onmouseleave = () => { b.style.background = CIRCLED_BG; b.style.transform = "none"; };
-    return b;
+  // One isolated toolbar: the primary action and dismiss button never overlap.
+  // Shadow DOM keeps player/site button and SVG rules out of these controls.
+  function videoDownloadBar(title) {
+    const host = document.createElement("div");
+    host.title = title;
+    host.style.cssText = "all:initial;display:block;width:240px;height:28px;margin:0;padding:0;border:0;box-sizing:border-box;z-index:2147483647;";
+    const root = host.attachShadow({mode:"open"});
+    const style = document.createElement("style");
+    style.textContent = `
+      :host { color-scheme:light; }
+      * { box-sizing:border-box; }
+      .bar { display:flex;width:100%;height:28px;overflow:hidden;border:1px solid #aab7c4;
+        border-radius:5px;background:#f8fafc;box-shadow:0 1px 5px #0003;font:12px/1.2 system-ui,sans-serif; }
+      button { all:unset;box-sizing:border-box;display:flex;align-items:center;justify-content:center;cursor:pointer;
+        color:#243444;background:#f8fafc;font:600 12px/1.2 system-ui,sans-serif; }
+      button:hover { background:#e7eff7; }
+      button:focus-visible { outline:2px solid #2563eb;outline-offset:-3px; }
+      .grip { flex:0 0 18px;width:18px;cursor:grab;color:#7b8794;touch-action:none; }
+      .grip:active { cursor:grabbing; }
+      .download { touch-action:none;flex:1;min-width:0;gap:6px;padding:0 8px; }
+      .label { white-space:nowrap;overflow:hidden;text-overflow:ellipsis; }
+      .close { flex:0 0 25px;width:25px;border-left:1px solid #d5dee7; }
+      .close:hover { color:#a91d2b;background:#ffe9ec; }
+      [hidden] { display:none !important; }
+      svg { display:block;flex:none;width:14px;height:14px;pointer-events:none; }
+    `;
+    const bar = document.createElement("div");bar.className="bar";
+    const main = document.createElement("button");main.type="button";main.className="download";
+    main.title=title;main.setAttribute("aria-label","Download this video");
+    const arrow=svgIcon(14,ICON_DOWN,2.5);arrow.style.color="#168047";
+    main.appendChild(arrow);
+    const label=document.createElement("span");label.className="label";label.textContent="Download this video";
+    main.appendChild(label);
+    const close=document.createElement("button");close.type="button";close.className="close";close.hidden=true;
+    close.setAttribute("data-dc-dismiss","1");
+    close.setAttribute("aria-label","Hide download bar for this video");
+    close.title="Hide for this video — restore from the extension toolbar";
+    close.appendChild(svgIcon(12,ICON_CLOSE,2));
+    const grip=document.createElement("button");grip.type="button";grip.className="grip";
+    grip.title="Drag to move · arrow keys move when focused";
+    grip.setAttribute("aria-label","Move video download bar");
+    grip.appendChild(svgIcon(12,"M8 5h.01M8 12h.01M8 19h.01M16 5h.01M16 12h.01M16 19h.01",3));
+    bar.append(grip,main,close);root.append(style,bar);
+    installBarDrag(host,main,grip);
+    host.__dcMain=main;host.__dcClose=close;
+    return host;
   }
 
   // Theme: tokens + painter live in rank.js (node-tested); these wrappers
@@ -1764,7 +1907,60 @@
     } catch (e) { /* ignore */ }
   }
 
+  // Dismiss just this video, surviving periodic refreshes and quality menu
+  // rebuilds. A different video gets its own control; page reload resets it.
+  const dismissedVideos = new Set();
+  function dismissalKey(video, id) {
+    return DCRank.videoDismissKey(location.href, video && (video.currentSrc || video.src), id);
+  }
+  function syncDismissControls() {
+    // Remove the separate X buttons left by an older injected extension.
+    document.querySelectorAll("button[data-dc-dismiss]").forEach(el=>el.remove());
+    document.querySelectorAll("[data-dc-pill]").forEach(host=>{
+      const video=host.__dcVideo;
+      if (!video || !video.isConnected) { host.remove(); return; }
+      const fullscreen=document.fullscreenElement;
+      const parent=fullscreen && fullscreen.contains(video) ? fullscreen : document.documentElement;
+      if(host.parentNode!==parent)parent.appendChild(host);
+      const r=video.getBoundingClientRect();
+      const vw=window.innerWidth, vh=window.innerHeight;
+      const width=Math.min(240,r.width-16,vw-16);
+      host.style.display=r.width>=120 && r.height>=70 && r.bottom>0 && r.top<vh && r.right>0 && r.left<vw ? "block" : "none";
+      if(activeBarDrag===host || applySavedBarPosition(host))return;
+      host.style.position="fixed";host.style.right="auto";host.style.bottom="auto";
+      host.style.width=Math.max(0,width)+"px";
+      host.style.left=Math.max(8,Math.min(vw-width-8,r.right-width-8))+"px";
+      host.style.top=Math.max(8,Math.min(vh-36,r.top+8))+"px";
+    });
+    const yt=document.getElementById && document.getElementById("dc-yt-btn");
+    if(yt)placeInPlayer(yt,document.getElementById("dc-yt-panel"));
+  }
+  function addDismissControl(button, key, panel) {
+    const close=button.__dcClose;
+    if(!close)return;
+    close.hidden=false;
+    close.onclick = ev => {
+      ev.preventDefault();ev.stopPropagation();
+      if(dismissedVideos.size>=100)dismissedVideos.clear();
+      dismissedVideos.add(typeof key==="function" ? key() : key);
+      button.remove();
+      if(panel)panel.remove();
+      if(button.__dcFbPanel)button.__dcFbPanel.remove();
+    };
+  }
+  document.addEventListener("scroll",syncDismissControls,true);
+  window.addEventListener("resize",syncDismissControls);
+  document.addEventListener("fullscreenchange",syncDismissControls);
+
   function ensureButton(info) {
+    const key = dismissalKey(null,info.videoId);
+    if (dismissedVideos.has(key)) {
+      const old=document.getElementById("dc-yt-btn");
+      if(old){if(old.__dcClose)old.__dcClose.remove();old.remove();}
+      const panel=document.getElementById("dc-yt-panel");if(panel)panel.remove();
+      return;
+    }
+    syncDismissControls();
     const oldBtn = document.getElementById("dc-yt-btn");
     const oldPanel = document.getElementById("dc-yt-panel");
     if (oldBtn && oldBtn.dataset.gen !== String(GEN)) {
@@ -1812,12 +2008,13 @@
         // Same content: keep everything, just re-anchor (the player
         // element can be recreated by SPA navigation).
         placeInPlayer(oldBtn, oldPanel);
+        addDismissControl(oldBtn,key,oldPanel);
         return;
       }
       oldBtn.remove();
       if (oldPanel) oldPanel.remove();
     }
-    const btn = circleButton(36, 18, "Send video to Download Craft");
+    const btn = videoDownloadBar("Choose video quality in Download Craft");
     btn.id = "dc-yt-btn";
     btn.dataset.vid = info.videoId;
     btn.dataset.gen = String(GEN);
@@ -1987,12 +2184,14 @@
       if (api.panel.style.display === "none") {
         hidePanels();
         api.show();
+        positionDraggedPanel(btn,api.panel);
       } else {
         api.hide();
       }
     };
     installDcCloser();
     placeInPlayer(btn, api.panel);
+    addDismissControl(btn,key,api.panel);
   }
 
   function refreshYouTube() {
@@ -2049,27 +2248,31 @@
 
   function ensureUniversalButtons() {
     if (!alive()) return;
+    syncDismissControls();
     // YouTube watch/Shorts pages already have the quality menu button —
     // a second generic pill on the same player is the "double button" bug.
     try { if (ytVideoId()) return; } catch (e) { /* ignore */ }
     try {
       // Drop pills left by an older injected generation (their handlers are
       // dead after an extension reload) so only this generation's pills show.
-      document.querySelectorAll("button[data-dc-pill]").forEach((el) => {
+      document.querySelectorAll("[data-dc-pill]").forEach((el) => {
         if (el.dataset.gen !== String(GEN)) el.remove();
       });
       const vids = [...document.querySelectorAll("video")].slice(0, 10);
       for (const v of vids) {
+        const key = dismissalKey(v,null);
+        if (dismissedVideos.has(key)) continue;
         if (v.__dcBtn) {
           if (!v.__dcBtn.isConnected) v.__dcBtn = null;
-          else continue;
+          else if (v.__dcKey === key) continue;
+          else { if(v.__dcBtn.__dcClose)v.__dcBtn.__dcClose.remove(); v.__dcBtn.remove();v.__dcBtn=null; }
         }
         // Skip anything inside YouTube's player (covered by its own button).
         try { if (v.closest && v.closest("#movie_player")) continue; } catch (e) {}
         // Skip tiny preview thumbnails.
         const r = v.getBoundingClientRect ? v.getBoundingClientRect() : null;
         if (r && (r.width < 120 || r.height < 70)) continue;
-        const pill = circleButton(32, 16, "Send to Download Craft");
+        const pill = videoDownloadBar("Download this video with Download Craft");
         pill.setAttribute("data-dc-pill", "1");
         pill.dataset.gen = String(GEN);
         pill.style.position = "absolute";
@@ -2122,16 +2325,11 @@
           }
         };
         try {
-          const cs = getComputedStyle(v.parentElement || v);
-          if (v.parentElement && cs.position === "static") {
-            v.parentElement.style.position = "relative";
-          }
-          (v.parentElement || document.documentElement).appendChild(pill);
-          // Anchor inside offset parent.
-          if (v.parentElement) {
-            pill.style.position = "absolute";
-          }
-          v.__dcBtn = pill;
+          pill.__dcVideo=v;
+          document.documentElement.appendChild(pill);
+          v.__dcBtn=pill;v.__dcKey=key;
+          addDismissControl(pill,()=>dismissalKey(v,null),null);
+          syncDismissControls();
         } catch (e) { /* overlay is best-effort */ }
       }
     } catch (e) { /* ignore */ }
@@ -2167,6 +2365,7 @@
       },
     });
     api.panel.id = "dc-fb-panel";
+    pill.__dcFbPanel=api.panel;
     const sizePairs = [];
     (rows || []).forEach((st) => {
       const qm = String(st.label || "").match(/quality\s+(.+?)(?:,|$)/i);
@@ -2272,6 +2471,23 @@
   // another tab's stale snapshot (global storage keys are fallback only).
   try {
     chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
+      if (msg && msg.type === "restoreVideoButtons" && alive()) {
+        dismissedVideos.clear();
+        refreshYouTube();ensureUniversalButtons();
+        sendResponse({ok:true});return false;
+      }
+      if (msg && msg.type === "mediaFrameInfo") {
+        const videos = [...document.querySelectorAll("video")];
+        const d = videos.length === 1 ? videos[0].duration : 0;
+        sendResponse({pageUrl:location.href, videoCount:videos.length,
+          audioExpected:videos.length === 1 && playerHasAudio(videos[0]),
+          durationSecs:Number.isFinite(d) && d > 0 && d < 86400 ? Math.max(1, Math.round(d)) : null});
+        return false;
+      }
+      if (msg && msg.type === "vimeoFramePage") {
+        sendResponse({ pageUrl: location.href });
+        return false;
+      }
       if (!msg || msg.type !== "peekState") return false;
       if (!alive()) return false;
       (async () => {
@@ -2304,6 +2520,29 @@
       return true;
     });
   } catch (e) { /* messaging unavailable */ }
+
+  // Ordinary archive/installer links and explicit <a download> links can
+  // bypass the browser downloader entirely. Preserve modified clicks and
+  // fall back to the original link if the app declines capture.
+  const bypassDownloadLinks = new WeakSet();
+  document.addEventListener("click", ev => {
+    if (!alive() || ev.button !== 0 || ev.ctrlKey || ev.metaKey || ev.shiftKey || ev.altKey) return;
+    const a = ev.target && ev.target.closest && ev.target.closest("a[href]");
+    if (!a) return;
+    if (bypassDownloadLinks.has(a)) { bypassDownloadLinks.delete(a); return; }
+    if (!DCRank.directDownloadLink(a.href,a.hasAttribute("download"))) return;
+    ev.preventDefault(); ev.stopImmediatePropagation();
+    const fallback = () => { bypassDownloadLinks.add(a); a.click(); };
+    try {
+      chrome.runtime.sendMessage({type:"captureLink",url:a.href,
+        filename:a.getAttribute("download") || null,pageUrl:location.href}, res => {
+        if (chrome.runtime.lastError || !res || !res.ok) fallback();
+      });
+    } catch (e) { fallback(); }
+  },true);
+
+  loadBarPosition();
+  window.addEventListener("focus",loadBarPosition);
 
   // Initial pass + SPA navigation (YouTube AND Facebook rarely reload).
   // Facebook reels swap /reel/<id> via history API: no reload, same video

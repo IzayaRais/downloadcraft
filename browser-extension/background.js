@@ -11,7 +11,7 @@ let lastFallbackError = "";
 // Must match manifest version + content.js EXT_VER. Tabs running an older
 // content script are rejected with a "reload the tab" error instead of
 // failing mysteriously (their extension APIs are gone after a reload).
-const EXT_VER = "0.9.6";
+const EXT_VER = "0.9.6.1";
 
 // Promise-style calls (the `await api.*` ones below) go through this handle so
 // one file serves both engines: Firefox exposes the promise-returning
@@ -35,17 +35,30 @@ function markSeen(url, filename) {
   }
 }
 function freshSeen(url, filename) {
-  const t = seen.get(url + "|" + (filename || ""));
+  const t = seen.get(url + "|" + (filename || "")) ?? seen.get(url + "|");
   return t !== undefined && Date.now() - t < GRACE_MS;
 }
 
 async function settings() {
   const s = await api.storage.local.get({
     autoCapture: true,
+    hideBrowserUI: false,
     minSizeKB: 100,
     blockHosts: "",
   });
   return s;
+}
+
+// Chromium's UI switch affects the whole profile, so it is opt-in and
+// explained in the popup. Release it when capture is disabled or unavailable.
+async function syncBrowserDownloadUI() {
+  if (!api.downloads || typeof api.downloads.setUiOptions !== "function") return {supported:false};
+  const cfg = await settings();
+  const hidden = typeof DCRank !== "undefined" && DCRank.hideDownloadUI(cfg, hostOk);
+  try {
+    await api.downloads.setUiOptions({enabled:!hidden});
+    return {supported:true, hidden};
+  } catch (e) { return {supported:true, error:(e && e.message) || String(e)}; }
 }
 
 function hostBlocked(url, blockHosts) {
@@ -101,6 +114,74 @@ function stripFbSlice(url) {
 async function sendToHost(url, filename, extra) {
   try {
     url = stripFbSlice(url);
+    if (typeof DCRank !== "undefined" && DCRank.isVimeoAdaptive(url)) {
+      // The captured document is the exact iframe which requested this
+      // asset, unlike the popup's top-level page (possibly several videos).
+      let capture = null;
+      let captureTab = null;
+      for (const [tabId, items] of tabMedia) {
+        const hit = items.find((m) => m.url === url);
+        if (hit) { capture = hit; captureTab = tabId; break; }
+      }
+      let framePage = capture && capture.pageUrl;
+      // Chromium omits documentUrl on webRequest events. Ask the content
+      // script in the requesting frame instead; do not guess from a feed.
+      if (!DCRank.vimeoVideoPage(framePage) && capture && capture.frameId >= 0) {
+        try {
+          const reply = await api.tabs.sendMessage(captureTab,
+            { type: "vimeoFramePage" }, { frameId: capture.frameId });
+          framePage = reply && reply.pageUrl;
+        } catch (e) { /* frame may have navigated or been removed */ }
+      }
+      const player = DCRank.vimeoVideoPage(framePage)
+        || DCRank.vimeoVideoPage(extra && extra.pageUrl)
+        || DCRank.vimeoVideoPage(extra && extra.referer);
+      if (!player && !DCRank.isPlaylistUrl(url)) throw new Error("Vimeo playback fragment: reload the video page and capture its full stream or Vimeo player link.");
+      // A full manifest can be resolved by yt-dlp without a player URL.
+      // Never feed it to the built-in video-only HLS concatenator.
+      url = player || url;
+      // Fragment byte counts/pairs do not describe the resolved full video.
+      extra = { ...extra, size: null, pairUrl: null, pairMime: null,
+        cookie: null, mime: null };
+    }
+    const observedPart = [...tabMedia.values()].some(items => items.some(m => m.url === url && m.segment));
+    if (typeof DCRank !== "undefined" && (DCRank.isSegmentUrl(url) || observedPart) && !DCRank.isPlaylistUrl(url)) {
+      let capture = null, items = [], tab = null;
+      for (const [tabId, list] of tabMedia) {
+        const hit = list.find(m => m.url === url);
+        if (hit) { capture = hit; items = list; tab = tabId; break; }
+      }
+      let frameInfo = null;
+      if (capture && capture.frameId >= 0) {
+        try { frameInfo = await api.tabs.sendMessage(tab,
+          {type:"mediaFrameInfo"}, {frameId:capture.frameId}); } catch (e) {}
+      }
+      const whole = capture && DCRank.completePlaylist(capture, items);
+      if (whole) {
+        url = whole.url;
+      } else if (frameInfo && frameInfo.videoCount === 1 && /^https?:\/\//i.test(frameInfo.pageUrl || "")) {
+        // Keep the fragment URL as evidence. The engine resolves its exact
+        // single-player frame page with yt-dlp; it never saves the fragment.
+        extra = {...extra, referer:frameInfo.pageUrl, pageUrl:frameInfo.pageUrl};
+      } else {
+        throw new Error("This capture is a playback fragment. Reload the video and capture its full playlist or a page containing one player.");
+      }
+      extra = {...extra, size:null, pairUrl:null, pairMime:null,
+        dur:(frameInfo && frameInfo.durationSecs) || (extra && extra.dur) || null,
+        audioExpected:!!((frameInfo && frameInfo.audioExpected) || (extra && extra.audioExpected))};
+    }
+    if (typeof DCRank !== "undefined") {
+      for (const items of tabMedia.values()) {
+        const selected = items.find(m => m.url === url);
+        if (!selected || DCRank.kindOf(selected) !== "playlist") continue;
+        const root = DCRank.completePlaylist(selected, items);
+        if (root && root.url !== url) {
+          url = root.url;
+          extra = {...extra, size:null, pairUrl:null, pairMime:null};
+        }
+        break;
+      }
+    }
     let cookie = (extra && extra.cookie) || null;
     if (!cookie && /^https?:\/\//i.test(url)) {
       cookie = await cookiesFor(url); // best-effort, same-host only
@@ -108,11 +189,19 @@ async function sendToHost(url, filename, extra) {
       // back to the page's session cookies so expiring signed URLs keep
       // working without a page reload.
       const pageUrl = extra && (extra.pageUrl || extra.referer);
-      if (!cookie && pageUrl && /^https?:\/\//i.test(pageUrl)) {
+      const vimeoTarget = typeof DCRank !== "undefined"
+        && (DCRank.isVimeoAdaptive(url) || DCRank.vimeoVideoPage(url));
+      if (!cookie && pageUrl && /^https?:\/\//i.test(pageUrl)
+          && (!vimeoTarget || DCRank.vimeoVideoPage(pageUrl))) {
         try {
           const uh = new URL(url).hostname.toLowerCase();
           const ph = new URL(pageUrl).hostname.toLowerCase();
-          if (uh !== ph) cookie = await cookiesFor(pageUrl);
+          const social = /(?:^|\.)(?:fbcdn\.net|facebook\.com|instagram\.com|cdninstagram\.com|fbsbx\.com)$/.test(uh)
+            || uh.includes("scontent") || uh.includes("lookaside");
+          const pageRecovery = typeof DCRank !== "undefined" && DCRank.isSegmentUrl(url) && !DCRank.isPlaylistUrl(url);
+          // An arbitrary CDN must not receive another site's cookies. A
+          // fragment recovery uses them only on its original player page.
+          if (uh !== ph && (social || pageRecovery || (vimeoTarget && DCRank.vimeoVideoPage(pageUrl)))) cookie = await cookiesFor(pageUrl);
         } catch (e) { /* host parse failed: no cookies */ }
       }
     }
@@ -129,6 +218,7 @@ async function sendToHost(url, filename, extra) {
       pairMime: (extra && extra.pairMime) || null,
       quality: (extra && extra.quality) || null,
       dur: (extra && extra.dur) || null,
+      audioExpected: !!(extra && extra.audioExpected),
     });
     return !!res && (res.type === "ok" || res.type === "pong");
   } catch (e) {
@@ -152,7 +242,8 @@ const sizeCache = new Map(); // url -> bytes (quality-menu sizes)
 const MEDIA_MIME = /^(video\/|audio\/|application\/(x-mpegurl|vnd\.apple\.mpegurl|dash\+xml|mp4|octet-stream))/i;
 const MEDIA_URL = /\.(mp4|webm|mkv|mov|avi|m4v|mp3|m4a|aac|flac|ogg|wav|m3u8|mpd|m4s|ts|cmfv|cmfa)(\?|#|$)/i;
 
-function rankKind(url) {
+function rankKind(url, mime) {
+  if (typeof DCRank !== "undefined") return DCRank.kindOf({url, mime});
   if (typeof DCRank !== "undefined" && DCRank.isPlaylistUrl(url)) return "playlist";
   if (typeof DCRank !== "undefined" && DCRank.isSegmentUrl(url)) return "segment";
   // Legacy fallback when rank.js failed to load (same shapes, inline).
@@ -171,7 +262,7 @@ function noteMedia(tabId, entry) {
   if (!entry || !entry.url || !/^https?:\/\//i.test(entry.url)) return;
   entry.url = stripFbSlice(entry.url);
   if (entry.url.length > 4000) return;
-  const kind = rankKind(entry.url);
+  const kind = rankKind(entry.url, entry.mime);
   // P4: a playlist on the tab demotes loose segments — they are children
   // the engine fetches itself (ad slivers hide among them), so menus must
   // offer the whole, and the badge must not count parts as downloads.
@@ -181,9 +272,23 @@ function noteMedia(tabId, entry) {
   if (!list) { list = []; tabMedia.set(tabId, list); }
   if (list.some((e) => e.url === entry.url)) return;
   list.push({ ...entry, kind, seenAt: Date.now() });
+  // An observed playlist reference is stronger evidence than a filename:
+  // some sites name every individual segment .mp4.
+  if (typeof DCRank !== "undefined") {
+    for (const item of list) {
+      if (DCRank.kindOf(item) === "playlist") continue;
+      if (list.some(parent => DCRank.kindOf(parent) === "playlist"
+          && DCRank.samePlayer(parent, item) && (parent.children || []).includes(item.url))) {
+        item.segment = true; item.kind = "segment"; item.child = true;
+      }
+    }
+  }
   if (list.length > 25) {
-    const dropped = list.splice(0, list.length - 25);
-    for (const d of dropped) pruneSeen(d.url, tabId);
+    while (list.length > 25) {
+      const part = list.findIndex(m => rankKind(m.url, m.mime) !== "playlist");
+      const [d] = list.splice(part < 0 ? 0 : part, 1);
+      pruneSeen(d.url, tabId);
+    }
   }
   // Cross-tab duplicate collapse (P4): one canonical entry, tab count.
   const ck = canonKey(entry.url);
@@ -260,12 +365,35 @@ try {
           // Skip tiny chunks unless HLS/DASH playlist (threshold configurable).
           const minB = Math.max(0, (parseInt(cfg.minSizeKB, 10) || 100)) * 1024;
           const isPlaylist = /m3u8|mpd|mpegurl|dash/i.test(details.url) || /m3u8|mpd|mpegurl|dash/i.test(ctype);
-          if (!isPlaylist && totalForFilter > 0 && totalForFilter < minB) return;
+          const fragment = typeof DCRank !== "undefined" && DCRank.isSegmentUrl(details.url);
+          if (!isPlaylist && !fragment && totalForFilter > 0 && totalForFilter < minB) return;
+          let master = false, children = [];
+          if (isPlaylist) {
+            try {
+              const res = await fetch(details.url, {credentials:"include", signal:AbortSignal.timeout(8000)});
+              if (res.ok && (!res.headers.get("content-length") || Number(res.headers.get("content-length")) <= 1024 * 1024)) {
+                const reader = res.body.getReader();
+                let body = "", size = 0;
+                const decoder = new TextDecoder();
+                try {
+                  while (size <= 1024 * 1024) {
+                    const {value, done} = await reader.read();
+                    if (done) break;
+                    size += value.length; body += decoder.decode(value, {stream:true});
+                    if (/#EXT-X-STREAM-INF|<MPD[\s>]/i.test(body)) master = true;
+                  }
+                  if (typeof DCRank !== "undefined") children = DCRank.playlistReferences(body, details.url);
+                } finally { await reader.cancel(); }
+              }
+            } catch (e) { /* metadata optional; keep the original signed URL */ }
+          }
           noteMedia(details.tabId, {
+            master, children,
             url: details.url,
             mime,
             size: totalForFilter || 0,
             pageUrl: details.documentUrl || null,
+            frameId: details.frameId,
           });
         } catch (e) { /* never break navigation */ }
         })();
@@ -326,6 +454,7 @@ async function sendToHostPing() {
     );
   }
   setBadge();
+  await syncBrowserDownloadUI();
 }
 
 chrome.runtime.onInstalled.addListener(() => {
@@ -352,7 +481,7 @@ async function refreshOpenTabs() {
       try {
         await api.scripting.executeScript({
           target: { tabId: t.id },
-          files: ["content.js"],
+          files: ["rank.js", "content.js"],
         });
       } catch (e) {
         /* chrome:// pages, web store, etc. — not scriptable, skip */
@@ -376,11 +505,14 @@ chrome.contextMenus.onClicked.addListener((info, tab) => {
 });
 
 // ---- automatic capture ----
-chrome.downloads.onCreated.addListener(async (item) => {
+async function performBrowserCapture(item) {
+  const cfg = await settings();
   const url = item.finalUrl || item.url;
   if (!url || !/^https?:\/\//i.test(url)) return; // blobs/data stay in browser
-  const cfg = await settings();
   if (!cfg.autoCapture) return;
+  // DownloadItem omits the original HTTP method. Replaying a form's POST as
+  // a GET loses the request body, so leave observed non-GET downloads intact.
+  if (nonReplayableDownload(item.url) || nonReplayableDownload(url)) return;
   if (hostBlocked(url, cfg.blockHosts)) return; // P0.1 site filter
   if (freshSeen(url, item.filename)) return; // our own fallback re-download
   // Honor the size filter here too (sniffer-only before): tiny files stay
@@ -395,7 +527,7 @@ chrome.downloads.onCreated.addListener(async (item) => {
     // re-sending would deliver a SECOND copy — leave the browser's file.
     return;
   }
-  const ok = await sendToHost(url, item.filename);
+  const ok = await sendToHost(url, item.filename, {pageUrl:item.referrer || null,referer:item.referrer || null});
   // Erase the browser entry only once the app confirmed receipt.
   if (ok) {
     try {
@@ -407,8 +539,9 @@ chrome.downloads.onCreated.addListener(async (item) => {
   hostOk = ok;
   setBadge();
   if (!ok) {
+    await syncBrowserDownloadUI();
     // Native host missing: hand the file back to the browser so nothing is lost.
-    markSeen(url, item.filename);
+    markSeen(url, null);
     chrome.downloads.download({ url, saveAs: false }, () => {
       if (chrome.runtime.lastError) {
         lastFallbackError = chrome.runtime.lastError.message || "browser re-download failed";
@@ -418,12 +551,90 @@ chrome.downloads.onCreated.addListener(async (item) => {
       }
     });
   }
-});
+}
+
+const nonGetRequests = new Map();
+function rememberDownloadRequest(details) {
+  if (!details.url || !details.method || String(details.method).toUpperCase() === "GET") return;
+  nonGetRequests.set(details.url, Date.now());
+  if (nonGetRequests.size > 500) nonGetRequests.delete(nonGetRequests.keys().next().value);
+}
+function nonReplayableDownload(url) {
+  const time = nonGetRequests.get(url);
+  if (time === undefined) return false;
+  if (Date.now() - time > 60000) { nonGetRequests.delete(url); return false; }
+  return true;
+}
+try {
+  if (chrome.webRequest && chrome.webRequest.onBeforeRequest) {
+    chrome.webRequest.onBeforeRequest.addListener(rememberDownloadRequest,
+      {urls:["http://*/*", "https://*/*"]});
+  }
+} catch (e) { /* unsupported API; normal direct-link capture still works */ }
+
+const browserCaptures = new Map();
+function captureBrowserDownload(item) {
+  const previous = browserCaptures.get(item.id);
+  if (previous) { Object.assign(previous.item,item); return previous.promise; }
+  const state = {item:{...item},promise:null};
+  state.promise = performBrowserCapture(state.item).catch(e => {
+    console.error("[download-craft] capture failed",e);
+  });
+  browserCaptures.set(item.id,state);
+  if (browserCaptures.size > 200) browserCaptures.delete(browserCaptures.keys().next().value);
+  return state.promise;
+}
+chrome.downloads.onCreated.addListener(item => { void captureBrowserDownload(item); });
+if (chrome.downloads.onDeterminingFilename) {
+  chrome.downloads.onDeterminingFilename.addListener((item,suggest) => {
+    captureBrowserDownload(item).finally(() => { try { suggest(); } catch (e) {} });
+    return true;
+  });
+}
+
+
+// Firefox supports asynchronous blocking at response headers. Chrome MV3
+// uses the shared early-link path plus downloads.onDeterminingFilename above.
+async function captureAttachmentResponse(details) {
+  try {
+    const file = DCRank.attachmentDownload(details);
+    if (!file || freshSeen(details.url, file.filename)) return {};
+    const cfg = await settings();
+    const minBytes = Math.max(0, Number(cfg.minSizeKB) || 0) * 1024;
+    if (!cfg.autoCapture || hostBlocked(details.url, cfg.blockHosts)
+        || (file.size > 0 && file.size < minBytes)) return {};
+    const pageUrl = details.originUrl || details.documentUrl || null;
+    const ok = await sendToHost(details.url, file.filename,
+      {pageUrl, referer:pageUrl, mime:file.mime, size:file.size || null});
+    // If the app declines, continue the original request, including its
+    // authentication/session. Do not cancel and recreate this request.
+    markSeen(details.url, null);
+    hostOk = ok; setBadge();
+    return ok ? {cancel:true} : {};
+  } catch (e) { return {}; }
+}
+try {
+  if (typeof browser !== "undefined" && browser.webRequest && browser.webRequest.onHeadersReceived) {
+    browser.webRequest.onHeadersReceived.addListener(captureAttachmentResponse,
+      {urls:["http://*/*", "https://*/*"], types:["main_frame", "sub_frame", "other"]},
+      ["blocking", "responseHeaders"]);
+  }
+} catch (e) { /* downloads.onCreated remains the fallback */ }
 
 // ---- popup / content-script messages ----
 chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   (async () => {
     if (!msg || typeof msg !== "object") return { ok: false };
+    if (msg.type === "getVideoBarPosition") {
+      const data=await api.storage.session.get("videoBarPosition");
+      return {ok:true,position:data.videoBarPosition || null};
+    }
+    if (msg.type === "setVideoBarPosition") {
+      const p=msg.position;
+      if(!p || !Number.isFinite(p.x) || !Number.isFinite(p.y) || p.x<0 || p.x>1 || p.y<0 || p.y>1)return {ok:false};
+      await api.storage.session.set({videoBarPosition:{x:p.x,y:p.y}});
+      return {ok:true};
+    }
     if (msg.type === "download" && msg.url) {
       if (!/^https?:\/\//i.test(msg.url) || msg.url.length > 4000) {
         return { ok: false, error: "only http(s) links up to 4000 chars can be sent" };
@@ -436,7 +647,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
               chrome.scripting && chrome.scripting.executeScript) {
             await api.scripting.executeScript({
               target: { tabId: sender.tab.id },
-              files: ["content.js"],
+              files: ["rank.js", "content.js"],
             });
             return {
               ok: false,
@@ -463,6 +674,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
           pairMime: msg.pairMime || null,
           quality: msg.quality || null,
           dur: msg.dur || null,
+          audioExpected: !!msg.audioExpected,
         });
         hostOk = ok;
         setBadge();
@@ -573,16 +785,32 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       }));
       return { sizes: out };
     }
+    if (msg.type === "captureLink") {
+      const cfg = await settings();
+      if (!cfg.autoCapture || !/^https?:\/\//i.test(msg.url || "") || hostBlocked(msg.url,cfg.blockHosts)) return {ok:false};
+      const ok = await sendToHost(msg.url,msg.filename,{pageUrl:msg.pageUrl,referer:msg.pageUrl});
+      // A failed direct handoff must replay in Brave without recapture.
+      markSeen(msg.url,null);
+      return {ok};
+    }
     if (msg.type === "getState") {
       // Fresh status on every popup open (the worker only pings at
       // startup, which can predate the app's first run).
       await sendToHostPing();
       const cfg = await settings();
-      return { autoCapture: !!cfg.autoCapture, minSizeKB: cfg.minSizeKB, blockHosts: cfg.blockHosts, hostOk, hostError: lastHostError || null, fallbackError: lastFallbackError || null };
+      const downloadUI = await syncBrowserDownloadUI();
+      return { hideBrowserUI:!!cfg.hideBrowserUI, downloadUI, autoCapture: !!cfg.autoCapture, minSizeKB: cfg.minSizeKB, blockHosts: cfg.blockHosts, hostOk, hostError: lastHostError || null, fallbackError: lastFallbackError || null };
     }
     if (msg.type === "setAuto" && typeof msg.value === "boolean") {
       await api.storage.local.set({ autoCapture: msg.value });
+      await syncBrowserDownloadUI();
       return { ok: true };
+    }
+    if (msg.type === "setBrowserUI" && typeof msg.value === "boolean") {
+      await api.storage.local.set({hideBrowserUI:msg.value});
+      await sendToHostPing();
+      const state = await syncBrowserDownloadUI();
+      return {ok:state.supported && !state.error, ...state};
     }
     if (msg.type === "setFilters") {
       const patch = {};
@@ -604,6 +832,6 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       return { ok: true };
     }
     return { ok: false };
-  })().then(sendResponse);
+  })().then(sendResponse,()=>sendResponse({ok:false}));
   return true; // async response
 });

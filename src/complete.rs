@@ -164,12 +164,9 @@ impl CompleteApp {
 
         // ---- actions ----
         let path = item.dest_path();
-        let acts: [(&str, &str); 4] = [
-            ("Open", "open"),
-            ("Open with...", "open-with"),
-            ("Open folder", "folder"),
-            ("Close", "close"),
-        ];
+        let mut acts = vec![("Open", "open"), ("Open folder", "folder"), ("Close", "close")];
+        #[cfg(windows)]
+        acts.insert(1,("Open with...", "open-with"));
         let bw = (IN_R - PAD_X - BTN_GAP * (acts.len() as f32 - 1.0)) / acts.len() as f32;
         for (i, (label, act)) in acts.iter().enumerate() {
             let r = at(o, PAD_X + i as f32 * (bw + BTN_GAP), BTN_Y, bw, BTN_H);

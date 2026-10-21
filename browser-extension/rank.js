@@ -7,15 +7,148 @@
 
   // Playlist manifests the engine assembles itself (offer these, not parts).
   function isPlaylistUrl(u) {
-    return /(\.m3u8|\.mpd)(\?|#|$)/i.test(String(u || "").split("?")[0])
-      || /m3u8|mpegurl|dash/i.test(String(u || ""));
+    try {
+      const x = new URL(String(u || ""));
+      if (/\.(m3u8|mpd)$/i.test(x.pathname)) return true;
+      return [...x.searchParams.values()].some(v => /^(?:m3u8|mpd|application\/(?:dash\+xml|(?:vnd\.apple\.)?mpegurl|x-mpegurl))$/i.test(v));
+    } catch (e) { return false; }
+  }
+
+  // Vimeo's signed range endpoints can end in .mp4 but contain only a
+  // playback fragment. Never rewrite their signed paths/query strings.
+  function isVimeoFragment(u) {
+    try {
+      const x = new URL(String(u || ""));
+      return (x.hostname === "vimeocdn.com" || x.hostname.endsWith(".vimeocdn.com"))
+        && (/\/v2\/range\//i.test(x.pathname) || /^\d+-\d+$/.test(x.searchParams.get("range") || ""));
+    } catch (e) { return false; }
+  }
+
+  // Manifests and adaptive MP4 legs must resolve together with audio.
+  function isVimeoAdaptive(u) {
+    try {
+      const x = new URL(String(u || ""));
+      const cdn = x.hostname === "vimeocdn.com" || x.hostname.endsWith(".vimeocdn.com");
+      return cdn && (isVimeoFragment(u) || isPlaylistUrl(u) || /^vod-adaptive[.-]/i.test(x.hostname));
+    } catch (e) { return false; }
+  }
+
+  function vimeoVideoPage(u) {
+    try {
+      const x = new URL(String(u || ""));
+      if (!/^https?:$/.test(x.protocol)) return null;
+      const player = x.hostname === "player.vimeo.com" && /^\/video\/\d+\/?$/.test(x.pathname);
+      const watch = (x.hostname === "vimeo.com" || x.hostname === "www.vimeo.com")
+        && /^\/\d+(?:\/[a-zA-Z0-9]+)?\/?$/.test(x.pathname);
+      return player || watch ? x.href : null;
+    } catch (e) { return null; }
   }
 
   // Stream parts that only make sense inside a playlist assembly.
   function isSegmentUrl(u) {
-    const base = String(u || "").split("?")[0];
-    return /(\.ts|\.m4s|\.cmfv|\.cmfa|\.mpd\.seg)(\?|#|$)/i.test(base)
-      || /\/chunklist|\/seg-|sequence/i.test(base);
+    try {
+      const x = new URL(String(u || ""));
+      const base = x.pathname;
+      const leaf = base.split("/").pop() || "";
+      const range = x.searchParams.get("range") || "";
+      const byteSlice = x.searchParams.has("bytestart") || x.searchParams.has("byteend");
+      const media = /\.(?:mp4|m4a|webm|mp3|aac|ts)$/i.test(base);
+      return isVimeoFragment(u) || (media && (/^\d+-\d+$/.test(range) || byteSlice))
+        || /\.(m4s|cmfv|cmfa|mpd\.seg)$/i.test(base)
+        || /^(?:(?:seg(?:ment)?|chunk|fragment|s|filesequence|sequence)[-_]?\d+|\d+)(?:[^/]*)\.ts$/i.test(leaf);
+    } catch (e) { return false; }
+  }
+
+  // Match the requesting frame, never another player's unrelated playlist.
+  function samePlayer(a, b) {
+    if (a.tabId !== undefined && b.tabId !== undefined && a.tabId !== b.tabId) return false;
+    if (a.frameId !== undefined && b.frameId !== undefined && a.frameId !== b.frameId) return false;
+    if (a.pageUrl && b.pageUrl && a.pageUrl !== b.pageUrl) return false;
+    return (a.frameId !== undefined && b.frameId !== undefined)
+      || !!(a.pageUrl && b.pageUrl && a.pageUrl === b.pageUrl);
+  }
+
+  function playlistReferences(text, base) {
+    const refs = [];
+    for (const line of String(text || "").split(/\r?\n/)) {
+      const t = line.trim();
+      const raw = t && !t.startsWith("#") && !t.startsWith("<") ? [t]
+        : [...t.matchAll(/(?:^|[, :])URI="([^"]+)"/g)].map(m => m[1]);
+      for (const r of raw) {
+        try { const u = new URL(r, base); if (/^https?:$/.test(u.protocol)) refs.push(u.href); } catch (e) {}
+      }
+    }
+    return [...new Set(refs)];
+  }
+
+  function completePlaylist(entry, items) {
+    const pool = (items || []).filter(m => m && kindOf(m) === "playlist" && samePlayer(entry, m));
+    const reaches = (node, target, seen = new Set()) => {
+      if (seen.has(node.url)) return false;
+      seen.add(node.url);
+      return (node.children || []).some(u => u === target
+        || pool.some(child => child.url === u && reaches(child, target, seen)));
+    };
+    const linked = pool.filter(m => m.url !== entry.url && reaches(m, entry.url));
+    if (linked.length) return linked.sort((a,b) => Number(!!b.master)-Number(!!a.master))[0];
+    const masters = pool.filter(m => m.master);
+    // With ambiguous roots, retain a selected complete manifest, or let a
+    // fragment fall back to its exact single-player page. Never guess.
+    if (kindOf(entry) === "playlist") return entry;
+    return masters.length === 1 ? masters[0] : pool.length === 1 ? pool[0] : null;
+  }
+
+
+  function playerEvidence(videos, url, mime, pageUrl, suppliedDuration) {
+    const isVideo = String(url) === String(pageUrl) || /^blob:/i.test(String(url))
+      || /^video\//i.test(String(mime || "")) || isPlaylistUrl(url)
+      || /\.(?:mp4|webm|mkv|mov|m4v|avi|ts|m4s|cmfv)(?:[?#]|$)/i.test(String(url));
+    const list = isVideo ? [...(videos || [])] : [];
+    const matches = list.filter(v => v.currentSrc === url || v.src === url);
+    const player = matches.length === 1 ? matches[0] : list.length === 1 ? list[0] : null;
+    let d = Number(suppliedDuration);
+    if (!(d > 0) && player) d = player.duration;
+    return {
+      dur: Number.isFinite(d) && d > 0 && d < 86400 ? Math.max(1, Math.round(d)) : null,
+      audioExpected: !!(player && (player.mozHasAudio === true || Number(player.webkitAudioDecodedByteCount) > 0
+        || (player.audioTracks && player.audioTracks.length > 0))),
+    };
+  }
+
+  function hideDownloadUI(settings, hostConnected) {
+    return !!(settings && settings.hideBrowserUI && settings.autoCapture && hostConnected);
+  }
+
+  // A navigation response explicitly offered as a download, never a player
+  // fragment or an XHR used internally by the page. Firefox can intercept it
+  // before its file picker starts, using webRequestBlocking.
+  function attachmentDownload(details) {
+    if (!details || details.method !== "GET" || !/^https?:\/\//i.test(details.url || "")
+        || !["main_frame", "sub_frame", "other"].includes(details.type)
+        || details.statusCode < 200 || details.statusCode >= 300 || details.statusCode === 206) return null;
+    const headers = new Map((details.responseHeaders || []).map(h => [String(h.name).toLowerCase(), String(h.value || "")]));
+    const disposition = headers.get("content-disposition") || "";
+    if (!/^\s*attachment(?:\s*;|$)/i.test(disposition)) return null;
+    let filename = null;
+    const encoded = disposition.match(/(?:^|;)\s*filename\*\s*=\s*UTF-8'[^']*'([^;]+)/i);
+    const plain = disposition.match(/(?:^|;)\s*filename\s*=\s*(?:"((?:[^"\\]|\\.)*)"|([^;]+))/i);
+    try { if (encoded) filename = decodeURIComponent(encoded[1].trim()); } catch (e) {}
+    if (!filename && plain) filename = (plain[1] || plain[2] || "").replace(/\\(.)/g, "$1").trim();
+    // A server filename is a basename, never a directory supplied by the server.
+    if (filename) filename = filename.split(/[\\/]/).pop().replace(/[\x00-\x1f\x7f]/g, "").slice(0,240) || null;
+    return {filename, size:Math.max(0, Number(headers.get("content-length")) || 0), mime:headers.get("content-type") || null};
+  }
+
+  function videoDismissKey(page, src, videoId) {
+    if (videoId) return `youtube:${videoId}`;
+    return `${String(page || "").split("#")[0]}|${String(src || "")}`;
+  }
+  function directDownloadLink(href, downloadAttribute) {
+    try {
+      const u = new URL(String(href || ""));
+      if (!/^https?:$/.test(u.protocol)) return false;
+      return !!downloadAttribute || /\.(?:zip|7z|rar|tar|tgz|gz|bz2|xz|exe|msi|dmg|pkg|deb|rpm|appimage|iso)(?:$)/i.test(u.pathname);
+    } catch (e) { return false; }
   }
 
   // Canonical identity for duplicate collapse: slice selectors
@@ -35,8 +168,8 @@
   // 'playlist' | 'segment' | 'file'
   function kindOf(entry) {
     const u = (entry && entry.url) || "";
-    if (isPlaylistUrl(u)) return "playlist";
-    if (isSegmentUrl(u)) return "segment";
+    if (isPlaylistUrl(u) || /^(?:application\/(?:x-mpegurl|vnd\.apple\.mpegurl|dash\+xml)|audio\/mpegurl)(?:;|$)/i.test(String(entry && entry.mime || ""))) return "playlist";
+    if ((entry && entry.segment) || isSegmentUrl(u)) return "segment";
     return "file";
   }
 
@@ -203,7 +336,7 @@
     } catch (e) {}
   }
 
-  const DCRank = { isPlaylistUrl, isSegmentUrl, canonicalUrl, kindOf, scoreMedia, collapseDupes, fmtDur, panelTokens, dcThemeMode, dcSetTheme, paintDcPanel };
+  const DCRank = { attachmentDownload, videoDismissKey, directDownloadLink, hideDownloadUI, playerEvidence, playlistReferences, samePlayer, completePlaylist, isVimeoAdaptive, isVimeoFragment, vimeoVideoPage, isPlaylistUrl, isSegmentUrl, canonicalUrl, kindOf, scoreMedia, collapseDupes, fmtDur, panelTokens, dcThemeMode, dcSetTheme, paintDcPanel };
   g.DCRank = DCRank;
   if (typeof module !== "undefined" && module.exports) module.exports = DCRank;
 })(typeof globalThis !== "undefined" ? globalThis : this);

@@ -89,12 +89,11 @@ fn hash_key(text: &str, size: f32) -> u64 {
 /// Read a system font (per-user copy first), cached for the process lifetime.
 /// The bytes are handed out as `&'static` so the parsed faces can borrow them.
 fn font_bytes(file: &str) -> Option<&'static [u8]> {
-    #[cfg(not(windows))]
-    {
-        let _ = file;
-        None
+    match file {
+        "bundled-bengali" => return Some(include_bytes!("../assets/fonts/NotoSansBengali.ttf")),
+        "bundled-emoji" => return Some(include_bytes!("../assets/fonts/NotoEmoji.ttf")),
+        _ => {}
     }
-    #[cfg(windows)]
     {
         type Cache = std::sync::Mutex<HashMap<String, Option<&'static [u8]>>>;
         static CACHE: OnceLock<Cache> = OnceLock::new();
@@ -156,7 +155,7 @@ fn sources() -> &'static Vec<Source> {
     static SOURCES: OnceLock<Vec<Source>> = OnceLock::new();
     SOURCES.get_or_init(|| {
         let mut v: Vec<Source> = vec![Source {
-            file: "segoeui.ttf",
+            file: if cfg!(windows) { "segoeui.ttf" } else if cfg!(target_os="macos") { "Helvetica.ttc" } else { "DejaVuSans.ttf" },
             index: 0,
             loaded: OnceLock::new(),
         }];
@@ -170,6 +169,10 @@ fn sources() -> &'static Vec<Source> {
             index: 0,
             loaded: OnceLock::new(),
         });
+        // Portable fallbacks also make shaping independent of optional OS fonts.
+        for file in ["bundled-bengali", "bundled-emoji"] {
+            v.push(Source { file, index: 0, loaded: OnceLock::new() });
+        }
         v
     })
 }
@@ -564,12 +567,13 @@ mod tests {
     /// codepoint; with it the conjunct swallows the virama.
     #[test]
     fn shaping_forms_conjuncts() {
-        let ids: Vec<u16> = glyphs("পোস্টে").into_iter().map(|g| g.1).collect();
+        // A conjunct can use one ligature or several positioned components,
+        // depending on the font. The unshaped virama must disappear either way.
+        let ids: Vec<u16> = glyphs("স্ট").into_iter().map(|g| g.1).collect();
         assert!(!ids.is_empty(), "no glyphs from the system font");
-        assert!(
-            ids.len() < "পোস্টে".chars().count(),
-            "run was not shaped: {ids:?}"
-        );
+        let font = &sources()[source_for('্').expect("Indic font")].get().unwrap().font;
+        let virama = font.glyph_id('্').0;
+        assert!(!ids.contains(&virama), "unshaped virama in {ids:?}");
         assert!(ids.iter().all(|id| *id != 0), "tofu in {ids:?}");
     }
 

@@ -37,23 +37,21 @@ fn ui_path() -> Option<std::path::PathBuf> {
 
 /// Claim (remove) our URL from the native inbox so the main window does not
 /// prompt for it too. Runs at dialog open; Cancel therefore discards.
-fn claim_inbox(url: &str) {
-    let Some(path) = crate::native_host::inbox_path() else {
-        return;
-    };
-    let _guard = crate::model::fs_lock("inbox");
-    let data = match std::fs::read_to_string(&path) {
-        Ok(d) => d,
-        Err(_) => return,
-    };
-    let items: Vec<crate::native_host::InboxItem> =
-        serde_json::from_str(&data).unwrap_or_default();
-    let rest: Vec<_> = items.into_iter().filter(|i| i.url != url).collect();
-    if rest.is_empty() {
-        let _ = std::fs::remove_file(&path);
-    } else if let Ok(json) = serde_json::to_string_pretty(&rest) {
-        let _ = atomic_write(&path, json.as_bytes());
-    }
+fn claim_inbox(url: &str) -> Option<crate::native_host::InboxItem> {
+    let path=crate::native_host::inbox_path()?;
+    let guard=crate::model::fs_lock("inbox");
+    if !guard.owned() {return None;}
+    claim_inbox_at(&path,url)
+}
+fn claim_inbox_at(path:&std::path::Path,url:&str) -> Option<crate::native_host::InboxItem> {
+    let data=std::fs::read_to_string(path).ok()?;
+    // Retain unreadable pending captures for recovery.
+    let items:Vec<crate::native_host::InboxItem>=serde_json::from_str(&data).ok()?;
+    let claimed=items.iter().find(|i|i.url==url)?.clone();
+    let rest:Vec<_>=items.into_iter().filter(|i|i.url!=url).collect();
+    if rest.is_empty() {std::fs::remove_file(path).ok()?;}
+    else {atomic_write(path,serde_json::to_string_pretty(&rest).ok()?.as_bytes()).ok()?;}
+    Some(claimed)
 }
 
 #[derive(Debug, Default)]
@@ -87,7 +85,7 @@ fn load_prefs() -> UiPrefs {
     if p.save_dir.is_empty() {
         p.save_dir = dirs::download_dir()
             .map(|x| x.to_string_lossy().to_string())
-            .unwrap_or_else(|| "C:\\Downloads".to_string());
+            .unwrap_or_else(|| crate::model::default_download_dir().to_string_lossy().into_owned());
     }
     if let Some(n) = v.get("connections_default").and_then(|x| x.as_u64()) {
         p.connections = (n as usize).clamp(1, 16);
@@ -158,7 +156,7 @@ fn main_app_running() -> bool {
 
 /// Launch the main window detached (fire-and-forget).
 fn launch_main_app() {
-    let Ok(exe) = std::env::current_exe() else {
+    let Ok(exe) = crate::platform::launch_path() else {
         return;
     };
     let mut cmd = std::process::Command::new(exe);
@@ -187,6 +185,7 @@ struct ConfirmApp {
     page_mime: String,
     /// Media duration in seconds from the extension (best-effort badge).
     duration_secs: u64,
+    expects_audio: bool,
     quality_pref: String,
     connections: usize,
     user_agent: String,
@@ -494,7 +493,7 @@ impl ConfirmApp {
         let page_mime = self.page_mime.clone();
         let opts = EngineOpts {
             user_agent: if self.user_agent.trim().is_empty() {
-                format!("download_craft/{}", env!("CARGO_PKG_VERSION"))
+                format!("download_craft/{}", crate::model::APP_VERSION)
             } else {
                 self.user_agent.clone()
             },
@@ -588,6 +587,7 @@ impl ConfirmApp {
         }
         item.quality_pref = self.quality_pref.trim().to_string();
         item.duration_secs = self.duration_secs;
+        item.expects_audio = self.expects_audio;
         let id = match crate::model::append_to_queue(&mut item) {
             crate::model::AppendResult::Added(id) => {
                 save_remember_category(self.remember_path);
@@ -626,6 +626,7 @@ impl ConfirmApp {
     fn wake_targets(&self, targets: &[u64]) {
         if let Some(p) = wake_path() {
             let _guard = crate::model::fs_lock("wake");
+            if !_guard.owned() { return; }
             let mut ids: Vec<u64> = std::fs::read_to_string(&p)
                 .ok()
                 .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
@@ -697,7 +698,7 @@ pub fn run() -> eframe::Result<()> {
             crate::model::filename_from_url_with_mime(&url, Some(page_mime.as_str()))
         });
     let referer = get("--referer").unwrap_or_default();
-    let cookie = get("--cookie").unwrap_or_default();
+    let mut cookie = get("--cookie").unwrap_or_default();
     let pair_url = get("--pair-url").filter(|s| s.starts_with("http")).unwrap_or_default();
     let pair_mime = get("--pair-mime").unwrap_or_default();
     let quality_pref = get("--quality").filter(|s| !s.trim().is_empty()).unwrap_or_default();
@@ -712,7 +713,11 @@ pub fn run() -> eframe::Result<()> {
         .unwrap_or(0);
 
     // Claim the inbox entry first so the main window won't prompt too.
-    claim_inbox(url.trim());
+    if let Some(item)=claim_inbox(url.trim()) {
+        // The native host leaves credentials in the private inbox, not the
+        // process command line where other local users can inspect them.
+        if cookie.is_empty() {cookie=item.cookie.unwrap_or_default();}
+    }
 
     let prefs = load_prefs();
     let category = category_of(&filename).to_string();
@@ -744,6 +749,7 @@ pub fn run() -> eframe::Result<()> {
         pair_mime,
         page_mime,
         duration_secs,
+        expects_audio: args.iter().any(|s| s == "--expect-audio"),
         quality_pref,
         connections: prefs.connections,
         user_agent: prefs.user_agent,
@@ -1312,5 +1318,27 @@ impl eframe::App for ConfirmApp {
                 );
             }
         });
+    }
+}
+
+#[cfg(test)]
+mod audit_inbox_tests {
+    #[test]
+    fn claiming_a_capture_returns_private_cookies_and_preserves_other_entries() {
+        let dir=std::env::temp_dir().join(format!("dc-inbox-audit-{}",std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();let path=dir.join("inbox.json");
+        let data=serde_json::json!([
+            {"url":"https://example.com/a","received_at":"2026-10-20","cookie":"session=secret"},
+            {"url":"https://example.com/b","received_at":"2026-10-20"}
+        ]);
+        super::atomic_write(&path,serde_json::to_string(&data).unwrap().as_bytes()).unwrap();
+        let capture=super::claim_inbox_at(&path,"https://example.com/a").unwrap();
+        assert_eq!(capture.cookie.as_deref(),Some("session=secret"));
+        let left:Vec<crate::native_host::InboxItem>=serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(left.len(),1);assert_eq!(left[0].url,"https://example.com/b");
+        std::fs::write(&path,b"{broken").unwrap();
+        assert!(super::claim_inbox_at(&path,"https://example.com/b").is_none());
+        assert_eq!(std::fs::read(&path).unwrap(),b"{broken");
+        std::fs::remove_dir_all(dir).unwrap();
     }
 }

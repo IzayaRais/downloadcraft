@@ -7,6 +7,11 @@ use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::Instant;
 
+#[cfg(windows)]
+type PlatformTray = tray_icon::TrayIcon;
+#[cfg(not(windows))]
+type PlatformTray = ();
+
 // ---------- theme ----------
 /// Unified geometry: every card, modal, field, and button across ALL
 /// windows (main, Add-download dialog, progress) uses this radius.
@@ -1729,7 +1734,7 @@ pub struct CraftApp {
     /// The main window is moved into the middle of the work area once, on the
     /// first frame where egui knows the screen geometry.
     placement_done: bool,
-    tray: Option<tray_icon::TrayIcon>,
+    tray: Option<PlatformTray>,
     details_id: Option<u64>,
     probing: bool,
     probe_size: Option<u64>,
@@ -1798,6 +1803,7 @@ pub struct CraftApp {
     /// the Add dialog can show the chosen stream's size, and honored by the
     /// engine at download time).
     add_quality: String,
+    captured_media: HashMap<String, (u64, bool)>,
     // Details-dialog checksum staging (validated live; see Details tab).
     det_sum: String,
     det_for: Option<u64>,
@@ -1816,7 +1822,7 @@ impl CraftApp {
     pub fn new(rt: Arc<tokio::runtime::Runtime>) -> Self {
         let dl_dir = dirs::download_dir()
             .map(|p| p.to_string_lossy().to_string())
-            .unwrap_or_else(|| "C:\\Downloads".to_string());
+            .unwrap_or_else(|| crate::model::default_download_dir().to_string_lossy().into_owned());
         let (tx, rx) = std::sync::mpsc::channel();
         std::thread::spawn(move || clipboard_watch(tx));
         let mut app = Self {
@@ -1864,14 +1870,14 @@ impl CraftApp {
             had_active: false,
             timeout_secs: 60,
             max_retries: 5,
-            user_agent: "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0 Safari/537.36".to_string(),
+            user_agent: crate::platform::default_user_agent().to_string(),
             proxy_url: String::new(),
             antivirus_cmd: String::new(),
             finish_action: "nothing".to_string(),
             category_folders: true,
             // Closing the window tucks the app into the tray (IDM-style); the
             // tray's Exit is how you quit. The Tasks menu switches it off.
-            close_to_tray: true,
+            close_to_tray: cfg!(windows),
             theme: "dark".to_string(),
             theme_applied: String::new(),
             placement_done: false,
@@ -1931,6 +1937,7 @@ impl CraftApp {
             add_user: String::new(),
             add_pass: String::new(),
             add_quality: String::new(),
+            captured_media: HashMap::new(),
             det_sum: String::new(),
             det_for: None,
             add_focus_req: false,
@@ -2056,6 +2063,7 @@ impl CraftApp {
             None => return,
         };
         let _guard = crate::model::fs_lock("cmd");
+        if !_guard.owned() { return; }
         let data = match std::fs::read_to_string(&path) {
             Ok(d) => d,
             Err(_) => return,
@@ -2095,7 +2103,7 @@ impl CraftApp {
 
     /// Pop a standalone IDM-style progress window for one download.
     fn spawn_progress(id: u64) {
-        let Ok(exe) = std::env::current_exe() else {
+        let Ok(exe) = crate::platform::launch_path() else {
             return;
         };
         let mut cmd = std::process::Command::new(exe);
@@ -2110,7 +2118,7 @@ impl CraftApp {
 
     /// Pop the standalone "Download complete" dialog for one finished download.
     fn spawn_complete(id: u64) {
-        let Ok(exe) = std::env::current_exe() else {
+        let Ok(exe) = crate::platform::launch_path() else {
             return;
         };
         let mut cmd = std::process::Command::new(exe);
@@ -2128,7 +2136,7 @@ impl CraftApp {
 
     /// Launch the standalone Settings window (separate OS process).
     fn open_settings_window() {
-        let Ok(exe) = std::env::current_exe() else {
+        let Ok(exe) = crate::platform::launch_path() else {
             return;
         };
         let mut cmd = std::process::Command::new(exe);
@@ -2150,9 +2158,9 @@ impl CraftApp {
         let Ok(mtime) = std::fs::metadata(&path).and_then(|m| m.modified()) else {
             return;
         };
-        let changed = self.last_ui_mtime.get().map(|t| mtime > t).unwrap_or(false);
-        self.last_ui_mtime.set(Some(mtime));
+        let changed = self.last_ui_mtime.get().map(|t| mtime > t).unwrap_or(true);
         if changed && !self.show_add {
+            self.last_ui_mtime.set(Some(mtime));
             self.load_ui_state();
             self.refresh_speed_limit();
             self.push_log("Settings reloaded from disk.");
@@ -2161,6 +2169,8 @@ impl CraftApp {
 
     fn save_ui_state(&self) {
         if let Some(path) = Self::ui_state_path() {
+            let _guard=crate::model::fs_lock("ui-settings");
+            if !_guard.owned() { return; }
             if let Some(parent) = path.parent() {
                 let _ = std::fs::create_dir_all(parent);
             }
@@ -2193,7 +2203,9 @@ impl CraftApp {
                 "speed_windows_on": self.speed_windows_on,
                 "update_check_on": self.update_check_on,
             });
-            if let Ok(json) = serde_json::to_string_pretty(&v) {
+            let existing=std::fs::read_to_string(&path).ok().and_then(|s|serde_json::from_str(&s).ok()).unwrap_or_else(||serde_json::json!({}));
+            let merged=crate::model::merge_ui_values(existing,v);
+            if let Ok(json) = serde_json::to_string_pretty(&merged) {
                 Self::atomic_write(&path, json.as_bytes());
                 if let Ok(mtime) =
                     std::fs::metadata(&path).and_then(|m| m.modified())
@@ -2273,7 +2285,7 @@ impl CraftApp {
                         self.category_folders = b;
                     }
                     if let Some(b) = g("close_to_tray").and_then(|x| x.as_bool()) {
-                        self.close_to_tray = b;
+                        self.close_to_tray = cfg!(windows) && b;
                     }
                     if let Some(s) = g("theme").and_then(|x| x.as_str()) {
                         self.theme = s.to_string();
@@ -2402,9 +2414,7 @@ impl CraftApp {
                 self.show_add = true;
             }
             2 => {
-                let _ = std::process::Command::new("explorer")
-                    .arg(&self.add_dir)
-                    .spawn();
+                open_path(std::path::Path::new(&self.add_dir), false);
             }
             4 => {
                 for id in self.selected_ids() {
@@ -2688,7 +2698,7 @@ impl CraftApp {
         self.probe_size = None;
         self.probe_name = None;
         let ua = if self.user_agent.trim().is_empty() {
-            format!("download_craft/{}", env!("CARGO_PKG_VERSION"))
+            format!("download_craft/{}", crate::model::APP_VERSION)
         } else {
             self.user_agent.clone()
         };
@@ -2761,7 +2771,7 @@ impl CraftApp {
         let exts = crate::grabber::parse_ext_list(&self.grab_exts);
         let depth_1 = self.grab_depth;
         let ua = if self.user_agent.trim().is_empty() {
-            format!("download_craft/{}", env!("CARGO_PKG_VERSION"))
+            format!("download_craft/{}", crate::model::APP_VERSION)
         } else {
             self.user_agent.clone()
         };
@@ -2886,6 +2896,7 @@ impl CraftApp {
         if !is_download_url(&url) {
             return false;
         }
+        let media = self.captured_media.get(&url).copied().unwrap_or_default();
         // Same URL already tracked. A live row is left alone; a dead row
         // (failed, or finished with its file gone) is refreshed so a
         // re-capture is never silently dropped.
@@ -2903,6 +2914,8 @@ impl CraftApp {
             if let Some(s) = size.filter(|s| *s > 0) {
                 self.downloads[pos].total_bytes = Some(s);
             }
+            self.downloads[pos].duration_secs = media.0;
+            self.downloads[pos].expects_audio = media.1;
             self.downloads[pos].downloaded_bytes = 0;
             self.downloads[pos].speed_bps = 0.0;
             self.downloads[pos].status = Status::Queued;
@@ -2931,6 +2944,8 @@ impl CraftApp {
                 self.downloads[pos].downloaded_bytes = 0;
                 crate::model::drop_resume_state(&dest);
             }
+            self.downloads[pos].duration_secs = media.0;
+            self.downloads[pos].expects_audio = media.1;
             self.downloads[pos].total_bytes = size.filter(|s| *s > 0);
             self.downloads[pos].speed_bps = 0.0;
             self.downloads[pos].status = Status::Queued;
@@ -2941,9 +2956,8 @@ impl CraftApp {
             self.save_queue();
             return true;
         }
-        let id = self.alloc_id();
         let mut item = DownloadItem::new(
-            id,
+            0,
             url,
             fname,
             dir,
@@ -2951,6 +2965,11 @@ impl CraftApp {
         );
         // Browser-measured size survives queueing (see confirm::commit).
         item.total_bytes = size.filter(|s| *s > 0);
+        item.duration_secs = media.0;
+        item.expects_audio = media.1;
+        if !self.persist_new_item(&mut item) { return false; }
+        let id=item.id;
+        self.downloads.retain(|d|d.id!=id);
         self.downloads.push(item);
         if autostart {
             self.start(id);
@@ -3009,6 +3028,7 @@ impl CraftApp {
 
     fn save_queue(&mut self) {
         let _guard = crate::model::fs_lock("queue");
+        if !_guard.owned() { return; }
         let Some(path) = Self::queue_path() else {
             return;
         };
@@ -3046,24 +3066,22 @@ impl CraftApp {
         }
     }
 
-    /// Fresh id that cannot collide with other processes' additions: refresh
-    /// from disk under the queue lock, then take max+1.
-    fn alloc_id(&mut self) -> u64 {
-        let _guard = crate::model::fs_lock("queue");
-        if let Some(path) = Self::queue_path() {
-            if let Ok(data) = std::fs::read_to_string(&path) {
-                if let Ok(disk) = serde_json::from_str::<Vec<DownloadItem>>(&data) {
-                    for it in &disk {
-                        self.known_ids.insert(it.id);
-                        self.next_id = self.next_id.max(it.id + 1);
-                    }
-                }
+    /// Assign an id AND persist the row under one lock. Reserving only the id
+    /// allowed a dialog to allocate the same id before our next queue save.
+    fn persist_new_item(&mut self, item: &mut DownloadItem) -> bool {
+        let mut queued=item.clone();
+        match crate::model::append_to_queue(&mut queued) {
+            crate::model::AppendResult::Added(id) => {
+                item.id=id;
+                self.next_id=self.next_id.max(id+1);
+                self.known_ids.insert(id);
+                true
             }
+            crate::model::AppendResult::AlreadyQueued(id) => {
+                self.push_log(format!("Already queued as #{id}."));false
+            }
+            crate::model::AppendResult::Error(e) => { self.push_log(format!("Could not queue download: {e}"));false }
         }
-        let id = self.next_id;
-        self.next_id += 1;
-        self.known_ids.insert(id);
-        id
     }
 
     /// Parse queue items tolerantly: one bad entry (schema drift, partial
@@ -3160,7 +3178,7 @@ impl CraftApp {
             timeout_secs: item.eff_timeout(self.timeout_secs),
             max_retries: item.eff_retries(self.max_retries),
             user_agent: if self.user_agent.trim().is_empty() {
-                format!("download_craft/{}", env!("CARGO_PKG_VERSION"))
+                format!("download_craft/{}", crate::model::APP_VERSION)
             } else {
                 self.user_agent.clone()
             },
@@ -3171,6 +3189,8 @@ impl CraftApp {
             proxy_url: self.proxy_url.clone(),
             allow_rename: true,
             expected_sha256: item.checksum_sha256.clone(),
+            expected_duration_secs: item.duration_secs,
+            require_audio: item.expects_audio || !item.pair_url.is_empty(),
             overwrite_existing: item.overwrite_existing,
             quality_pref: item.quality_pref.clone(),
             global_limit: Some(self.speed_limit_live.clone()),
@@ -3192,6 +3212,8 @@ impl CraftApp {
             if let Err(e) = r {
                 shared2.set_error(format!("{e:#}"));
                 eprintln!("download failed: {e:#}");
+            } else {
+                shared2.succeeded.store(true, Ordering::SeqCst);
             }
         });
         self.tasks.insert(
@@ -3237,6 +3259,13 @@ impl CraftApp {
     }
 
     fn pause(&mut self, id: u64) {
+        if self.tasks.get(&id).map(|t|t.shared.external_helper.load(Ordering::SeqCst)).unwrap_or(false) {
+            // yt-dlp has no portable suspend command. Stop its process now;
+            // Resume starts a fresh helper, retaining its .part/.ytdl files.
+            self.cancel_task(id);
+            self.push_log(format!("Paused #{id}; Resume continues the media download from available partial files."));
+            return;
+        }
         if let Some(t) = self.tasks.get(&id) {
             t.shared.paused.store(true, Ordering::SeqCst);
             if let Some(d) = self.downloads.iter_mut().find(|d| d.id == id) {
@@ -3360,8 +3389,8 @@ impl CraftApp {
             } else {
                 self.phases.insert(*id, phase);
             }
-            if let Ok(mut g) = task.shared.resolved_name.lock() {
-                if let Some(name) = g.take() {
+            if let Ok(g) = task.shared.resolved_name.lock() {
+                if let Some(name) = g.clone() {
                     if let Some(d) = self.downloads.iter_mut().find(|d| d.id == *id) {
                         if d.status != Status::Completed {
                             d.filename = name;
@@ -3515,7 +3544,7 @@ impl CraftApp {
                         && d.dest_path().exists();
                     if cancelled {
                         d.status = Status::Paused;
-                    } else if complete || file_done {
+                    } else if task_can_complete(&task.shared, complete || file_done) {
                         d.status = Status::Completed;
                         // The file on disk is the truth. A retried or merged
                         // transfer can end with a byte counter that claims more
@@ -3642,20 +3671,12 @@ impl CraftApp {
     fn on_download_finished(&mut self, name: &str, path: &std::path::Path) {
         notify("Download Craft — download finished", name);
         if !self.antivirus_cmd.trim().is_empty() {
-            let cmd = self.antivirus_cmd.replace("{file}", &path.to_string_lossy());
-            self.push_log(format!("Antivirus scan: {cmd}"));
-            #[cfg(windows)]
-            {
-                use std::os::windows::process::CommandExt;
-                let _ = std::process::Command::new("cmd")
-                    .arg("/C")
-                    .arg(format!("start /min \"\" {cmd}"))
-                    .creation_flags(0x08000000)
-                    .spawn();
-            }
-            #[cfg(not(windows))]
-            {
-                let _ = std::process::Command::new("sh").arg("-c").arg(&cmd).spawn();
+            match crate::platform::antivirus_command(&self.antivirus_cmd,path) {
+                Ok(mut cmd) => {
+                    self.push_log(format!("Antivirus scan: {}",path.display()));
+                    if let Err(e)=cmd.spawn() {self.push_log(format!("Antivirus launch failed: {e}"));}
+                }
+                Err(e) => self.push_log(e),
             }
         }
     }
@@ -3689,6 +3710,7 @@ impl CraftApp {
                 "Queue drained with {leftovers} paused/failed item(s) left — finish action still runs."
             ));
         }
+        #[cfg(windows)]
         match self.finish_action.as_str() {
             "shutdown" => {
                 self.push_log("Queue done — shutting down.");
@@ -3712,6 +3734,13 @@ impl CraftApp {
             }
             _ => {
                 self.push_log("Queue finished.");
+            }
+        }
+        #[cfg(not(windows))]
+        if self.finish_action != "nothing" && !self.finish_action.is_empty() {
+            match crate::platform::power(&self.finish_action) {
+                Ok(())=>self.push_log(format!("Queue done — {} requested.",self.finish_action)),
+                Err(e)=>self.push_log(format!("Queue finished; power action was not completed: {e}")),
             }
         }
         notify("Download Craft — queue finished", "All downloads completed.");
@@ -3743,6 +3772,7 @@ impl CraftApp {
             None => return false,
         };
         let _guard = crate::model::fs_lock("inbox");
+        if !_guard.owned() { return false; }
         let data = match std::fs::read_to_string(&path) {
             Ok(d) => d,
             Err(_) => return false,
@@ -3818,6 +3848,8 @@ impl CraftApp {
             .or_else(|| item.page_url)
             .unwrap_or_default();
         let cookie = item.cookie.unwrap_or_default();
+        if self.captured_media.len() >= 200 { self.captured_media.clear(); }
+        self.captured_media.insert(url.clone(), (item.dur.unwrap_or(0), item.audio_expected));
         let size = item.size;
         let quality = item.quality;
         self.add_url = url.clone();
@@ -3900,6 +3932,7 @@ impl CraftApp {
             None => return,
         };
         let _guard = crate::model::fs_lock("wake");
+        if !_guard.owned() { return; }
         let data = match std::fs::read_to_string(&path) {
             Ok(d) => d,
             Err(_) => return,
@@ -3981,6 +4014,7 @@ fn quiet(cmd: &mut std::process::Command) {
 fn quiet(_cmd: &mut std::process::Command) {}
 
 /// Open a file (or reveal it in Explorer when `reveal`).
+#[cfg(windows)]
 pub(crate) fn open_path(path: &std::path::Path, reveal: bool) {
     if reveal {
         if path.exists() {
@@ -3997,6 +4031,9 @@ pub(crate) fn open_path(path: &std::path::Path, reveal: bool) {
         let _ = c.spawn();
     }
 }
+
+#[cfg(not(windows))]
+pub(crate) fn open_path(path: &std::path::Path, reveal: bool) { crate::platform::open(path,reveal); }
 
 /// Show `path` selected in the file manager.
 #[cfg(windows)]
@@ -4025,13 +4062,14 @@ fn select_in_file_manager(path: &std::path::Path) {
 /// always this value — nothing to paste.
 pub(crate) const EXTENSION_ID: &str = "pgdhmfgefjnfijmlheboncdmfhcnoikk";
 
+#[cfg(windows)]
 pub(crate) fn install_native_host(browser: &str) -> Result<String, String> {
     let base = crate::model::config_dir()
         .map(|p| p.join("native-host"))
         .ok_or_else(|| "no config dir".to_string())?;
     std::fs::create_dir_all(&base).map_err(|e| e.to_string())?;
 
-    let exe = std::env::current_exe().map_err(|e| e.to_string())?;
+    let exe = crate::platform::launch_path().map_err(|e| e.to_string())?;
     let bat = base.join("download_craft_host.bat");
     // NOTE: `@echo off` is mandatory — cmd echoes every command to stdout
     // by default, which corrupts the length-prefixed native-messaging
@@ -4084,6 +4122,9 @@ pub(crate) fn install_native_host(browser: &str) -> Result<String, String> {
     Ok(manifest_path.to_string_lossy().to_string())
 }
 
+#[cfg(not(windows))]
+pub(crate) fn install_native_host(browser: &str) -> Result<String,String> { crate::platform::install_native_host(browser) }
+
 /// Registry key for a Chromium-family / Firefox native host (HKCU, no admin).
 /// Opera / Brave / Vivaldi share the Chromium layout with vendor keys.
 fn native_host_key(browser: &str) -> &'static str {
@@ -4112,11 +4153,12 @@ fn legacy_host_key(browser: &str) -> &'static str {
 /// (first run, portable exe moved or renamed, etc.).
 /// Returns Ok(true) when something was (re)installed.
 /// Best-effort: failures are reported to the caller, never fatal.
+#[cfg(windows)]
 fn ensure_native_host(browser: &str) -> Result<bool, String> {
     let base = crate::model::config_dir()
         .map(|p| p.join("native-host"))
         .ok_or_else(|| "no config dir".to_string())?;
-    let exe = std::env::current_exe().map_err(|e| e.to_string())?;
+    let exe = crate::platform::launch_path().map_err(|e| e.to_string())?;
     let exe_s = exe.to_string_lossy().into_owned();
     let manifest_path = base.join(format!("{browser}.json"));
     let manifest_s = manifest_path.to_string_lossy().into_owned();
@@ -4153,12 +4195,17 @@ fn ensure_native_host(browser: &str) -> Result<bool, String> {
     Ok(true)
 }
 
+#[cfg(not(windows))]
+fn ensure_native_host(browser:&str)->Result<bool,String>{
+    crate::platform::install_native_host(browser).map(|_|true)
+}
+
 /// Opt-in update check (P3.4, extended P5): compare the running version
 /// against the latest GitHub release tag, and locate the portable Windows
 /// asset when one is newer. Network failures become a status string —
 /// never a popup, never an auto-download.
 async fn update_check_async() -> (String, Option<String>) {
-    let current = env!("CARGO_PKG_VERSION");
+    let current = crate::model::APP_VERSION;
     let client = match reqwest::Client::builder()
         .user_agent(format!("download_craft/{current}"))
         .connect_timeout(std::time::Duration::from_secs(15))
@@ -4194,7 +4241,7 @@ async fn update_check_async() -> (String, Option<String>) {
             .unwrap_or("https://github.com/hungry-detective/downloadcraft/releases");
         (
             format!("Update available: {tag} (you have v{current}) — {url}"),
-            crate::model::pick_windows_asset(&v),
+            if cfg!(windows) {crate::model::pick_windows_asset(&v)} else {None},
         )
     } else {
         (format!("Up to date (v{current})."), None)
@@ -4210,6 +4257,7 @@ fn notify(title: &str, body: &str) {
 }
 
 /// Build the system tray icon (uses the bundled app icon).
+#[cfg(windows)]
 fn build_tray() -> Option<tray_icon::TrayIcon> {
     let img = image::load_from_memory(include_bytes!("../assets/icon.png"))
         .ok()?
@@ -4233,6 +4281,11 @@ fn build_tray() -> Option<tray_icon::TrayIcon> {
         .build()
         .ok()
 }
+
+// Portable first version uses the regular taskbar/Dock window. This avoids
+// depending on an AppIndicator service or a second GTK event loop.
+#[cfg(not(windows))]
+fn build_tray()->Option<PlatformTray>{None}
 
 fn clipboard_watch(tx: std::sync::mpsc::Sender<String>) {
     let mut last = String::new();
@@ -4261,6 +4314,8 @@ const DATE_W: f32 = 104.0;
 
 impl eframe::App for CraftApp {
     fn update(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
+        crate::tray::set_context(ctx);
+        self.watch_ui_state();
         // The tray helpers work on the native window (parking = visible but
         // far off-screen, because a hidden window stops painting and eframe
         // then stops running frames altogether).
@@ -4404,6 +4459,7 @@ impl eframe::App for CraftApp {
         // The menu itself is handled in `tray::install_menu_handler`, which acts
         // on the click without waiting for a frame; this loop is the fallback
         // for the case where that handler could not be installed.
+        #[cfg(windows)]
         while let Ok(ev) = tray_icon::menu::MenuEvent::receiver().try_recv() {
             if ev.id() == "tray-show" {
                 crate::tray::show();
@@ -4413,6 +4469,7 @@ impl eframe::App for CraftApp {
                 crate::tray::request_quit();
             }
         }
+        #[cfg(windows)]
         while let Ok(ev) = tray_icon::TrayIconEvent::receiver().try_recv() {
             if matches!(
                 ev,
@@ -5628,7 +5685,7 @@ impl eframe::App for CraftApp {
             if self.add_dir.trim().is_empty() {
                 self.add_dir = dirs::download_dir()
                     .map(|p| p.to_string_lossy().to_string())
-                    .unwrap_or_else(|| "C:\\Downloads".to_string());
+                    .unwrap_or_else(|| crate::model::default_download_dir().to_string_lossy().into_owned());
             }
             // ---- recent-folders menu (the path field's caret) ----
             // A click outside the caret and outside the menu closes it. The
@@ -6440,7 +6497,7 @@ impl eframe::App for CraftApp {
                 job.wrap.max_width = body_w;
                 for (t, f, c) in [
                     ("Version ", f_ver.clone(), p.dim),
-                    (env!("CARGO_PKG_VERSION"), f_ver_b.clone(), accent_hi),
+                    (crate::model::APP_VERSION, f_ver_b.clone(), accent_hi),
                     (" — check this to confirm your build.", f_ver.clone(), p.dim),
                 ] {
                     job.append(
@@ -6832,10 +6889,10 @@ impl CraftApp {
         if self.add_dir.trim().is_empty() {
             self.add_dir = dirs::download_dir()
                 .map(|p| p.to_string_lossy().to_string())
-                .unwrap_or_else(|| "C:\\Downloads".to_string());
+                .unwrap_or_else(|| crate::model::default_download_dir().to_string_lossy().into_owned());
         }
         let final_dir = self.save_dir_for(&self.add_file);
-        let id = match existing {
+        let mut id = match existing {
             Some(pos) => {
                 // Refresh the dead row in place (same id): drop any stale
                 // resume state so a mixed-URL resume can't corrupt the file.
@@ -6844,7 +6901,7 @@ impl CraftApp {
                 crate::model::drop_resume_state(&dp);
                 id
             }
-            None => self.alloc_id(),
+            None => 0,
         };
         let mut item = DownloadItem::new(
             id,
@@ -6878,6 +6935,9 @@ impl CraftApp {
                 self.push_log(format!("Re-queued #{id}"));
             }
             None => {
+                if !self.persist_new_item(&mut item) { self.show_add=true; return; }
+                id=item.id;
+                self.downloads.retain(|d|d.id!=id);
                 self.downloads.push(item);
                 self.push_log(format!("Queued #{id}"));
             }
@@ -7038,7 +7098,7 @@ impl CraftApp {
                 if self.add_dir.trim().is_empty() {
                     self.add_dir = dirs::download_dir()
                         .map(|p| p.to_string_lossy().to_string())
-                        .unwrap_or_else(|| "C:\\Downloads".to_string());
+                        .unwrap_or_else(|| crate::model::default_download_dir().to_string_lossy().into_owned());
                 }
                 self.save_ui_state();
             }
@@ -7617,5 +7677,29 @@ impl CraftApp {
             self.ctx_menu = None;
         }
         self.man_hover_dbg = hover_dbg;
+    }
+}
+
+/// Byte counts cannot override a failed audio/duration/checksum validation.
+fn task_can_complete(shared: &SharedState, bytes_landed: bool) -> bool {
+    bytes_landed && shared.succeeded.load(Ordering::SeqCst)
+        && !shared.cancelled.load(Ordering::SeqCst)
+}
+#[cfg(test)]
+mod audit_completion_tests {
+    use super::*;
+    #[test]
+    fn validation_failure_never_becomes_completed_from_full_byte_count() {
+        let s=SharedState::new();
+        s.downloaded.store(100,Ordering::SeqCst);
+        s.total.store(100,Ordering::SeqCst);
+        s.set_error("finished media has no audio track");
+        assert!(!task_can_complete(&s,true));
+        let success=SharedState::new();
+        success.succeeded.store(true,Ordering::SeqCst);
+        assert!(task_can_complete(&success,true));
+        assert!(!task_can_complete(&success,false));
+        success.cancelled.store(true,Ordering::SeqCst);
+        assert!(!task_can_complete(&success,true));
     }
 }

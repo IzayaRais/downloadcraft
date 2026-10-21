@@ -14,7 +14,7 @@ use std::sync::atomic::Ordering;
 use std::sync::Arc;
 
 #[derive(Debug, Parser)]
-#[command(name = "download_craft", version, about = "Download Craft — download manager (CLI)")]
+#[command(name = "download_craft", version = crate::model::APP_VERSION, about = "Download Craft — download manager (CLI)")]
 pub struct Cli {
     #[command(subcommand)]
     pub command: Commands,
@@ -42,6 +42,13 @@ pub enum Commands {
         #[arg(long, action = clap::ArgAction::SetTrue)]
         overwrite: bool,
     },
+    /// Check media helpers or install the app-managed copies (no GUI required)
+    Helpers {
+        #[arg(long)] install_ytdlp: bool,
+        #[arg(long)] install_ffmpeg: bool,
+    },
+    /// Register this app as a browser's native messaging host
+    RegisterBrowser { browser:String },
     /// Show queued downloads
     List {
         #[arg(long)]
@@ -88,6 +95,7 @@ pub enum Commands {
     /// Totals by status
     Status,
     /// Build the system tray icon and keep it alive briefly (self-test)
+    #[cfg(windows)]
     TrayTest,
 }
 
@@ -97,31 +105,20 @@ fn queue_path() -> std::path::PathBuf {
         .join("queue.json")
 }
 
-fn load_queue() -> Vec<DownloadItem> {
-    std::fs::read_to_string(queue_path())
-        .ok()
-        .and_then(|s| serde_json::from_str(&s).ok())
-        .unwrap_or_default()
+fn load_queue() -> anyhow::Result<Vec<DownloadItem>> {
+    crate::model::read_queue_items(&queue_path()).map_err(anyhow::Error::msg)
 }
-
-fn save_queue(items: &[DownloadItem]) {
-    let path = queue_path();
-    if let Some(parent) = path.parent() {
-        let _ = std::fs::create_dir_all(parent);
-    }
-    if let Ok(json) = serde_json::to_string_pretty(items) {
-        // Atomic temp+rename so a crash never leaves half-written JSON.
-        let tmp = path.with_extension("tmp");
-        if std::fs::write(&tmp, json).is_ok() {
-            let _ = std::fs::rename(&tmp, &path);
-        }
-    }
+fn save_queue(items: &[DownloadItem]) -> anyhow::Result<()> {
+    let path=queue_path();
+    if let Some(parent)=path.parent() { std::fs::create_dir_all(parent)?; }
+    crate::model::atomic_write(&path,serde_json::to_string_pretty(items)?.as_bytes())?;
+    Ok(())
 }
 
 /// Global network settings shared with the GUI (ui.json).
 fn global_opts() -> EngineOpts {
     let mut o = EngineOpts {
-        user_agent: "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0 Safari/537.36".to_string(),
+        user_agent: crate::platform::default_user_agent().to_string(),
         timeout_secs: 60,
         max_retries: 5,
         ..Default::default()
@@ -160,6 +157,8 @@ fn opts_for(item: &DownloadItem, limit_bps: u64) -> EngineOpts {
     o.username = item.username.clone();
     o.password = item.password.clone();
     o.expected_sha256 = item.checksum_sha256.clone();
+    o.expected_duration_secs = item.duration_secs;
+    o.require_audio = item.expects_audio || !item.pair_url.is_empty();
     o.overwrite_existing = item.overwrite_existing;
     o.quality_pref = item.quality_pref.clone();
     o
@@ -167,6 +166,19 @@ fn opts_for(item: &DownloadItem, limit_bps: u64) -> EngineOpts {
 
 pub fn run(cli: Cli) -> anyhow::Result<()> {
     match cli.command {
+        Commands::RegisterBrowser {browser} => {
+            println!("{}",crate::app::install_native_host(&browser).map_err(anyhow::Error::msg)?);
+            Ok(())
+        }
+
+        Commands::Helpers {install_ytdlp,install_ffmpeg} => {
+            if install_ytdlp {crate::engine::ytdlp_refresh_blocking()?;}
+            if install_ffmpeg {crate::helpers::install_ffmpeg()?;}
+            let yt=crate::engine::ytdlp_info();let ff=crate::engine::ffmpeg_info();
+            println!("{}",serde_json::json!({"yt_dlp":yt.path,"yt_dlp_version":yt.version,"yt_dlp_managed":yt.managed,"ffmpeg":ff.path,"ffmpeg_version":ff.version,"ffprobe":ff.probe_path,"ffmpeg_managed":ff.managed,"js_runtime":yt.js_runtime}));
+            Ok(())
+        }
+
         Commands::Add {
             url,
             dir,
@@ -177,6 +189,7 @@ pub fn run(cli: Cli) -> anyhow::Result<()> {
             overwrite,
         } => {
             let _guard = crate::model::fs_lock("queue");
+            anyhow::ensure!(_guard.owned(), "Queue is busy; retry shortly");
             if !is_download_url(&url) {
                 anyhow::bail!("not an http(s) URL: {url}");
             }
@@ -184,7 +197,7 @@ pub fn run(cli: Cli) -> anyhow::Result<()> {
             if !csum.is_empty() && !crate::model::is_valid_sha256(&csum) {
                 anyhow::bail!("invalid --checksum (want 64 hex chars)");
             }
-            let mut items = load_queue();
+            let mut items = load_queue()?;
             if items.iter().any(|d| d.url == url) {
                 println!("already queued");
                 return Ok(());
@@ -193,7 +206,7 @@ pub fn run(cli: Cli) -> anyhow::Result<()> {
             let dir = dir.unwrap_or_else(|| {
                 dirs::download_dir()
                     .map(|p| p.to_string_lossy().to_string())
-                    .unwrap_or_else(|| "C:\\Downloads".to_string())
+                    .unwrap_or_else(|| crate::model::default_download_dir().to_string_lossy().into_owned())
             });
             let dest = std::path::Path::new(&dir).join(&fname);
             // Same file, fresh URL: refresh in place (see append_to_queue).
@@ -206,8 +219,9 @@ pub fn run(cli: Cli) -> anyhow::Result<()> {
                 }
                 items[pos].speed_bps = 0.0;
                 items[pos].status = crate::model::Status::Queued;
-                save_queue(&items);
+                save_queue(&items)?;
                 println!("refreshed #{id} {fname}");
+                drop(_guard);
                 if !no_start {
                     run_id(id)?;
                 }
@@ -218,15 +232,16 @@ pub fn run(cli: Cli) -> anyhow::Result<()> {
             item.checksum_sha256 = csum;
             item.overwrite_existing = overwrite;
             items.push(item);
-            save_queue(&items);
+            save_queue(&items)?;
             println!("queued #{id} {fname}");
+            drop(_guard);
             if !no_start {
                 run_id(id)?;
             }
             Ok(())
         }
         Commands::List { json } => {
-            let items = load_queue();
+            let items = load_queue()?;
             if json {
                 println!("{}", serde_json::to_string_pretty(&items)?);
                 return Ok(());
@@ -279,19 +294,21 @@ pub fn run(cli: Cli) -> anyhow::Result<()> {
         }
         Commands::Remove { id } => {
             let _guard = crate::model::fs_lock("queue");
-            let mut items = load_queue();
+            anyhow::ensure!(_guard.owned(), "Queue is busy; retry shortly");
+            let mut items = load_queue()?;
             let n = items.len();
             items.retain(|d| d.id != id);
             if items.len() == n {
                 anyhow::bail!("no such id: {id}");
             }
-            save_queue(&items);
+            save_queue(&items)?;
             println!("removed #{id}");
             Ok(())
         }
         Commands::Redownload { id } => {
             let _guard = crate::model::fs_lock("queue");
-            let mut items = load_queue();
+            anyhow::ensure!(_guard.owned(), "Queue is busy; retry shortly");
+            let mut items = load_queue()?;
             let d = items
                 .iter_mut()
                 .find(|d| d.id == id)
@@ -306,22 +323,25 @@ pub fn run(cli: Cli) -> anyhow::Result<()> {
             d.total_bytes = None;
             d.speed_bps = 0.0;
             d.status = crate::model::Status::Queued;
-            save_queue(&items);
+            save_queue(&items)?;
+            drop(_guard);
             run_id(id)
         }
         Commands::Clear => {
             let _guard = crate::model::fs_lock("queue");
-            let mut items = load_queue();
+            anyhow::ensure!(_guard.owned(), "Queue is busy; retry shortly");
+            let mut items = load_queue()?;
             let n = items.len();
             items.retain(|d| !matches!(d.status, crate::model::Status::Completed));
-            save_queue(&items);
+            save_queue(&items)?;
             println!("cleared {} finished item(s)", n - items.len());
             Ok(())
         }
         Commands::Import { file } => {
             let _guard = crate::model::fs_lock("queue");
+            anyhow::ensure!(_guard.owned(), "Queue is busy; retry shortly");
             let data = std::fs::read_to_string(&file)?;
-            let mut items = load_queue();
+            let mut items = load_queue()?;
             let mut n = 0;
             for line in data.lines() {
                 let t = line.trim().trim_matches(|c| c == '"' || c == '\'');
@@ -329,7 +349,7 @@ pub fn run(cli: Cli) -> anyhow::Result<()> {
                     let id = items.iter().map(|d| d.id).max().unwrap_or(0) + 1;
                     let dir = dirs::download_dir()
                         .map(|p| p.to_string_lossy().to_string())
-                        .unwrap_or_else(|| "C:\\Downloads".to_string());
+                        .unwrap_or_else(|| crate::model::default_download_dir().to_string_lossy().into_owned());
                     items.push(DownloadItem::new(
                         id,
                         t.to_string(),
@@ -340,12 +360,12 @@ pub fn run(cli: Cli) -> anyhow::Result<()> {
                     n += 1;
                 }
             }
-            save_queue(&items);
+            save_queue(&items)?;
             println!("imported {n} URL(s)");
             Ok(())
         }
         Commands::Export { file } => {
-            let items = load_queue();
+            let items = load_queue()?;
             let body: String = items
                 .iter()
                 .map(|d| d.url.clone())
@@ -356,7 +376,7 @@ pub fn run(cli: Cli) -> anyhow::Result<()> {
             Ok(())
         }
         Commands::Status => {
-            let items = load_queue();
+            let items = load_queue()?;
             let mut by: std::collections::HashMap<String, usize> = Default::default();
             let mut bytes = 0u64;
             for d in &items {
@@ -372,6 +392,7 @@ pub fn run(cli: Cli) -> anyhow::Result<()> {
             println!("downloaded total: {}", format_bytes(bytes));
             Ok(())
         }
+        #[cfg(windows)]
         Commands::TrayTest => {
             let img = image::load_from_memory(include_bytes!("../assets/icon.png"))?.to_rgba8();
             let (w, h) = (img.width(), img.height());
@@ -395,7 +416,7 @@ pub fn run(cli: Cli) -> anyhow::Result<()> {
 }
 
 fn run_id(id: u64) -> anyhow::Result<()> {
-    let items = load_queue();
+    let items = load_queue()?;
     let item = items
         .iter()
         .find(|d| d.id == id)
@@ -404,8 +425,10 @@ fn run_id(id: u64) -> anyhow::Result<()> {
     let dest = item.dest_path();
     let opts = opts_for(&item, 0);
     let (got_bytes, got_total) = run_engine(item.url.clone(), dest, item.connections, opts)?;
-    // refresh persisted state
-    let mut items = load_queue();
+    // Re-read under the lock so a completed CLI job retains concurrent adds.
+    let _guard=crate::model::fs_lock("queue");
+    anyhow::ensure!(_guard.owned(), "Download finished but queue is busy; retry updating its status");
+    let mut items = load_queue()?;
     if let Some(d) = items.iter_mut().find(|d| d.id == id) {
         d.status = crate::model::Status::Completed;
         d.speed_bps = 0.0;
@@ -413,7 +436,7 @@ fn run_id(id: u64) -> anyhow::Result<()> {
         if got_total.is_some() {
             d.total_bytes = got_total;
         }
-        save_queue(&items);
+        save_queue(&items)?;
     }
     Ok(())
 }

@@ -1,3 +1,6 @@
+/// Public four-part app version; Cargo uses SemVer build metadata internally.
+pub const APP_VERSION: &str = include_str!("../VERSION");
+
 use chrono::{DateTime, Local};
 use serde::{Deserialize, Serialize};
 
@@ -41,65 +44,42 @@ fn shorten(s: &str, n: usize) -> String {
     format!("{}…", &s[..cut])
 }
 
-/// Best-effort interprocess file lock (no new deps): `config/<name>.lock
-/// created with `create_new`. Stale locks (mtime older than 20 s — no
-/// operation legitimately holds one longer) are stolen. All shared-file
-/// read-modify-writes (queue, inbox, wake, cmd) take the matching lock so
-/// the GUI, dialogs, CLI, and native host stop clobbering each other.
-/// If the lock can never be acquired we proceed anyway (single-user box:
-///
-/// better to risk a race than deadlock the UI).
+/// OS-held interprocess lock. Lock files persist; the handle owns the lock,
+/// which the OS releases on close/crash. A long download must never lose its
+/// destination lock merely because a timestamp is old.
 pub struct FsGuard {
-    path: std::path::PathBuf,
-    ours: bool,
+    _file: Option<std::fs::File>,
 }
-
 impl FsGuard {
-    /// Whether this guard actually holds the lock (a `false` guard means
-    /// another process is inside the critical section right now).
     pub fn owned(&self) -> bool {
-        self.ours
+        self._file.is_some()
     }
 }
-
-impl Drop for FsGuard {
-    fn drop(&mut self) {
-        if self.ours {
-            let _ = std::fs::remove_file(&self.path);
-        }
-    }
-}
-
 pub fn fs_lock(name: &str) -> FsGuard {
-    let path = match config_dir() {
-        Some(d) => d.join(format!("{name}.lock")),
-        None => return FsGuard { path: std::path::PathBuf::new(), ours: false },
-    };
-    if let Some(parent) = path.parent() {
-        let _ = std::fs::create_dir_all(parent);
-    }
-    for _ in 0..100 {
-        let mut opts = std::fs::OpenOptions::new();
-        match opts.write(true).create_new(true).open(&path) {
-            Ok(mut f) => {
-                use std::io::Write;
-                let _ = writeln!(f, "{}", std::process::id());
-                return FsGuard { path, ours: true };
-            }
-            Err(_) => {
-                let stale = std::fs::metadata(&path)
-                    .and_then(|m| m.modified())
-                    .map(|t| t.elapsed().map(|e| e.as_secs() > 20).unwrap_or(true))
-                    .unwrap_or(true);
-                if stale {
-                    let _ = std::fs::remove_file(&path);
-                    continue;
+    fn acquire(name: &str) -> Option<std::fs::File> {
+        let path = config_dir()?.join(format!("{name}.lock"));
+        std::fs::create_dir_all(path.parent()?).ok()?;
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(path)
+            .ok()?;
+        for _ in 0..100 {
+            match file.try_lock() {
+                Ok(()) => return Some(file),
+                Err(std::fs::TryLockError::WouldBlock) => {
+                    std::thread::sleep(std::time::Duration::from_millis(20))
                 }
-                std::thread::sleep(std::time::Duration::from_millis(20));
+                Err(_) => return None,
             }
         }
+        None
     }
-    FsGuard { path, ours: false }
+    FsGuard {
+        _file: acquire(name),
+    }
 }
 
 /// Liveness heartbeat for the main window (`main.lock` timestamp, refreshed
@@ -181,9 +161,12 @@ pub struct DownloadItem {
     #[serde(default)]
     pub resolution: String,
     /// Media duration in seconds from the extension (best-effort, P4).
-    /// Display/metadata only — never affects engine behavior.
+    /// Used to check the completed file when ffprobe is available.
     #[serde(default)]
     pub duration_secs: u64,
+    /// Positive audio evidence from the captured player; unknown stays false.
+    #[serde(default)]
+    pub expects_audio: bool,
     /// Per-download retry budget (P5). None = use the global setting.
     /// Some(n) overrides it for this item only (clamped 1–20 at use).
     #[serde(default)]
@@ -225,6 +208,7 @@ impl DownloadItem {
             quality_pref: String::new(),
             resolution: String::new(),
             duration_secs: 0,
+            expects_audio: false,
             max_retries: None,
             timeout_secs: None,
             checksum_repaired: false,
@@ -454,6 +438,12 @@ pub fn config_dir() -> Option<std::path::PathBuf> {
     dirs::config_dir().map(|p| p.join(APP_SLUG))
 }
 
+/// Default destination when the OS has no configured Downloads directory.
+pub fn default_download_dir() -> std::path::PathBuf {
+    dirs::download_dir().or_else(|| dirs::home_dir().map(|p| p.join("Downloads")))
+        .unwrap_or_else(|| std::path::PathBuf::from("Downloads"))
+}
+
 /// Claim the single-instance slot for a standalone window (`name` values look
 /// like `progress_12` / `complete_12`). Windows enforces the exclusivity and
 /// releases it when the owning process ends, so a window the user closed frees
@@ -470,7 +460,10 @@ pub fn claim_window(name: &str) -> Option<std::fs::File> {
         // No other process may even open it while this handle lives.
         opts.share_mode(0);
     }
-    opts.open(dir.join(name)).ok()
+    let file = opts.open(dir.join(name)).ok()?;
+    #[cfg(unix)]
+    file.try_lock().ok()?;
+    Some(file)
 }
 
 /// The monitor's work area in points: the desktop minus the taskbar (and any
@@ -576,6 +569,8 @@ pub fn ui_pref_str(key: &str, default: &str) -> String {
 /// Merge one boolean into ui.json, leaving every other key alone. The main app
 /// watches that file's mtime and reloads it, so the change lands live.
 pub fn ui_pref_set_bool(key: &str, value: bool) {
+    let _guard=fs_lock("ui-settings");
+    if !_guard.owned() { return; }
     let Some(p) = config_dir().map(|d| d.join("ui.json")) else {
         return;
     };
@@ -693,12 +688,43 @@ pub fn conflict_free_dest(dest: &std::path::Path) -> std::path::PathBuf {
 /// Atomically write `data` to `path` (temp file + rename) so a crash or
 /// power loss never leaves a half-written queue/settings file.
 pub fn atomic_write(path: &std::path::Path, data: &[u8]) -> std::io::Result<()> {
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
+    if let Some(parent) = path.parent() { std::fs::create_dir_all(parent)?; }
+    static NEXT:std::sync::atomic::AtomicU64=std::sync::atomic::AtomicU64::new(0);
+    struct Temp(std::path::PathBuf);
+    impl Drop for Temp {fn drop(&mut self){let _=std::fs::remove_file(&self.0);}}
+    let name=path.file_name().ok_or_else(||std::io::Error::other("No state filename"))?.to_string_lossy();
+    for _ in 0..100 {
+        let id=NEXT.fetch_add(1,std::sync::atomic::Ordering::Relaxed);
+        let temp=path.with_file_name(format!(".{name}.{}.{id}.tmp",std::process::id()));
+        let mut options=std::fs::OpenOptions::new();options.write(true).create_new(true);
+        #[cfg(unix)] {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        match options.open(&temp) {
+            Ok(mut file) => {
+                let cleanup=Temp(temp);
+                std::io::Write::write_all(&mut file,data)?;
+                drop(file);
+                std::fs::rename(&cleanup.0,path)?;
+                return Ok(());
+            }
+            Err(e) if e.kind()==std::io::ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(e),
+        }
     }
-    let tmp = path.with_extension("tmp");
-    std::fs::write(&tmp, data)?;
-    std::fs::rename(&tmp, path)?;
+    Err(std::io::Error::other("Cannot create a private state file"))
+}
+
+/// The queue and inbox can contain captured session credentials. Also protect
+/// existing state files before any app, dialog, CLI or native-host mode starts.
+pub fn secure_config_directory() -> std::io::Result<()> {
+    #[cfg(unix)]
+    if let Some(dir)=config_dir() {
+        use std::os::unix::fs::{DirBuilderExt,PermissionsExt};
+        let mut builder=std::fs::DirBuilder::new();builder.recursive(true).mode(0o700).create(&dir)?;
+        std::fs::set_permissions(dir,std::fs::Permissions::from_mode(0o700))?;
+    }
     Ok(())
 }
 
@@ -859,6 +885,7 @@ pub fn queued_entry(url: &str) -> Option<(u64, bool)> {
 /// re-click never creates a colliding duplicate.
 pub fn append_to_queue(item: &mut DownloadItem) -> AppendResult {
     let _guard = fs_lock("queue");
+    if !_guard.owned() { return AppendResult::Error("Queue is busy; retry shortly".into()); }
     let path = match config_dir() {
         Some(d) => d.join("queue.json"),
         None => return AppendResult::Error("no config directory".to_string()),
@@ -914,6 +941,7 @@ fn append_to_queue_at(path: &std::path::Path, item: &mut DownloadItem) -> Append
         items[pos].pair_mime = std::mem::take(&mut item.pair_mime);
         items[pos].quality_pref = std::mem::take(&mut item.quality_pref);
         items[pos].duration_secs = item.duration_secs;
+        items[pos].expects_audio = item.expects_audio;
         items[pos].max_retries = item.max_retries;
         items[pos].timeout_secs = item.timeout_secs;
         if checksum_changed {
@@ -1456,5 +1484,56 @@ mod tests {
         let v3: serde_json::Value = serde_json::json!({"assets": []});
         assert_eq!(pick_windows_asset(&v3), None);
         assert_eq!(pick_windows_asset(&serde_json::json!({})), None);
+    }
+}
+
+/// Overlay only fields owned by this writer, preserving plugin preferences.
+pub fn merge_ui_values(mut current:serde_json::Value,patch:serde_json::Value)->serde_json::Value {
+    if !current.is_object(){current=serde_json::json!({});}
+    if let (Some(target),Some(changes))=(current.as_object_mut(),patch.as_object()) {
+        for (key,value) in changes {target.insert(key.clone(),value.clone());}
+    }
+    current
+}
+#[cfg(test)]
+mod preference_merge_tests {
+    #[test]fn main_window_save_keeps_helper_locations(){
+        let saved=super::merge_ui_values(serde_json::json!({"ytdlp_source":"custom","ytdlp_custom_path":"/home/user/yt-dlp","ffmpeg_custom_path":"/home/user/ffmpeg","theme":"dark"}),serde_json::json!({"columns":["name"],"theme":"light"}));
+        assert_eq!(saved["ytdlp_source"],"custom");assert_eq!(saved["ffmpeg_custom_path"],"/home/user/ffmpeg");assert_eq!(saved["theme"],"light");
+    }
+}
+
+#[cfg(test)]
+mod audit_lock_tests {
+    use super::*;
+    #[test]
+    fn audit_active_lock_is_not_stolen_after_twenty_seconds() {
+        let name=format!("audit-held-{}",std::process::id());
+        let first=fs_lock(&name);
+        assert!(first.owned());
+        let path=config_dir().unwrap().join(format!("{name}.lock"));
+        let file=std::fs::OpenOptions::new().write(true).open(&path).unwrap();
+        file.set_times(std::fs::FileTimes::new().set_modified(std::time::SystemTime::now()-std::time::Duration::from_secs(60))).unwrap();
+        let second=fs_lock(&name);
+        assert!(!second.owned(),"a live owner's lock must never expire");
+        drop(second);drop(first);
+        assert!(fs_lock(&name).owned());
+    }
+}
+
+#[cfg(all(test,unix))]
+mod audit_private_state_tests {
+    #[test]
+    fn replacing_state_makes_credentials_private_and_cleans_temporary_files() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir=std::env::temp_dir().join(format!("dc-private-state-{}",std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();let p=dir.join("state.json");
+        std::fs::write(&p,b"old").unwrap();
+        std::fs::set_permissions(&p,std::fs::Permissions::from_mode(0o644)).unwrap();
+        super::atomic_write(&p,b"private").unwrap();
+        assert_eq!(std::fs::read(&p).unwrap(),b"private");
+        assert_eq!(std::fs::metadata(&p).unwrap().permissions().mode() & 0o777,0o600);
+        assert_eq!(std::fs::read_dir(&dir).unwrap().count(),1);
+        std::fs::remove_dir_all(dir).unwrap();
     }
 }

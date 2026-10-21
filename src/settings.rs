@@ -62,6 +62,7 @@ struct Settings {
     ytdlp_source: String,
     /// The executable picked for "custom"; empty until one is chosen.
     ytdlp_custom_path: String,
+    ffmpeg_custom_path: String,
     // Updates
     update_check_on: bool,
 }
@@ -70,11 +71,11 @@ impl Default for Settings {
     fn default() -> Self {
         Self {
             theme: "dark".to_string(),
-            close_to_tray: true,
+            close_to_tray: cfg!(windows),
             show_complete: true,
             save_dir: dirs::download_dir()
                 .map(|p| p.to_string_lossy().to_string())
-                .unwrap_or_else(|| "C:\\Downloads".to_string()),
+                .unwrap_or_else(|| crate::model::default_download_dir().to_string_lossy().into_owned()),
             category_folders: true,
             connections_default: 8,
             speed_limit_kbps: 0,
@@ -95,6 +96,7 @@ impl Default for Settings {
             ytdlp_prefer_path: false,
             ytdlp_source: "managed".to_string(),
             ytdlp_custom_path: String::new(),
+            ffmpeg_custom_path: String::new(),
             update_check_on: false,
         }
     }
@@ -125,8 +127,9 @@ fn load() -> Settings {
     str_in("antivirus_cmd", &mut s.antivirus_cmd);
     str_in("finish_action", &mut s.finish_action);
     str_in("rename_template", &mut s.rename_template);
+    if let Some(p) = g("ffmpeg_custom_path").and_then(|v|v.as_str()) { s.ffmpeg_custom_path=p.to_string(); }
     if let Some(b) = g("close_to_tray").and_then(|x| x.as_bool()) {
-        s.close_to_tray = b;
+        s.close_to_tray = cfg!(windows) && b;
     }
     if let Some(b) = g("show_complete").and_then(|x| x.as_bool()) {
         s.show_complete = b;
@@ -201,6 +204,8 @@ fn load() -> Settings {
 
 /// Read-modify-write: overlay our keys onto whatever is on disk now.
 fn save(s: &Settings) -> bool {
+    let _guard=crate::model::fs_lock("ui-settings");
+    if !_guard.owned() { return false; }
     let Some(path) = ui_path() else { return false };
     let mut v: serde_json::Value = std::fs::read_to_string(&path)
         .ok()
@@ -215,6 +220,7 @@ fn save(s: &Settings) -> bool {
     };
     set(obj, "theme", s.theme.clone().into());
     set(obj, "close_to_tray", s.close_to_tray.into());
+    set(obj, "ffmpeg_custom_path", s.ffmpeg_custom_path.clone().into());
     set(obj, "show_complete", s.show_complete.into());
     set(obj, "save_dir", s.save_dir.clone().into());
     set(obj, "category_folders", s.category_folders.into());
@@ -292,7 +298,7 @@ fn ytdlp_probe(
         if force {
             msg = match crate::engine::ytdlp_refresh_blocking() {
                 Ok(p) => format!("Fetched the newest build into {}", p.display()),
-                Err(e) => format!("Re-download failed: {e}"),
+                Err(e) => format!("Re-download failed: {e:#}"),
             };
         }
         let info = crate::engine::ytdlp_info();
@@ -304,12 +310,20 @@ fn ytdlp_probe(
 
 /// The native "open file" dialog, for picking a yt-dlp executable.
 fn pick_executable() -> Option<std::path::PathBuf> {
-    let picked = rfd::FileDialog::new()
-        .set_title("Pick a yt-dlp executable")
-        .add_filter("yt-dlp", &["exe"])
-        .add_filter("All files", &["*"])
-        .pick_file();
-    picked.filter(|p| p.is_file())
+    pick_tool("yt-dlp")
+}
+
+fn pick_tool(name:&str) -> Option<std::path::PathBuf> {
+    let dialog=rfd::FileDialog::new().set_title(format!("Pick {name}"));
+    #[cfg(windows)] let dialog=dialog.add_filter("Executable", &["exe"]);
+    dialog.pick_file().filter(|p|crate::platform::executable_file(p))
+}
+fn ffmpeg_install_probe() -> std::sync::mpsc::Receiver<(String,crate::engine::YtdlpInfo,crate::engine::FfmpegInfo)> {
+    let (tx,rx)=std::sync::mpsc::channel();
+    std::thread::spawn(move||{
+        let message=match crate::helpers::install_ffmpeg(){Ok(_)=>"FFmpeg and ffprobe installed and ready.".into(),Err(e)=>format!("FFmpeg install failed: {e:#}")};
+        let _=tx.send((message,crate::engine::ytdlp_info(),crate::engine::ffmpeg_info()));
+    });rx
 }
 
 fn install_one(browser: &str) -> String {
@@ -450,7 +464,9 @@ impl eframe::App for SettingsApp {
                 );
                 foot_ui.spacing_mut().item_spacing = Vec2::new(8.0, 0.0);
                 if button(&mut foot_ui, "Save", false).clicked() {
-                    self.notice = if save(&self.s) {
+                    let saved=save(&self.s);
+                    if saved {self.ytdlp_rx=Some(ytdlp_probe(false));self.ytdlp_busy=true;}
+                    self.notice = if saved {
                         "Saved ✓ (the main app picks it up live)".to_string()
                     } else {
                         "Could not write settings.".to_string()
@@ -1820,7 +1836,7 @@ fn runtime_note(ui: &mut Ui, runtime: Option<&str>) {
 fn runtime_tail(runtime: Option<&str>) -> (&'static str, bool) {
     match runtime {
         Some(_) => ("— solves YouTube's player challenge", false),
-        None => ("— none found; install Node.js", true),
+        None => ("— needs Node.js 22+ or Deno 2.3+", true),
     }
 }
 
@@ -1862,6 +1878,7 @@ impl SettingsApp {
             }
         });
         ui.add_space(14.0);
+        #[cfg(windows)]
         toggle(
             ui,
             &mut self.s.close_to_tray,
@@ -1892,7 +1909,7 @@ impl SettingsApp {
                 iw,
                 true,
                 false,
-                "C:\\Downloads",
+                if cfg!(windows){"C:\\Downloads"}else{"~/Downloads"},
             );
             c.add_space(6.0);
             if icon_sq(&mut c, "\u{e2c7}", 28.0, 6.0)
@@ -1984,9 +2001,9 @@ impl SettingsApp {
             let mut c = field_row(
                 ui,
                 "av",
-                "Antivirus command",
+                "After-download command",
                 None,
-                Some("{file} is replaced with the downloaded file path."),
+                Some("Executable and arguments; {file} is passed as the file path. Shell operators are not supported."),
             );
             let w = c.available_width();
             input_box(
@@ -1996,13 +2013,13 @@ impl SettingsApp {
                 w,
                 true,
                 false,
-                "\"C:\\Program Files\\Defender\\MpCmdRun.exe\" -Scan -ScanType 3 -File {file}",
+                if cfg!(windows) { r#""C:\Program Files\Defender\MpCmdRun.exe" -Scan -ScanType 3 -File {file}"# } else { r#"clamscan "{file}""# },
             );
             let mut c = field_row(ui, "finish", "When a download finishes", None, None);
             segmented(
                 &mut c,
                 "finish",
-                &["nothing", "shutdown", "sleep", "hibernate"],
+                if cfg!(target_os="macos") { &["nothing", "shutdown", "sleep"] } else { &["nothing", "shutdown", "sleep", "hibernate"] },
                 &mut s.finish_action,
             );
         });
@@ -2105,7 +2122,7 @@ impl SettingsApp {
             (Some(_), _) => format!("from PATH · {size}"),
         };
         let custom_missing = !custom.trim().is_empty()
-            && !info.as_ref().map(|i| i.custom_ok).unwrap_or(false);
+            && !crate::platform::executable_file(std::path::Path::new(custom.trim()));
 
         let w = ui.available_width();
         let mut want_open = open;
@@ -2172,7 +2189,7 @@ impl SettingsApp {
                         let managed_sub = managed_dir
                             .as_ref()
                             .map(|p| p.display().to_string())
-                            .unwrap_or_else(|| "your Windows app data folder".to_string());
+                            .unwrap_or_else(|| "your application data folder".to_string());
                         let (hit, _) = loc_option(
                             ui,
                             source == "managed",
@@ -2206,7 +2223,7 @@ impl SettingsApp {
                         ui.add_space(6.0);
 
                         let custom_sub = if custom.trim().is_empty() {
-                            "pick any yt-dlp.exe on this PC".to_string()
+                            if cfg!(windows) { "pick yt-dlp.exe on this computer" } else { "pick an executable yt-dlp file" }.to_string()
                         } else if custom_missing {
                             format!("{custom}  — not there any more")
                         } else {
@@ -2239,7 +2256,7 @@ impl SettingsApp {
                                 let from = if i.managed {
                                     "App's own copy"
                                 } else if i.path.is_some() {
-                                    "yt-dlp on PATH"
+                                    if !custom.trim().is_empty() && i.path.as_deref()==Some(std::path::Path::new(custom.trim())) { "Custom yt-dlp" } else { "System yt-dlp" }
                                 } else {
                                     "Nothing installed yet"
                                 };
@@ -2270,7 +2287,7 @@ impl SettingsApp {
                                 // e5d5 renders as a refresh arrow in this build
                                 // of Material Icons — which is what re-fetching
                                 // the helper means anyway.
-                                if btn_icon(ui, "\u{e5d5}", "Re-download", true).clicked() {
+                                if btn_icon(ui, "\u{e5d5}", if info.as_ref().and_then(|i|i.path.as_ref()).is_some(){"Update yt-dlp"}else{"Download yt-dlp"}, true).clicked() {
                                     redownload = true;
                                 }
                             });
@@ -2293,6 +2310,7 @@ impl SettingsApp {
                             runtime_note(ui, rt);
                         }
 
+                        ui.hyperlink_to("Install a JavaScript runtime", "https://github.com/yt-dlp/yt-dlp/wiki/EJS#step-1-install-a-supported-javascript-runtime");
                         if !msg.is_empty() {
                             ui.add_space(7.0);
                             wrapped(ui, msg.as_str(), reg(10.0), t.accent);
@@ -2355,6 +2373,10 @@ impl SettingsApp {
         let w = ui.available_width();
         let mut want_open = open;
         let mut reveal: Option<std::path::PathBuf> = None;
+        let mut install=false;
+        let mut recheck=false;
+        let mut custom_pick=None;
+        let mut clear_custom=false;
 
         let edge = if open {
             blend(t.border, t.accent, 0.5)
@@ -2406,15 +2428,14 @@ impl SettingsApp {
                         capabilities(ui, &FFMPEG_CAPS);
                         ui.add_space(13.0);
 
-                        sec_head(ui, "Windows build");
+                        sec_head(ui, if cfg!(windows){"Windows tools"}else if cfg!(target_os="macos"){"macOS tools"}else{"Linux tools"});
                         let (status, warn) = match (&ff, &found) {
                             (None, _) => ("Checking what you have…".to_string(), false),
                             (Some(_), Some(_)) => {
-                                ("Active: the ffmpeg on your PATH".to_string(), false)
+                                (if ff.as_ref().map(|f|f.managed).unwrap_or(false){"Active: app-managed FFmpeg".to_string()}else{"Active: system or custom FFmpeg".to_string()}, false)
                             }
                             (Some(_), None) => (
-                                "Not found — run \u{201c}winget install ffmpeg\u{201d}, then reopen this window"
-                                    .to_string(),
+                                if cfg!(windows){"Not found — install FFmpeg with winget, then press Check again".to_string()}else{"Not found — use Download tools below, or choose your installed FFmpeg".to_string()},
                                 true,
                             ),
                         };
@@ -2430,6 +2451,21 @@ impl SettingsApp {
                         }
                         ui.add_space(13.0);
 
+                        ui.add_enabled_ui(!self.ytdlp_busy,|ui| {
+                            ui.horizontal_wrapped(|ui| {
+                                if crate::helpers::install_supported() && button(ui,"Download tools",true).clicked(){install=true;}
+                                if button(ui,"Choose FFmpeg…",false).clicked(){custom_pick=pick_tool("FFmpeg");}
+                                if button(ui,"Check again",false).clicked(){recheck=true;}
+                                if !self.s.ffmpeg_custom_path.is_empty() && button(ui,"Use automatic detection",false).clicked(){clear_custom=true;}
+                            });
+                        });
+                        if self.ytdlp_busy {ui.add(egui::Spinner::new().size(14.0));}
+                        if !self.ytdlp_msg.is_empty(){wrapped(ui,&self.ytdlp_msg,reg(10.0),t.accent);}
+                        if let Some(info)=&ff { if info.path.is_some() && info.probe_path.is_none(){wrapped(ui,if cfg!(windows){"ffprobe is missing. Install it next to FFmpeg."}else{"ffprobe is missing. Download tools installs the matching pair."},reg(10.0),pl().warning);} }
+                        if cfg!(target_os="macos"){hint(ui,"System alternative: brew install ffmpeg. Homebrew locations are detected automatically.");}
+                        #[cfg(target_os="linux")]
+                        hint(ui,"System alternatives: Ubuntu/Debian: sudo apt install ffmpeg; Fedora: sudo dnf install ffmpeg-free. Download tools needs no administrator access.");
+                        ui.add_space(8.0);
                         ui.horizontal(|ui| {
                             ui.spacing_mut().item_spacing.x = 8.0;
                             ui.add_enabled_ui(found.is_some(), |ui| {
@@ -2442,7 +2478,7 @@ impl SettingsApp {
                                 |ui| {
                                     txt(
                                         ui,
-                                        "used only to merge video + audio",
+                                        "merges tracks and verifies completed media",
                                         reg(9.0),
                                         t.muted,
                                     );
@@ -2453,6 +2489,9 @@ impl SettingsApp {
             });
 
         self.plugins_open[1] = want_open;
+        if let Some(p)=custom_pick { self.s.ffmpeg_custom_path=p.to_string_lossy().into_owned(); self.notice="Save to apply the FFmpeg location, then Check again.".into(); }
+        if clear_custom {self.s.ffmpeg_custom_path.clear();self.notice="Save to apply automatic FFmpeg detection, then Check again.".into();}
+        if install || recheck {self.ytdlp_rx=Some(if install{ffmpeg_install_probe()}else{ytdlp_probe(false)});self.ytdlp_busy=true;self.ytdlp_msg.clear();}
         if let Some(p) = reveal {
             crate::app::open_path(&p, true);
         }
@@ -2464,7 +2503,7 @@ impl SettingsApp {
         h2(ui, "Browser Integration");
         para(
             ui,
-            "Load browser-extension/ unpacked once — its ID is pinned, no pasting needed.",
+            "Chrome/Brave: load browser-extension. Firefox: load browser-extension-firefox. Launch the app once from its permanent location.",
         );
         ui.add_space(6.0);
         para(
@@ -2472,7 +2511,12 @@ impl SettingsApp {
             "One-time setup: host auto-repairs on every launch — buttons below are manual repair only.",
         );
         ui.add_space(6.0);
-        para(ui, &format!("Extension ID: {}", crate::app::EXTENSION_ID));
+        ui.horizontal_wrapped(|ui| {
+            for (firefox,label) in [(false,"Open Chrome/Brave extension folder"),(true,"Open Firefox extension folder")] {
+                if button(ui,label,false).clicked(){match crate::platform::extension_directory(firefox){Ok(dir)=>crate::app::open_path(&dir,false),Err(e)=>self.browser_msg=e}}
+            }
+        });
+        para(ui, &format!("Chrome/Brave extension ID: {}", crate::app::EXTENSION_ID));
         ui.add_space(16.0);
         ui.horizontal_wrapped(|ui| {
             ui.spacing_mut().item_spacing = Vec2::new(8.0, 8.0);

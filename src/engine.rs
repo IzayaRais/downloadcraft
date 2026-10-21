@@ -10,12 +10,19 @@ pub struct SharedState {
     pub downloaded: AtomicU64,
     pub total: AtomicU64,
     pub has_total: AtomicBool,
+    /// Duration/audio expectations from the player, manifest or extractor.
+    pub expected_duration: AtomicU64,
+    pub expects_audio: AtomicBool,
     /// Transfer rate in bytes/s reported by the helper itself (yt-dlp). Left at
     /// 0 by the built-in engine, which lets the UI measure the rate from the
     /// byte counter instead.
     pub speed_bps: AtomicU64,
     pub paused: AtomicBool,
     pub cancelled: AtomicBool,
+    /// Set only after the engine and all final validation have succeeded.
+    pub succeeded: AtomicBool,
+    /// External tools pause by stopping and restarting from their partial files.
+    pub external_helper: AtomicBool,
     /// Engine-detected filename (Content-Disposition / video title).
     pub resolved_name: std::sync::Mutex<Option<String>>,
     /// Whether the server supports range resume.
@@ -52,9 +59,13 @@ impl SharedState {
             downloaded: AtomicU64::new(0),
             total: AtomicU64::new(0),
             has_total: AtomicBool::new(false),
+            expected_duration: AtomicU64::new(0),
+            expects_audio: AtomicBool::new(false),
             speed_bps: AtomicU64::new(0),
             paused: AtomicBool::new(false),
             cancelled: AtomicBool::new(false),
+            succeeded: AtomicBool::new(false),
+            external_helper: AtomicBool::new(false),
             resolved_name: std::sync::Mutex::new(None),
             resumable: AtomicBool::new(false),
             part_total: std::sync::Mutex::new(Vec::new()),
@@ -158,6 +169,8 @@ pub struct EngineOpts {
     /// Optional expected SHA-256 hex digest; verified after transfer.
     /// Empty = skip verification.
     pub expected_sha256: String,
+    pub expected_duration_secs: u64,
+    pub require_audio: bool,
     /// When true, an existing destination file is replaced instead of
     /// auto-renaming to `name (1).ext`.
     pub overwrite_existing: bool,
@@ -184,6 +197,8 @@ impl Default for EngineOpts {
             proxy_url: String::new(),
             allow_rename: true,
             expected_sha256: String::new(),
+            expected_duration_secs: 0,
+            require_audio: false,
             overwrite_existing: false,
             quality_pref: String::new(),
             global_limit: None,
@@ -262,7 +277,7 @@ impl EngineOpts {
                     format!("\"Chromium\";v=\"{v}\", \"Google Chrome\";v=\"{v}\", \"Not-A.Brand\";v=\"99\""),
                 )
                 .header("sec-ch-ua-mobile", "?0")
-                .header("sec-ch-ua-platform", "\"Windows\"");
+                .header("sec-ch-ua-platform", format!("\"{}\"", client_hint_platform(&self.user_agent)));
         }
         // Default page referer for social CDNs when the caller captured none:
         // bare CDN hosts (fbcdn/instagram) often 403 Range requests with no
@@ -295,6 +310,24 @@ impl EngineOpts {
             );
         }
         r
+    }
+}
+
+fn client_hint_platform(ua: &str) -> &'static str {
+    if ua.contains("Android") {
+        "Android"
+    } else if ua.contains("iPhone") || ua.contains("iPad") {
+        "iOS"
+    } else if ua.contains("Windows") {
+        "Windows"
+    } else if ua.contains("Macintosh") {
+        "macOS"
+    } else if ua.contains("CrOS") {
+        "Chrome OS"
+    } else if ua.contains("Linux") {
+        "Linux"
+    } else {
+        "Unknown"
     }
 }
 
@@ -350,6 +383,22 @@ struct ResumeMeta {
 
 fn resume_meta_path(dest: &std::path::Path) -> std::path::PathBuf {
     dest.with_extension("dcmeta")
+}
+
+/// Resume metadata is useful only while partial data exists. Call after
+/// successful completion/verification; retain it for paused/failed jobs.
+fn cleanup_completed_resume(dest: &std::path::Path) {
+    if !dest.is_file() || dest.with_extension("dcpart").exists()
+        || (0..16).any(|i| dest.with_extension(format!("dcpart{i}")).exists()) {
+        return;
+    }
+    let _ = std::fs::remove_file(resume_meta_path(dest));
+}
+
+fn cleanup_completed_job(dest: &std::path::Path, shared: &Arc<SharedState>) {
+    let resolved = mutex_guard(&shared.resolved_name).clone();
+    let actual = resolved.map(|n| dest.with_file_name(n)).unwrap_or_else(|| dest.to_path_buf());
+    cleanup_completed_resume(&actual);
 }
 
 fn read_resume_meta(dest: &std::path::Path) -> Option<ResumeMeta> {
@@ -628,17 +677,101 @@ fn social_page_url(asset: &str, referer: &str) -> Option<String> {
     Some(page.to_string())
 }
 
+/// A URL naming an individual media fragment, rather than an ordinary
+/// complete file which merely supports HTTP Range requests.
+fn is_media_fragment(raw: &str) -> bool {
+    let Ok(u) = url::Url::parse(raw) else { return false; };
+    let path = u.path().to_ascii_lowercase();
+    let leaf = path.rsplit('/').next().unwrap_or("");
+    if [".m4s", ".cmfv", ".cmfa", ".mpd.seg"].iter().any(|e| path.ends_with(e)) { return true; }
+    if path.ends_with(".ts") {
+        let stem = leaf.trim_end_matches(".ts");
+        if stem.bytes().all(|c| c.is_ascii_digit())
+            || ["seg", "segment", "chunk", "fragment", "s", "filesequence", "sequence"].iter()
+                .any(|p| stem.strip_prefix(p).map(|v| v.trim_start_matches(['-', '_']).starts_with(|c: char| c.is_ascii_digit())).unwrap_or(false)) {
+            return true;
+        }
+    }
+    let media = [".mp4", ".m4a", ".webm", ".mp3", ".aac", ".ts"].iter().any(|e| path.ends_with(e));
+    media && u.query_pairs().any(|(k,v)| {
+        k == "bytestart" || k == "byteend" || (k == "range" && v.split_once('-').map(|(a,b)|
+            !a.is_empty() && !b.is_empty() && a.bytes().all(|c| c.is_ascii_digit()) && b.bytes().all(|c| c.is_ascii_digit())
+        ).unwrap_or(false))
+    })
+}
+
+fn fragment_page(raw: &str, referer: &str) -> Result<Option<String>> {
+    if !is_media_fragment(raw) { return Ok(None); }
+    let page = url::Url::parse(referer).ok().filter(|u| matches!(u.scheme(), "http" | "https")
+        && !looks_media_url(referer) && !is_media_fragment(referer));
+    page.map(|p| Some(p.to_string())).ok_or_else(|| anyhow!(
+        "this URL is a playback fragment, not the complete media — capture the full playlist or the specific player page"))
+}
+
+/// Vimeo fragments are not progressive MP4 files, even when named .mp4.
+fn is_vimeo_fragment(raw: &str) -> bool {
+    let Ok(u) = url::Url::parse(raw) else { return false; };
+    let host = u.host_str().unwrap_or("");
+    (host == "vimeocdn.com" || host.ends_with(".vimeocdn.com"))
+        && (u.path().contains("/v2/range/") || u.query_pairs().any(|(k, v)| {
+            k == "range" && v.split_once('-').map(|(a, b)| {
+                !a.is_empty() && !b.is_empty()
+                    && a.bytes().all(|c| c.is_ascii_digit())
+                    && b.bytes().all(|c| c.is_ascii_digit())
+            }).unwrap_or(false)
+        }))
+}
+
+/// Manifests and adaptive legs need audio-aware resolution, not HLS concat.
+fn is_vimeo_adaptive(raw: &str) -> bool {
+    let Ok(u) = url::Url::parse(raw) else { return false; };
+    let host = u.host_str().unwrap_or("");
+    (host == "vimeocdn.com" || host.ends_with(".vimeocdn.com"))
+        && (is_playlist_url(raw) || is_vimeo_fragment(raw)
+            || host.starts_with("vod-adaptive.") || host.starts_with("vod-adaptive-"))
+}
+
+fn vimeo_download_target(raw: &str, referer: &str) -> Result<Option<String>> {
+    if is_vimeo_video_page(raw) { return Ok(Some(raw.to_string())); }
+    if !is_vimeo_adaptive(raw) { return Ok(None); }
+    if is_vimeo_video_page(referer) { return Ok(Some(referer.to_string())); }
+    if is_playlist_url(raw) { return Ok(Some(raw.to_string())); }
+    Err(anyhow!("Vimeo URL is only a playback fragment — capture the full manifest or the specific Vimeo player URL"))
+}
+
+fn vimeo_needs_audio(raw: &str) -> bool {
+    is_vimeo_video_page(raw) || is_vimeo_adaptive(raw)
+}
+
+/// Only a specific video, never a profile/feed. Keep unlisted hashes and query.
+fn is_vimeo_video_page(raw: &str) -> bool {
+    let Ok(u) = url::Url::parse(raw) else { return false; };
+    if !matches!(u.scheme(), "http" | "https") { return false; }
+    let parts: Vec<_> = u.path().trim_matches('/').split('/').collect();
+    let numeric = |s: &str| !s.is_empty() && s.bytes().all(|c| c.is_ascii_digit());
+    match u.host_str().unwrap_or("") {
+        "player.vimeo.com" => parts.len() == 2 && parts[0] == "video" && numeric(parts[1]),
+        "vimeo.com" | "www.vimeo.com" => (parts.len() == 1 || parts.len() == 2) && numeric(parts[0]),
+        _ => false,
+    }
+}
+
 /// Which site a cookie string belongs to, for the Netscape jar yt-dlp reads.
 /// The wrong domain silently drops every cookie, and Facebook then answers as
 /// a logged-out visitor that hides the video.
-fn cookie_domain(url: &str) -> &'static str {
+fn cookie_domain(url: &str) -> String {
+    if vimeo_needs_audio(url) {
+        return ".vimeo.com".to_string();
+    }
     let low = url.to_ascii_lowercase();
     if low.contains("facebook") || low.contains("fbcdn") || low.contains("fbsbx") {
-        ".facebook.com"
+        ".facebook.com".to_string()
     } else if low.contains("instagram") || low.contains("cdninstagram") {
-        ".instagram.com"
+        ".instagram.com".to_string()
+    } else if low.contains("youtube.com") || low.contains("youtu.be") || low.contains("googlevideo.com") {
+        ".youtube.com".to_string()
     } else {
-        ".youtube.com"
+        url::Url::parse(url).ok().and_then(|u| u.host_str().map(|h| format!(".{h}"))).unwrap_or_default()
     }
 }
 
@@ -2562,6 +2695,14 @@ async fn download_hls(
         .text()
         .await
         .map_err(|e| anyhow!("playlist read: {e}"))?;
+    let external_audio = hls_external_audio(&text);
+    if external_audio || text.contains("#EXT-X-BYTERANGE") || text.contains("BYTERANGE=") {
+        if external_audio { shared.expects_audio.store(true, Ordering::SeqCst); }
+        let mut helper_opts = opts.clone();
+        helper_opts.require_audio |= external_audio;
+        let exe = ensure_ytdlp(&client).await?;
+        return download_with_ytdlp(&exe, playlist_url, dest, connections, &helper_opts, shared).await;
+    }
     if text.contains("#EXT-X-STREAM-INF") {
         pl_url = hls_pick_variant(&text, &pl_url).ok_or_else(|| {
             anyhow!("could not pick a variant from this master playlist — use the extension MP4 qualities")
@@ -2576,6 +2717,13 @@ async fn download_hls(
             .text()
             .await
             .map_err(|e| anyhow!("variant read: {e}"))?;
+    }
+    if text.contains("#EXT-X-ENDLIST") {
+        let seconds: f64 = text.lines().filter_map(|l| l.trim().strip_prefix("#EXTINF:")
+            .and_then(|v| v.split(',').next()).and_then(|v| v.parse::<f64>().ok())).sum();
+        if seconds.is_finite() && seconds > 0.0 {
+            let _ = shared.expected_duration.compare_exchange(0, seconds.round().max(1.0) as u64, Ordering::SeqCst, Ordering::SeqCst);
+        }
     }
     let schedule = hls_key_schedule(&text, &pl_url)?;
     let seq0 = hls_media_sequence(&text);
@@ -2975,12 +3123,45 @@ async fn download_hls(
 /// segment-by-segment; DASH (.mpd) likewise; `ftp://` URLs go to the
 /// plain-FTP backend.
 pub async fn download(
+    url: String, dest: PathBuf, connections: usize, opts: EngineOpts, shared: Arc<SharedState>,
+) -> Result<()> {
+    shared.expected_duration.store(opts.expected_duration_secs, Ordering::SeqCst);
+    shared.expects_audio.store(opts.require_audio, Ordering::SeqCst);
+    download_inner(url, dest.clone(), connections, opts.clone(), shared.clone()).await?;
+    verify_completed_media(&dest, &shared).await?;
+    cleanup_completed_job(&dest, &shared);
+    Ok(())
+}
+
+async fn download_inner(
     mut url: String,
     mut dest: PathBuf,
     connections: usize,
     mut opts: EngineOpts,
     shared: Arc<SharedState>,
 ) -> Result<()> {
+    // Resolve Vimeo before probing the CDN: a successful fragment response
+    // proves nothing about the full video's size or completeness.
+    let resolve_page = match vimeo_download_target(&url, &opts.referer)? {
+        Some(page) => Some(page),
+        None => fragment_page(&normalize_media_url(&url), &opts.referer)?,
+    };
+    if let Some(page) = resolve_page {
+        let _job = claim_dest_job(&dest).ok_or_else(|| anyhow!("this destination is already downloading elsewhere"))?;
+        if opts.allow_rename && dest.exists() && !opts.overwrite_existing {
+            dest = crate::model::conflict_free_dest(&dest);
+            if let Some(name) = dest.file_name() {
+                mutex_guard(&shared.resolved_name).replace(name.to_string_lossy().to_string());
+            }
+        }
+        let client = opts.build_client()?;
+        let exe = ensure_ytdlp(&client).await?;
+        shared.total.store(0, Ordering::SeqCst);
+        shared.has_total.store(false, Ordering::SeqCst);
+        shared.downloaded.store(0, Ordering::SeqCst);
+        // Fail on extraction errors; never fall back to saving a fragment.
+        return download_with_ytdlp(&exe, &page, &dest, connections, &opts, &shared).await;
+    }
     // Facebook slice URLs (bytestart/byteend) can only ever return that
     // preview slice: normalize to the full-file URL before any probe, and
     // drop the stale slice prefix (it starts at ~byte 967, not 0, so it
@@ -3092,6 +3273,19 @@ pub async fn download(
         Some(verified) => (verified.or(seeded_total), verified.is_some(), None, None),
         None => probe(&client, &opts, &url).await,
     };
+    // Some CDNs use opaque manifest URLs. Route by the actual response
+    // type as well as extension, instead of saving playlist text as video.
+    if let Some(mime) = ctype.as_deref() {
+        let mime = mime.to_ascii_lowercase();
+        if mime.contains("mpegurl") || mime.contains("dash+xml") {
+            drop(_job);
+            return if mime.contains("dash+xml") {
+                download_dash(&url, dest, connections, opts, shared).await
+            } else {
+                download_hls(&url, &dest, connections, &opts, &shared).await
+            };
+        }
+    }
     // Pre-seeded totals imply resume support until proven otherwise; the
     // first response corrects this (single_stream updates it live).
     shared
@@ -3531,20 +3725,38 @@ pub async fn download(
     Ok(())
 }
 
+/// Include common Unix tool locations when launched from a Dock or desktop.
+fn tool_dirs() -> Vec<std::path::PathBuf> {
+    let mut paths: Vec<_> = std::env::var_os("PATH").map(|v| std::env::split_paths(&v).collect()).unwrap_or_default();
+    #[cfg(unix)]
+    {
+        for dir in ["/opt/homebrew/bin", "/usr/local/bin", "/usr/bin", "/bin"] {
+            let p = std::path::PathBuf::from(dir);
+            if !paths.contains(&p) { paths.push(p); }
+        }
+        if let Some(h) = dirs::home_dir() { paths.push(h.join(".local/bin")); }
+    }
+    paths
+}
+
 /// Locate `ffmpeg` on PATH (with `.exe` on Windows). `None` = not installed.
 pub fn ffmpeg_path() -> Option<std::path::PathBuf> {
+    let custom=crate::model::ui_pref_str("ffmpeg_custom_path", "");
+    let custom=std::path::PathBuf::from(custom);
+    if crate::platform::executable_file(&custom) { return Some(custom); }
+    if let Some(path)=crate::helpers::managed_ffmpeg_path() {
+        if crate::platform::executable_file(&path) { return Some(path); }
+    }
+
     let names: &[&str] = if cfg!(windows) {
         &["ffmpeg.exe", "ffmpeg"]
     } else {
         &["ffmpeg"]
     };
-    let Ok(path_var) = std::env::var("PATH") else {
-        return None;
-    };
-    for dir in std::env::split_paths(&path_var) {
+    for dir in tool_dirs() {
         for n in names {
             let cand = dir.join(n);
-            if cand.is_file() {
+            if crate::platform::executable_file(&cand) {
                 return Some(cand);
             }
         }
@@ -3565,18 +3777,15 @@ pub fn ffprobe_path() -> Option<std::path::PathBuf> {
     if let Some(dir) = ffmpeg_path().and_then(|p| p.parent().map(|d| d.to_path_buf())) {
         for n in names {
             let cand = dir.join(n);
-            if cand.is_file() {
+            if crate::platform::executable_file(&cand) {
                 return Some(cand);
             }
         }
     }
-    let Ok(path_var) = std::env::var("PATH") else {
-        return None;
-    };
-    for dir in std::env::split_paths(&path_var) {
+    for dir in tool_dirs() {
         for n in names {
             let cand = dir.join(n);
-            if cand.is_file() {
+            if crate::platform::executable_file(&cand) {
                 return Some(cand);
             }
         }
@@ -3642,6 +3851,7 @@ fn is_video_codec(codec: &str) -> bool {
 pub async fn ffprobe_resolution(video: &std::path::Path) -> Option<String> {
     let exe = ffprobe_path()?;
     let mut cmd = tokio::process::Command::new(exe);
+    cmd.kill_on_drop(true);
     #[cfg(windows)]
     {
         // No console flash for the helper process.
@@ -3714,13 +3924,14 @@ pub async fn ffmpeg_mux(
 ) -> Result<()> {
     let ff = ffmpeg_path().ok_or_else(|| {
         anyhow!(
-            "ffmpeg not found — install it (https://ffmpeg.org/download.html, or `winget install ffmpeg`) and put it on PATH to merge video+audio qualities; progressive ≤720p rows download as single files without it"
+            "FFmpeg not found — open Settings ▸ Plugins ▸ FFmpeg to install or select it; merging separate video and audio streams requires FFmpeg"
         )
     })?;
     if let Some(parent) = dest.parent() {
         tokio::fs::create_dir_all(parent).await?;
     }
     let mut cmd = tokio::process::Command::new(ff);
+    cmd.kill_on_drop(true);
     #[cfg(windows)]
     {
         // No console flash for the helper process.
@@ -3750,8 +3961,12 @@ pub async fn ffmpeg_mux(
 /// no copy is on PATH.
 const YTDLP_URL: &str = if cfg!(windows) {
     "https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp.exe"
+} else if cfg!(target_os="macos") {
+    "https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp_macos"
+} else if cfg!(target_arch="aarch64") {
+    "https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp_linux_aarch64"
 } else {
-    "https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp"
+    "https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp_linux"
 };
 const YTDLP_BIN: &str = if cfg!(windows) {
     "yt-dlp.exe"
@@ -3766,11 +3981,10 @@ fn ytdlp_on_path() -> Option<std::path::PathBuf> {
     } else {
         &["yt-dlp"]
     };
-    let path_var = std::env::var("PATH").ok()?;
-    for dir in std::env::split_paths(&path_var) {
+    for dir in tool_dirs() {
         for n in names {
             let cand = dir.join(n);
-            if cand.is_file() {
+            if crate::platform::executable_file(&cand) {
                 return Some(cand);
             }
         }
@@ -3780,14 +3994,7 @@ fn ytdlp_on_path() -> Option<std::path::PathBuf> {
 
 /// Where a self-fetched yt-dlp lives.
 fn ytdlp_local_path() -> Option<std::path::PathBuf> {
-    let base = if cfg!(windows) {
-        std::path::PathBuf::from(std::env::var_os("LOCALAPPDATA")?)
-    } else {
-        std::path::PathBuf::from(std::env::var_os("HOME")?)
-            .join(".local")
-            .join("share")
-    };
-    Some(base.join("download_craft").join("bin").join(YTDLP_BIN))
+    Some(crate::platform::helper_dir()?.join(YTDLP_BIN))
 }
 
 /// How the user wants yt-dlp sourced: a copy they picked, whatever is on
@@ -3826,6 +4033,11 @@ impl YtdlpSource {
     }
 }
 
+fn select_ytdlp(source:YtdlpSource, on_path:Option<PathBuf>, custom:Option<PathBuf>, local:Option<PathBuf>) -> (Option<PathBuf>,bool) {
+    let external=match source {YtdlpSource::Custom=>custom,YtdlpSource::Path=>on_path,YtdlpSource::Managed=>None};
+    if external.is_some(){(external,false)}else{let managed=local.is_some();(local,managed)}
+}
+
 /// The user's own yt-dlp, when they picked one *and* it is still on disk.
 fn ytdlp_custom_path() -> Option<std::path::PathBuf> {
     let raw = crate::model::ui_pref_str("ytdlp_custom_path", "");
@@ -3834,7 +4046,7 @@ fn ytdlp_custom_path() -> Option<std::path::PathBuf> {
         return None;
     }
     let p = std::path::PathBuf::from(raw);
-    p.is_file().then_some(p)
+    crate::platform::executable_file(&p).then_some(p)
 }
 
 /// The JS runtime yt-dlp needs to solve YouTube's player challenges. Only
@@ -3842,23 +4054,27 @@ fn ytdlp_custom_path() -> Option<std::path::PathBuf> {
 /// without one, extraction fails outright on many videos with yt-dlp's
 /// "The page needs to be reloaded" (verified live here: same URL and cookies,
 /// same release, works with `--js-runtimes node` and fails without it).
-fn js_runtime() -> Option<&'static str> {
-    let path_var = std::env::var("PATH").ok()?;
-    for (name, files) in [
-        ("node", ["node.exe", "node"]),
-        ("deno", ["deno.exe", "deno"]),
-        ("bun", ["bun.exe", "bun"]),
-    ] {
-        for dir in std::env::split_paths(&path_var) {
-            for f in files {
-                if dir.join(f).is_file() {
-                    return Some(name);
-                }
+fn js_runtime_path() -> Option<(&'static str, std::path::PathBuf)> {
+    for name in ["deno", "node"] {
+        let file = if cfg!(windows) { format!("{name}.exe") } else { name.to_string() };
+        for dir in tool_dirs() {
+            let path=dir.join(&file);
+            if crate::platform::executable_file(&path) {
+                let mut command=std::process::Command::new(&path);command.arg("--version");
+                let valid=crate::platform::version_output(command).map(|out|runtime_version_supported(name,&String::from_utf8_lossy(&out.stdout))).unwrap_or(false);
+                if valid {return Some((name,path));}
             }
         }
     }
     None
 }
+fn runtime_version_supported(name:&str,version:&str)->bool {
+    let word=version.split_whitespace().find(|w|w.chars().next().map(|c|c.is_ascii_digit()||c=='v').unwrap_or(false)).unwrap_or("");
+    let parts:Vec<u32>=word.trim_start_matches('v').split('.').map(|s|s.parse().unwrap_or(0)).collect();
+    let major=parts.first().copied().unwrap_or(0);let minor=parts.get(1).copied().unwrap_or(0);
+    match name {"node"=>major>=22,"deno"=>major>2||(major==2&&minor>=3),_=>false}
+}
+fn js_runtime() -> Option<&'static str> { js_runtime_path().map(|(name,_)| name) }
 
 /// Whether a helper we fetched is old enough that YouTube has probably moved
 /// on (extractors break within weeks).
@@ -3885,31 +4101,18 @@ fn ytdlp_preferred(opts: &EngineOpts) -> bool {
 /// `Err` means nothing is available and the caller should stay with the
 /// built-in engine.
 async fn ensure_ytdlp(client: &reqwest::Client) -> Result<std::path::PathBuf> {
-    match YtdlpSource::from_settings() {
-        // A pick the user made themselves wins for as long as it is on disk;
-        // if it has since been deleted we fall through to a copy that works.
-        YtdlpSource::Custom => {
-            if let Some(p) = ytdlp_custom_path() {
-                return Ok(p);
-            }
-        }
-        // Settings can pin the app to a PATH copy instead of its own.
-        YtdlpSource::Path => {
-            if let Some(p) = ytdlp_on_path() {
-                return Ok(p);
-            }
-        }
-        // "App's own copy": whatever else is on PATH is deliberately ignored.
-        YtdlpSource::Managed => {}
-    }
-    let dst = ytdlp_local_path().ok_or_else(|| anyhow!("no LOCALAPPDATA to keep yt-dlp in"))?;
-    if dst.is_file() && !ytdlp_stale(&dst).await {
+    let source=YtdlpSource::from_settings();
+    let local=ytdlp_local_path().filter(|p|crate::platform::executable_file(p));
+    let (existing,managed)=select_ytdlp(source,ytdlp_on_path(),ytdlp_custom_path(),local);
+    if !managed { if let Some(path)=existing{return Ok(path);} }
+    let dst = ytdlp_local_path().ok_or_else(|| anyhow!("No writable application data folder for yt-dlp"))?;
+    if crate::platform::executable_file(&dst) && !ytdlp_stale(&dst).await {
         return Ok(dst);
     }
     match fetch_ytdlp(client, &dst).await {
         Ok(()) => Ok(dst),
         // A failed refresh must not cost us a working older copy.
-        Err(_) if dst.is_file() => Ok(dst),
+        Err(_) if crate::platform::executable_file(&dst) => Ok(dst),
         Err(e) => Err(e),
     }
 }
@@ -3917,6 +4120,8 @@ async fn ensure_ytdlp(client: &reqwest::Client) -> Result<std::path::PathBuf> {
 /// Download the helper over `dst` (fetch to a sidecar, then rename, so a
 /// half-written executable can never be launched).
 async fn fetch_ytdlp(client: &reqwest::Client, dst: &std::path::Path) -> Result<()> {
+    static FETCH:tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+    let _guard=FETCH.lock().await;
     if let Some(dir) = dst.parent() {
         tokio::fs::create_dir_all(dir).await?;
     }
@@ -3924,22 +4129,28 @@ async fn fetch_ytdlp(client: &reqwest::Client, dst: &std::path::Path) -> Result<
         .get(YTDLP_URL)
         .send()
         .await
-        .map_err(|e| anyhow!("yt-dlp fetch: {e}"))?;
+        .map_err(|e| anyhow!("yt-dlp fetch: {e:#}"))?;
     if !resp.status().is_success() {
         return Err(anyhow!("yt-dlp fetch: HTTP {}", resp.status()));
     }
     let bytes = resp
         .bytes()
         .await
-        .map_err(|e| anyhow!("yt-dlp fetch: {e}"))?;
+        .map_err(|e| anyhow!("yt-dlp fetch: {e:#}"))?;
     if bytes.len() < 1_000_000 {
         return Err(anyhow!(
             "yt-dlp fetch: suspicious payload ({} bytes)",
             bytes.len()
         ));
     }
-    let tmp = dst.with_extension("part");
+    let tmp = dst.with_file_name(format!("yt-dlp.{}.part{}",std::process::id(),if cfg!(windows){".exe"}else{""}));
     tokio::fs::write(&tmp, &bytes).await?;
+    #[cfg(unix)]
+    {use std::os::unix::fs::PermissionsExt;tokio::fs::set_permissions(&tmp,std::fs::Permissions::from_mode(0o700)).await?;}
+    if ytdlp_version(&tmp).is_none() {
+        let _=tokio::fs::remove_file(&tmp).await;
+        return Err(anyhow!("Downloaded yt-dlp did not pass its version check; previous copy retained"));
+    }
     tokio::fs::rename(&tmp, dst).await?;
     Ok(())
 }
@@ -3971,6 +4182,8 @@ pub struct FfmpegInfo {
     pub path: Option<std::path::PathBuf>,
     pub version: Option<String>,
     pub size: Option<u64>,
+    pub probe_path: Option<std::path::PathBuf>,
+    pub managed: bool,
 }
 
 impl FfmpegInfo {
@@ -3979,7 +4192,7 @@ impl FfmpegInfo {
         if self.path.is_none() {
             return "not installed".to_string();
         }
-        let mut bits = vec!["on PATH".to_string()];
+        let mut bits = vec![if self.managed { "app copy".to_string() } else { "system/custom copy".to_string() }];
         if let Some(sz) = self.size {
             bits.push(crate::model::format_bytes(sz));
         }
@@ -4002,7 +4215,8 @@ fn ytdlp_version(exe: &std::path::Path) -> Option<String> {
         const CREATE_NO_WINDOW: u32 = 0x08000000;
         cmd.creation_flags(CREATE_NO_WINDOW);
     }
-    let out = cmd.arg("--version").output().ok()?;
+    cmd.arg("--version");
+    let out = crate::platform::version_output(cmd)?;
     if !out.status.success() {
         return None;
     }
@@ -4021,28 +4235,10 @@ pub fn ytdlp_info() -> YtdlpInfo {
     let on_path = ytdlp_on_path();
     let local = ytdlp_local_path();
     let custom = ytdlp_custom_path();
-    let managed_present = local.as_deref().map(|p| p.is_file()).unwrap_or(false);
+    let managed_present = local.as_deref().map(crate::platform::executable_file).unwrap_or(false);
     // Same order `ensure_ytdlp` uses, so what Settings shows is what a
     // YouTube download would really run.
-    let (path, managed) = match source {
-        YtdlpSource::Custom => match &custom {
-            Some(p) => (Some(p.clone()), false),
-            None if managed_present => (local.clone(), true),
-            None => (on_path.clone(), false),
-        },
-        YtdlpSource::Path => match &on_path {
-            Some(p) => (Some(p.clone()), false),
-            _ if managed_present => (local.clone(), true),
-            _ => (None, false),
-        },
-        YtdlpSource::Managed => {
-            if managed_present {
-                (local.clone(), true)
-            } else {
-                (on_path.clone(), false)
-            }
-        }
-    };
+    let (path, managed) = select_ytdlp(source,on_path.clone(),custom.clone(),local.clone().filter(|_|managed_present));
     let meta = path.as_deref().and_then(|p| std::fs::metadata(p).ok());
     let stale = match (managed, local.as_deref()) {
         (true, Some(p)) => std::fs::metadata(p)
@@ -4077,7 +4273,8 @@ pub fn ffmpeg_info() -> FfmpegInfo {
         .as_deref()
         .and_then(|p| std::fs::metadata(p).ok())
         .map(|m| m.len());
-    FfmpegInfo { path, version, size }
+    let managed=path.as_deref().zip(crate::helpers::managed_ffmpeg_path().as_deref()).map(|(a,b)|a==b).unwrap_or(false);
+    FfmpegInfo { path, version, size, probe_path:ffprobe_path(), managed }
 }
 
 /// `ffmpeg -version` opens with "ffmpeg version 7.1-full_build-www.gyan.dev
@@ -4090,7 +4287,8 @@ fn ffmpeg_version(exe: &std::path::Path) -> Option<String> {
         const CREATE_NO_WINDOW: u32 = 0x08000000;
         cmd.creation_flags(CREATE_NO_WINDOW);
     }
-    let out = cmd.arg("-version").output().ok()?;
+    cmd.arg("-version");
+    let out = crate::platform::version_output(cmd)?;
     let text = String::from_utf8_lossy(&out.stdout);
     let first = text.lines().next()?.trim();
     let mut words = first.split_whitespace();
@@ -4109,7 +4307,7 @@ fn ffmpeg_version(exe: &std::path::Path) -> Option<String> {
 /// existing one looks stale; the fetched file is parsed-checked by size only
 /// (yt-dlp ships as one executable).
 pub fn ytdlp_refresh_blocking() -> Result<std::path::PathBuf> {
-    let dst = ytdlp_local_path().ok_or_else(|| anyhow!("no LOCALAPPDATA to keep yt-dlp in"))?;
+    let dst = ytdlp_local_path().ok_or_else(|| anyhow!("No writable application data folder for yt-dlp"))?;
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()?;
@@ -4124,43 +4322,56 @@ pub fn ytdlp_refresh_blocking() -> Result<std::path::PathBuf> {
 /// `--cookies` reads), so yt-dlp inherits the signed-in YouTube session
 /// without touching the browser's locked profile database. Removed after the
 /// run, so no credentials linger on disk.
-async fn write_cookie_jar(cookie: &str, domain: &str) -> Option<std::path::PathBuf> {
+struct CookieJar(PathBuf);
+impl Drop for CookieJar {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
+    }
+}
+async fn write_cookie_jar(cookie: &str, domain: &str) -> Result<Option<CookieJar>> {
     if cookie.trim().is_empty() {
-        return None;
+        return Ok(None);
     }
     let mut body = String::from("# Netscape HTTP Cookie File\n");
-    let mut rows = 0usize;
     for part in cookie.split(';') {
         let Some((name, value)) = part.trim().split_once('=') else {
             continue;
         };
         let name = name.trim();
-        let bad = |s: &str| s.contains('\t') || s.contains('\n') || s.contains('\r');
+        let bad = |s: &str| s.contains(['\t', '\n', '\r']);
         if name.is_empty() || bad(name) || bad(value) {
             continue;
         }
         body.push_str(&format!("{domain}\tTRUE\t/\tFALSE\t0\t{name}\t{value}\n"));
-        rows += 1;
     }
-    if rows == 0 {
-        return None;
+    if body.lines().count() == 1 {
+        return Ok(None);
     }
-    // One jar per cookie set: the old pid-only name was shared by every
-    // concurrent download, so a YouTube job and a Facebook job could read each
-    // other's (wrong-domain) jar.
-    let tag = {
-        use std::hash::{Hash, Hasher};
-        let mut h = std::collections::hash_map::DefaultHasher::new();
-        domain.hash(&mut h);
-        cookie.hash(&mut h);
-        h.finish()
-    };
-    let path = std::env::temp_dir().join(format!(
-        "download_craft_cookies_{}_{tag:x}.txt",
-        std::process::id()
-    ));
-    tokio::fs::write(&path, body).await.ok()?;
-    Some(path)
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    for _ in 0..100 {
+        let tag = NEXT.fetch_add(1, Ordering::Relaxed);
+        let path = std::env::temp_dir().join(format!(
+            "download_craft_cookies_{}_{tag}.txt",
+            std::process::id()
+        ));
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        match options.open(&path) {
+            Ok(mut f) => {
+                let jar = CookieJar(path);
+                std::io::Write::write_all(&mut f, body.as_bytes())?;
+                return Ok(Some(jar));
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(e.into()),
+        }
+    }
+    Err(anyhow!("Could not create a private cookie file"))
 }
 
 /// yt-dlp format expression for a menu preference: the best video at or below
@@ -4190,6 +4401,96 @@ fn ytdlp_format_with(pref: &str, can_merge: bool) -> String {
         (None, true) => "bv*+ba[ext=m4a]/bv*+ba/b".to_string(),
         (None, false) => "b".to_string(),
     }
+}
+
+/// Vimeo can expose a video-only media playlist as an otherwise valid
+/// format. Require a real audio leg or a muxed format with an audio codec.
+fn audio_required_format(pref: &str, can_merge: bool) -> String {
+    match (quality_cap(pref), can_merge) {
+        (Some(h), true) => format!("bv[height<={h}]+ba[ext=m4a]/bv[height<={h}]+ba/b[height<={h}][acodec!=none]/bv+ba/b[acodec!=none]"),
+        (Some(h), false) => format!("b[height<={h}][acodec!=none]/b[acodec!=none]"),
+        (None, true) => "bv+ba[ext=m4a]/bv+ba/b[acodec!=none]".to_string(),
+        (None, false) => "b[acodec!=none]".to_string(),
+    }
+}
+
+fn hls_external_audio(text: &str) -> bool {
+    text.lines().filter(|line| line.trim().starts_with("#EXT-X-MEDIA:")).any(|line| {
+        let attrs = hls_key_attrs(line.trim());
+        hls_attr(&attrs, "TYPE").map(|t| t.eq_ignore_ascii_case("AUDIO")).unwrap_or(false)
+            && hls_attr(&attrs, "URI").map(|u| !u.is_empty()).unwrap_or(false)
+    })
+}
+
+fn completed_media_check(json: &str, expected_secs: u64, require_audio: bool) -> Result<()> {
+    let value: serde_json::Value = serde_json::from_str(json)?;
+    if require_audio && !ffprobe_has_audio(json)? {
+        return Err(anyhow!("downloaded media has no audio track, although the source includes audio — capture the full master playlist or player page"));
+    }
+    if expected_secs > 0 {
+        let number = |v: &serde_json::Value| v.as_str().and_then(|s| s.parse::<f64>().ok()).or_else(|| v.as_f64());
+        let duration = value.get("format").and_then(|v| v.get("duration")).and_then(number)
+            .or_else(|| value.get("streams").and_then(|v| v.as_array()).and_then(|s|
+                s.iter().filter_map(|v| v.get("duration").and_then(number)).filter(|d| d.is_finite()).reduce(f64::max)))
+            .filter(|d| d.is_finite() && *d > 0.0)
+            .ok_or_else(|| anyhow!("could not verify the finished media duration"))?;
+        let expected = expected_secs as f64;
+        let tolerance = (expected * 0.03).max(2.0).min(expected * 0.25);
+        if duration < expected - tolerance {
+            return Err(anyhow!("incomplete media: downloaded {duration:.1}s but the player/source reports {expected_secs}s — capture the full master playlist or player page"));
+        }
+    }
+    Ok(())
+}
+
+async fn verify_completed_media(dest: &std::path::Path, shared: &Arc<SharedState>) -> Result<()> {
+    let expected = shared.expected_duration.load(Ordering::SeqCst);
+    let audio = shared.expects_audio.load(Ordering::SeqCst);
+    if expected == 0 && !audio { return Ok(()); }
+    let Some(exe) = ffprobe_path() else {
+        shared.set_note("finished media could not be checked for duration/audio: ffprobe was not found".to_string());
+        return Ok(());
+    };
+    let resolved = mutex_guard(&shared.resolved_name).clone();
+    let actual = resolved.map(|name| dest.with_file_name(name)).unwrap_or_else(|| dest.to_path_buf());
+    let mut cmd = tokio::process::Command::new(exe);
+    cmd.kill_on_drop(true);
+    #[cfg(windows)]
+    cmd.creation_flags(0x08000000);
+    cmd.args(["-v", "error", "-show_entries", "format=duration:stream=codec_type,duration", "-of", "json"])
+        .arg(actual).stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::null());
+    let out = tokio::time::timeout(std::time::Duration::from_secs(20), cmd.output()).await
+        .map_err(|_| anyhow!("finished media verification timed out"))??;
+    if !out.status.success() { return Err(anyhow!("could not inspect the finished media file")); }
+    completed_media_check(&String::from_utf8_lossy(&out.stdout), expected, audio)
+}
+
+fn ffprobe_has_audio(json: &str) -> Result<bool> {
+    let data: serde_json::Value = serde_json::from_str(json)?;
+    let streams = data.get("streams").and_then(|v| v.as_array())
+        .ok_or_else(|| anyhow!("ffprobe returned no stream list"))?;
+    Ok(streams.iter().any(|s| s.get("codec_type").and_then(|v| v.as_str()) == Some("audio")))
+}
+
+async fn verify_vimeo_audio(dest: &std::path::Path) -> Result<()> {
+    // Strict format selection is always active; additionally inspect the
+    // finished file when the ffprobe companion is installed.
+    let Some(exe) = ffprobe_path() else { return Ok(()); };
+    let mut cmd = tokio::process::Command::new(exe);
+    cmd.kill_on_drop(true);
+    #[cfg(windows)]
+    cmd.creation_flags(0x08000000);
+    cmd.args(["-v", "error", "-show_entries", "stream=codec_type", "-of", "json"])
+        .arg(dest).stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::null());
+    let out = tokio::time::timeout(std::time::Duration::from_secs(20), cmd.output()).await
+        .map_err(|_| anyhow!("Vimeo audio verification timed out"))??;
+    if !out.status.success() { return Err(anyhow!("could not verify the downloaded Vimeo audio")); }
+    if !ffprobe_has_audio(&String::from_utf8_lossy(&out.stdout))? {
+        return Err(anyhow!("Vimeo download has no audio track — capture the full master manifest or Vimeo player URL instead of a video-only playlist"));
+    }
+    Ok(())
 }
 
 /// [`ytdlp_format_with`] with the merge capability of this machine.
@@ -4363,6 +4664,20 @@ fn phase_for_line(line: &str) -> Option<&'static str> {
     None
 }
 
+fn valid_ytdlp_output(path: &std::path::Path, dest: &std::path::Path) -> bool {
+    if !path.is_file() || path.file_stem() != dest.file_stem() {
+        return false;
+    }
+    let parent = |p: &std::path::Path| {
+        p.parent()
+            .filter(|p| !p.as_os_str().is_empty())
+            .unwrap_or_else(|| std::path::Path::new("."))
+            .canonicalize()
+            .ok()
+    };
+    matches!((parent(path),parent(dest)),(Some(a),Some(b)) if a==b)
+}
+
 async fn download_with_ytdlp(
     exe: &std::path::Path,
     url: &str,
@@ -4371,14 +4686,17 @@ async fn download_with_ytdlp(
     opts: &EngineOpts,
     shared: &Arc<SharedState>,
 ) -> Result<()> {
+    shared.external_helper.store(true, Ordering::SeqCst);
+    wait_if_paused(shared).await?;
     if let Some(parent) = dest.parent() {
         tokio::fs::create_dir_all(parent).await?;
     }
     // A file already sitting at the destination makes yt-dlp report
     // "already downloaded" and exit without fetching anything.
     let _ = tokio::fs::remove_file(dest).await;
-    let jar = write_cookie_jar(&opts.cookie, cookie_domain(url)).await;
+    let jar = write_cookie_jar(&opts.cookie, &cookie_domain(url)).await?;
     let mut cmd = tokio::process::Command::new(exe);
+    cmd.kill_on_drop(true);
     #[cfg(windows)]
     {
         // No console flash for the helper process.
@@ -4390,6 +4708,11 @@ async fn download_with_ytdlp(
     let merge_ffmpeg = ffmpeg_path();
     cmd.arg("--no-playlist")
         .arg("--no-warnings")
+        .arg("--abort-on-unavailable-fragments")
+        .arg("--no-simulate")
+        .arg("--print")
+        .arg("before_dl:dcinfo@{\"duration\":%(duration)j,\"acodec\":%(acodec)j}")
+        .arg("--print").arg("after_move:dcfile@%(filepath)j")
         .arg("--newline")
         .arg("--progress-template")
         .arg(ytdlp_progress_template())
@@ -4402,20 +4725,28 @@ async fn download_with_ytdlp(
         .arg("--merge-output-format")
         .arg("mp4")
         .arg("-f")
-        .arg(ytdlp_format_with(&opts.quality_pref, merge_ffmpeg.is_some()))
+        .arg(if vimeo_needs_audio(url) || opts.require_audio {
+            audio_required_format(&opts.quality_pref, merge_ffmpeg.is_some())
+        } else {
+            ytdlp_format_with(&opts.quality_pref, merge_ffmpeg.is_some())
+        })
         .arg("-o")
-        .arg(dest);
+        .arg(dest.to_string_lossy().replace('%',"%%"));
+    if vimeo_needs_audio(url) || is_playlist_url(url) || opts.require_audio {
+        // Missing fragments must fail rather than produce a shortened video.
+        cmd.arg("--abort-on-unavailable-fragments");
+    }
     if let Some(ff) = &merge_ffmpeg {
         cmd.arg("--ffmpeg-location").arg(ff);
     }
     // Without a JS runtime yt-dlp cannot solve YouTube's player challenges:
     // extraction fails on many videos and it reports only "The page needs to
     // be reloaded" (reproduced live against this very URL).
-    if let Some(rt) = js_runtime() {
-        cmd.arg("--js-runtimes").arg(rt);
+    if let Some((name,path)) = js_runtime_path() {
+        cmd.arg("--js-runtimes").arg(format!("{name}:{}",path.display()));
     }
     if let Some(jar) = &jar {
-        cmd.arg("--cookies").arg(jar);
+        cmd.arg("--cookies").arg(&jar.0);
     }
     if !opts.referer.trim().is_empty() {
         cmd.arg("--referer").arg(opts.referer.trim());
@@ -4430,7 +4761,11 @@ async fn download_with_ytdlp(
     cmd.stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped());
+    #[cfg(unix)]
+    cmd.process_group(0);
     let mut child = cmd.spawn().map_err(|e| anyhow!("yt-dlp launch: {e}"))?;
+    let process_tree=crate::platform::HelperProcessTree::attach(&child)
+        .map_err(|e|anyhow!("Could not supervise media helper processes: {e}"))?;
     // Nothing is on the wire until the player challenge is solved, so say what
     // is happening instead of showing a motionless 0%.
     shared.set_phase("Getting info");
@@ -4449,7 +4784,23 @@ async fn download_with_ytdlp(
         // folds the finished legs in so the bar keeps moving forward and the
         // size ends up being all legs together.
         let mut folded = MergedProgress::default();
+        let mut final_path=None;
         while let Ok(Some(line)) = lines.next_line().await {
+            if let Some(json)=line.strip_prefix("dcfile@") {
+                final_path=serde_json::from_str::<String>(json).ok().map(PathBuf::from);
+                continue;
+            }
+            if let Some(json) = line.strip_prefix("dcinfo@") {
+                if let Ok(info) = serde_json::from_str::<serde_json::Value>(json) {
+                    if let Some(d) = info.get("duration").and_then(|v| v.as_f64()).filter(|d| d.is_finite() && *d > 0.0 && *d < 86400.0) {
+                        let _ = progress.expected_duration.compare_exchange(0, d.round().max(1.0) as u64, Ordering::SeqCst, Ordering::SeqCst);
+                    }
+                    if info.get("acodec").and_then(|v| v.as_str()).map(|a| !matches!(a, "none" | "NA" | "unknown" | "")).unwrap_or(false) {
+                        progress.expects_audio.store(true, Ordering::SeqCst);
+                    }
+                }
+                continue;
+            }
             let Some(p) = parse_progress_line(&line) else {
                 // Not a progress line: it may still name the stage the run is
                 // in ("[download] Destination:", "[Merger] …").
@@ -4486,6 +4837,7 @@ async fn download_with_ytdlp(
                 progress.speed_bps.store(speed as u64, Ordering::SeqCst);
             }
         }
+        final_path
     });
     let err_task = tokio::spawn(async move {
         let mut kept: std::collections::VecDeque<String> = std::collections::VecDeque::new();
@@ -4512,11 +4864,10 @@ async fn download_with_ytdlp(
             Err(_) => continue,
         }
     };
-    let _ = out_task.await;
+    drop(process_tree);
+    let final_path = out_task.await.unwrap_or(None);
     let err_tail = err_task.await.unwrap_or_default();
-    if let Some(jar) = &jar {
-        let _ = tokio::fs::remove_file(jar).await;
-    }
+    drop(jar);
     let status = finish?;
     if !status.success() {
         // yt-dlp's own words are far more useful than an exit code.
@@ -4536,28 +4887,19 @@ async fn download_with_ytdlp(
         }
         return Err(anyhow!(msg));
     }
-    // It can still land the file under a different container extension.
+    // Postprocessing can change the extension. Only the exact file reported
+    // by this run, with the expected stem and directory, may be promoted.
     if !dest.is_file() {
-        let stem = dest
-            .file_stem()
-            .map(|s| s.to_string_lossy().to_string())
-            .unwrap_or_default();
-        if let Some(dir) = dest.parent() {
-            if let Ok(mut rd) = tokio::fs::read_dir(dir).await {
-                while let Ok(Some(entry)) = rd.next_entry().await {
-                    let name = entry.file_name().to_string_lossy().to_string();
-                    let usable = !name.ends_with(".part") && !name.ends_with(".ytdl");
-                    if usable && name.starts_with(&stem) && entry.path() != *dest {
-                        let _ = tokio::fs::rename(entry.path(), dest).await;
-                        break;
-                    }
-                }
-            }
+        if let Some(path)=final_path.filter(|p| valid_ytdlp_output(p,dest)) {
+            tokio::fs::rename(path,dest).await?;
         }
     }
     let len = tokio::fs::metadata(dest).await.map(|m| m.len()).unwrap_or(0);
     if len == 0 {
         return Err(anyhow!("yt-dlp finished without writing a file"));
+    }
+    if vimeo_needs_audio(url) {
+        verify_vimeo_audio(dest).await?;
     }
     shared.downloaded.store(len, Ordering::SeqCst);
     shared.total.store(len, Ordering::SeqCst);
@@ -4666,6 +5008,18 @@ async fn adaptive_leg(
 /// anything WebM/Opus becomes `.mkv` (same convention download managers use).
 /// Without `audio` this is a plain direct download through the same path.
 pub async fn download_adaptive(
+    video_url: String, audio_url: Option<String>, dest: PathBuf, connections: usize,
+    opts: EngineOpts, shared: Arc<SharedState>,
+) -> Result<()> {
+    if opts.expected_duration_secs > 0 { shared.expected_duration.store(opts.expected_duration_secs, Ordering::SeqCst); }
+    shared.expects_audio.store(opts.require_audio || audio_url.is_some(), Ordering::SeqCst);
+    download_adaptive_inner(video_url, audio_url, dest.clone(), connections, opts, shared.clone()).await?;
+    verify_completed_media(&dest, &shared).await?;
+    cleanup_completed_job(&dest, &shared);
+    Ok(())
+}
+
+async fn download_adaptive_inner(
     video_url: String,
     audio_url: Option<String>,
     mut dest: PathBuf,
@@ -5478,6 +5832,11 @@ pub async fn download_dash(
         })
         .and_then(|d| parse_pt_duration(&d));
     let (videos, audios) = parse_mpd(&xml)?;
+    if let Some(seconds) = mpd_dur.filter(|d| d.is_finite() && *d > 0.0) {
+        let _ = shared.expected_duration.compare_exchange(0, seconds.round().max(1.0) as u64, Ordering::SeqCst, Ordering::SeqCst);
+    }
+    if !audios.is_empty() { shared.expects_audio.store(true, Ordering::SeqCst); }
+
     // Best video = most pixels (fallback: bandwidth); best audio = bandwidth.
     let v = videos
         .iter()
@@ -6693,6 +7052,112 @@ mod tests {
         // An estimate is a size too.
         let mut g = MergedProgress::default();
         assert_eq!(g.step(&line("dcp@5|NA|900|NA")), (5, Some(900)));
+    }
+
+    #[test]
+    fn resume_metadata_is_removed_only_for_completed_files() {
+        let dir = std::env::temp_dir().join(format!("dc-cleanup-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let dest = dir.join("movie.mp4");
+        let meta = resume_meta_path(&dest);
+        std::fs::write(&meta, "resume").unwrap();
+        cleanup_completed_resume(&dest);
+        assert!(meta.exists()); // interrupted, no finished file
+        std::fs::write(&dest, "complete").unwrap();
+        std::fs::write(dest.with_extension("dcpart"), "partial").unwrap();
+        cleanup_completed_resume(&dest);
+        assert!(meta.exists()); // active partial data still needs its binding
+        std::fs::remove_file(dest.with_extension("dcpart")).unwrap();
+        cleanup_completed_resume(&dest);
+        assert!(!meta.exists());
+        assert!(dest.exists());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn general_fragments_need_a_complete_source() {
+        assert!(is_media_fragment("https://cdn.example.org/seg-003.ts"));
+        assert!(is_media_fragment("https://cdn.example.org/part.m4s"));
+        assert!(is_media_fragment("https://cdn.example.org/v.mp4?range=100-200"));
+        assert!(!is_media_fragment("https://cdn.example.org/short.mp4"));
+        assert!(!is_media_fragment("https://cdn.example.org/movie.ts"));
+        assert!(!is_media_fragment("https://cdn.example.org/file.zip?range=100-200"));
+        assert!(fragment_page("https://cdn.example.org/part.m4s", "").is_err());
+        assert_eq!(fragment_page("https://cdn.example.org/part.m4s", "https://example.org/watch/1").unwrap().as_deref(), Some("https://example.org/watch/1"));
+        assert_eq!(cookie_domain("https://player.example.org/watch/1"), ".player.example.org");
+    }
+
+    #[test]
+    fn generic_hls_separate_audio_is_detected_from_manifest_evidence() {
+        assert!(hls_external_audio("#EXTM3U\n#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID=\"a\",URI=\"audio.m3u8\"\n"));
+        assert!(!hls_external_audio("#EXTM3U\n#EXT-X-MEDIA:TYPE=SUBTITLES,URI=\"subs.m3u8\"\n"));
+        assert!(!hls_external_audio("#EXTM3U\n#EXTINF:2,\nseg0.ts\n#EXT-X-ENDLIST\n"));
+    }
+
+    #[test]
+    fn completed_duration_checks_allow_short_and_silent_sources() {
+        let silent = r#"{"format":{"duration":"3.0"},"streams":[{"codec_type":"video"}]}"#;
+        assert!(completed_media_check(silent, 3, false).is_ok());
+        assert!(completed_media_check(silent, 0, false).is_ok());
+        assert!(completed_media_check(silent, 2700, false).unwrap_err().to_string().contains("incomplete media"));
+        assert!(completed_media_check(silent, 3, true).unwrap_err().to_string().contains("no audio"));
+        let sound = r#"{"format":{"duration":"2699.5"},"streams":[{"codec_type":"video"},{"codec_type":"audio"}]}"#;
+        assert!(completed_media_check(sound, 2700, true).is_ok());
+        assert!(completed_media_check(r#"{"streams":[]}"#, 2700, false).is_err());
+    }
+
+    #[test]
+    fn vimeo_manifests_bypass_video_only_hls_concat() {
+        let manifest = "https://vod-adaptive-ak.vimeocdn.com/video/master.m3u8?token=signed";
+        let player = "https://player.vimeo.com/video/123?h=unlisted";
+        assert_eq!(vimeo_download_target(manifest, player).unwrap().as_deref(), Some(player));
+        assert_eq!(vimeo_download_target(manifest, "https://example.com/watch").unwrap().as_deref(), Some(manifest));
+        assert!(vimeo_download_target("https://vod-adaptive-ak.vimeocdn.com/video.mp4", "").is_err());
+        assert_eq!(vimeo_download_target("https://vod.vimeocdn.com/full.mp4", "").unwrap(), None);
+        assert!(!vimeo_needs_audio("https://vimeocdn.com.evil.test/master.m3u8"));
+    }
+
+    #[test]
+    fn vimeo_format_selection_requires_audio() {
+        assert_eq!(audio_required_format("", true), "bv+ba[ext=m4a]/bv+ba/b[acodec!=none]");
+        assert_eq!(audio_required_format("", false), "b[acodec!=none]");
+        assert!(audio_required_format("720p", true).contains("bv[height<=720]+ba"));
+        assert!(audio_required_format("720p", false).contains("[acodec!=none]"));
+    }
+
+    #[test]
+    fn vimeo_finished_file_must_have_an_audio_track() {
+        assert!(ffprobe_has_audio(r#"{"streams":[{"codec_type":"video"},{"codec_type":"audio"}]}"#).unwrap());
+        assert!(!ffprobe_has_audio(r#"{"streams":[{"codec_type":"video"}]}"#).unwrap());
+        assert!(!ffprobe_has_audio(r#"{"streams":[]}"#).unwrap());
+        assert!(ffprobe_has_audio("invalid").is_err());
+    }
+
+    #[test]
+    fn vimeo_range_captures_are_not_full_files() {
+        assert!(is_vimeo_fragment("https://vod-adaptive-ak.vimeocdn.com/v2/range/prot/token/avf/v.mp4?range=3938712-4982381"));
+        assert!(is_vimeo_fragment("https://vod.vimeocdn.com/v2/range/prot/token/v.mp4"));
+        assert!(is_vimeo_fragment("https://vod.vimeocdn.com/v.mp4?range=0-99"));
+        assert!(!is_vimeo_fragment("https://vod.vimeocdn.com/full.mp4"));
+        assert!(!is_vimeo_fragment("https://vimeocdn.com.evil.test/v2/range/v.mp4"));
+        assert!(is_vimeo_video_page("https://player.vimeo.com/video/123?h=secret"));
+        assert!(is_vimeo_video_page("https://vimeo.com/123/secret"));
+        assert!(!is_vimeo_video_page("https://vimeo.com/user123"));
+        assert!(!is_vimeo_video_page("https://vimeo.com/"));
+        assert!(!is_vimeo_video_page("ftp://vimeo.com/123"));
+        assert_eq!(cookie_domain("https://player.vimeo.com/video/123?h=secret"), ".vimeo.com");
+    }
+
+    #[tokio::test]
+    async fn vimeo_fragment_without_player_fails_before_transfer() {
+        let shared = Arc::new(SharedState::new());
+        let result = download(
+            "https://vod.vimeocdn.com/v2/range/prot/token/v.mp4?range=0-99".to_string(),
+            std::env::temp_dir().join("downloadcraft-vimeo-fragment-guard.mp4"),
+            1, EngineOpts::default(), shared.clone(),
+        ).await;
+        assert!(result.unwrap_err().to_string().contains("playback fragment"));
+        assert_eq!(shared.downloaded.load(Ordering::SeqCst), 0);
     }
 
     #[test]
@@ -8119,9 +8584,12 @@ mod tests {
         assert!(is_youtube_page("https://youtu.be/x"));
         assert!(!is_youtube_page("https://vimeo.com/1"));
 
+        // These assembly fixtures contain deterministic random bytes, not
+        // playable media. Exercise the transfer/assembly layer directly;
+        // completed-media validation has separate real-file regressions.
         // 7. HLS plain VOD: master → best variant → parallel segments → exact.
         let dest = dir.join("hls.bin");
-        download(
+        download_inner(
             format!("{base}/hls/pl.m3u8"),
             dest.clone(),
             6,
@@ -8134,7 +8602,7 @@ mod tests {
 
         // 8. HLS AES-128: key fetch + per-segment decrypt → exact.
         let dest = dir.join("hlsaes.bin");
-        download(
+        download_inner(
             format!("{base}/hls-enc/pl.m3u8"),
             dest.clone(),
             6,
@@ -8147,7 +8615,7 @@ mod tests {
 
         // 8b. HLS key rotation (P3): s0/s1 under k1, s2 under k2+IV.
         let dest = dir.join("hlsrot.bin");
-        download(
+        download_inner(
             format!("{base}/hls-rot/pl.m3u8"),
             dest.clone(),
             6,
@@ -8160,7 +8628,7 @@ mod tests {
 
         // 8c. HLS EXT-X-MAP (P3): init section leads the assembled file.
         let dest = dir.join("hlsmap.bin");
-        download(
+        download_inner(
             format!("{base}/hls-map/pl.m3u8"),
             dest.clone(),
             6,
@@ -8176,7 +8644,7 @@ mod tests {
 
         // 9. DASH video-only manifest → assembled track delivered.
         let dest = dir.join("dashv.bin");
-        download(
+        download_inner(
             format!("{base}/dash/vonly.mpd"),
             dest.clone(),
             4,
@@ -8190,7 +8658,7 @@ mod tests {
         // 9b. DASH SegmentTemplate (init + 3 media segments): parallel
         // fetch with strictly ordered assembly (init must lead).
         let dest = dir.join("dashtpl.bin");
-        download(
+        download_inner(
             format!("{base}/dash/tpl.mpd"),
             dest.clone(),
             6,
@@ -8206,7 +8674,7 @@ mod tests {
         // 9c. DASH SegmentTimeline (`r="2"` → 3 segments, no MPD duration):
         // count comes from the timeline, assembly identical to 9b.
         let dest = dir.join("dashtl.bin");
-        download(
+        download_inner(
             format!("{base}/dash/tl.mpd"),
             dest.clone(),
             6,
@@ -8249,5 +8717,130 @@ mod tests {
 
         srv.abort();
         std::fs::remove_dir_all(&dir).ok();
+    }
+}
+
+#[cfg(test)]
+mod platform_helper_tests {
+    use super::*;
+    #[test]
+    fn supported_runtime_versions_are_not_just_executable_names(){
+        assert!(runtime_version_supported("node","v22.0.0"));
+        assert!(!runtime_version_supported("node","v18.20.0"));
+        assert!(runtime_version_supported("deno","deno 2.3.0"));
+        assert!(!runtime_version_supported("deno","deno 2.2.9"));
+        assert!(!runtime_version_supported("node","unrecognized"));
+    }
+    #[test]
+    fn helper_status_and_download_selection_use_the_same_precedence(){
+        let system=Some(PathBuf::from("system"));let local=Some(PathBuf::from("managed"));let custom=Some(PathBuf::from("custom"));
+        assert_eq!(select_ytdlp(YtdlpSource::Managed,system.clone(),None,None),(None,false));
+        assert_eq!(select_ytdlp(YtdlpSource::Managed,system.clone(),None,local.clone()),(local.clone(),true));
+        assert_eq!(select_ytdlp(YtdlpSource::Custom,system.clone(),custom.clone(),local.clone()),(custom,false));
+        assert_eq!(select_ytdlp(YtdlpSource::Custom,system.clone(),None,local.clone()),(local.clone(),true));
+        assert_eq!(select_ytdlp(YtdlpSource::Path,system.clone(),None,local.clone()),(system,false));
+        assert_eq!(select_ytdlp(YtdlpSource::Path,None,None,local.clone()),(local,true));
+    }
+}
+
+#[cfg(test)]
+mod audit_cookie_tests {
+    use super::*;
+    #[tokio::test]
+    async fn audit_concurrent_cookie_jars_are_independent_and_private() {
+        let a=write_cookie_jar("session=secret", ".example.com").await.unwrap().unwrap();
+        let b=write_cookie_jar("session=secret", ".example.com").await.unwrap().unwrap();
+        assert_ne!(a.0,b.0,"same-site jobs must not share a credential file");
+        #[cfg(unix)] {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(std::fs::metadata(&a.0).unwrap().permissions().mode() & 0o777, 0o600);
+        }
+        drop(a);
+        assert!(b.0.is_file(),"finishing one job must not remove another job's cookies");
+        let path=b.0.clone();
+        drop(b);
+        assert!(!path.exists());
+    }
+}
+
+#[cfg(all(test, unix))]
+mod audit_helper_tests {
+    use super::*;
+    use std::os::unix::fs::PermissionsExt;
+    static NEXT: AtomicU64=AtomicU64::new(0);
+    struct Temp(PathBuf);
+    impl Temp {
+        fn new() -> Self {
+            let p=std::env::temp_dir().join(format!("dc-helper-test-{}-{}",std::process::id(),NEXT.fetch_add(1,Ordering::Relaxed)));
+            std::fs::create_dir_all(&p).unwrap();Self(p)
+        }
+        fn script(&self,body:&str) -> PathBuf {
+            let p=self.0.join("helper.py");
+            std::fs::write(&p,format!("#!/usr/bin/env python3\n{body}\n")).unwrap();
+            std::fs::set_permissions(&p,std::fs::Permissions::from_mode(0o700)).unwrap();p
+        }
+    }
+    impl Drop for Temp { fn drop(&mut self) {let _=std::fs::remove_dir_all(&self.0);} }
+    #[tokio::test]
+    async fn exact_reported_output_is_used_and_neighboring_files_are_untouched() {
+        let temp=Temp::new();let dest=temp.0.join("clip.mp4");
+        let neighbor=temp.0.join("clip-notes.txt");std::fs::write(&neighbor,b"keep me").unwrap();
+        let exe=temp.script("import sys,pathlib,json\np=pathlib.Path(sys.argv[sys.argv.index('-o')+1]).with_suffix('.mkv')\np.write_bytes(b'video bytes')\nprint('dcfile@'+json.dumps(str(p)))");
+        download_with_ytdlp(&exe,"https://example.com/media",&dest,1,&EngineOpts::default(),&Arc::new(SharedState::new())).await.unwrap();
+        assert_eq!(std::fs::read(&dest).unwrap(),b"video bytes");
+        assert_eq!(std::fs::read(&neighbor).unwrap(),b"keep me");
+        std::fs::remove_file(&dest).unwrap();
+        let exe=temp.script("import sys,pathlib,json\np=pathlib.Path(sys.argv[sys.argv.index('-o')+1]).with_name('clip-notes.txt')\nprint('dcfile@'+json.dumps(str(p)))");
+        assert!(download_with_ytdlp(&exe,"https://example.com/media",&dest,1,&EngineOpts::default(),&Arc::new(SharedState::new())).await.is_err());
+        assert!(!dest.exists());assert_eq!(std::fs::read(&neighbor).unwrap(),b"keep me");
+    }
+    #[tokio::test]
+    async fn aborting_a_download_kills_the_child_and_removes_private_cookies() {
+        let temp=Temp::new();let pidfile=temp.0.join("pid");let jarfile=temp.0.join("jar-path");
+        let exe=temp.script(&format!("import sys,pathlib,os,time\npathlib.Path({:?}).write_text(str(os.getpid()))\npathlib.Path({:?}).write_text(sys.argv[sys.argv.index('--cookies')+1])\ntime.sleep(60)",pidfile.to_str().unwrap(),jarfile.to_str().unwrap()));
+        let childfile=temp.0.join("child-pid");
+        let body=std::fs::read_to_string(&exe).unwrap().replace("time.sleep(60)",
+            &format!("import subprocess\nchild=subprocess.Popen([sys.executable,'-c','import time;time.sleep(60)'])\npathlib.Path({:?}).write_text(str(child.pid))\ntime.sleep(60)",childfile.to_str().unwrap()));
+        std::fs::write(&exe,body).unwrap();
+        let dest=temp.0.join("video.mp4");
+        let shared=Arc::new(SharedState::new());let state=shared.clone();
+        let task=tokio::spawn(async move {
+            let opts=EngineOpts{cookie:"session=secret".into(),..EngineOpts::default()};
+            download_with_ytdlp(&exe,"https://example.com/media",&dest,1,&opts,&state).await
+        });
+        for _ in 0..200 {
+            if childfile.is_file() {break;}
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+        assert!(childfile.is_file(),"mock helper and merger must launch");
+        assert!(shared.external_helper.load(Ordering::SeqCst));
+        let childpid=std::fs::read_to_string(&childfile).unwrap();
+        let pid=std::fs::read_to_string(&pidfile).unwrap();
+        let jar=PathBuf::from(std::fs::read_to_string(&jarfile).unwrap());assert!(jar.is_file());
+        task.abort();let _=task.await;
+        assert!(!jar.exists(),"abort must remove credentials");
+        let mut gone=false;
+        for _ in 0..100 {
+            let status=std::process::Command::new("kill").args(["-0",pid.trim()]).stderr(std::process::Stdio::null()).status().unwrap();
+            if !status.success() {gone=true;break;}
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert!(gone,"aborted helper must not keep downloading");
+        let mut child_stopped=false;
+        for _ in 0..100 {
+            let out=std::process::Command::new("ps").args(["-o","stat=","-p",childpid.trim()]).output().unwrap();
+            let state=String::from_utf8_lossy(&out.stdout);
+            if state.trim().is_empty() || state.trim().starts_with('Z') {child_stopped=true;break;}
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert!(child_stopped,"an aborted helper's merger must stop too");
+    }
+    #[test]
+    fn browser_platform_hint_matches_the_configured_user_agent() {
+        for (ua,want) in [("Mozilla Macintosh Chrome/126.0","macOS"),("Mozilla X11 Linux Chrome/126.0","Linux"),("Mozilla Windows Chrome/126.0","Windows")] {
+            let opts=EngineOpts{user_agent:ua.into(),..EngineOpts::default()};
+            let req=opts.get(&reqwest::Client::new(),"https://example.com").build().unwrap();
+            assert_eq!(req.headers().get("sec-ch-ua-platform").unwrap(),&format!("\"{want}\""));
+        }
     }
 }

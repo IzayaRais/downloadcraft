@@ -11,6 +11,8 @@ chrome.runtime.sendMessage({ type: "getState" }, (res) => {
     return;
   }
   $("auto").checked = !!res.autoCapture;
+  $("hideUI").checked = !!res.hideBrowserUI;
+  $("hideUI").disabled = !(res.downloadUI && res.downloadUI.supported);
   if (res.minSizeKB !== undefined) $("minSize").value = String(res.minSizeKB);
   if (typeof res.blockHosts === "string") $("block").value = res.blockHosts;
   if (res.fallbackError) {
@@ -23,6 +25,12 @@ chrome.runtime.sendMessage({ type: "getState" }, (res) => {
 
 $("auto").onchange = () => {
   chrome.runtime.sendMessage({ type: "setAuto", value: $("auto").checked });
+};
+
+$("hideUI").onchange = () => {
+  chrome.runtime.sendMessage({type:"setBrowserUI",value:$("hideUI").checked}, res => {
+    $("status").textContent = res && res.ok ? "Browser download UI preference saved" : "This browser could not change its download UI.";
+  });
 };
 
 $("saveFilters").onclick = () => {
@@ -235,6 +243,7 @@ function renderLinks(list, links, net, pageUrl, pageTitle) {
       return true;
     })
     .map((n) => ({ ...n, _score: R ? R.scoreMedia(n, { hasPlaylist }) : 0 }))
+    .filter((n) => n._score >= 0)
     .sort((a, b) => b._score - a._score);
   const sizeJobs = [];
   // IDM-style sizes on network rows (measured in-tab, best-effort).
@@ -355,3 +364,13 @@ async function activeTab() {
     }
   );
 })();
+
+$("restoreVideoButtons").onclick = async () => {
+  try {
+    const [tab]=await api.tabs.query({active:true,currentWindow:true});
+    if(!tab || !tab.id)throw new Error("No active page");
+    // Omit frameId so embedded Vimeo and other players receive it too.
+    await api.tabs.sendMessage(tab.id,{type:"restoreVideoButtons"});
+    $("status").textContent="Video download buttons restored.";
+  } catch(e) { $("status").textContent="Reload this page, then try again."; }
+};

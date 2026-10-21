@@ -1,0 +1,82 @@
+name: Desktop packages
+on:
+  workflow_dispatch:
+  pull_request:
+  push:
+    branches: [main, master]
+jobs:
+  linux:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: sudo apt-get update && sudo apt-get install -y pkg-config libx11-dev libxi-dev libxcursor-dev libxrandr-dev libgl1-mesa-dev libdbus-1-dev libxkbcommon-dev rpm squashfs-tools
+      - run: pip install cargo-zigbuild ziglang==0.17.0
+      - run: node --test browser-extension/*.test.js
+      - run: cargo test --locked --release
+      - run: cargo zigbuild --locked --release --target x86_64-unknown-linux-gnu.2.28
+      - name: Package DEB, RPM and AppImage
+        run: |
+          curl -fL https://github.com/AppImage/type2-runtime/releases/download/continuous/runtime-x86_64 -o /tmp/runtime-x86_64
+          python scripts/package_linux.py --binary target/x86_64-unknown-linux-gnu/release/download_craft --runtime /tmp/runtime-x86_64
+          for image in dist/DownloadCraft-*-x86_64.AppImage; do "$image" --appimage-extract-and-run --version; done
+      - uses: actions/upload-artifact@v4
+        with:
+          name: DownloadCraft-Linux
+          path: dist/*
+  macos:
+    runs-on: macos-14
+    env:
+      MACOSX_DEPLOYMENT_TARGET: '12.0'
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin,x86_64-apple-darwin
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: node --test browser-extension/*.test.js
+      - run: cargo test --locked --release
+      - run: cargo build --locked --release --target aarch64-apple-darwin --target x86_64-apple-darwin
+      - run: lipo -create target/aarch64-apple-darwin/release/download_craft target/x86_64-apple-darwin/release/download_craft -output /tmp/download_craft
+      - run: python scripts/package.py --platform macos --arch Universal --binary /tmp/download_craft
+      - uses: actions/upload-artifact@v4
+        with:
+          name: DownloadCraft-macOS
+          path: dist/*.zip
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Windows resource compiler
+        shell: pwsh
+        run: |
+          choco install mingw --no-progress -y
+          $resource = Get-ChildItem C:\ProgramData\chocolatey\lib\mingw -Filter windres.exe -Recurse | Select-Object -First 1
+          if ($resource) { "WINDRES=$($resource.FullName)" >> $env:GITHUB_ENV }
+      - run: node --test browser-extension/*.test.js
+        shell: bash
+      - run: cargo test --locked --release
+      - run: cargo build --locked --release
+      - run: python scripts/package.py --platform windows --arch x64
+      - uses: actions/upload-artifact@v4
+        with:
+          name: DownloadCraft-Windows
+          path: dist/*.zip

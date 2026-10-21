@@ -1,0 +1,101 @@
+//! Portable alternative to Windows' off-screen tray parking. The normal
+//! taskbar/Dock window remains the primary surface on Linux and macOS.
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Mutex;
+static CONTEXT: Mutex<Option<egui::Context>> = Mutex::new(None);
+static SHOW: AtomicBool = AtomicBool::new(false);
+static QUIT: AtomicBool = AtomicBool::new(false);
+static QUITTING: AtomicBool = AtomicBool::new(false);
+static STARTED: AtomicBool = AtomicBool::new(false);
+fn show_file() -> Option<std::path::PathBuf> {
+    crate::model::config_dir().map(|d| d.join("show.request"))
+}
+pub fn set_context(ctx: &egui::Context) {
+    if let Ok(mut c) = CONTEXT.lock() {
+        *c = Some(ctx.clone());
+    }
+}
+fn context() -> Option<egui::Context> {
+    CONTEXT.lock().ok().and_then(|c| c.clone())
+}
+pub fn claim_main_instance() -> Option<std::fs::File> {
+    match crate::model::claim_window("main") {
+        Some(f) => {
+            start_keepalive();
+            Some(f)
+        }
+        None => {
+            if let Some(p) = show_file() {
+                let _ = std::fs::write(p, b"show");
+            }
+            None
+        }
+    }
+}
+pub fn request_show() {
+    SHOW.store(true, Ordering::SeqCst);
+    nudge_paint();
+}
+pub fn take_show_request() -> bool {
+    SHOW.swap(false, Ordering::SeqCst)
+}
+pub fn set_hwnd(_: isize) {}
+pub fn is_parked() -> bool {
+    false
+}
+pub fn quitting() -> bool {
+    QUITTING.load(Ordering::SeqCst)
+}
+pub fn take_quit() -> bool {
+    QUIT.swap(false, Ordering::SeqCst)
+}
+pub fn frame_tick() {}
+pub fn nudge_paint() {
+    if let Some(c) = context() {
+        c.request_repaint();
+    }
+}
+pub fn start_keepalive() {
+    if STARTED.swap(true, Ordering::SeqCst) {
+        return;
+    }
+    std::thread::spawn(|| {
+        while !quitting() {
+            if let Some(p) = show_file() {
+                if p.exists() {
+                    let _ = std::fs::remove_file(p);
+                    request_show();
+                }
+            }
+            nudge_paint();
+            std::thread::sleep(std::time::Duration::from_millis(250));
+        }
+    });
+}
+pub fn park() {
+    if let Some(c) = context() {
+        c.send_viewport_cmd(egui::ViewportCommand::Minimized(true));
+    }
+}
+pub fn show() {
+    if let Some(c) = context() {
+        c.send_viewport_cmd(egui::ViewportCommand::Visible(true));
+        c.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
+        c.send_viewport_cmd(egui::ViewportCommand::Focus);
+        c.request_repaint();
+    }
+}
+// Portable windows are never parked off screen. Called every frame.
+pub fn restore() {}
+pub fn request_quit() {
+    QUITTING.store(true, Ordering::SeqCst);
+    QUIT.store(true, Ordering::SeqCst);
+    nudge_paint();
+}
+pub fn install_menu_handler() {}
+pub fn tooltip() -> &'static str {
+    "Download Craft"
+}
+pub fn set_titlebar_dark(_: bool) {}
+pub fn set_titlebar_color(_: (u8, u8, u8)) {}
+pub fn refresh_titlebar() {}
