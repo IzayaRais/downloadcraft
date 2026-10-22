@@ -683,6 +683,10 @@ mod win32 {
         pub fn SwitchToThisWindow(hwnd: isize, alt_tab: i32);
         pub fn GetWindowRect(hwnd: isize, rect: *mut Rect) -> i32;
         pub fn FindWindowW(class_name: *const u16, window_name: *const u16) -> isize;
+        pub fn SetWindowCompositionAttribute(
+            hwnd: isize,
+            data: *mut WindowCompositionAttribData,
+        ) -> i32;
     }
 
     #[link(name = "dwmapi")]
@@ -701,10 +705,6 @@ mod win32 {
             hwnd: isize,
             sub_app_name: *const u16,
             sub_id_list: *const u16,
-        ) -> i32;
-        pub fn SetWindowCompositionAttribute(
-            hwnd: isize,
-            data: *mut WindowCompositionAttribData,
         ) -> i32;
     }
 
