@@ -16,26 +16,20 @@ fn main() {
     println!("cargo:rerun-if-changed=build.rs");
     println!("cargo:rerun-if-changed=assets/icon.ico");
     println!("cargo:rerun-if-changed=Cargo.toml");
+    println!("cargo:rerun-if-changed=VERSION");
 
-    #[cfg(windows)]
-    if let Err(e) = windows_resources() {
-        println!("cargo:warning=windows resources not embedded: {e}");
+    if std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("windows") {
+        if let Err(e) = windows_resources() { println!("cargo:warning=windows resources not embedded: {e}"); }
     }
 }
 
-/// `<space-free dir>` holding the generated .rc/.ico and the compiled object.
-#[cfg(windows)]
+/// Cargo's per-target output directory holds the generated .rc/.ico/object.
 fn scratch_dir() -> Result<PathBuf, String> {
-    let dir = std::env::temp_dir().join("download_craft_res");
-    if dir.to_string_lossy().contains(' ') {
-        // The whole point of the scratch dir is a space-free path.
-        return Err(format!("temp dir has a space in it: {}", dir.display()));
-    }
+    let dir = PathBuf::from(std::env::var("OUT_DIR").map_err(|_| "OUT_DIR is unset")?);
     std::fs::create_dir_all(&dir).map_err(|e| format!("{}: {e}", dir.display()))?;
     Ok(dir)
 }
 
-#[cfg(windows)]
 fn windows_resources() -> Result<(), String> {
     let manifest = PathBuf::from(
         std::env::var("CARGO_MANIFEST_DIR").map_err(|_| "CARGO_MANIFEST_DIR is unset")?,
@@ -45,7 +39,7 @@ fn windows_resources() -> Result<(), String> {
         return Err(format!("{} is missing", ico.display()));
     }
 
-    let version = std::env::var("CARGO_PKG_VERSION").unwrap_or_else(|_| "0.0.0".into());
+    let version = include_str!("VERSION").trim();
     let mut nums = [0u32; 4];
     for (i, part) in version.split('.').take(4).enumerate() {
         nums[i] = part
@@ -114,7 +108,6 @@ VALUE "Translation", 0x0, 0x04b0
 }
 
 /// `windres` from the environment, then `PATH`, then a rustup GNU toolchain.
-#[cfg(windows)]
 fn find_windres() -> Result<PathBuf, String> {
     if let Ok(explicit) = std::env::var("WINDRES") {
         let path = Path::new(&explicit);

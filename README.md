@@ -1,3 +1,5 @@
+> Development builds: see [portable build and browser handoff instructions](PORTABLE-BUILDS.md) for the Windows-first Linux/macOS port and updated Brave extension.
+
 # Download Craft
 
 ![Download Craft main window](docs/screenshot-main-window.png)

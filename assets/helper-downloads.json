@@ -1,0 +1,34 @@
+{
+  "ffmpeg-linux-x64": {
+    "url": "https://github.com/descriptinc/ffmpeg-ffprobe-static/releases/download/b7.1.0-rc.1/ffmpeg-linux-x64",
+    "sha256": "9011e412b63928c4b4a35fedb15c689e94719359d00c461b2bb5e8d02599bb5d"
+  },
+  "ffprobe-linux-x64": {
+    "url": "https://github.com/descriptinc/ffmpeg-ffprobe-static/releases/download/b7.1.0-rc.1/ffprobe-linux-x64",
+    "sha256": "74f18f3728e3aed5c3b06e102c2126192bcdf69858d2f29a2bc7fd728b34cb7e"
+  },
+  "ffmpeg-linux-arm64": {
+    "url": "https://github.com/descriptinc/ffmpeg-ffprobe-static/releases/download/b7.1.0-rc.1/ffmpeg-linux-arm64",
+    "sha256": "6445302f6633da63792a1a6de375dfa8c3612ce2c963a98b642d2a2f3218450b"
+  },
+  "ffprobe-linux-arm64": {
+    "url": "https://github.com/descriptinc/ffmpeg-ffprobe-static/releases/download/b7.1.0-rc.1/ffprobe-linux-arm64",
+    "sha256": "a428fea7933cc5f3414bdb670df73c668d39eb6904926b3a7480bb2918193705"
+  },
+  "ffmpeg-darwin-x64": {
+    "url": "https://github.com/descriptinc/ffmpeg-ffprobe-static/releases/download/b7.1.0-rc.1/ffmpeg-darwin-x64",
+    "sha256": "4a4a968b98859588e98500ae25973d80a5ca5eed0724222b9f76360dcb72a001"
+  },
+  "ffprobe-darwin-x64": {
+    "url": "https://github.com/descriptinc/ffmpeg-ffprobe-static/releases/download/b7.1.0-rc.1/ffprobe-darwin-x64",
+    "sha256": "ce5414269f0efa1e88b5e23b57f801d5b9a40be554716544936e0332b4601a62"
+  },
+  "ffmpeg-darwin-arm64": {
+    "url": "https://github.com/descriptinc/ffmpeg-ffprobe-static/releases/download/b7.1.0-rc.1/ffmpeg-darwin-arm64",
+    "sha256": "6d175a4743ca50256e89a8cdd731100f9cee33bd79aeea46894d209410dc6617"
+  },
+  "ffprobe-darwin-arm64": {
+    "url": "https://github.com/descriptinc/ffmpeg-ffprobe-static/releases/download/b7.1.0-rc.1/ffprobe-darwin-arm64",
+    "sha256": "df2684842eca145bd72f4724ce9cecbf38558a4d64b2aef7846680f877702baa"
+  }
+}

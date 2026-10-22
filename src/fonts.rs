@@ -67,12 +67,19 @@ pub(crate) const SYSTEM_FONTS: &[(&str, &str, u32)] = &[
     ("seguisym", "seguisym.ttf", 0),
 ];
 
-#[cfg(not(windows))]
-const SYSTEM_FONTS: &[(&str, &str, u32)] = &[];
+#[cfg(target_os = "macos")]
+pub(crate) const SYSTEM_FONTS: &[(&str, &str, u32)] = &[
+    ("arabic", "GeezaPro.ttc", 0), ("devanagari", "KohinoorDevanagari.ttc", 0),
+    ("bengali", "KohinoorBangla.ttc", 0), ("cjk", "PingFang.ttc", 0),
+];
+#[cfg(all(unix, not(target_os = "macos")))]
+pub(crate) const SYSTEM_FONTS: &[(&str, &str, u32)] = &[
+    ("arabic", "NotoSansArabic-Regular.ttf", 0), ("devanagari", "NotoSansDevanagari-Regular.ttf", 0),
+    ("bengali", "NotoSansBengali-Regular.ttf", 0), ("thai", "NotoSansThai-Regular.ttf", 0),
+    ("cjk", "NotoSansCJK-Regular.ttc", 0),
+];
 
-/// Where the OS keeps its fonts. Windows is the only platform this app ships
-/// for (it embeds Windows resources, drives Explorer and the tray), but the
-/// lookup is written so a missing directory is simply a no-op.
+/// Where the OS keeps its fonts. Missing optional fonts are skipped.
 #[cfg(windows)]
 pub(crate) fn font_dirs() -> Vec<std::path::PathBuf> {
     let mut dirs = Vec::new();
@@ -92,6 +99,19 @@ pub(crate) fn font_dirs() -> Vec<std::path::PathBuf> {
     dirs
 }
 
+#[cfg(target_os = "macos")]
+pub(crate) fn font_dirs() -> Vec<std::path::PathBuf> {
+    let mut paths = vec!["/System/Library/Fonts".into(), "/System/Library/Fonts/Supplemental".into(), "/Library/Fonts".into()];
+    if let Some(h) = dirs::home_dir() { paths.insert(0, h.join("Library/Fonts")); }
+    paths
+}
+#[cfg(all(unix, not(target_os = "macos")))]
+pub(crate) fn font_dirs() -> Vec<std::path::PathBuf> {
+    let mut paths = vec!["/usr/share/fonts/truetype/noto".into(), "/usr/share/fonts/opentype/noto".into(), "/usr/share/fonts/truetype/dejavu".into(), "/usr/local/share/fonts".into()];
+    if let Some(h) = dirs::home_dir() { paths.insert(0, h.join(".local/share/fonts")); paths.push(h.join(".fonts")); }
+    paths
+}
+
 /// Read one system font and register it under `key`.
 ///
 /// Returns whether it was registered. epaint *panics* on a font it cannot
@@ -104,12 +124,6 @@ fn load_system(
     file: &str,
     index: u32,
 ) -> bool {
-    #[cfg(not(windows))]
-    {
-        let _ = (fonts, key, file, index);
-        false
-    }
-    #[cfg(windows)]
     {
         let bytes = font_dirs()
             .into_iter()
@@ -141,8 +155,9 @@ pub fn install(cc: &eframe::CreationContext<'_>, primary: bool) {
             "../assets/fonts/MaterialIcons-Regular.ttf"
         ))),
     );
-    let has_reg = load_system(&mut fonts, "segoe", "segoeui.ttf", 0);
-    let has_semi = load_system(&mut fonts, "segoe_semi", "seguisb.ttf", 0);
+    let has_reg = load_system(&mut fonts, "segoe", if cfg!(windows) { "segoeui.ttf" } else if cfg!(target_os="macos") { "Helvetica.ttc" } else { "DejaVuSans.ttf" }, 0);
+    let has_semi = load_system(&mut fonts, "segoe_semi", if cfg!(windows) { "seguisb.ttf" } else if cfg!(target_os="macos") { "Helvetica.ttc" } else { "DejaVuSans-Bold.ttf" }, 0);
+    fonts.font_data.insert("bundled-bengali".into(), std::sync::Arc::new(egui::FontData::from_static(include_bytes!("../assets/fonts/NotoSansBengali.ttf"))));
     // Script fallbacks, in the order they are consulted. Segoe UI leads: it
     // covers Greek, Cyrillic, Arabic, Hebrew and the wider Latin ranges.
     let mut fallbacks: Vec<String> = Vec::new();
@@ -154,6 +169,7 @@ pub fn install(cc: &eframe::CreationContext<'_>, primary: bool) {
             fallbacks.push(key.to_owned());
         }
     }
+    fallbacks.push("bundled-bengali".into());
     {
         let prop = fonts
             .families

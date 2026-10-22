@@ -20,7 +20,13 @@ mod native_host;
 mod progress;
 mod settings;
 mod shaped;
+#[cfg(windows)]
 mod tray;
+#[cfg(not(windows))]
+#[path="tray_portable.rs"]
+mod tray;
+mod platform;
+mod helpers;
 
 use app::CraftApp;
 use clap::Parser;
@@ -45,6 +51,7 @@ fn install_panic_hook() {
 fn main() -> eframe::Result<()> {
     // Migrate legacy `idm_rust` config (queue/settings/inbox) forward.
     model::migrate_config();
+    if let Err(e)=model::secure_config_directory() { eprintln!("Could not protect application state directory: {e}"); }
     install_panic_hook();
     // Native-messaging host mode for the browser extension:
     // launched by Chrome/Edge/Firefox, speaks length-prefixed JSON on stdio.

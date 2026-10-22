@@ -11,7 +11,8 @@
     "scripting",
     "tabs",
     "cookies",
-    "webRequest"
+    "webRequest",
+    "webRequestBlocking"
   ],
   "host_permissions": [
     "http://*/*",

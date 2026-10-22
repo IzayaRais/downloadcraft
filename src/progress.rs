@@ -114,6 +114,7 @@ fn read_ui_prefs() -> (String, String) {
 fn send_cmd_kv(action: &str, k: &str, v: serde_json::Value) {
     let Some(p) = cmd_path() else { return };
     let _guard = crate::model::fs_lock("cmd");
+    if !_guard.owned() { return; }
     let mut val: serde_json::Value = std::fs::read_to_string(&p)
         .ok()
         .and_then(|s| serde_json::from_str(&s).ok())
@@ -137,6 +138,7 @@ fn send_cmd_kv(action: &str, k: &str, v: serde_json::Value) {
 fn send_cmd(id: u64, action: &str) {
     let Some(p) = cmd_path() else { return };
     let _guard = crate::model::fs_lock("cmd");
+    if !_guard.owned() { return; }
     let mut v: serde_json::Value = std::fs::read_to_string(&p)
         .ok()
         .and_then(|s| serde_json::from_str(&s).ok())

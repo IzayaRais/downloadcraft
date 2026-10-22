@@ -1,3 +1,7 @@
 /target
 *.zip
 *.xpi
+/target-*/
+/dist/
+__pycache__/
+*.pyc

@@ -1,3 +1,17 @@
+## Draggable video download bar
+
+Drag the grip at the left or drag the Download this video button to reposition it. A normal click still downloads or opens the quality menu; the small X dismisses the bar. Focus the grip and use arrow keys for keyboard movement (Shift moves farther).
+
+The last position is shared through browser-session extension storage. It survives reloads, new pages and background-worker restarts, and resets when the browser fully exits. Extension reload/disable/update also resets session storage. Nothing is stored in website storage or synced between devices. Positions stay within the viewport when resizing. In embedded players, movement is bounded by the frame.
+
+Restore a dismissed bar through the extension popup's Show video download buttons again command. Reload existing video tabs after updating the extension.
+
+> Version 0.9.6.1: automatic takeover and the video-dismiss X are shared by
+> Chrome/Brave and Firefox on Windows, macOS and Linux. Portable packages now
+> include a ready-to-load `browser-extension-firefox` folder and Firefox XPI.
+> `python3 scripts/package_extensions.py` builds both extension variants on any OS.
+> Firefox has an additional attachment-response handoff; the X follows fullscreen.
+
 # Browser extension — "Send to Download Craft" (zero-config)
 
 Every download is captured automatically — no pasting IDs,
