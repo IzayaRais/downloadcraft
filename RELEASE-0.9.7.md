@@ -68,8 +68,6 @@ files inside Resources as well as in the ZIP.
 Mac/Linux use a normal Dock/taskbar window; closing the main window quits, so
 minimize it while downloads run. Mac UI omits the unsupported hibernate action.
 
-## Fixes in this release
-
 ## What Changed
 
 This release incorporates PR #51 from [@dazzlejacket](https://github.com/dazzlejacket),
@@ -79,6 +77,8 @@ handling, and macOS/Linux support. The integration also preserves Download Craft
 
 The browser extension compatibility fix is version 0.9.7.1; the desktop app remains
 version 0.9.7. Chrome now skips Firefox-only blocking webRequest registration.
+
+## Fixes in this release
 
 - Preserve helper/custom paths when the main window saves its state.
 - Apply settings changes before subsequent main-window saves.
@@ -90,7 +90,8 @@ version 0.9.7. Chrome now skips Firefox-only blocking webRequest registration.
 - Supply DEB, RPM, AppImage and a universal Mac app, with reproducible packaging scripts.
 
 See VALIDATION.txt in the source/release archive for the exact checks and
-remaining runtime limits. No upstream changes have been submitted.
+remaining runtime limits. PR #51 is integrated; other product proposals remain
+unimplemented.
 
 HTTPS downloads use the operating system's trusted certificate store, including
 locally trusted certificates on managed networks. Certificate verification stays
