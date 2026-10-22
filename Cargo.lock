@@ -1104,7 +1104,7 @@ checksum = "75b325c5dbd37f80359721ad39aca5a29fb04c89279657cffdda8736d0c0b9d2"
 
 [[package]]
 name = "download_craft"
-version = "0.9.6"
+version = "0.9.7"
 dependencies = [
  "ab_glyph",
  "anyhow",
@@ -1114,6 +1114,7 @@ dependencies = [
  "dirs 5.0.1",
  "eframe",
  "egui",
+ "flate2",
  "futures-util",
  "image",
  "notify-rust",

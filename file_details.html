@@ -1,0 +1,231 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="dark">
+<head>
+<meta charset="UTF-8">
+<title>Downloaded File Details — Redesign</title>
+<style>
+  :root {
+    --page-bg: #0a0a1a; --page-title: #ffffff; --page-sub: #8888a8;
+    --bg: #0f172a; --card: #1e293b; --input: #0f172a;
+    --hover: #334155;
+    --border: #334155; --border-soft: #24334a;
+    --text: #f1f5f9; --text-2: #94a3b8; --text-3: #64748b;
+    --accent: #3b82f6; --accent-hover: #60a5fa;
+    --success: #22c55e; --warning: #f59e0b;
+    --shadow: 0 20px 60px rgba(0,0,0,0.55);
+  }
+  [data-theme="light"] {
+    --page-bg: #eef2f7; --page-title: #0f172a; --page-sub: #64748b;
+    --bg: #ffffff; --card: #f8fafc; --input: #f1f5f9;
+    --hover: #e2e8f0;
+    --border: #dbe3ec; --border-soft: #eef2f7;
+    --text: #0f172a; --text-2: #475569; --text-3: #94a3b8;
+    --shadow: 0 20px 60px rgba(15,23,42,0.18);
+  }
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body { background: var(--page-bg); color: var(--text); font-family: 'Segoe UI', sans-serif; padding: 14px 16px; transition: background 0.2s; }
+  h1 { text-align: center; font-size: 19px; margin-bottom: 3px; color: var(--page-title); }
+  .subtitle { text-align: center; color: var(--page-sub); margin-bottom: 8px; font-size: 10.5px; }
+  .theme-toggle { display: flex; justify-content: center; gap: 8px; margin-bottom: 11px; }
+  .theme-btn { padding: 5px 15px; border-radius: 16px; border: 1px solid var(--border); background: var(--card); color: var(--text-2); font-size: 10.5px; font-family: inherit; cursor: pointer; transition: all 0.2s; }
+  .theme-btn.active { background: var(--accent); color: #fff; border-color: var(--accent); }
+
+  .stage { display: flex; justify-content: center; }
+
+  /* ---------- Dialog ---------- */
+  .dialog {
+    width: 480px; background: var(--bg); border: 1px solid var(--border);
+    border-radius: 11px; overflow: hidden; box-shadow: var(--shadow);
+  }
+
+  /* Title bar */
+  .dlg-head { display: flex; align-items: center; gap: 8px; height: 40px; padding: 0 9px 0 13px; border-bottom: 1px solid var(--border); }
+  .file-badge { width: 19px; height: 19px; flex-shrink: 0; color: var(--warning); display: flex; align-items: center; justify-content: center; }
+  .file-badge svg { width: 100%; height: 100%; }
+  .dlg-title { flex: 1; min-width: 0; font-size: 11.5px; font-weight: 600; color: var(--text); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .close-btn { width: 25px; height: 25px; flex-shrink: 0; display: flex; align-items: center; justify-content: center; border: none; background: transparent; color: var(--text-3); border-radius: 5px; cursor: pointer; transition: all 0.15s; }
+  .close-btn:hover { background: var(--hover); color: var(--text); }
+
+  /* Body */
+  .dlg-body { padding: 9px 13px 10px; }
+
+  /* Meta strip — Type / Status / Size */
+  .meta { display: grid; grid-template-columns: 1.5fr 0.95fr 1fr; background: var(--card); border: 1px solid var(--border-soft); border-radius: 8px; padding: 6px 0; }
+  .meta > div { padding: 0 11px; min-width: 0; border-right: 1px solid var(--border-soft); }
+  .meta > div:last-child { border-right: none; }
+  .meta-label { font-size: 8px; text-transform: uppercase; letter-spacing: 0.5px; color: var(--text-3); margin-bottom: 2px; }
+  .meta-value { display: flex; align-items: center; gap: 5px; font-size: 11px; font-weight: 500; color: var(--text); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .meta-sub { font-size: 8.5px; color: var(--text-3); margin-top: 1px; white-space: nowrap; }
+  .dot { width: 5px; height: 5px; border-radius: 50%; background: var(--success); box-shadow: 0 0 0 3px rgba(34,197,94,0.15); flex-shrink: 0; }
+  .meta-value.ok { color: var(--success); }
+
+  /* Divider */
+  .div { height: 1px; background: var(--border-soft); margin: 5px 0; }
+
+  /* Rows: label left, control right */
+  .row { display: grid; grid-template-columns: 76px minmax(0, 1fr); align-items: center; column-gap: 10px; margin-bottom: 4px; }
+  .row:last-child { margin-bottom: 0; }
+  .row-label { font-size: 10.5px; color: var(--text-2); }
+
+  /* Controls */
+  .ctl { display: flex; align-items: center; gap: 5px; min-width: 0; }
+  .ctl > .grow { flex: 1; min-width: 0; }
+
+  .input { width: 100%; background: var(--input); border: 1px solid var(--border); border-radius: 5px; padding: 4px 8px; font-size: 10.5px; color: var(--text); outline: none; font-family: inherit; transition: border-color 0.15s; }
+  .input:focus { border-color: var(--accent); }
+  .input::placeholder { color: var(--text-3); }
+  .input.mono { font-family: 'Consolas', monospace; font-size: 9.5px; }
+
+  .txt { font-size: 9.5px; font-family: 'Consolas', monospace; color: var(--text-2); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .txt.link { color: var(--accent); }
+
+  .btn-sm { height: 25px; padding: 0 10px; flex-shrink: 0; border-radius: 5px; border: 1px solid var(--border); background: var(--card); color: var(--text-2); font-size: 10px; font-weight: 500; font-family: inherit; cursor: pointer; white-space: nowrap; transition: all 0.15s; }
+  .btn-sm:hover { background: var(--hover); color: var(--text); }
+
+  .icon-btn { width: 25px; height: 25px; flex-shrink: 0; display: flex; align-items: center; justify-content: center; border-radius: 5px; border: 1px solid var(--border); background: var(--card); color: var(--text-3); cursor: pointer; transition: all 0.15s; }
+  .icon-btn:hover { background: var(--hover); color: var(--accent); }
+  .icon-btn svg { width: 12px; height: 12px; }
+
+  /* Source / Referer */
+  .source-note { font-size: 9.5px; color: var(--text-3); margin-bottom: 2px; }
+  .source-link { display: inline-block; font-size: 10.5px; color: var(--accent); text-decoration: underline; text-underline-offset: 2px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 100%; }
+  .source-link:hover { color: var(--accent-hover); }
+
+  /* Authentication */
+  .auth { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
+  .auth-field { display: flex; align-items: center; gap: 7px; min-width: 0; }
+  .auth-label { font-size: 10.5px; color: var(--text-2); flex-shrink: 0; }
+  .auth-field .input { flex: 1; min-width: 0; }
+
+  /* Footer */
+  .dlg-foot { display: flex; justify-content: flex-end; align-items: center; gap: 7px; padding: 7px 13px; border-top: 1px solid var(--border); }
+  .btn { height: 28px; padding: 0 17px; border-radius: 5px; font-size: 10.5px; font-weight: 500; font-family: inherit; cursor: pointer; border: 1px solid var(--border); background: var(--card); color: var(--text); transition: all 0.15s; }
+  .btn:hover { background: var(--hover); }
+  .btn-primary { background: var(--accent); border-color: var(--accent); color: #fff; }
+  .btn-primary:hover { background: var(--accent-hover); border-color: var(--accent-hover); }
+</style>
+</head>
+<body>
+
+<h1>Downloaded File Details</h1>
+<p class="subtitle">Compact — meta strip, grouped fields, source &amp; referer block</p>
+
+<div class="theme-toggle">
+  <button class="theme-btn active" onclick="setTheme('dark')">Dark</button>
+  <button class="theme-btn" onclick="setTheme('light')">Light</button>
+</div>
+
+<div class="stage">
+  <div class="dialog">
+
+    <!-- Title bar -->
+    <div class="dlg-head">
+      <div class="file-badge">
+        <svg viewBox="0 0 24 24" fill="none"><path d="M21 8l-9-5-9 5v8l9 5 9-5V8z" stroke="currentColor" stroke-width="1.8" stroke-linejoin="round"/><path d="M3 8l9 5 9-5M12 13v8" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/></svg>
+      </div>
+      <span class="dlg-title" title="photocraft-0.7.0-windows-x64-portable.zip">photocraft-0.7.0-windows-x64-portable.zip</span>
+      <button class="close-btn" title="Close"><svg width="11" height="11" viewBox="0 0 24 24" fill="none"><path d="M6 6l12 12M18 6L6 18" stroke="currentColor" stroke-width="2" stroke-linecap="round"/></svg></button>
+    </div>
+
+    <div class="dlg-body">
+
+      <!-- Type / Status / Size -->
+      <div class="meta">
+        <div>
+          <div class="meta-label">Type</div>
+          <div class="meta-value" title="Compressed (zipped) Folder">Compressed (zipped) Folder</div>
+        </div>
+        <div>
+          <div class="meta-label">Status</div>
+          <div class="meta-value ok"><span class="dot"></span>Complete</div>
+        </div>
+        <div>
+          <div class="meta-label">Size</div>
+          <div class="meta-value">73.27 MB</div>
+          <div class="meta-sub">76,833,799 bytes</div>
+        </div>
+      </div>
+
+      <div class="row" style="margin-top:8px">
+        <span class="row-label">Save to</span>
+        <div class="ctl">
+          <span class="txt grow" title="C:\Users\moham\Downloads\Compressed\photocraft-0.7.0-windows-x64-portable.zip">C:\Users\moham\Downloads\Compressed\photocraft-0.7.0-windows-x64-portable.zip</span>
+          <button class="btn-sm">Move</button>
+        </div>
+      </div>
+
+      <div class="row">
+        <span class="row-label">Address</span>
+        <div class="ctl">
+          <span class="txt link grow" title="https://release-assets.githubusercontent.com/github-production-release-asset-2e65be/7a1c4d90/photocraft-0.7.0-windows-x64-portable.zip">https://release-assets.githubusercontent.com/github-production-release-asset-2e65be/7a1c4d90/photocraft-0.7.0-windows-x64-portable.zip</span>
+          <button class="icon-btn" title="Copy link"><svg viewBox="0 0 24 24" fill="none"><rect x="8" y="8" width="12" height="12" rx="2.5" stroke="currentColor" stroke-width="1.6"/><path d="M4 16V4h12" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/></svg></button>
+        </div>
+      </div>
+
+      <div class="div"></div>
+
+      <div class="row">
+        <span class="row-label">Description</span>
+        <div class="ctl"><input class="input grow" placeholder="Add a note"></div>
+      </div>
+
+      <div class="row">
+        <span class="row-label">Start at</span>
+        <div class="ctl">
+          <input class="input grow" placeholder="HH:MM (blank = now)">
+          <button class="icon-btn" title="Pick a time"><svg viewBox="0 0 24 24" fill="none"><circle cx="12" cy="12" r="9" stroke="currentColor" stroke-width="1.6"/><path d="M12 7v5l3.5 2" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/></svg></button>
+        </div>
+      </div>
+
+      <div class="row">
+        <span class="row-label">Integrity</span>
+        <div class="ctl">
+          <input class="input grow" placeholder="SHA-256 (optional)">
+          <button class="btn-sm">Verify</button>
+        </div>
+      </div>
+
+      <div class="div"></div>
+
+      <!-- Source page + Referer -->
+      <div class="source-note">The web page from which this file was obtained:</div>
+      <a class="source-link" href="#" title="https://github.com/storytold/photocraft">https://github.com/storytold/photocraft</a>
+
+      <div class="row" style="margin-top:7px">
+        <span class="row-label">Referer</span>
+        <div class="ctl"><input class="input mono grow" value="https://github.com/storytold/photocraft/releases/tag/v0.7.0"></div>
+      </div>
+
+      <div class="div"></div>
+
+      <!-- Authentication -->
+      <div class="auth">
+        <div class="auth-field">
+          <span class="auth-label">Login</span>
+          <input class="input">
+        </div>
+        <div class="auth-field">
+          <span class="auth-label">Password</span>
+          <input class="input" type="password">
+        </div>
+      </div>
+
+    </div>
+
+    <!-- Footer -->
+    <div class="dlg-foot">
+      <button class="btn">Open</button>
+      <button class="btn btn-primary">OK</button>
+    </div>
+
+  </div>
+</div>
+
+<script>
+  function setTheme(t) {
+    document.documentElement.setAttribute('data-theme', t);
+    document.querySelectorAll('.theme-btn').forEach((b, i) => b.classList.toggle('active', (t === 'dark') === (i === 0)));
+  }
+</script>
+</body>
+</html>

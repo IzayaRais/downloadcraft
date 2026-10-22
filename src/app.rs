@@ -12,6 +12,9 @@ use std::time::Instant;
 /// windows (main, Add-download dialog, progress) uses this radius.
 pub const RADIUS: f32 = 10.0;
 
+/// Unified title bar height (`main_window_titlebar.html` `.title-bar`).
+pub const TB_H: f32 = 46.0;
+
 /// Every hand-painted surface reads its colours from the ACTIVE palette
 /// (`pl()`) instead of a hard-coded constant, so a theme switch repaints the
 /// whole app — not just the stock egui widgets.
@@ -395,7 +398,6 @@ pub fn apply_widget_theme(ctx: &egui::Context) {
 
 // ---------- Material Icons codepoints (font bundled under assets/fonts) ----------
 pub(crate) const MI_SEARCH: &str = "\u{e8b6}";
-pub(crate) const MI_ADD_LINK: &str = "\u{e178}";
 pub(crate) const MI_PLAY: &str = "\u{e037}";
 pub(crate) const MI_STOP: &str = "\u{e047}";
 pub(crate) const MI_IMAGE: &str = "\u{e3f4}";
@@ -479,14 +481,6 @@ fn cat_color(cat: &str) -> egui::Color32 {
     }
 }
 
-fn mi(ui: &mut egui::Ui, glyph: &str, size: f32, color: egui::Color32) {
-    // Hover-only on purpose: icon glyphs must never steal row clicks.
-    ui.add(
-        egui::Label::new(egui::RichText::new(glyph).color(color).font(crate::fonts::icon(size)))
-            .sense(egui::Sense::hover()),
-    );
-}
-
 /// Standard modal dialog frame (dark card, 1px border, rounded).
 fn modal_frame() -> egui::Frame {
     egui::Frame::new()
@@ -520,6 +514,19 @@ fn dm_icon_btn(
     color: egui::Color32,
 ) {
     crate::dm::icon_btn(p, rect, man.hover(&rect), icon, size, w, color);
+}
+
+/// Icon button on the field surface (same fill/border as an input box).
+fn dm_icon_btn_box(
+    p: &egui::Painter,
+    man: &ManState,
+    rect: egui::Rect,
+    icon: DmIcon,
+    size: f32,
+    w: f32,
+    color: egui::Color32,
+) {
+    crate::dm::icon_btn_box(p, rect, man.hover(&rect), icon, size, w, color);
 }
 
 /// Outline button (concept "Add" / "Cancel").
@@ -786,8 +793,6 @@ enum ButtonId {
     DMove,
     DVerify,
     AbClose,
-    TAdd,
-    TDismiss,
     ThemeSystem,
     ThemeDark,
     ThemeLight,
@@ -1043,11 +1048,20 @@ fn mtext(
 ///
 /// The manager's search sits in its own rounded pill, so the field must not
 /// draw a second inner box (that read as "a box inside the search box").
-fn mtext_bare(ui: &mut egui::Ui, id: &str, text: &mut String, hint: &str, width: f32) -> egui::Rect {
+fn mtext_bare(
+    ui: &mut egui::Ui,
+    id: &str,
+    text: &mut String,
+    hint: &str,
+    width: f32,
+    font: egui::FontId,
+) -> egui::Rect {
     let te = egui::TextEdit::singleline(text)
         .id(egui::Id::new(id))
         .hint_text(hint)
         .desired_width(width)
+        .font(font)
+        .margin(egui::Margin::ZERO)
         .frame(false);
     ui.add(te).rect
 }
@@ -1061,51 +1075,24 @@ fn mtext_bare(ui: &mut egui::Ui, id: &str, text: &mut String, hint: &str, width:
 
 /// Concept width (`file_properties.html` `.dialog { width: 480px }`).
 const DP_W: f32 = 480.0;
-const DP_LABEL_W: f32 = 70.0;
+/// Label column of the redesigned `.row`s (mock `grid-template-columns: 76px`).
+const DP_ROW_LABEL: f32 = 76.0;
 const DP_ROW_H: f32 = 16.0;
 
-/// Right-aligned 70 px field label: 10 px, muted (mock `.field-label`).
-fn dp_label(ui: &mut egui::Ui, text: &str) {
-    ui.allocate_ui_with_layout(
-        egui::vec2(DP_LABEL_W, DP_ROW_H),
-        egui::Layout::right_to_left(egui::Align::Center),
-        |ui| {
-            ui.add(egui::Label::new(
-                egui::RichText::new(text)
-                    .font(crate::fonts::reg(10.0))
-                    .color(pl().dim),
-            ));
-        },
-    );
-}
-
-/// One clipped value cell (mock `.field-value`).
+/// One clipped value cell (mock `.field-value`). Always occupies exactly
+/// `width`, so every row can line up on one right edge.
 fn dp_value(ui: &mut egui::Ui, text: &str, color: egui::Color32, size: f32, width: f32) {
-    ui.allocate_ui_with_layout(
-        egui::vec2(width.max(24.0), DP_ROW_H),
-        egui::Layout::left_to_right(egui::Align::Center),
-        |ui| {
-            ui.add(
-                egui::Label::new(
-                    egui::RichText::new(text)
-                        .font(crate::fonts::reg(size))
-                        .color(color),
-                )
-                .truncate(),
-            );
-        },
-    );
-}
-
-/// 1 px divider (mock `.divider`).
-fn dp_rule(ui: &mut egui::Ui) {
-    let (r, _) = ui.allocate_exact_size(
-        egui::vec2(ui.available_width(), 1.0),
-        egui::Sense::hover(),
-    );
-    ui.painter().line_segment(
-        [r.left_center(), r.right_center()],
-        egui::Stroke::new(1.0, pl().modal_bd),
+    let w = width.max(24.0);
+    let (rect, _) = ui.allocate_exact_size(egui::vec2(w, DP_ROW_H), egui::Sense::hover());
+    let p = ui.painter();
+    let font = crate::fonts::reg(size);
+    let shown = truncate_to_width(p, text, font.clone(), color, w);
+    p.text(
+        egui::pos2(rect.min.x, rect.center().y),
+        egui::Align2::LEFT_CENTER,
+        shown,
+        font,
+        color,
     );
 }
 
@@ -1186,6 +1173,9 @@ fn dp_input(
     password: bool,
     underline: bool,
 ) -> egui::Rect {
+    // `desired_width` is the inner text width; the frame margin sits outside
+    // it, so subtract it to make the *outer* rect exactly `width` wide.
+    let inset_x = if underline { 0.0 } else { 16.0 };
     let rect = ui
         .scope(|ui| {
             let v = ui.visuals_mut();
@@ -1218,7 +1208,7 @@ fn dp_input(
                     if underline { 0 } else { 8 },
                     if underline { 2 } else { 3 },
                 ))
-                .desired_width(width);
+                .desired_width((width - inset_x).max(24.0));
             if underline {
                 te = te.frame(false);
             }
@@ -1237,19 +1227,42 @@ fn dp_input(
     rect
 }
 
-/// Mock `.auth-label`: 46 px, right-aligned, 10 px muted.
-fn dp_auth_label(ui: &mut egui::Ui, text: &str) {
-    ui.allocate_ui_with_layout(
-        egui::vec2(46.0, 18.0),
-        egui::Layout::right_to_left(egui::Align::Center),
-        |ui| {
-            ui.add(egui::Label::new(
-                egui::RichText::new(text)
-                    .font(crate::fonts::reg(10.0))
-                    .color(pl().dim),
-            ));
-        },
+/// 76 px left-aligned label column of the redesigned rows (mock `.row-label`).
+fn dp_lbl(ui: &mut egui::Ui, text: &str) {
+    let (rect, _) = ui.allocate_exact_size(egui::vec2(DP_ROW_LABEL, DP_ROW_H), egui::Sense::hover());
+    ui.painter().text(
+        egui::pos2(rect.min.x, rect.center().y),
+        egui::Align2::LEFT_CENTER,
+        text,
+        crate::fonts::reg(10.5),
+        pl().dim,
     );
+}
+
+/// Hairline divider in an explicit tone (the redesigned card's `--border-soft`).
+fn dp_rule_soft(ui: &mut egui::Ui, color: egui::Color32) {
+    let (r, _) = ui.allocate_exact_size(
+        egui::vec2(ui.available_width(), 1.0),
+        egui::Sense::hover(),
+    );
+    ui.painter().line_segment(
+        [r.left_center(), r.right_center()],
+        egui::Stroke::new(1.0, color),
+    );
+}
+
+/// A byte count with thousands separators, like the mock's "76,833,799".
+fn thousands(n: u64) -> String {
+    let s = n.to_string();
+    let b = s.as_bytes();
+    let mut out = String::with_capacity(s.len() + s.len() / 3);
+    for (i, ch) in b.iter().enumerate() {
+        if i > 0 && (b.len() - i) % 3 == 0 {
+            out.push(',');
+        }
+        out.push(*ch as char);
+    }
+    out
 }
 
 /// "MP4 Video File", "ZIP Archive", ... for the mock's Type row.
@@ -1517,9 +1530,71 @@ fn tool_button(
 }
 
 /// Add-URL button: the same metrics and the same hover-only wash as the other
-/// toolbar buttons — nothing is pre-highlighted.
-fn add_url_button(ui: &mut egui::Ui, man: &ManState) -> egui::Rect {
-    tool_button(ui, man, MI_ADD, "Add URL", true, "Add a download by URL")
+/// toolbar buttons. When a download link is sitting on the clipboard it lights
+/// up in the accent colour (a soft breathing tint) so the user knows where to
+/// click, instead of a banner pushing the list down.
+fn add_url_button(ui: &mut egui::Ui, man: &ManState, hot: bool) -> egui::Rect {
+    if !hot {
+        return tool_button(ui, man, MI_ADD, "Add URL", true, "Add a download by URL");
+    }
+    let label = "Add URL";
+    let label_w = ui
+        .painter()
+        .layout_no_wrap(label.to_owned(), egui::FontId::proportional(11.0), pl().txt)
+        .size()
+        .x;
+    let (rect, _) = ui.allocate_exact_size(
+        egui::vec2((label_w + 16.0).max(56.0), TOOL_H),
+        egui::Sense::hover(),
+    );
+    let hov = man.hover(&rect);
+    // Breathing accent: enough motion to catch the eye, no layout shift.
+    let t = ui.input(|i| i.time) as f32;
+    let pulse = 0.5 + 0.5 * (t * 2.6).sin();
+    ui.ctx()
+        .request_repaint_after(std::time::Duration::from_millis(70));
+    let p = ui.painter();
+    p.rect_filled(
+        rect,
+        6.0,
+        mix(pl().surface, pl().primary, if hov { 0.30 } else { 0.13 + 0.07 * pulse }),
+    );
+    p.rect_stroke(
+        rect,
+        6.0,
+        egui::Stroke::new(
+            1.2_f32,
+            mix(pl().primary, pl().surface_lt, 0.15 + 0.25 * pulse),
+        ),
+        egui::StrokeKind::Inside,
+    );
+    p.text(
+        egui::pos2(rect.center().x, rect.min.y + TOOL_H * 0.34),
+        egui::Align2::CENTER_CENTER,
+        MI_ADD.to_string(),
+        crate::fonts::icon(16.0),
+        pl().primary,
+    );
+    p.text(
+        egui::pos2(rect.center().x, rect.min.y + TOOL_H * 0.72),
+        egui::Align2::CENTER_CENTER,
+        label.to_string(),
+        egui::FontId::proportional(11.0),
+        pl().primary,
+    );
+    if hov {
+        egui::Tooltip::always_open(
+            ui.ctx().clone(),
+            ui.layer_id(),
+            ui.id().with("toolbar_tip_add_url_hot"),
+            egui::PopupAnchor::Pointer,
+        )
+        .gap(12.0)
+        .show(|ui| {
+            ui.label("The clipboard has a download link — click to paste it");
+        });
+    }
+    rect
 }
 
 fn status_bar_w(ui: &mut egui::Ui, w: f32, frac: f32, c0: egui::Color32, c1: egui::Color32) {
@@ -1646,6 +1721,8 @@ enum HitKind {
     Slider(SliderId, f64, f64, bool), // id, min, max, log
     Field(&'static str),
     ComboAnchor,
+    /// Queue v2 reorder: (item id, -1 up / +1 down).
+    QMove(u64, i32),
 }
 
 /// Active manual divider drag: table column resize (window edges are the
@@ -1695,7 +1772,10 @@ pub struct CraftApp {
     scheduler_time: String,
     scheduler_started: bool,
     clipboard_rx: std::sync::mpsc::Receiver<String>,
-    clipboard_toast: Option<String>,
+    /// A download link found on the clipboard that is not in the list yet.
+    /// It is not shown as a banner (that pushed the list down); instead the
+    /// toolbar's Add URL button lights up and clicking it pastes this.
+    clipboard_url: Option<String>,
     browser_msg: String,
     pending_browser_install: Option<String>,
     /// mtime of ui.json at our last load/save — a newer stamp means the
@@ -1711,6 +1791,9 @@ pub struct CraftApp {
     col_w: std::collections::HashMap<SortCol, f32>,
     // ---- power features ----
     max_concurrent: usize,
+    /// Cap on simultaneous connections per host across every download
+    /// (0 = no extra cap). Loaded from ui.json so Settings can change it.
+    per_host_conns: usize,
     /// Pop the standalone "Download complete" dialog when a download finishes.
     /// Its own "Don't show this dialog again" checkbox clears this.
     show_complete: bool,
@@ -1729,6 +1812,9 @@ pub struct CraftApp {
     /// The main window is moved into the middle of the work area once, on the
     /// first frame where egui knows the screen geometry.
     placement_done: bool,
+    /// Last press on the title bar (when, where): a second one inside 420 ms
+    /// and 24 px is the OS's missing "double-click the caption" gesture.
+    tb_press: Option<(std::time::Instant, egui::Pos2)>,
     tray: Option<tray_icon::TrayIcon>,
     details_id: Option<u64>,
     probing: bool,
@@ -1760,9 +1846,12 @@ pub struct CraftApp {
     update_check_on: bool,
     update_status: String,
     update_busy: bool,
-    update_rx: Option<std::sync::mpsc::Receiver<(String, Option<String>)>>,
+    update_rx: Option<std::sync::mpsc::Receiver<(String, Option<String>, bool)>>,
     /// Portable-update asset URL from the last check (P5), if any.
     update_asset: Option<String>,
+    /// A newer release exists: only then does the title bar show its update
+    /// chip. (An asset URL can be missing while an update still exists.)
+    update_found: bool,
     update_auto_done: bool,
     // ---- P5: per-download speed history (EWMA input + Details graph) ----
     // Last ≤60 half-second samples per download id, pruned with tasks.
@@ -1836,13 +1925,16 @@ impl CraftApp {
             add_dir: dl_dir,
             add_file: String::new(),
             add_conns: 8,
-            connections_default: 8,
+            // 12 parallel ranges per file out of the box: the modern
+            // equivalent of IDM's 8 against today's fatter pipes, while the
+            // fragile-CDN detector still collapses those hosts to one stream.
+            connections_default: 12,
             speed_limit_kbps: 0,
             scheduler_enabled: false,
             scheduler_time: "02:00".to_string(),
             scheduler_started: false,
             clipboard_rx: rx,
-            clipboard_toast: None,
+            clipboard_url: None,
             browser_msg: String::new(),
             pending_browser_install: None,
             last_ui_mtime: std::cell::Cell::new(None),
@@ -1859,6 +1951,7 @@ impl CraftApp {
             ],
             col_w: Default::default(),
             max_concurrent: 3,
+        per_host_conns: 0,
             show_complete: true,
             queue_running: false,
             had_active: false,
@@ -1875,6 +1968,7 @@ impl CraftApp {
             theme: "dark".to_string(),
             theme_applied: String::new(),
             placement_done: false,
+            tb_press: None,
             tray: None,
             details_id: None,
             probing: false,
@@ -1904,11 +1998,12 @@ impl CraftApp {
             }],
             speed_windows_on: false,
             speed_limit_live: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(u64::MAX)),
-            update_check_on: false,
+            update_check_on: true,
             update_status: String::new(),
             update_busy: false,
             update_rx: None,
             update_asset: None,
+            update_found: false,
             update_auto_done: false,
             speed_hist: std::collections::HashMap::new(),
             phases: std::collections::HashMap::new(),
@@ -2170,10 +2265,11 @@ impl CraftApp {
                 .iter()
                 .map(|(c, w)| (c.key(), *w))
                 .collect();
-            let v = serde_json::json!({
+            let mine = serde_json::json!({
                 "columns": order,
                 "widths": widths,
                 "max_concurrent": self.max_concurrent,
+                "per_host_conns": self.per_host_conns,
                 "show_complete": self.show_complete,
                 "timeout_secs": self.timeout_secs,
                 "max_retries": self.max_retries,
@@ -2193,6 +2289,20 @@ impl CraftApp {
                 "speed_windows_on": self.speed_windows_on,
                 "update_check_on": self.update_check_on,
             });
+            // Overlay our keys, never replace the whole file: the Settings
+            // window keeps its own keys here too (helper paths and their
+            // "app's own copy / PATH / custom" source choices) and a full
+            // rewrite would silently drop them.
+            let mut v: serde_json::Value = std::fs::read_to_string(&path)
+                .ok()
+                .and_then(|d| serde_json::from_str(&d).ok())
+                .filter(serde_json::Value::is_object)
+                .unwrap_or_else(|| serde_json::json!({}));
+            if let (Some(dst), Some(src)) = (v.as_object_mut(), mine.as_object()) {
+                for (k, val) in src {
+                    dst.insert(k.clone(), val.clone());
+                }
+            }
             if let Ok(json) = serde_json::to_string_pretty(&v) {
                 Self::atomic_write(&path, json.as_bytes());
                 if let Ok(mtime) =
@@ -2245,6 +2355,9 @@ impl CraftApp {
                     let g = |k: &str| v.get(k);
                     if let Some(n) = g("max_concurrent").and_then(|x| x.as_u64()) {
                         self.max_concurrent = (n as usize).clamp(1, 16);
+                    }
+                    if let Some(n) = g("per_host_conns").and_then(|x| x.as_u64()) {
+                        self.per_host_conns = (n as usize).clamp(0, 64);
                     }
                     if let Some(b) = g("show_complete").and_then(|x| x.as_bool()) {
                         self.show_complete = b;
@@ -2839,6 +2952,62 @@ impl CraftApp {
         }
     }
 
+    /// The OS caption is off (`main.rs`), so these edge strips do what the
+    /// native frame used to: a resize cursor on hover and a resize drag on
+    /// press. A maximized window has no edges to grab.
+    ///
+    /// Corners come first, so a press in a corner is never taken by one of
+    /// the straight edges, and only the first matching zone is acted on.
+    fn handle_window_edges(&mut self, ctx: &egui::Context) {
+        use egui::viewport::ResizeDirection as Dir;
+        if ctx.input(|i| i.viewport().maximized.unwrap_or(false)) {
+            return;
+        }
+        let Some(q) = self.man.pos() else {
+            return;
+        };
+        let r = ctx.screen_rect();
+        let z = 5.0;
+        let c = 12.0;
+        let over = |a: egui::Pos2, b: egui::Pos2| egui::Rect::from_min_max(a, b);
+        let zones: [(egui::Rect, Dir, egui::CursorIcon); 8] = [
+            (over(r.min, egui::pos2(r.min.x + c, r.min.y + c)), Dir::NorthWest, egui::CursorIcon::ResizeNorthWest),
+            (over(egui::pos2(r.max.x - c, r.min.y), egui::pos2(r.max.x, r.min.y + c)), Dir::NorthEast, egui::CursorIcon::ResizeNorthEast),
+            (over(egui::pos2(r.min.x, r.max.y - c), egui::pos2(r.min.x + c, r.max.y)), Dir::SouthWest, egui::CursorIcon::ResizeSouthWest),
+            (over(egui::pos2(r.max.x - c, r.max.y - c), r.max), Dir::SouthEast, egui::CursorIcon::ResizeSouthEast),
+            (over(egui::pos2(r.min.x + c, r.min.y), egui::pos2(r.max.x - c, r.min.y + z)), Dir::North, egui::CursorIcon::ResizeNorth),
+            (over(egui::pos2(r.min.x + c, r.max.y - z), egui::pos2(r.max.x - c, r.max.y)), Dir::South, egui::CursorIcon::ResizeSouth),
+            (over(egui::pos2(r.min.x, r.min.y + c), egui::pos2(r.min.x + z, r.max.y - c)), Dir::West, egui::CursorIcon::ResizeWest),
+            (over(egui::pos2(r.max.x - z, r.min.y + c), egui::pos2(r.max.x, r.max.y - c)), Dir::East, egui::CursorIcon::ResizeEast),
+        ];
+        for (rect, dir, icon) in zones {
+            if rect.contains(q) {
+                ctx.set_cursor_icon(icon);
+                if self.man.press_started_in(&rect) {
+                    ctx.send_viewport_cmd(egui::ViewportCommand::BeginResize(dir));
+                }
+                return;
+            }
+        }
+    }
+
+    /// Send the window to the tray (the title bar's close button, or the OS
+    /// close while the tray is on). Parking, not hiding: a hidden window
+    /// stops painting, which freezes transfers and the browser inbox.
+    fn park_to_tray(&mut self) {
+        crate::tray::park();
+        // Say where the window went the first time, or a vanish reads as a
+        // crash (the tray icon is easy to miss). Once per run.
+        static HID_HINT: std::sync::atomic::AtomicBool =
+            std::sync::atomic::AtomicBool::new(false);
+        if !HID_HINT.swap(true, std::sync::atomic::Ordering::SeqCst) {
+            notify(
+                "Download Craft is still running",
+                "In the tray — left-click its icon to reopen, right-click for Exit.",
+            );
+        }
+    }
+
     /// One-shot opt-in update check against GitHub releases (P3.4, P5 asset).
     fn start_update_check(&mut self) {
         if self.update_busy {
@@ -2849,6 +3018,7 @@ impl CraftApp {
         self.update_busy = true;
         self.update_status.clear();
         self.update_asset = None;
+        self.update_found = false;
         self.rt.spawn(async move {
             let _ = tx.send(update_check_async().await);
         });
@@ -3174,6 +3344,7 @@ impl CraftApp {
             overwrite_existing: item.overwrite_existing,
             quality_pref: item.quality_pref.clone(),
             global_limit: Some(self.speed_limit_live.clone()),
+            per_host_conns: self.per_host_conns,
         };
         let shared2 = shared.clone();
         // Adaptive pairs (video-only + audio) merge via ffmpeg on completion.
@@ -3227,13 +3398,68 @@ impl CraftApp {
             let next = self
                 .downloads
                 .iter()
-                .find(|d| matches!(d.status, Status::Queued))
+                .filter(|d| matches!(d.status, Status::Queued))
+                // Queue v2: a row scheduled for later waits even when a slot
+                // is free, and priority decides who goes first.
+                .filter(|d| crate::model::start_at_due(&d.start_at, chrono::Local::now()))
+                .max_by(|a, b| {
+                    a.priority
+                        .cmp(&b.priority)
+                        // Same priority: oldest first (stable, predictable).
+                        .then_with(|| b.created_at.cmp(&a.created_at))
+                })
                 .map(|d| d.id);
             match next {
                 Some(id) => self.start(id),
                 None => return,
             }
         }
+    }
+
+    /// Queued rows in the order the pump will start them.
+    fn queued_order(&self) -> Vec<u64> {
+        let mut rows: Vec<&DownloadItem> = self
+            .downloads
+            .iter()
+            .filter(|d| matches!(d.status, Status::Queued))
+            .collect();
+        rows.sort_by(|a, b| {
+            b.priority
+                .cmp(&a.priority)
+                .then_with(|| a.created_at.cmp(&b.created_at))
+        });
+        rows.into_iter().map(|d| d.id).collect()
+    }
+
+    /// Move one queued row up (-1) or down (+1) in the pump's order by nudging
+    /// its priority past the neighbour's. Ties keep creation order, so an
+    /// untouched queue still runs oldest-first.
+    fn move_in_queue(&mut self, id: u64, dir: i32) {
+        let order = self.queued_order();
+        let Some(pos) = order.iter().position(|x| *x == id) else {
+            return;
+        };
+        let target = pos as i32 + dir;
+        if target < 0 || target as usize >= order.len() {
+            return;
+        }
+        let other = order[target as usize];
+        let other_prio = self
+            .downloads
+            .iter()
+            .find(|d| d.id == other)
+            .map(|d| d.priority)
+            .unwrap_or(0);
+        let new_prio = if dir < 0 { other_prio + 1 } else { other_prio - 1 };
+        if let Some(d) = self.downloads.iter_mut().find(|d| d.id == id) {
+            d.priority = new_prio;
+        }
+        self.save_queue();
+        self.push_log(format!(
+            "Moved #{} {} the queue.",
+            id,
+            if dir < 0 { "up in" } else { "down in" }
+        ));
     }
 
     fn pause(&mut self, id: u64) {
@@ -3279,6 +3505,15 @@ impl CraftApp {
     }
 
     fn cancel_task(&mut self, id: u64) {
+        // A live recording has no "later": Stop means finish. Whatever was
+        // written is already a playable file, so the row becomes Completed
+        // instead of Paused (which would imply a resumable partial).
+        let live = self
+            .tasks
+            .get(&id)
+            .map(|t| t.shared.live.load(Ordering::SeqCst))
+            .unwrap_or(false);
+        let mut stopped: Option<(String, String)> = None;
         if let Some(t) = self.tasks.remove(&id) {
             t.shared.cancelled.store(true, Ordering::SeqCst);
             t.handle.abort();
@@ -3290,8 +3525,21 @@ impl CraftApp {
         // its partial state kept for resume.
         if let Some(d) = self.downloads.iter_mut().find(|d| d.id == id) {
             if !matches!(d.status, Status::Completed) {
-                d.status = Status::Paused;
+                d.status = if live && d.downloaded_bytes > 0 {
+                    Status::Completed
+                } else {
+                    Status::Paused
+                };
             }
+            if live {
+                stopped = Some((
+                    d.filename.clone(),
+                    crate::model::format_bytes(d.downloaded_bytes),
+                ));
+            }
+        }
+        if let Some((name, size)) = stopped {
+            self.push_log(format!("Live capture stopped: {name} — {size} saved"));
         }
         self.save_queue();
     }
@@ -4156,8 +4404,9 @@ fn ensure_native_host(browser: &str) -> Result<bool, String> {
 /// Opt-in update check (P3.4, extended P5): compare the running version
 /// against the latest GitHub release tag, and locate the portable Windows
 /// asset when one is newer. Network failures become a status string —
-/// never a popup, never an auto-download.
-async fn update_check_async() -> (String, Option<String>) {
+/// never a popup, never an auto-download. The third field says "a newer
+/// release exists", which is what puts the chip in the title bar.
+async fn update_check_async() -> (String, Option<String>, bool) {
     let current = env!("CARGO_PKG_VERSION");
     let client = match reqwest::Client::builder()
         .user_agent(format!("download_craft/{current}"))
@@ -4165,7 +4414,7 @@ async fn update_check_async() -> (String, Option<String>) {
         .build()
     {
         Ok(c) => c,
-        Err(e) => return (format!("Update check failed: {e:#}"), None),
+        Err(e) => return (format!("Update check failed: {e:#}"), None, false),
     };
     let resp = client
         .get("https://api.github.com/repos/hungry-detective/downloadcraft/releases/latest")
@@ -4174,18 +4423,18 @@ async fn update_check_async() -> (String, Option<String>) {
         .await;
     let resp = match resp {
         Ok(r) => r,
-        Err(e) => return (format!("Update check failed (network): {e:#}"), None),
+        Err(e) => return (format!("Update check failed (network): {e:#}"), None, false),
     };
     if !resp.status().is_success() {
-        return (format!("Update check failed: HTTP {}", resp.status()), None);
+        return (format!("Update check failed: HTTP {}", resp.status()), None, false);
     }
     let v: serde_json::Value = match resp.json().await {
         Ok(v) => v,
-        Err(e) => return (format!("Update check failed (parse): {e:#}"), None),
+        Err(e) => return (format!("Update check failed (parse): {e:#}"), None, false),
     };
     let tag = v.get("tag_name").and_then(|t| t.as_str()).unwrap_or("");
     if tag.is_empty() {
-        return ("Update check failed: no releases found.".to_string(), None);
+        return ("Update check failed: no releases found.".to_string(), None, false);
     }
     if crate::model::is_newer_version(current, tag) {
         let url = v
@@ -4195,9 +4444,10 @@ async fn update_check_async() -> (String, Option<String>) {
         (
             format!("Update available: {tag} (you have v{current}) — {url}"),
             crate::model::pick_windows_asset(&v),
+            true,
         )
     } else {
-        (format!("Up to date (v{current})."), None)
+        (format!("Up to date (v{current})."), None, false)
     }
 }
 
@@ -4311,12 +4561,14 @@ impl eframe::App for CraftApp {
         // Manual pointer routing: snapshot input, then match layout rects
         // recorded below (process_hits runs after all layout, topmost first).
         self.man.begin(ctx);
+        // Borderless window: the edges resize it (see `handle_window_edges`).
+        self.handle_window_edges(ctx);
         self.hits.clear();
         while let Ok(url) = self.clipboard_rx.try_recv() {
             if !self.downloads.iter().any(|d| d.url == url)
-                && self.clipboard_toast.as_deref() != Some(url.as_str())
+                && self.clipboard_url.as_deref() != Some(url.as_str())
             {
-                self.clipboard_toast = Some(url);
+                self.clipboard_url = Some(url);
             }
         }
 
@@ -4342,10 +4594,11 @@ impl eframe::App for CraftApp {
                 while let Ok(m) = rx.try_recv() {
                     got = Some(m);
                 }
-                if let Some((m, asset)) = got {
+                if let Some((m, asset, found)) = got {
                     self.update_busy = false;
                     self.update_status = m.clone();
                     self.update_asset = asset;
+                    self.update_found = found;
                     if m.starts_with("Update available") {
                         self.push_log(m);
                     }
@@ -4457,17 +4710,7 @@ impl eframe::App for CraftApp {
             // Parking (not hiding) keeps the app running: hiding the window
             // stops WM_PAINT, which stops eframe frames, which froze transfers
             // and the browser inbox while "in the tray".
-            crate::tray::park();
-            // Say where the window went the first time, or a vanish reads as a
-            // crash (the tray icon is easy to miss). Once per run.
-            static HID_HINT: std::sync::atomic::AtomicBool =
-                std::sync::atomic::AtomicBool::new(false);
-            if !HID_HINT.swap(true, std::sync::atomic::Ordering::SeqCst) {
-                notify(
-                    "Download Craft is still running",
-                    "In the tray — left-click its icon to reopen, right-click for Exit.",
-                );
-            }
+            self.park_to_tray();
         } else if self.close_to_tray
             && self.tray.is_some()
             && ctx.input(|i| i.viewport().minimized) == Some(true)
@@ -4478,9 +4721,10 @@ impl eframe::App for CraftApp {
             crate::tray::park();
         }
 
-        // Native OS window chrome (title bar, min/max/close, drag, resize,
-        // snap, taskbar) — a custom-painted titlebar can never match it and
-        // is the fastest way to look unprofessional.
+        // The window is borderless: the title bar below is the app's own
+        // (`main.rs` turns the OS caption off). Dragging and Aero snap go
+        // through the OS move loop, the resize strips through
+        // `handle_window_edges`.
 
         // ---- per-frame counts, shared by the sidebar and the status bar ----
         let n_all = self.downloads.len();
@@ -4503,90 +4747,268 @@ impl eframe::App for CraftApp {
         }
         let n_incomplete = n_all - n_done;
 
-        // ================= menu bar + search =================
-        // Flat desktop menu bar in the concept's metrics
-        // (`main_window.html` .menu-bar / .search-box): text items on the left,
-        // a bordered search field with a trailing magnifier on the right, and
-        // one hairline closing the strip. Dropdowns render at the end of update
+        // ================= title bar =================
+        // `main_window_titlebar.html`: one 46 px row carrying the brand, the
+        // File/Tasks/Tools/Theme/Help menus, the list search, the update chip
+        // and the window buttons. The taskbar (Add URL, Resume, Stop …) stays
+        // in the workspace card below — only the menu row and the search moved
+        // up here. The OS caption is off (`main.rs` drops the decorations), so
+        // this row is also what drags the window; `handle_window_edges` owns
+        // the resize strips. Dropdowns still render at the end of update
         // (topmost).
-        egui::TopBottomPanel::top("menubar")
+        let maximized = ctx.input(|i| i.viewport().maximized.unwrap_or(false));
+        egui::TopBottomPanel::top("titlebar")
+            .exact_height(TB_H)
             .frame(egui::Frame::new().fill(pl().bg).inner_margin(egui::Margin {
-                left: 14,
-                right: 14,
-                top: 4,
-                bottom: 4,
+                left: 12,
+                right: 8,
+                top: 0,
+                bottom: 0,
             }))
             .show(ctx, |ui| {
-                ui.horizontal(|ui| {
-                    ui.spacing_mut().item_spacing.x = 2.0;
-                    for (m, label) in
-                        ["File", "Tasks", "Tools", "Theme", "Help"].iter().enumerate()
-                    {
-                        let g = ui.painter().layout_no_wrap(
-                            label.to_string(),
-                            egui::FontId::proportional(11.5),
-                            pl().txt,
-                        );
-                        let (rect, _) = ui.allocate_exact_size(
-                            egui::vec2(g.size().x + 20.0, 24.0),
-                            egui::Sense::hover(),
-                        );
-                        let hov = self.man.hover(&rect);
-                        let open = self.drop_menu == Some(m as u8);
-                        if hov || open {
-                            ui.painter().rect_filled(rect, 4.0, pl().surface_lt);
-                        }
-                        ui.painter().galley(
-                            egui::pos2(
-                                rect.center().x - g.size().x / 2.0,
-                                rect.center().y - g.size().y / 2.0,
-                            ),
-                            g,
-                            if hov || open { pl().txt } else { pl().dim },
-                        );
-                        self.hits.push((HitKind::MenuBtn(m as u8), rect));
+                let (bar, _) = ui.allocate_exact_size(
+                    egui::vec2(ui.available_width(), TB_H),
+                    egui::Sense::hover(),
+                );
+                let p = ui.painter().clone();
+                let cy = bar.center().y;
+                // Interactive children: a press on one of these must never
+                // turn into a window drag.
+                let mut live: Vec<egui::Rect> = Vec::new();
+
+                // ---- brand: the dialog mark + the product name ----
+                let mark = egui::Rect::from_center_size(
+                    egui::pos2(bar.left() + 9.0, cy),
+                    egui::Vec2::splat(18.0),
+                );
+                crate::dm::dm_mark(&p, mark);
+                let name = p.layout_no_wrap(
+                    crate::model::APP_NAME.to_owned(),
+                    crate::fonts::semi(13.0),
+                    pl().txt,
+                );
+                p.galley(
+                    egui::pos2(mark.right() + 6.0, cy - name.size().y / 2.0),
+                    name.clone(),
+                    pl().txt,
+                );
+                let mut x = mark.right() + 6.0 + name.size().x + 11.0;
+                p.vline(x, (cy - 9.0)..=(cy + 9.0), egui::Stroke::new(1.0, pl().card_bd));
+                x += 9.0;
+
+                // ---- menus (`.menu-item`): the same dropdowns, now up here ----
+                for (m, label) in ["File", "Tasks", "Tools", "Theme", "Help"].iter().enumerate() {
+                    let g = p.layout_no_wrap(label.to_string(), crate::fonts::reg(11.0), pl().dim);
+                    let r = egui::Rect::from_min_size(
+                        egui::pos2(x, cy - 12.0),
+                        egui::vec2(g.size().x + 12.0, 24.0),
+                    );
+                    let hov = self.man.hover(&r);
+                    let open = self.drop_menu == Some(m as u8);
+                    if hov || open {
+                        p.rect_filled(r, 5.0, pl().surface_lt);
                     }
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        // Search box: filled, 1px border, 6px radius, a single
-                        // box (no inner frame) with the magnifier on the
-                        // trailing edge — the concept's `.search-box`.
-                        egui::Frame::new()
-                            .fill(pl().surface)
-                            .stroke(egui::Stroke::new(1.0_f32, pl().card_bd))
-                            .corner_radius(6.0)
-                            .inner_margin(egui::Margin {
-                                left: 10,
-                                right: 10,
-                                top: 4,
-                                bottom: 4,
-                            })
-                            .show(ui, |ui| {
-                                ui.horizontal(|ui| {
-                                    ui.spacing_mut().item_spacing.x = 6.0;
-                                    // The menu bar lays its children out right
-                                    // to left, so the magnifier is added first
-                                    // to land on the pill's trailing edge —
-                                    // the concept's `.search-box` order
-                                    // (input, then `.search-icon`).
-                                    mi(ui, MI_SEARCH, 13.0, pl().dim);
-                                    let r = mtext_bare(
-                                        ui,
-                                        "search",
-                                        &mut self.search,
-                                        "Search in the List",
-                                        176.0,
-                                    );
-                                    self.hits.push((HitKind::Field("search"), r));
-                                });
-                            });
-                    });
-                });
-                // menu-bar bottom hairline (`.menu-bar { border-bottom }`)
-                let r = ui.max_rect();
-                ui.painter()
-                    .hline(r.x_range(), r.bottom() + 3.5, egui::Stroke::new(1.0_f32, pl().card_bd));
+                    p.galley(
+                        egui::pos2(r.center().x - g.size().x / 2.0, cy - g.size().y / 2.0),
+                        g,
+                        if hov || open { pl().txt } else { pl().dim },
+                    );
+                    self.hits.push((HitKind::MenuBtn(m as u8), r));
+                    live.push(r);
+                    x = r.right() + 1.0;
+                }
+
+                // ---- right edge, built inwards from the window buttons:
+                // controls · update chip · search (`.win-controls` order) ----
+                let ctrl_l = bar.right() - (28.0 * 3.0 + 2.0);
+                for (i, (icon, kind)) in [
+                    (DmIcon::Minimize, 0u8),
+                    (
+                        if maximized { DmIcon::Restore } else { DmIcon::Maximize },
+                        1,
+                    ),
+                    (DmIcon::Close, 2),
+                ]
+                .iter()
+                .enumerate()
+                {
+                    let r = egui::Rect::from_min_size(
+                        egui::pos2(ctrl_l + i as f32 * 29.0, cy - 13.0),
+                        egui::vec2(28.0, 26.0),
+                    );
+                    let hov = self.man.hover(&r);
+                    let close = *kind == 2;
+                    if hov {
+                        p.rect_filled(r, 4.0, if close { pl().error } else { pl().surface_lt });
+                    }
+                    dm_icon(
+                        &p,
+                        egui::Rect::from_center_size(r.center(), egui::Vec2::splat(12.0)),
+                        *icon,
+                        if hov {
+                            if close { egui::Color32::WHITE } else { pl().txt }
+                        } else {
+                            pl().dim
+                        },
+                        2.0,
+                    );
+                    if self.man.clicked(&r) {
+                        match kind {
+                            0 => ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(true)),
+                            1 => {
+                                ctx.send_viewport_cmd(egui::ViewportCommand::Maximized(!maximized))
+                            }
+                            _ => {
+                                if self.close_to_tray && self.tray.is_some() {
+                                    self.park_to_tray();
+                                } else {
+                                    ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                                }
+                            }
+                        }
+                    }
+                    live.push(r);
+                }
+                let mut right = ctrl_l - 8.0;
+
+                // ---- update chip: only when a newer release was found on
+                // launch (`.update-btn`). A circle at rest; the word "Update"
+                // grows out of it on hover. The glyph is the concept's arrow
+                // *without* its baseline (the line under it read as a second,
+                // unrelated icon).
+                if self.update_found && !self.update_busy {
+                    let rest = egui::Rect::from_min_size(
+                        egui::pos2(right - 28.0, cy - 14.0),
+                        egui::vec2(28.0, 28.0),
+                    );
+                    let hov = self.man.hover(&rest);
+                    let t = ctx.animate_bool_with_time(egui::Id::new("update_chip"), hov, 0.22);
+                    let label = p.layout_no_wrap(
+                        "Update".to_owned(),
+                        crate::fonts::semi(10.5),
+                        pl().primary,
+                    );
+                    let w = 28.0 + t * (label.size().x + 5.0);
+                    let chip = egui::Rect::from_min_size(
+                        egui::pos2(right - w, cy - 14.0),
+                        egui::vec2(w, 28.0),
+                    );
+                    p.rect_filled(chip, 14.0, wash(pl().txt, if hov { 20 } else { 12 }));
+                    let ib = egui::Rect::from_min_size(
+                        egui::pos2(chip.left() + 7.0, cy - 7.0),
+                        egui::Vec2::splat(14.0),
+                    );
+                    let s = ib.width() / 24.0;
+                    let m = |x: f32, y: f32| egui::pos2(ib.min.x + x * s, ib.min.y + y * s);
+                    let st = egui::Stroke::new((2.0 * s).max(1.0), pl().primary);
+                    p.line_segment([m(12.0, 3.5), m(12.0, 13.5)], st);
+                    p.line_segment([m(7.5, 9.0), m(12.0, 13.5)], st);
+                    p.line_segment([m(12.0, 13.5), m(16.5, 9.0)], st);
+                    if t > 0.01 {
+                        p.galley(
+                            egui::pos2(ib.right() + 5.0, cy - label.size().y / 2.0),
+                            p.layout_no_wrap(
+                                "Update".to_owned(),
+                                crate::fonts::semi(10.5),
+                                pl().primary.gamma_multiply(t),
+                            ),
+                            pl().primary,
+                        );
+                    }
+                    if self.man.clicked(&chip) {
+                        // The About card carries the details and the
+                        // "Download update" button (never a silent replace).
+                        self.show_about = true;
+                    }
+                    live.push(chip);
+                    right = chip.left() - 8.0;
+                }
+
+                // ---- search: rounded pill with the magnifier inside, no
+                // second inner box (`.search-box`) ----
+                let pill = egui::Rect::from_min_size(
+                    egui::pos2(right - 176.0, cy - 14.0),
+                    egui::vec2(176.0, 28.0),
+                );
+                let focused = ui.memory(|m| m.has_focus(egui::Id::new("search")));
+                let hov = self.man.hover(&pill);
+                if focused {
+                    // 3 px accent glow, where the concept uses box-shadow.
+                    p.rect_stroke(
+                        pill.expand(1.5),
+                        16.0,
+                        egui::Stroke::new(3.0, wash(pl().primary, 34)),
+                        egui::StrokeKind::Middle,
+                    );
+                }
+                p.rect(
+                    pill,
+                    14.0,
+                    wash(pl().txt, if focused { 13 } else if hov { 16 } else { 10 }),
+                    egui::Stroke::new(
+                        1.0,
+                        if focused { pl().primary } else { egui::Color32::TRANSPARENT },
+                    ),
+                    egui::StrokeKind::Inside,
+                );
+                p.text(
+                    egui::pos2(pill.left() + 17.5, cy),
+                    egui::Align2::CENTER_CENTER,
+                    MI_SEARCH.to_string(),
+                    crate::fonts::icon(11.0),
+                    pl().dim,
+                );
+                let inner = egui::Rect::from_min_max(
+                    egui::pos2(pill.left() + 30.0, pill.top() + 4.0),
+                    egui::pos2(pill.right() - 10.0, pill.bottom() - 4.0),
+                );
+                let mut fui = ui.new_child(
+                    egui::UiBuilder::new()
+                        .max_rect(inner)
+                        .layout(egui::Layout::left_to_right(egui::Align::Center)),
+                );
+                mtext_bare(
+                    &mut fui,
+                    "search",
+                    &mut self.search,
+                    "Search in the List",
+                    inner.width(),
+                    crate::fonts::reg(10.5),
+                );
+                self.hits.push((HitKind::Field("search"), pill));
+                live.push(pill);
+
+                // ---- the strip itself moves the window, through the OS: a
+                // custom drag hook would lose Aero snap. A second press
+                // inside the double-click window toggles maximize instead
+                // (there is no OS caption left to do that for us). ----
+                let over_live = self
+                    .man
+                    .pos()
+                    .map_or(false, |q| live.iter().any(|r| r.contains(q)));
+                if !over_live {
+                    if let Some(q) = self.man.pos() {
+                        if self.man.press_started_in(&bar) {
+                            let now = std::time::Instant::now();
+                            let again = matches!(
+                                self.tb_press,
+                                Some((t, p))
+                                    if now.duration_since(t).as_millis() <= 420
+                                        && p.distance(q) <= 24.0
+                            );
+                            if again {
+                                self.tb_press = None;
+                                ctx.send_viewport_cmd(egui::ViewportCommand::Maximized(!maximized));
+                            } else {
+                                self.tb_press = Some((now, q));
+                                ctx.send_viewport_cmd(egui::ViewportCommand::StartDrag);
+                            }
+                        }
+                    }
+                }
             });
         // Menu/dropdown actions run from process_hits (see do_menu_act).
+
 
         // ================= bottom status bar =================
         // The concept's `.status-bar`: session totals on the left, state on the
@@ -4826,7 +5248,7 @@ impl eframe::App for CraftApp {
                 ui.horizontal_wrapped(|ui| {
                     ui.add_space(10.0);
                     ui.spacing_mut().item_spacing = egui::vec2(TOOL_GAP, 2.0);
-                    let r = add_url_button(ui, &self.man);
+                    let r = add_url_button(ui, &self.man, self.clipboard_url.is_some());
                     self.hits.push((HitKind::Tool(ToolId::AddUrl), r));
                     for (id, icon, label, enabled, tip) in tools {
                         let r = tool_button(ui, &self.man, icon, label, enabled, tip);
@@ -4841,47 +5263,9 @@ impl eframe::App for CraftApp {
                 );
                 ui.painter().rect_filled(tr, 0.0, pl().card_bd);
                 ui.add_space(5.0);
-                // clipboard toast: dismissible banner card, never loose text
-                if let Some(url) = self.clipboard_toast.clone() {
-                    egui::Frame::new()
-                        .fill(pl().surface)
-                        .stroke(egui::Stroke::new(1.0_f32, pl().primary))
-                        .corner_radius(RADIUS)
-                        .inner_margin(egui::Margin {
-                            left: 12,
-                            right: 8,
-                            top: 8,
-                            bottom: 8,
-                        })
-                        .show(ui, |ui| {
-                            ui.horizontal(|ui| {
-                                mi(ui, MI_ADD_LINK, 16.0, pl().primary);
-                                ui.vertical(|ui| {
-                                    ui.spacing_mut().item_spacing.y = 0.0;
-                                    ui.label(
-                                        egui::RichText::new("Link copied from clipboard").strong(),
-                                    );
-                                    ui.label(
-                                        egui::RichText::new(
-                                            url.chars().take(90).collect::<String>(),
-                                        )
-                                        .small()
-                                        .color(pl().dim),
-                                    );
-                                });
-                                ui.with_layout(
-                                    egui::Layout::right_to_left(egui::Align::Center),
-                                    |ui| {
-                                        let r = mbutton(ui, &self.man, "×", 34.0, 30.0, false);
-                                        self.hits.push((HitKind::Btn(ButtonId::TDismiss), r));
-                                        let r = mbutton(ui, &self.man, "Add URL", 90.0, 30.0, false);
-                                        self.hits.push((HitKind::Btn(ButtonId::TAdd), r));
-                                    },
-                                );
-                            });
-                        });
-                    ui.add_space(6.0);
-                }
+                // A link found on the clipboard is surfaced on the toolbar's
+                // Add URL button (see `add_url_button`), not as a banner here:
+                // the banner pushed the whole list down by a row.
                 // Bulk actions for the checked rows live in the toolbar itself
                 // (Delete sits next to Stop All): a bar that appeared only while
                 // something was checked pushed the whole list down by a row's
@@ -5044,6 +5428,12 @@ impl eframe::App for CraftApp {
                                     // from ROW_H plus the faint row rule, not
                                     // from the style's 10px item spacing.
                                     ui.spacing_mut().item_spacing.y = 0.0;
+                                    // A row that is scrolled out of sight still
+                                    // has a rect (egui only clips the paint),
+                                    // so its hit would reach over the toolbar
+                                    // and swallow the buttons there. Every hit
+                                    // is therefore clipped to the viewport.
+                                    let view = ui.clip_rect();
                                     for id in &ids {
                                         let id = *id;
                                         let (sel, fname, cat, size_s, prog, spd, eta, date, st, preparing) = {
@@ -5060,6 +5450,11 @@ impl eframe::App for CraftApp {
                                             // out — the browser probe often measured it
                                             // before the transfer even started.
                                             let preparing = match self.phases.get(&id) {
+                                                // A live capture has no percentage to
+                                                // show, so the pill names the state.
+                                                Some(p) if p == "Recording live" => {
+                                                    "LIVE".to_string()
+                                                }
                                                 Some(p)
                                                     if d.downloaded_bytes == 0
                                                         && p != "Downloading" =>
@@ -5112,7 +5507,7 @@ impl eframe::App for CraftApp {
                                                 pl().card_bd.gamma_multiply(0.55),
                                             ),
                                         );
-                                        self.hits.push((HitKind::Row(id), rrect));
+                                        self.hits.push((HitKind::Row(id), rrect.intersect(view)));
                                         // Manual select checkbox.
                                         let cb = egui::Rect::from_center_size(
                                             egui::pos2(
@@ -5129,7 +5524,7 @@ impl eframe::App for CraftApp {
                                         );
                                         self.hits.push((
                                             HitKind::RowCheck(id),
-                                            cb.expand(6.0),
+                                            cb.expand(6.0).intersect(view),
                                         ));
                                 // Cells painted at explicit sub-rects: pure
                                 // paint, no widgets, no cursor use — the row
@@ -5498,9 +5893,9 @@ impl eframe::App for CraftApp {
                         false,
                     );
                     self.hits.push((HitKind::Field("add_file"), file_box));
-                    dm_icon_btn(&p, &self.man, refr_btn, DmIcon::Refresh, 14.0, 1.5, pl().dm_dim);
+                    dm_icon_btn_box(&p, &self.man, refr_btn, DmIcon::Refresh, 14.0, 1.5, pl().dm_dim);
                     self.hits.push((HitKind::Btn(ButtonId::AddRefresh), refr_btn));
-                    dm_icon_btn(&p, &self.man, gear_btn, DmIcon::Settings, 14.0, 1.5, pl().dm_dim);
+                    dm_icon_btn_box(&p, &self.man, gear_btn, DmIcon::Settings, 15.0, 1.5, pl().dm_dim);
                     self.hits.push((HitKind::Btn(ButtonId::AddAdv), gear_btn));
                     // ---- advanced panel (gear): same tokens, placeholders
                     // instead of labels, per the concept's field style ----
@@ -5809,98 +6204,154 @@ impl eframe::App for CraftApp {
                 .max_height((ctx.screen_rect().height() * 0.86).clamp(300.0, 900.0))
                 .frame(modal_frame())
                 .show(ctx, |ui| {
-                ui.label(format!("{n_items} item(s) in queue, {n_active} active."));
-                ui.horizontal(|ui| {
-                    let r = mbutton(ui, &self.man, "Start Queue", 130.0, 32.0, false);
-                    self.hits.push((HitKind::Btn(ButtonId::QStart), r));
-                    let r = mbutton(ui, &self.man, "Stop Queue", 130.0, 32.0, false);
-                    self.hits.push((HitKind::Btn(ButtonId::QStop), r));
-                });
-                ui.label(
-                    egui::RichText::new(format!(
-                        "Max simultaneous downloads: {}",
-                        self.max_concurrent
-                    ))
-                    .color(pl().dim),
-                );
-                let r = mslider(
-                    ui,
-                    &self.man,
-                    "",
-                    1.0,
-                    16.0,
-                    self.slider_get(SliderId::QMax),
-                    false,
-                );
-                self.hits.push((
-                    HitKind::Slider(SliderId::QMax, 1.0, 16.0, false),
-                    r,
-                ));
-                ui.separator();
-                ui.horizontal(|ui| {
-                    ui.label("When queue finishes:");
-                    let cur = match self.finish_action.as_str() {
-                        "shutdown" => "Shut down",
-                        "sleep" => "Sleep",
-                        "hibernate" => "Hibernate",
-                        _ => "Do nothing",
-                    };
-                    let g = ui.painter().layout_no_wrap(
-                        cur.to_string(),
-                        egui::FontId::proportional(12.5),
-                        pl().txt,
+                // The Next-up list grows the body past a short window;
+                // scroll the body and keep the Close button on screen.
+                let body_max =
+                    (ctx.screen_rect().height() * 0.86 - 120.0).clamp(180.0, 760.0);
+                egui::ScrollArea::vertical()
+                    .max_height(body_max)
+                    .auto_shrink([false, true])
+                    .show(ui, |ui| {
+                    ui.label(format!("{n_items} item(s) in queue, {n_active} active."));
+                    ui.horizontal(|ui| {
+                        let r = mbutton(ui, &self.man, "Start Queue", 130.0, 32.0, false);
+                        self.hits.push((HitKind::Btn(ButtonId::QStart), r));
+                        let r = mbutton(ui, &self.man, "Stop Queue", 130.0, 32.0, false);
+                        self.hits.push((HitKind::Btn(ButtonId::QStop), r));
+                    });
+                    ui.label(
+                        egui::RichText::new(format!(
+                            "Max simultaneous downloads: {}",
+                            self.max_concurrent
+                        ))
+                        .color(pl().dim),
                     );
-                    let (r, _) = ui.allocate_exact_size(
-                        egui::vec2((g.size().x + 40.0).max(140.0), 28.0),
-                        egui::Sense::hover(),
+                    let r = mslider(
+                        ui,
+                        &self.man,
+                        "",
+                        1.0,
+                        16.0,
+                        self.slider_get(SliderId::QMax),
+                        false,
                     );
-                    if self.man.hover(&r) {
-                        ui.painter().rect_filled(r, 6.0, pl().surface_lt);
-                    }
-                    ui.painter().rect_stroke(
+                    self.hits.push((
+                        HitKind::Slider(SliderId::QMax, 1.0, 16.0, false),
                         r,
-                        6.0,
-                        egui::Stroke::new(1.0, pl().modal_bd),
-                        egui::StrokeKind::Inside,
+                    ));
+                    // Queue v2: live ordering. The list is exactly the pump's
+                    // start order (priority, then oldest first).
+                    ui.separator();
+                    ui.label(
+                        egui::RichText::new("Next up — the first row starts first")
+                            .color(pl().dim),
                     );
-                    ui.painter().galley(
-                        egui::pos2(r.min.x + 10.0, r.center().y - g.size().y / 2.0),
-                        g,
-                        pl().txt,
-                    );
-                    // dropdown arrow
-                    ui.painter().text(
-                        egui::pos2(r.max.x - 14.0, r.center().y),
-                        egui::Align2::CENTER_CENTER,
-                        "▾".to_string(),
-                        egui::FontId::proportional(12.0),
-                        pl().dim,
-                    );
-                    self.hits.push((HitKind::ComboAnchor, r));
-                });
-                ui.separator();
-                let r = mcheck(
-                    ui,
-                    &self.man,
-                    "Start queue automatically at (HH:MM):",
-                    self.scheduler_enabled,
-                );
-                self.hits.push((HitKind::Check(CheckId::SchedOn), r));
-                let r = mtext(ui, "sched_time", &mut self.scheduler_time, "HH:MM", 90.0, false);
-                self.hits.push((HitKind::Field("sched_time"), r));
-                if !sched_fired {
-                    ui.small("Waiting for scheduled time…");
-                } else {
-                    ui.small("Scheduler already fired this session.");
-                    let r = mbutton(ui, &self.man, "Reset Scheduler", 140.0, 30.0, false);
-                    self.hits.push((HitKind::Btn(ButtonId::QSchedReset), r));
-                }
-                ui.separator();
-                ui.collapsing("Log", |ui| {
-                    egui::ScrollArea::vertical().max_height(140.0).show(ui, |ui| {
-                        for line in &log {
-                            ui.monospace(line);
+                    let order = self.queued_order();
+                    if order.is_empty() {
+                        ui.small("Nothing waiting — every row is running or finished.");
+                    } else {
+                        egui::ScrollArea::vertical()
+                            .max_height(132.0)
+                            .show(ui, |ui| {
+                                for (i, id) in order.iter().take(24).enumerate() {
+                                    let row = self.downloads.iter().find(|d| d.id == *id);
+                                    let mut name = row
+                                        .map(|d| d.filename.clone())
+                                        .unwrap_or_else(|| format!("#{id}"));
+                                    if name.chars().count() > 42 {
+                                        name = name.chars().take(41).collect::<String>() + "…";
+                                    }
+                                    let at = row.map(|d| d.start_at.clone()).unwrap_or_default();
+                                    ui.horizontal(|ui| {
+                                        let when = if at.is_empty() {
+                                            String::new()
+                                        } else {
+                                            format!("  (at {at})")
+                                        };
+                                        ui.label(
+                                            egui::RichText::new(format!("{}. {name}{when}", i + 1))
+                                                .size(11.0),
+                                        );
+                                        ui.with_layout(
+                                            egui::Layout::right_to_left(egui::Align::Center),
+                                            |ui| {
+                                                ui.spacing_mut().item_spacing.x = 4.0;
+                                                let r = mbutton(ui, &self.man, "Down", 40.0, 22.0, false);
+                                                self.hits.push((HitKind::QMove(*id, 1), r));
+                                                let r = mbutton(ui, &self.man, "Up", 32.0, 22.0, false);
+                                                self.hits.push((HitKind::QMove(*id, -1), r));
+                                            },
+                                        );
+                                    });
+                                }
+                            });
+                    }
+                    ui.separator();
+                    ui.horizontal(|ui| {
+                        ui.label("When queue finishes:");
+                        let cur = match self.finish_action.as_str() {
+                            "shutdown" => "Shut down",
+                            "sleep" => "Sleep",
+                            "hibernate" => "Hibernate",
+                            _ => "Do nothing",
+                        };
+                        let g = ui.painter().layout_no_wrap(
+                            cur.to_string(),
+                            egui::FontId::proportional(12.5),
+                            pl().txt,
+                        );
+                        let (r, _) = ui.allocate_exact_size(
+                            egui::vec2((g.size().x + 40.0).max(140.0), 28.0),
+                            egui::Sense::hover(),
+                        );
+                        if self.man.hover(&r) {
+                            ui.painter().rect_filled(r, 6.0, pl().surface_lt);
                         }
+                        ui.painter().rect_stroke(
+                            r,
+                            6.0,
+                            egui::Stroke::new(1.0, pl().modal_bd),
+                            egui::StrokeKind::Inside,
+                        );
+                        ui.painter().galley(
+                            egui::pos2(r.min.x + 10.0, r.center().y - g.size().y / 2.0),
+                            g,
+                            pl().txt,
+                        );
+                        // dropdown arrow
+                        ui.painter().text(
+                            egui::pos2(r.max.x - 14.0, r.center().y),
+                            egui::Align2::CENTER_CENTER,
+                            "▾".to_string(),
+                            egui::FontId::proportional(12.0),
+                            pl().dim,
+                        );
+                        self.hits.push((HitKind::ComboAnchor, r));
+                    });
+                    ui.separator();
+                    let r = mcheck(
+                        ui,
+                        &self.man,
+                        "Start queue automatically at (HH:MM):",
+                        self.scheduler_enabled,
+                    );
+                    self.hits.push((HitKind::Check(CheckId::SchedOn), r));
+                    let r = mtext(ui, "sched_time", &mut self.scheduler_time, "HH:MM", 90.0, false);
+                    self.hits.push((HitKind::Field("sched_time"), r));
+                    if !sched_fired {
+                        ui.small("Waiting for scheduled time…");
+                    } else {
+                        ui.small("Scheduler already fired this session.");
+                        let r = mbutton(ui, &self.man, "Reset Scheduler", 140.0, 30.0, false);
+                        self.hits.push((HitKind::Btn(ButtonId::QSchedReset), r));
+                    }
+                    ui.separator();
+                    ui.collapsing("Log", |ui| {
+                        egui::ScrollArea::vertical().max_height(140.0).show(ui, |ui| {
+                            for line in &log {
+                                ui.monospace(line);
+                            }
+                        });
                     });
                 });
                 ui.add_space(4.0);
@@ -5939,7 +6390,9 @@ impl eframe::App for CraftApp {
                     let mut desc = item.description.clone();
                     let mut user = item.username.clone();
                     let mut pass = item.password.clone();
+                    let mut start_at = item.start_at.clone();
                     let mut sum = self.det_sum.clone();
+                    let mut referer = item.referer.clone();
 
                     let det_w = modal_width(ctx, DP_W);
                     let mut open = true;
@@ -5969,22 +6422,29 @@ impl eframe::App for CraftApp {
                             // The dialog is a card: no window item spacing
                             // between the header, the content and the bar.
                             ui.spacing_mut().item_spacing.y = 0.0;
-                            // ---- title bar: file icon · name · close ----
+                            // ---- title bar: file badge · name · close ----
                             let (bar, _) = ui.allocate_exact_size(
-                                egui::vec2(det_w, 38.0),
+                                egui::vec2(det_w, 40.0),
                                 egui::Sense::hover(),
                             );
                             let p = ui.painter().clone();
+                            p.line_segment(
+                                [
+                                    egui::pos2(bar.min.x, bar.max.y - 0.5),
+                                    egui::pos2(bar.max.x, bar.max.y - 0.5),
+                                ],
+                                egui::Stroke::new(1.0, pl().modal_bd),
+                            );
                             p.text(
                                 egui::pos2(bar.min.x + 22.0, bar.center().y),
                                 egui::Align2::CENTER_CENTER,
                                 file_icon(crate::model::category_of(&item.filename)).to_string(),
                                 crate::fonts::icon(16.0),
-                                pl().primary,
+                                pl().warning,
                             );
                             let close_r = egui::Rect::from_center_size(
-                                egui::pos2(bar.max.x - 25.0, bar.center().y),
-                                egui::vec2(22.0, 22.0),
+                                egui::pos2(bar.max.x - 21.5, bar.center().y),
+                                egui::vec2(25.0, 25.0),
                             );
                             let close_hover = self.man.hover(&close_r);
                             if close_hover {
@@ -6001,7 +6461,7 @@ impl eframe::App for CraftApp {
                             // Filename between icon and X, elided on overflow.
                             // Drawn through the shaper so a Bangla caption name
                             // keeps its conjuncts and matra order.
-                            let title_l = bar.min.x + 36.0;
+                            let title_l = bar.min.x + 40.0;
                             let title_w = (close_r.min.x - 8.0 - title_l).max(40.0);
                             let shown = truncate_to_width(
                                 &p,
@@ -6019,37 +6479,25 @@ impl eframe::App for CraftApp {
                                 pl().txt,
                             );
 
-                            // ---- content (mock `.content`) ----
+                            // ---- content (mock `.dlg-body`) ----
                             egui::Frame::new()
                                 .inner_margin(egui::Margin {
-                                    left: 16,
-                                    right: 16,
-                                    top: 4,
-                                    bottom: 12,
+                                    left: 13,
+                                    right: 13,
+                                    top: 9,
+                                    bottom: 10,
                                 })
                                 .show(ui, |ui| {
-                                    ui.spacing_mut().item_spacing.y = 3.0;
-                                    let row_w = det_w - 32.0;
+                                    ui.spacing_mut().item_spacing.y = 0.0;
+                                    let row_w = det_w - 26.0;
                                     ui.set_width(row_w);
+                                    let soft = mix(pl().modal_bg, pl().modal_bd, 0.45);
 
-                                    // Type
-                                    ui.horizontal(|ui| {
-                                        ui.spacing_mut().item_spacing.x = 10.0;
-                                        dp_label(ui, "Type:");
-                                        dp_value(
-                                            ui,
-                                            &dp_type_label(&item.filename),
-                                            pl().txt,
-                                            11.0,
-                                            row_w - DP_LABEL_W - 10.0,
-                                        );
-                                    });
-                                    // Status
                                     let (status_txt, status_col) = match &item.status {
                                         Status::Queued => ("Queued".to_string(), pl().dim),
                                         Status::Downloading => (
                                             if item.downloaded_bytes == 0 {
-                                                "Downloading — connecting…".to_string()
+                                                "Connecting…".to_string()
                                             } else {
                                                 "Downloading".to_string()
                                             },
@@ -6059,29 +6507,114 @@ impl eframe::App for CraftApp {
                                         Status::Completed => ("Complete".to_string(), pl().success),
                                         Status::Failed(_) => ("Failed".to_string(), pl().error),
                                     };
-                                    ui.horizontal(|ui| {
-                                        ui.spacing_mut().item_spacing.x = 10.0;
-                                        dp_label(ui, "Status:");
-                                        dp_value(ui, &status_txt, status_col, 11.0, row_w - DP_LABEL_W - 10.0);
-                                    });
-                                    // Size
-                                    let size_txt = match item.total_bytes {
-                                        Some(t) if t > 0 => {
-                                            format!("{} ({} Bytes)", format_bytes(t), t)
+
+                                    // ---- meta strip: Type | Status | Size ----
+                                    let (strip, _) = ui.allocate_exact_size(
+                                        egui::vec2(row_w, 48.0),
+                                        egui::Sense::hover(),
+                                    );
+                                    {
+                                        let p = ui.painter();
+                                        p.rect(
+                                            strip,
+                                            8.0,
+                                            pl().surface,
+                                            egui::Stroke::new(1.0, soft),
+                                            egui::StrokeKind::Inside,
+                                        );
+                                        let fr = [1.5_f32, 0.95, 1.0];
+                                        let sum_fr: f32 = fr.iter().sum();
+                                        let mut cx = strip.min.x;
+                                        for i in 0..3 {
+                                            let cw = row_w * fr[i] / sum_fr;
+                                            if i > 0 {
+                                                p.line_segment(
+                                                    [
+                                                        egui::pos2(cx, strip.min.y + 6.0),
+                                                        egui::pos2(cx, strip.max.y - 6.0),
+                                                    ],
+                                                    egui::Stroke::new(1.0, soft),
+                                                );
+                                            }
+                                            let tx = cx + 11.0;
+                                            let tw = (cw - 22.0).max(10.0);
+                                            p.text(
+                                                egui::pos2(tx, strip.min.y + 5.0),
+                                                egui::Align2::LEFT_TOP,
+                                                ["TYPE", "STATUS", "SIZE"][i],
+                                                crate::fonts::reg(8.0),
+                                                pl().dim,
+                                            );
+                                            let vy = strip.min.y + 17.0;
+                                            match i {
+                                                0 => {
+                                                    let tv = truncate_to_width(
+                                                        p,
+                                                        &dp_type_label(&item.filename),
+                                                        crate::fonts::reg(11.0),
+                                                        pl().txt,
+                                                        tw,
+                                                    );
+                                                    p.text(
+                                                        egui::pos2(tx, vy),
+                                                        egui::Align2::LEFT_TOP,
+                                                        tv,
+                                                        crate::fonts::reg(11.0),
+                                                        pl().txt,
+                                                    );
+                                                }
+                                                1 => {
+                                                    p.circle_filled(
+                                                        egui::pos2(tx + 2.5, vy + 5.5),
+                                                        2.5,
+                                                        status_col,
+                                                    );
+                                                    let sv = truncate_to_width(
+                                                        p,
+                                                        &status_txt,
+                                                        crate::fonts::reg(11.0),
+                                                        status_col,
+                                                        (tw - 10.0).max(10.0),
+                                                    );
+                                                    p.text(
+                                                        egui::pos2(tx + 10.0, vy),
+                                                        egui::Align2::LEFT_TOP,
+                                                        sv,
+                                                        crate::fonts::reg(11.0),
+                                                        status_col,
+                                                    );
+                                                }
+                                                _ => {
+                                                    let raw = match item.total_bytes {
+                                                        Some(t) if t > 0 => t,
+                                                        _ => item.downloaded_bytes,
+                                                    };
+                                                    p.text(
+                                                        egui::pos2(tx, vy),
+                                                        egui::Align2::LEFT_TOP,
+                                                        format_bytes(raw),
+                                                        crate::fonts::reg(11.0),
+                                                        pl().txt,
+                                                    );
+                                                    p.text(
+                                                        egui::pos2(tx, vy + 14.0),
+                                                        egui::Align2::LEFT_TOP,
+                                                        format!("{} bytes", thousands(raw)),
+                                                        crate::fonts::reg(8.5),
+                                                        pl().dim,
+                                                    );
+                                                }
+                                            }
+                                            cx += cw;
                                         }
-                                        _ => format!("{} downloaded", format_bytes(item.downloaded_bytes)),
-                                    };
-                                    ui.horizontal(|ui| {
-                                        ui.spacing_mut().item_spacing.x = 10.0;
-                                        dp_label(ui, "Size:");
-                                        dp_value(ui, &size_txt, pl().txt, 11.0, row_w - DP_LABEL_W - 10.0);
-                                    });
+                                    }
 
                                     // Live progress for anything not finished:
-                                    // one slim bar (the concept has no room
-                                    // for a second dialog).
+                                    // one slim bar plus a summary line under the
+                                    // meta strip (the concept has no room for a
+                                    // second dialog).
                                     if !finished {
-                                        ui.add_space(2.0);
+                                        ui.add_space(8.0);
                                         let (br, _) = ui.allocate_exact_size(
                                             egui::vec2(row_w, 4.0),
                                             egui::Sense::hover(),
@@ -6107,117 +6640,182 @@ impl eframe::App for CraftApp {
                                         if eta != "-" {
                                             bits.push(format!("{eta} left"));
                                         }
+                                        ui.add_space(3.0);
                                         dp_value(ui, &bits.join("  ·  "), pl().dim, 10.0, row_w);
-                                        ui.add_space(2.0);
+                                        ui.add_space(3.0);
+                                    } else {
+                                        ui.add_space(8.0);
                                     }
 
-                                    // Save To + Move (finished files only: a
-                                    // partial file must stay where it resumes).
+                                    // ---- Save to + Move ----
                                     let dest = item.dest_path();
                                     let exists = dest.exists();
+                                    let shown = if exists {
+                                        dest.to_string_lossy().to_string()
+                                    } else if finished {
+                                        "The file has been moved.".to_string()
+                                    } else {
+                                        item.save_dir.clone()
+                                    };
                                     ui.horizontal(|ui| {
-                                        ui.spacing_mut().item_spacing.x = 6.0;
-                                        dp_label(ui, "Save To:");
-                                        let text_w =
-                                            (ui.available_width() - if finished { 62.0 } else { 0.0 })
-                                                .max(60.0);
-                                        let shown = if exists {
-                                            dest.to_string_lossy().to_string()
-                                        } else if finished {
-                                            "The file has been moved.".to_string()
-                                        } else {
-                                            item.save_dir.clone()
-                                        };
-                                        dp_value(ui, &shown, pl().dim, 10.0, text_w);
+                                        ui.spacing_mut().item_spacing.x = 10.0;
+                                        dp_lbl(ui, "Save to");
                                         if finished {
-                                            let r = dp_small(ui, &self.man, "Move", 56.0);
-                                            self.hits.push((HitKind::Btn(ButtonId::DMove), r));
+                                            ui.with_layout(
+                                                egui::Layout::right_to_left(egui::Align::Center),
+                                                |ui| {
+                                                    let r = dp_small(ui, &self.man, "Move", 56.0);
+                                                    self.hits.push((HitKind::Btn(ButtonId::DMove), r));
+                                                    let w = ui.available_width();
+                                                    dp_value(ui, &shown, pl().dim, 9.5, w);
+                                                },
+                                            );
+                                        } else {
+                                            let w = ui.available_width();
+                                            dp_value(ui, &shown, pl().dim, 9.5, w);
                                         }
                                     });
+                                    ui.add_space(4.0);
 
-                                    // Address (media URL) + copy
+                                    // ---- Address (media URL) + copy ----
                                     ui.horizontal(|ui| {
-                                        ui.spacing_mut().item_spacing.x = 6.0;
-                                        dp_label(ui, "Address:");
-                                        let text_w = (ui.available_width() - 26.0).max(60.0);
-                                        dp_value(ui, &item.url, pl().primary, 10.0, text_w);
+                                        ui.spacing_mut().item_spacing.x = 10.0;
+                                        dp_lbl(ui, "Address");
+                                        let text_w = (ui.available_width() - 30.0).max(40.0);
+                                        dp_value(ui, &item.url, pl().primary, 9.5, text_w);
                                         let r = dp_icon(ui, &self.man, MI_COPY);
                                         self.hits.push((HitKind::Btn(ButtonId::DCopyAddr), r));
                                     });
+                                    ui.add_space(5.0);
+                                    dp_rule_soft(ui, soft);
+                                    ui.add_space(5.0);
 
-                                    // Description (live note)
+                                    // ---- Description (live note) ----
                                     ui.horizontal(|ui| {
-                                        ui.spacing_mut().item_spacing.x = 6.0;
-                                        dp_label(ui, "Description:");
+                                        ui.spacing_mut().item_spacing.x = 10.0;
+                                        dp_lbl(ui, "Description");
                                         let w = ui.available_width();
                                         let r = dp_input(ui, "det_desc", &mut desc, "Add a note", w, false, false);
                                         self.hits.push((HitKind::Field("det_desc"), r));
                                     });
+                                    ui.add_space(4.0);
 
-                                    // Web page (the captured page, when the
-                                    // referer is an HTML page) + copy
-                                    let web = page_url_of(&item.referer);
-                                    let refr = if item.referer.trim().is_empty()
-                                        || item.referer.trim() == web
+                                    // ---- Start at + clock (Queue v2: start
+                                    // this row no earlier than HH:MM; blank =
+                                    // as soon as a slot is free) ----
+                                    ui.horizontal(|ui| {
+                                        ui.spacing_mut().item_spacing.x = 10.0;
+                                        dp_lbl(ui, "Start at");
+                                        let w = (ui.available_width() - 30.0).max(40.0);
+                                        let r = dp_input(
+                                            ui,
+                                            "det_start",
+                                            &mut start_at,
+                                            "HH:MM (blank = now)",
+                                            w,
+                                            false,
+                                            false,
+                                        );
+                                        self.hits.push((HitKind::Field("det_start"), r));
+                                        dp_icon(ui, &self.man, MI_SCHEDULE);
+                                    });
+                                    if !start_at.trim().is_empty()
+                                        && crate::model::parse_hhmm(&start_at).is_none()
                                     {
-                                        String::new()
-                                    } else {
-                                        item.referer.trim().to_string()
-                                    };
+                                        ui.add_space(2.0);
+                                        dp_value(
+                                            ui,
+                                            "Use HH:MM (24-hour), e.g. 23:30.",
+                                            pl().error,
+                                            10.0,
+                                            row_w,
+                                        );
+                                    }
+                                    ui.add_space(4.0);
+
+                                    // ---- Web page + Referer ----
+                                    let web = page_url_of(&item.referer);
                                     if !web.is_empty() {
+                                        dp_value(
+                                            ui,
+                                            "The web page from which this file was obtained:",
+                                            pl().dim,
+                                            9.5,
+                                            row_w,
+                                        );
+                                        ui.add_space(2.0);
                                         ui.horizontal(|ui| {
                                             ui.spacing_mut().item_spacing.x = 6.0;
-                                            dp_label(ui, "Web page:");
-                                            let text_w = (ui.available_width() - 26.0).max(60.0);
-                                            dp_value(ui, &web, pl().primary, 10.0, text_w);
+                                            let text_w = (ui.available_width() - 26.0).max(40.0);
+                                            dp_value(ui, &web, pl().primary, 10.5, text_w);
                                             let r = dp_icon(ui, &self.man, MI_COPY);
                                             self.hits.push((HitKind::Btn(ButtonId::DCopyPage), r));
                                         });
+                                        ui.add_space(7.0);
                                     }
-                                    if !refr.is_empty() {
-                                        ui.horizontal(|ui| {
-                                            ui.spacing_mut().item_spacing.x = 10.0;
-                                            dp_label(ui, "Referer:");
-                                            dp_value(
-                                                ui,
-                                                &refr,
-                                                pl().dim,
-                                                10.0,
-                                                row_w - DP_LABEL_W - 10.0,
-                                            );
-                                        });
-                                    }
+                                    ui.horizontal(|ui| {
+                                        ui.spacing_mut().item_spacing.x = 10.0;
+                                        dp_lbl(ui, "Referer");
+                                        let w = ui.available_width();
+                                        let r = dp_input(
+                                            ui,
+                                            "det_ref",
+                                            &mut referer,
+                                            "https://… (empty = none)",
+                                            w,
+                                            false,
+                                            false,
+                                        );
+                                        self.hits.push((HitKind::Field("det_ref"), r));
+                                    });
+                                    ui.add_space(4.0);
 
-                                    // Integrity: the README-documented SHA-256
-                                    // check keeps its home here (finished or
-                                    // already-set items only).
+                                    // ---- Integrity + Verify ----
                                     if finished || !item.checksum_sha256.trim().is_empty() {
                                         ui.horizontal(|ui| {
-                                            ui.spacing_mut().item_spacing.x = 6.0;
-                                            dp_label(ui, "Integrity:");
-                                            let w = (ui.available_width()
-                                                - if finished { 66.0 } else { 0.0 })
-                                                .max(60.0);
-                                            let r = dp_input(
-                                                ui,
-                                                "det_sum",
-                                                &mut sum,
-                                                "SHA-256 (optional)",
-                                                w,
-                                                false,
-                                                false,
-                                            );
-                                            self.hits.push((HitKind::Field("det_sum"), r));
+                                            ui.spacing_mut().item_spacing.x = 10.0;
+                                            dp_lbl(ui, "Integrity");
                                             if finished {
-                                                let vr = dp_small(ui, &self.man, "Verify", 60.0);
-                                                self.hits
-                                                    .push((HitKind::Btn(ButtonId::DVerify), vr));
+                                                ui.with_layout(
+                                                    egui::Layout::right_to_left(egui::Align::Center),
+                                                    |ui| {
+                                                        let vr = dp_small(ui, &self.man, "Verify", 62.0);
+                                                        self.hits.push((
+                                                            HitKind::Btn(ButtonId::DVerify),
+                                                            vr,
+                                                        ));
+                                                        let w = ui.available_width();
+                                                        let r = dp_input(
+                                                            ui,
+                                                            "det_sum",
+                                                            &mut sum,
+                                                            "SHA-256 (optional)",
+                                                            w,
+                                                            false,
+                                                            false,
+                                                        );
+                                                        self.hits.push((HitKind::Field("det_sum"), r));
+                                                    },
+                                                );
+                                            } else {
+                                                let w = ui.available_width();
+                                                let r = dp_input(
+                                                    ui,
+                                                    "det_sum",
+                                                    &mut sum,
+                                                    "SHA-256 (optional)",
+                                                    w,
+                                                    false,
+                                                    false,
+                                                );
+                                                self.hits.push((HitKind::Field("det_sum"), r));
                                             }
                                         });
                                         let norm = crate::model::normalize_sha256(&sum);
                                         if !sum.trim().is_empty()
                                             && !crate::model::is_valid_sha256(&norm)
                                         {
+                                            ui.add_space(2.0);
                                             dp_value(
                                                 ui,
                                                 "Invalid SHA-256 — 64 hex characters expected.",
@@ -6226,26 +6824,50 @@ impl eframe::App for CraftApp {
                                                 row_w,
                                             );
                                         }
+                                        ui.add_space(4.0);
                                     }
 
-                                    ui.add_space(4.0);
-                                    dp_rule(ui);
-                                    ui.add_space(4.0);
+                                    dp_rule_soft(ui, soft);
+                                    ui.add_space(5.0);
 
-                                    // Login + Password on one row (mock `.auth-row`)
+                                    // ---- Login + Password side by side ----
                                     ui.horizontal(|ui| {
                                         ui.spacing_mut().item_spacing.x = 8.0;
-                                        let field_w = ((row_w - 8.0) / 2.0 - 54.0).max(40.0);
-                                        dp_auth_label(ui, "Login");
-                                        let r = dp_input(
-                                            ui, "det_user", &mut user, "", field_w, false, true,
+                                        let half = ((row_w - 8.0) / 2.0).max(60.0);
+                                        ui.allocate_ui_with_layout(
+                                            egui::vec2(half, DP_ROW_H),
+                                            egui::Layout::left_to_right(egui::Align::Center),
+                                            |ui| {
+                                                ui.spacing_mut().item_spacing.x = 7.0;
+                                                ui.add(egui::Label::new(
+                                                    egui::RichText::new("Login")
+                                                        .font(crate::fonts::reg(10.5))
+                                                        .color(pl().dim),
+                                                ));
+                                                let w = ui.available_width();
+                                                let r = dp_input(
+                                                    ui, "det_user", &mut user, "", w, false, false,
+                                                );
+                                                self.hits.push((HitKind::Field("det_user"), r));
+                                            },
                                         );
-                                        self.hits.push((HitKind::Field("det_user"), r));
-                                        dp_auth_label(ui, "Password");
-                                        let r = dp_input(
-                                            ui, "det_pass", &mut pass, "", field_w, true, true,
+                                        ui.allocate_ui_with_layout(
+                                            egui::vec2(half, DP_ROW_H),
+                                            egui::Layout::left_to_right(egui::Align::Center),
+                                            |ui| {
+                                                ui.spacing_mut().item_spacing.x = 7.0;
+                                                ui.add(egui::Label::new(
+                                                    egui::RichText::new("Password")
+                                                        .font(crate::fonts::reg(10.5))
+                                                        .color(pl().dim),
+                                                ));
+                                                let w = ui.available_width();
+                                                let r = dp_input(
+                                                    ui, "det_pass", &mut pass, "", w, true, false,
+                                                );
+                                                self.hits.push((HitKind::Field("det_pass"), r));
+                                            },
                                         );
-                                        self.hits.push((HitKind::Field("det_pass"), r));
                                     });
                                 });
 
@@ -6260,9 +6882,9 @@ impl eframe::App for CraftApp {
                             );
                             egui::Frame::new()
                                 .inner_margin(egui::Margin {
-                                    left: 16,
-                                    right: 16,
-                                    top: 10,
+                                    left: 13,
+                                    right: 13,
+                                    top: 9,
                                     bottom: 10,
                                 })
                                 .show(ui, |ui| {
@@ -6308,6 +6930,19 @@ impl eframe::App for CraftApp {
                         }
                         if d.password != pass {
                             d.password = pass;
+                            dirty = true;
+                        }
+                        // Bad input never sticks: the previous schedule stays.
+                        let next_start = start_at.trim().to_string();
+                        if crate::model::parse_hhmm(&next_start).is_some() || next_start.is_empty() {
+                            if d.start_at != next_start {
+                                d.start_at = next_start;
+                                dirty = true;
+                            }
+                        }
+                        let next_ref = referer.trim().to_string();
+                        if d.referer != next_ref {
+                            d.referer = next_ref;
                             dirty = true;
                         }
                     }
@@ -7165,18 +7800,6 @@ impl CraftApp {
                 }
             }
             ButtonId::AbClose => self.show_about = false,
-            ButtonId::TAdd => {
-                if let Some(url) = self.clipboard_toast.clone() {
-                    self.add_url = url.clone();
-                    self.add_file = filename_from_url(&url);
-                    self.add_checksum.clear();
-                    self.add_quality.clear();
-                    self.clipboard_toast = None;
-                    self.add_focus_req = true;
-                    self.show_add = true;
-                }
-            }
-            ButtonId::TDismiss => self.clipboard_toast = None,
         }
     }
 
@@ -7310,6 +7933,7 @@ impl CraftApp {
                     | HitKind::Slider(..)
                     | HitKind::Field(_)
                     | HitKind::ComboAnchor
+                    | HitKind::QMove(_, _)
             );
             if modal_open && !dialog_kind {
                 continue;
@@ -7335,6 +7959,7 @@ impl CraftApp {
                     HitKind::Slider(..) => "slider".to_string(),
                     HitKind::Field(f) => format!("field:{f}"),
                     HitKind::ComboAnchor => "combo".to_string(),
+                    HitKind::QMove(id, d) => format!("qmove:#{id}:{d}"),
                 };
             }
             if clk || sec {
@@ -7353,6 +7978,14 @@ impl CraftApp {
                                 self.add_file.clear();
                                 self.add_checksum.clear();
                                 self.add_quality.clear();
+                                // A link picked up from the clipboard is
+                                // pre-filled here: the lit Add URL button is
+                                // the only affordance (no banner row).
+                                if let Some(url) = self.clipboard_url.take() {
+                                    self.add_file = filename_from_url(&url);
+                                    self.add_url = url;
+                                    self.add_focus_req = true;
+                                }
                                 self.show_add = true;
                             }
                             ToolId::StartQueue => self.start_queue(),
@@ -7453,6 +8086,11 @@ impl CraftApp {
                         if let Some(d) = self.downloads.iter_mut().find(|d| d.id == id) {
                             d.selected = !d.selected;
                         }
+                    }
+                }
+                HitKind::QMove(id, dir) => {
+                    if clk {
+                        self.move_in_queue(id, dir);
                     }
                 }
                 HitKind::Row(id) => {

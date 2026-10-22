@@ -187,74 +187,78 @@ fn fmt_eta(left: u64, speed: f64) -> String {
 }
 
 // ================= concept geometry =================
-// `Downloading gui concepts.html` (measured in Chrome, border-box):
-//   card     522 wide (520 content + 2x1px border), 403 + 25n tall
-//   header   1..45     mark 20 at (17,13), title 14/500 at x=45, controls 14
-//   tabs     45..82    trough (17,53,488,29), three 161.33x25 segments
-//   info     82..320   eight 13px rows at y=98 step 27, right edge 503
-//   progress 320..340  track (19,320,484,8), r4, accent gradient fill
-//   parts    340..     rule, Part Info row (h16 at y=351), strip (y=375,h10),
-//                      table header (y=393,h23), rows at y=416 step 25, pad 14
+// `Downloading gui concepts.html` (measured in Chrome, border-box), tightened:
+// the concept spaced its info rows 27 px apart and padded every block, which
+// left the card both wide and airy. Same layout, denser rhythm.
+//   card     470 wide (468 content + 2x1px border), 361 + 22n tall
+//   header   1..38     mark 18 at (15,10), title 14/500 at x=41, controls 14
+//   tabs     38..72    trough (15,46,440,26), three 145.33x22 segments
+//   info     72..265   eight 13px rows at y=84 step 22, right edge 455
+//   progress 265..273  track (15,266,440,7), r4, accent gradient fill
+//   parts    273..     rule, Part Info row (h15 at y=293), strip (y=315,h9),
+//                      table header (y=331,h20), rows at y=351 step 22, pad 10
 
 /// Concept card width, border-box.
-const PG_W: f32 = 522.0;
+const PG_W: f32 = 470.0;
 /// Card height with no part list: title + tabs + info + progress + rule.
-const PG_MIN_H: f32 = 341.0;
+const PG_MIN_H: f32 = 286.0;
 /// Card height with the part list collapsed but its header row still shown
 /// (the chevron and the Pause/Close actions must stay reachable).
-const PG_PART_HEAD_H: f32 = 376.0;
+const PG_PART_HEAD_H: f32 = 320.0;
 /// Dead state (the item left the queue): title + notice + Close.
-const PG_DEAD_H: f32 = 163.0;
+const PG_DEAD_H: f32 = 148.0;
 
-const HDR_H: f32 = 44.0;
-const MARK_X: f32 = 17.0;
-const MARK_Y: f32 = 13.0;
-const MARK_S: f32 = 20.0;
-const TITLE_X: f32 = 45.0;
+const HDR_H: f32 = 38.0;
+const MARK_X: f32 = 15.0;
+const MARK_Y: f32 = 10.0;
+const MARK_S: f32 = 18.0;
+const TITLE_X: f32 = 41.0;
 /// Vertical centre of the header (and of its two window controls).
-const HDR_CY: f32 = 23.0;
-const CTL_X1: f32 = 468.0;
-const CTL_X2: f32 = 498.0;
+const HDR_CY: f32 = 19.0;
+const CTL_X1: f32 = 416.0;
+const CTL_X2: f32 = 446.0;
 
-const SEG_X: f32 = 17.0;
-const SEG_Y: f32 = 53.0;
-const SEG_W: f32 = 488.0;
-const SEG_H: f32 = 29.0;
+const SEG_X: f32 = 15.0;
+const SEG_Y: f32 = 44.0;
+const SEG_W: f32 = 440.0;
+const SEG_H: f32 = 24.0;
 const SEG_PAD: f32 = 2.0;
-const TAB_H: f32 = 25.0;
-const TAB_ICON: f32 = 15.0;
+const TAB_H: f32 = 20.0;
+const TAB_ICON: f32 = 11.0;
+/// Gap between the two neighbouring tabs of the strip.
+const TAB_GAP: f32 = 3.0;
 
-/// Content gutter (the concept's 16/18px padding inside the 1px border).
-const PAD_X: f32 = 19.0;
+/// Content gutter (the concept's 15px padding inside the 1px border).
+const PAD_X: f32 = 15.0;
 /// Content right edge.
-const IN_R: f32 = 503.0;
-const INFO_Y: f32 = 98.0;
-const ROW_STEP: f32 = 27.0;
-const ROW_H: f32 = 17.0;
+const IN_R: f32 = 455.0;
+const INFO_Y: f32 = 84.0;
+const ROW_STEP: f32 = 22.0;
+const ROW_H: f32 = 15.0;
 
-const PROG_Y: f32 = 320.0;
-const PROG_W: f32 = 484.0;
-const PROG_H: f32 = 8.0;
+const PROG_Y: f32 = 266.0;
+const PROG_W: f32 = 440.0;
+const PROG_H: f32 = 7.0;
 
-const PART_Y: f32 = 340.0;
-const HEAD_Y: f32 = 351.0;
-const HEAD_H: f32 = 16.0;
-const STRIP_Y: f32 = 375.0;
-const STRIP_H: f32 = 10.0;
-const TBL_HDR_Y: f32 = 393.0;
-const TBL_HDR_H: f32 = 23.0;
-const TBL_Y: f32 = 416.0;
-const TBL_STEP: f32 = 25.0;
-const TBL_PAD: f32 = 5.0;
-const FOOT_PAD: f32 = 14.0;
+const PART_Y: f32 = 284.0;
+const HEAD_Y: f32 = 293.0;
+const HEAD_H: f32 = 15.0;
+const STRIP_Y: f32 = 315.0;
+const STRIP_H: f32 = 9.0;
+const TBL_HDR_Y: f32 = 331.0;
+const TBL_HDR_H: f32 = 20.0;
+const TBL_Y: f32 = 351.0;
+const TBL_STEP: f32 = 22.0;
+const TBL_PAD: f32 = 4.0;
+const FOOT_PAD: f32 = 10.0;
 /// Table columns: # | Status (flex) | Downloaded | Total, both right on IN_R.
 const COL_NUM_W: f32 = 24.0;
 const COL_DL_X: f32 = IN_R - 170.0;
 const COL_TOT_X: f32 = IN_R - 80.0;
 
-/// Card height with `n` part rows — 580 at the concept's six samples.
+/// Card height with `n` part rows — 493 at the concept's six samples.
 fn card_h(n: usize) -> f32 {
-    430.0 + TBL_STEP * n as f32
+    361.0 + TBL_STEP * n as f32
 }
 
 /// The concept's three tabs, in its order.
@@ -300,6 +304,39 @@ fn info_row(
             col,
         );
     }
+
+/// One compact label/value row (the concept's `.kv`): a dim label on the
+/// gutter, the value right on the content edge. Denser than the Info tab's
+/// rows, which stay exactly as they are.
+fn kv_row(
+    p: &egui::Painter,
+    o: egui::Pos2,
+    y: f32,
+    label: &str,
+    value: String,
+    col: egui::Color32,
+    font: egui::FontId,
+) {
+    let lf = reg(12.0);
+    let lw = crate::shaped::width(p, label, &lf);
+    crate::shaped::draw(
+        p,
+        egui::pos2(o.x + PAD_X, y),
+        egui::Align2::LEFT_TOP,
+        label,
+        lf,
+        pl().dm_lbl,
+    );
+    let v = elide_mid(p, &value, font.clone(), IN_R - PAD_X - lw - 12.0);
+    crate::shaped::draw(
+        p,
+        egui::pos2(o.x + IN_R, y),
+        egui::Align2::RIGHT_TOP,
+        &v,
+        font,
+        col,
+    );
+}
 
 struct ProgressApp {
     id: u64,
@@ -491,16 +528,18 @@ impl eframe::App for ProgressApp {
         // The card follows the concept's own rules: one 25px row per part,
         // everything else fixed. A monitor-sized cap keeps a 32-connection
         // list usable — the table scrolls instead of leaving the screen.
+        //
+        // Every tab carries the part section (its header row holds the state
+        // actions), so the height no longer depends on the tab.
         let parts = self.snap.parts.len();
-        let want_h = match (&self.item, self.tab) {
-            (None, _) => PG_DEAD_H,
-            (Some(_), 0) if parts > 0 && self.parts_open => card_h(parts),
-            // Info always keeps the part header row: it carries the state
-            // actions (Pause/Resume/Cancel, and Open file/folder + Close once
-            // the transfer is done), so a finished download is not a dead end
+        let want_h = match &self.item {
+            None => PG_DEAD_H,
+            // The header row is always there: it carries the state actions
+            // (Pause/Resume/Cancel, and Open file/folder + Close once the
+            // transfer is done), so a finished download is not a dead end
             // even though the engine drops the part snapshot at the end.
-            (Some(_), 0) => PG_PART_HEAD_H,
-            _ => PG_MIN_H,
+            Some(_) if parts > 0 && self.parts_open => card_h(parts),
+            Some(_) => PG_PART_HEAD_H,
         };
         let want_h = match crate::model::work_area_rect(ctx) {
             Some(w) => want_h.min((w.height() - 40.0).max(PG_MIN_H)),
@@ -590,17 +629,35 @@ impl ProgressApp {
         }
     }
 
-    /// The concept's segmented control: trough, one segment per tab.
+    /// The concept's segmented control: an inset trough with a hairline
+    /// border, and the three tabs as separate pills inside it (the active one
+    /// is the accent pill, the others are plain until hovered).
     fn tabs(&mut self, ui: &mut egui::Ui, o: egui::Pos2) {
         let ctx = ui.ctx().clone();
         let p = ui.painter().clone();
-        p.rect_filled(at(o, SEG_X, SEG_Y, SEG_W, SEG_H), 7.0, pl().dm_trough);
-        let tw = (SEG_W - 2.0 * SEG_PAD) / TABS.len() as f32;
+        let trough = at(o, SEG_X, SEG_Y, SEG_W, SEG_H);
+        p.rect_filled(trough, 6.0, pl().dm_trough);
+        p.rect_stroke(
+            trough,
+            6.0,
+            egui::Stroke::new(1.0_f32, pl().dm_box_bd),
+            egui::StrokeKind::Inside,
+        );
+        let inner = SEG_W - 2.0 * SEG_PAD;
+        let tw = (inner - TAB_GAP * (TABS.len() as f32 - 1.0)) / TABS.len() as f32;
         for (i, (icon, name)) in TABS.iter().enumerate() {
-            let r = at(o, SEG_X + SEG_PAD + i as f32 * tw, SEG_Y + SEG_PAD, tw, TAB_H);
+            let x = SEG_X + SEG_PAD + i as f32 * (tw + TAB_GAP);
+            let r = at(o, x, SEG_Y + SEG_PAD, tw, TAB_H);
             let b = ui.interact(r, egui::Id::new(("pg-tab", i)), egui::Sense::click());
             let sel = self.tab as usize == i;
             if sel {
+                // The pill casts a soft shadow on the trough, so it reads as
+                // raised rather than as a painted block.
+                p.rect_filled(
+                    r.translate(egui::vec2(0.0, 1.0)),
+                    5.0,
+                    egui::Color32::from_black_alpha(90),
+                );
                 dm_gradient(&p, r, 5.0, DM_ACC, DM_ACC2);
             } else if b.hovered() {
                 p.rect_filled(r, 5.0, pl().dm_hover);
@@ -609,7 +666,7 @@ impl ProgressApp {
                 ctx.set_cursor_icon(egui::CursorIcon::PointingHand);
             }
             let col = if sel { egui::Color32::WHITE } else { pl().dm_lbl };
-            let font = if sel { semi(10.0) } else { reg(10.0) };
+            let font = if sel { semi(11.0) } else { reg(11.0) };
             let gw = p
                 .layout_no_wrap((*name).to_string(), font.clone(), col)
                 .size()
@@ -623,7 +680,7 @@ impl ProgressApp {
                 ),
                 *icon,
                 col,
-                2.0,
+                1.8,
             );
             p.text(
                 egui::pos2(x0 + TAB_ICON + 5.0, r.center().y),
@@ -639,7 +696,9 @@ impl ProgressApp {
     }
 
     /// The card for a live queue item: chrome, tabs, the active tab's body,
-    /// the progress bar and — on Info — the part section.
+    /// the progress bar and the part section. The part section belongs to the
+    /// card, not to the Info tab: every tab keeps its collapse toggle and the
+    /// state actions.
     fn paint(&mut self, ui: &mut egui::Ui, item: &DownloadItem, o: egui::Pos2) {
         let p = ui.painter().clone();
         let frac = Self::frac(item);
@@ -657,13 +716,11 @@ impl ProgressApp {
             && matches!(item.status, Status::Downloading | Status::Queued);
         match self.tab {
             1 => self.body_speed(ui, o, item, downloading),
-            2 => self.body_settings(ui, o, item),
+            2 => self.body_settings(ui, o),
             _ => self.body_info(ui, o, item, downloading),
         }
         self.progress_bar(ui, o, item, frac);
-        if self.tab == 0 {
-            self.parts(ui, o, item, downloading);
-        }
+        self.parts(ui, o, item, downloading);
     }
 
     /// The item left the queue (removed or cancelled elsewhere).
@@ -673,13 +730,13 @@ impl ProgressApp {
         let title = format!("Download #{}", self.id);
         self.chrome(ui, o, &title);
         p.text(
-            egui::pos2(o.x + PAD_X, o.y + 82.0),
+            egui::pos2(o.x + PAD_X, o.y + 66.0),
             egui::Align2::LEFT_TOP,
             "No longer in the queue.",
             reg(13.0),
             pl().dm_dim,
         );
-        let r = at(o, PAD_X, 110.0, 100.0, 36.0);
+        let r = at(o, PAD_X, 96.0, 92.0, 32.0);
         let b = ui.interact(r, egui::Id::new("pg-dead-close"), egui::Sense::click());
         btn_flat(&p, r, b.hovered(), "Close");
         if b.hovered() {
@@ -806,23 +863,27 @@ impl ProgressApp {
     }
 
     /// Concept Speed tab: thread count, live rate and the global cap.
+    ///
+    /// The rows keep the right edge of the Info tab but sit on the concept's
+    /// denser rhythm; below them the cap gets a compact field and a compact
+    /// accent button, with the two hint lines that explain it.
     fn body_speed(&mut self, ui: &mut egui::Ui, o: egui::Pos2, item: &DownloadItem, downloading: bool) {
         let ctx = ui.ctx().clone();
         let p = ui.painter().clone();
         let cap: u64 = self.limit_input.trim().parse().unwrap_or(0);
-        info_row(
+        kv_row(
             &p,
             o,
-            0,
+            84.0,
             "Connections:",
             format!("{} threads (fixed at start)", item.connections),
             pl().dm_txt,
-            reg(13.0),
+            reg(12.0),
         );
-        info_row(
+        kv_row(
             &p,
             o,
-            1,
+            111.0,
             "Current Speed:",
             if downloading && item.speed_bps > 0.0 {
                 format!("{}/s", format_bytes(item.speed_bps as u64))
@@ -830,12 +891,12 @@ impl ProgressApp {
                 "-".into()
             },
             pl().dm_txt,
-            reg(13.0),
+            reg(12.0),
         );
-        info_row(
+        kv_row(
             &p,
             o,
-            2,
+            138.0,
             "Global Speed Cap:",
             if cap == 0 {
                 "Unlimited".into()
@@ -843,19 +904,20 @@ impl ProgressApp {
                 format!("{cap} KB/s")
             },
             pl().dm_txt,
-            reg(13.0),
+            reg(12.0),
         );
-        let field = at(o, PAD_X, 182.0, 280.0, DM_BOX_H);
+        // ---- the cap row: a slim field and a slim accent button ----
+        let field = at(o, PAD_X, 168.0, 348.0, 30.0);
         dm_field(
             ui,
             "pg_limit",
             field,
-            field.max.x - 12.0,
+            field.max.x - 10.0,
             &mut self.limit_input,
-            "0 = unlimited",
+            "0 = unlimited (KB/s)",
             false,
         );
-        let apply = at(o, PAD_X + 288.0, 182.0, 100.0, DM_BOX_H);
+        let apply = at(o, IN_R - 84.0, 168.0, 84.0, 30.0);
         let ab = ui.interact(apply, egui::Id::new("pg-apply"), egui::Sense::click());
         dm_gradient(&p, apply, DM_RAD, DM_ACC, DM_ACC2);
         p.text(
@@ -879,64 +941,118 @@ impl ProgressApp {
         }
         let note = match self.limit_known {
             Some(k) => format!("Cap {k} KB/s sent — the app applies it live."),
-            None => "Type a number and Apply.".to_string(),
+            None => "Type a number in KB/s and press Apply — 0 means unlimited.".to_string(),
         };
         p.text(
-            egui::pos2(o.x + PAD_X, o.y + 228.0),
+            egui::pos2(o.x + PAD_X, o.y + 212.0),
             egui::Align2::LEFT_TOP,
             note,
-            reg(12.0),
+            reg(10.0),
             pl().dm_dim,
         );
         p.text(
-            egui::pos2(o.x + PAD_X, o.y + 246.0),
+            egui::pos2(o.x + PAD_X, o.y + 228.0),
             egui::Align2::LEFT_TOP,
             "Tip: Settings → Speed windows automates caps by time of day.",
-            reg(12.0),
+            reg(10.0),
             pl().dm_lbl,
         );
     }
 
-    /// Concept Settings tab: what happens when the queue drains, plus the
-    /// folder/cancel actions the design has no room for elsewhere.
-    fn body_settings(&mut self, ui: &mut egui::Ui, o: egui::Pos2, item: &DownloadItem) {
+    /// Concept Settings tab: what happens when the queue drains.
+    ///
+    /// The four choices are cards in a two-column grid (radio, icon, label);
+    /// the picked one is outlined in the accent and tinted with it. The block
+    /// sits in the middle of the pane, like the concept's centred pane.
+    fn body_settings(&mut self, ui: &mut egui::Ui, o: egui::Pos2) {
         let ctx = ui.ctx().clone();
         let p = ui.painter().clone();
+        // The block sits in the middle of the pane, like the concept's
+        // centred pane: equal air above and below, no dead band.
+        let y0 = 104.0;
         p.text(
-            egui::pos2(o.x + PAD_X, o.y + INFO_Y),
+            egui::pos2(o.x + PAD_X, o.y + y0),
             egui::Align2::LEFT_TOP,
             "When the queue drains:",
-            reg(13.0),
+            reg(11.0),
             pl().dm_lbl,
         );
-        for (i, (val, label)) in [
-            ("nothing", "Nothing"),
-            ("shutdown", "Shut down"),
-            ("sleep", "Sleep"),
-            ("hibernate", "Hibernate"),
-        ]
-        .iter()
-        .enumerate()
-        {
-            let r = at(o, PAD_X, 124.0 + 28.0 * i as f32, IN_R - PAD_X, 26.0);
+        p.text(
+            egui::pos2(o.x + PAD_X, o.y + y0 + 19.0),
+            egui::Align2::LEFT_TOP,
+            "Choose what Download Craft does once the last item in the queue finishes.",
+            reg(10.0),
+            pl().dm_dim,
+        );
+        // value, label, Material glyph
+        const OPTS: [(&str, &str, &str); 4] = [
+            ("nothing", "Nothing", "\u{e15d}"),
+            ("shutdown", "Shut down", "\u{e8ac}"),
+            ("sleep", "Sleep", "\u{ef44}"),
+            ("hibernate", "Hibernate", "\u{eb3b}"),
+        ];
+        let grid_y = o.y + y0 + 38.0;
+        let cw = (PROG_W - 6.0) / 2.0;
+        for (i, (val, label, glyph)) in OPTS.iter().enumerate() {
+            let col = (i % 2) as f32;
+            let row = (i / 2) as f32;
+            let r = egui::Rect::from_min_size(
+                egui::pos2(o.x + PAD_X + col * (cw + 6.0), grid_y + row * 39.0),
+                egui::vec2(cw, 33.0),
+            );
             let b = ui.interact(r, egui::Id::new(("pg-fin", i)), egui::Sense::click());
             let sel = self.finish_sel == *val;
+            p.rect_filled(
+                r,
+                7.0,
+                if sel {
+                    pl().dm_line
+                } else if b.hovered() {
+                    pl().dm_hover2
+                } else {
+                    pl().dm_line
+                },
+            );
+            if sel {
+                // The accent tint sits on top of the card fill, so the card
+                // keeps its own surface under the colour.
+                p.rect_filled(
+                    r,
+                    7.0,
+                    egui::Color32::from_rgba_unmultiplied(DM_ACC.r(), DM_ACC.g(), DM_ACC.b(), 42),
+                );
+            }
+            p.rect_stroke(
+                r,
+                7.0,
+                egui::Stroke::new(1.0_f32, if sel { DM_ACC } else { pl().dm_box_bd }),
+                egui::StrokeKind::Inside,
+            );
             if b.hovered() {
-                p.rect_filled(r, DM_RAD, pl().dm_hover);
                 ctx.set_cursor_icon(egui::CursorIcon::PointingHand);
             }
-            let c = egui::pos2(o.x + PAD_X + 7.0, r.center().y);
+            // radio
+            let rc = egui::pos2(r.min.x + 15.0, r.center().y);
             if sel {
-                p.circle_filled(c, 7.0, DM_ACC);
-                p.circle_filled(c, 2.5, egui::Color32::WHITE);
+                p.circle_filled(rc, 6.0, DM_ACC);
+                p.circle_filled(rc, 2.2, egui::Color32::WHITE);
             } else {
-                p.circle_stroke(c, 7.0, egui::Stroke::new(1.0, pl().dm_box_bd));
+                p.circle_stroke(rc, 6.0, egui::Stroke::new(1.0_f32, pl().dm_box_bd));
             }
+            // icon + label
+            let icol = if sel { DM_ACC } else { pl().dm_dim };
             p.text(
-                egui::pos2(o.x + PAD_X + 22.0, r.center().y),
+                egui::pos2(r.min.x + 28.0, r.center().y),
+                egui::Align2::LEFT_CENTER,
+                (*glyph).to_string(),
+                crate::fonts::icon(13.0),
+                icol,
+            );
+            p.text(
+                egui::pos2(r.min.x + 48.0, r.center().y),
                 egui::Align2::LEFT_CENTER,
                 (*label).to_string(),
-                reg(13.0),
+                if sel { semi(11.0) } else { reg(11.0) },
                 if sel { pl().dm_txt } else { pl().dm_dim },
             );
             if b.clicked() {
@@ -944,28 +1060,13 @@ impl ProgressApp {
                 send_cmd_kv("finish", "value", serde_json::Value::from(*val));
             }
         }
-        let open = at(o, PAD_X, 246.0, 180.0, DM_BOX_H);
-        let ob = ui.interact(open, egui::Id::new("pg-open-dir"), egui::Sense::click());
-        btn_flat(&p, open, ob.hovered(), "Open download folder");
-        if ob.hovered() {
-            ctx.set_cursor_icon(egui::CursorIcon::PointingHand);
-        }
-        if ob.clicked() {
-            if let Some(dir) = item.dest_path().parent() {
-                open_path(dir);
-            }
-        }
-        if !matches!(item.status, Status::Completed) {
-            let cancel = at(o, PAD_X + 190.0, 246.0, 150.0, DM_BOX_H);
-            let cb = ui.interact(cancel, egui::Id::new("pg-cancel"), egui::Sense::click());
-            btn_flat_c(&p, cancel, cb.hovered(), "Cancel download", pl().dm_warn);
-            if cb.hovered() {
-                ctx.set_cursor_icon(egui::CursorIcon::PointingHand);
-            }
-            if cb.clicked() {
-                send_cmd(self.id, "cancel");
-            }
-        }
+        p.text(
+            egui::pos2(o.x + PAD_X, o.y + y0 + 123.0),
+            egui::Align2::LEFT_TOP,
+            "Only applies when the queue runs out of items — active downloads are not interrupted.",
+            reg(10.0),
+            pl().dm_lbl,
+        );
     }
 
     /// The concept's 8px accent bar (every tab keeps it: it is the "still

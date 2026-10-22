@@ -142,6 +142,8 @@ pub fn dm_mark(p: &egui::Painter, r: egui::Rect) {
 pub enum DmIcon {
     Minimize,
     Maximize,
+    /// Two offset squares — the maximize button while the window is maximized.
+    Restore,
     Close,
     Clipboard,
     Folder,
@@ -192,6 +194,21 @@ pub fn dm_icon(p: &egui::Painter, r: egui::Rect, icon: DmIcon, color: egui::Colo
         DmIcon::Maximize => {
             p.rect_stroke(
                 egui::Rect::from_min_size(m(5.0, 5.0), egui::vec2(14.0 * s, 14.0 * s)),
+                egui::CornerRadius::same(1),
+                st,
+                egui::StrokeKind::Inside,
+            );
+        }
+        DmIcon::Restore => {
+            // The front sheet, then the one behind it peeking out top-left.
+            p.rect_stroke(
+                egui::Rect::from_min_size(m(8.0, 8.0), egui::vec2(11.0 * s, 11.0 * s)),
+                egui::CornerRadius::same(1),
+                st,
+                egui::StrokeKind::Inside,
+            );
+            p.rect_stroke(
+                egui::Rect::from_min_size(m(5.0, 5.0), egui::vec2(11.0 * s, 11.0 * s)),
                 egui::CornerRadius::same(1),
                 st,
                 egui::StrokeKind::Inside,
@@ -255,19 +272,16 @@ pub fn dm_icon(p: &egui::Painter, r: egui::Rect, icon: DmIcon, color: egui::Colo
             line((20.0, 14.0), (14.0, 14.0));
         }
         DmIcon::Settings => {
-            p.circle_stroke(m(12.0, 12.0), 3.5 * s, st);
-            for (x, y) in [
-                (12.0, 2.0),
-                (12.0, 22.0),
-                (2.0, 12.0),
-                (20.0, 12.0),
-                (4.9, 4.9),
-                (17.7, 17.7),
-                (4.9, 19.1),
-                (17.7, 6.3),
-            ] {
-                line((x, y), (x + (12.0 - x) * 0.28, y + (12.0 - y) * 0.28));
-            }
+            // The hand-traced "cog" (a ring with eight inward spokes) read as a
+            // sunburst at 14 px, not as settings. Use the bundled Material gear
+            // glyph instead - it is drawn as a real cog outline.
+            p.text(
+                r.center(),
+                egui::Align2::CENTER_CENTER,
+                "\u{e8b8}".to_string(),
+                crate::fonts::icon(r.width().min(r.height()) * 1.02),
+                color,
+            );
         }
         DmIcon::Info => {
             p.circle_stroke(m(12.0, 12.0), 9.0 * s, st);
@@ -404,6 +418,34 @@ pub fn icon_btn(
     if hovered {
         p.rect_filled(rect, DM_RAD, pl().dm_hover2);
     }
+    dm_icon(
+        p,
+        egui::Rect::from_center_size(rect.center(), egui::Vec2::splat(size)),
+        icon,
+        color,
+        w,
+    );
+}
+
+/// Same icon button, but sitting on the field surface: the same fill, border
+/// and radius as `dm_box`, so a button beside an input reads as part of the
+/// same row instead of a bare glyph.
+pub fn icon_btn_box(
+    p: &egui::Painter,
+    rect: egui::Rect,
+    hovered: bool,
+    icon: DmIcon,
+    size: f32,
+    w: f32,
+    color: egui::Color32,
+) {
+    p.rect(
+        rect,
+        DM_RAD,
+        if hovered { pl().dm_hover2 } else { pl().dm_line },
+        egui::Stroke::new(1.0, pl().dm_box_bd),
+        egui::StrokeKind::Inside,
+    );
     dm_icon(
         p,
         egui::Rect::from_center_size(rect.center(), egui::Vec2::splat(size)),

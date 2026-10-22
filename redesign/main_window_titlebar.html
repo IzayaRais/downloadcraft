@@ -1,0 +1,495 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>Download Craft — Main Window (menus in title bar)</title>
+<style>
+  :root {
+    --bg: #0a0a14; --bg-sidebar: #08080f; --bg-card: #16213a;
+    --bg-title: #0a0a14;
+    --bg-hover: #334155; --bg-active: #1e293b;
+    --text-primary: #f1f5f9; --text-secondary: #94a3b8; --text-muted: #64748b;
+    --border: #1e293b; --accent: #3b82f6; --accent-hover: #60a5fa;
+    --success: #22c55e; --warning: #eab308; --danger: #ef4444;
+    --shadow: 0 8px 32px rgba(0,0,0,0.4);
+  }
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body { background: #0a0a1a; color: #e0e0f0; font-family: 'Segoe UI', sans-serif; padding: 16px; }
+  h1 { text-align: center; font-size: 20px; margin-bottom: 4px; color: #fff; }
+  .subtitle { text-align: center; color: #8888a8; margin-bottom: 10px; font-size: 11px; }
+
+  .view-bar { display: flex; justify-content: center; align-items: center; gap: 4px; margin-bottom: 14px; }
+  .view-label { font-size: 10px; color: #8888a8; margin-right: 4px; letter-spacing: 0.3px; text-transform: uppercase; }
+  .view-btn { padding: 4px 14px; border-radius: 14px; border: 1px solid var(--border); background: var(--bg-card); color: var(--text-secondary); font-size: 10.5px; font-family: inherit; cursor: pointer; transition: all 0.15s; }
+  .view-btn:hover { color: var(--text-primary); border-color: var(--text-muted); }
+  .view-btn.active { background: var(--accent); border-color: var(--accent); color: #fff; }
+
+  .window { width: 960px; margin: 0 auto; background: var(--bg); border: 1px solid var(--border); border-radius: 12px; overflow: hidden; box-shadow: var(--shadow); }
+
+  /* ===== Unified title bar: brand + menus + taskbar + search + window controls ===== */
+  .title-bar {
+    display: flex; align-items: center; gap: 8px;
+    height: 46px; padding: 0 8px 0 12px;
+    background: var(--bg);
+    border-bottom: none;
+    user-select: none;
+  }
+  .brand { display: flex; align-items: center; gap: 6px; flex-shrink: 0; }
+  .title-icon { width: 18px; height: 18px; display: flex; align-items: center; justify-content: center; }
+  .title-text { font-size: 13px; font-weight: 600; color: var(--text-primary); white-space: nowrap; }
+
+  .v-sep { width: 1px; height: 18px; background: var(--border); flex-shrink: 0; }
+
+  .menus { display: flex; align-items: center; gap: 1px; flex-shrink: 0; }
+  .menu-item { padding: 4px 6px; font-size: 11px; color: var(--text-secondary); cursor: pointer; border-radius: 5px; transition: all 0.1s; white-space: nowrap; }
+  .menu-item:hover { background: var(--bg-hover); color: var(--text-primary); }
+
+  .tools { display: flex; align-items: center; gap: 2px; flex-shrink: 0; }
+
+  .title-spacer { flex: 1; min-width: 4px; }
+
+  .search-box {
+    display: flex; align-items: center; gap: 7px; flex-shrink: 0;
+    height: 28px; width: 176px; padding: 0 12px;
+    border-radius: 999px;
+    background: rgba(148, 163, 184, 0.075);
+    border: 1px solid transparent;
+    transition: background 0.15s, border-color 0.15s, box-shadow 0.15s;
+  }
+  .search-box:hover { background: rgba(148, 163, 184, 0.115); }
+  .search-box:focus-within {
+    background: rgba(148, 163, 184, 0.10);
+    border-color: var(--accent);
+    box-shadow: 0 0 0 3px rgba(59, 130, 246, 0.14);
+  }
+  .search-box input { flex: 1; min-width: 0; background: transparent; border: none; outline: none; font-size: 10.5px; color: var(--text-primary); font-family: inherit; }
+  .search-box input::placeholder { color: var(--text-muted); }
+  .search-icon { width: 11px; height: 11px; color: var(--text-muted); flex-shrink: 0; }
+
+  /* Update chip — circle at rest, expands into a pill on hover */
+  .update-btn {
+    display: flex; align-items: center;
+    height: 28px; padding: 0 7px; flex-shrink: 0;
+    border: none; border-radius: 999px;
+    background: rgba(148, 163, 184, 0.10);
+    color: var(--accent-hover);
+    cursor: pointer; font-family: inherit;
+    transition: background 0.18s;
+  }
+  .update-btn:hover { background: rgba(148, 163, 184, 0.17); }
+  .update-btn svg { width: 14px; height: 14px; flex-shrink: 0; }
+  .update-label {
+    max-width: 0; opacity: 0; overflow: hidden;
+    font-size: 10.5px; font-weight: 600; white-space: nowrap;
+    transition: max-width 0.22s ease, opacity 0.18s ease, margin-right 0.22s ease;
+  }
+  .update-btn:hover .update-label { max-width: 56px; opacity: 1; margin-right: 5px; }
+
+  .win-controls { display: flex; align-items: center; gap: 1px; flex-shrink: 0; }
+  .title-btn { width: 28px; height: 26px; display: flex; align-items: center; justify-content: center; border-radius: 4px; cursor: pointer; color: var(--text-muted); transition: all 0.1s; }
+  .title-btn:hover { background: var(--bg-hover); color: var(--text-primary); }
+  .title-btn.close:hover { background: var(--danger); color: #fff; }
+
+  .main-content { display: flex; height: 420px; gap: 12px; padding: 12px; }
+
+  /* Left Panel — distinct container */
+  .sidebar { width: 180px; background: var(--bg-sidebar); border: 1px solid var(--border); border-radius: 10px; padding: 8px; display: flex; flex-direction: column; gap: 2px; flex-shrink: 0; overflow-y: auto; max-height: 100%; }
+  .sidebar::-webkit-scrollbar { width: 4px; }
+  .sidebar::-webkit-scrollbar-track { background: transparent; }
+  .sidebar::-webkit-scrollbar-thumb { background: var(--border); border-radius: 2px; }
+  .sidebar::-webkit-scrollbar-thumb:hover { background: var(--text-muted); }
+  .sidebar-section { font-size: 9px; color: var(--text-muted); text-transform: uppercase; letter-spacing: 0.5px; padding: 10px 8px 4px 8px; cursor: pointer; display: flex; align-items: center; gap: 6px; user-select: none; }
+  .sidebar-section:hover { color: var(--text-secondary); }
+  .sidebar-section::before { content: ""; width: 5px; height: 5px; border-right: 1.5px solid currentColor; border-bottom: 1.5px solid currentColor; transform: rotate(45deg); transition: transform 0.2s; flex-shrink: 0; }
+  .sidebar-section.collapsed::before { transform: rotate(-45deg); }
+  .sidebar-item.hidden { display: none !important; }
+  .sidebar-item { display: flex; align-items: center; gap: 8px; padding: 6px 8px; border-radius: 6px; font-size: 11px; color: var(--text-secondary); cursor: pointer; transition: all 0.1s; }
+  .sidebar-item:hover { background: var(--bg-hover); color: var(--text-primary); }
+  .sidebar-item.active { background: var(--bg-active); color: var(--accent); }
+  .sidebar-item svg { width: 13px; height: 13px; flex-shrink: 0; }
+  .sidebar-count { margin-left: auto; font-size: 9px; color: var(--text-muted); background: var(--bg-hover); padding: 1px 6px; border-radius: 8px; }
+  .sidebar-item.active .sidebar-count { background: var(--accent); color: #fff; }
+  .sidebar-footer { margin-top: auto; padding: 6px 8px; font-size: 10px; color: var(--text-muted); border-top: 1px solid var(--border); }
+
+  /* Right Panel — distinct container */
+  .content-area { flex: 1; min-width: 0; background: var(--bg-sidebar); border: 1px solid var(--border); border-radius: 10px; display: flex; flex-direction: column; overflow: hidden; }
+
+  /* Taskbar — unchanged, its own row above the table */
+  .toolbar { display: flex; align-items: center; gap: 4px; padding: 8px 12px; border-bottom: 1px solid var(--border); flex-shrink: 0; }
+  .tool-btn { display: flex; flex-direction: column; align-items: center; gap: 3px; padding: 6px 8px; border-radius: 6px; cursor: pointer; color: var(--text-secondary); transition: all 0.1s; min-width: 55px; border: none; background: transparent; font-family: inherit; }
+  .tool-btn:hover { background: var(--bg-hover); color: var(--text-primary); }
+  .tool-btn svg { width: 14px; height: 14px; flex-shrink: 0; }
+  .tool-btn span { font-size: 9px; white-space: nowrap; }
+
+  /* Table — fixed layout keeps every column clipped inside its own strip */
+  .table-container { flex: 1; min-width: 0; overflow: auto; }
+  .table-container::-webkit-scrollbar { width: 6px; height: 6px; }
+  .table-container::-webkit-scrollbar-track { background: transparent; }
+  .table-container::-webkit-scrollbar-thumb { background: var(--border); border-radius: 3px; }
+  .table-container::-webkit-scrollbar-thumb:hover { background: var(--text-muted); }
+
+  table.downloads { width: 100%; border-collapse: collapse; table-layout: fixed; }
+  table.downloads th {
+    position: sticky; top: 0; z-index: 5;
+    padding: 6px 8px; font-size: 9px; font-weight: 600; color: var(--text-muted);
+    text-transform: uppercase; letter-spacing: 0.3px; text-align: left;
+    border-bottom: 1px solid var(--border); background: var(--bg-sidebar);
+    overflow: hidden; white-space: nowrap; text-overflow: ellipsis; user-select: none;
+  }
+  table.downloads th .resizer { position: absolute; top: 0; right: -3px; width: 7px; height: 100%; cursor: col-resize; z-index: 6; }
+  table.downloads th .resizer::before { content: ""; position: absolute; right: 3px; top: 20%; height: 60%; width: 3px; border-radius: 1.5px; background: transparent; transition: background 0.15s; }
+  table.downloads th:hover .resizer::before { background: var(--border); }
+  table.downloads th .resizer:hover::before, table.downloads th.resizing .resizer::before { background: var(--accent); }
+
+  table.downloads td { padding: 6px 8px; border-bottom: 1px solid rgba(30,41,59,0.5); overflow: hidden; white-space: nowrap; text-overflow: ellipsis; vertical-align: middle; }
+  table.downloads tbody tr { transition: background 0.1s; }
+  table.downloads tbody tr:hover { background: var(--bg-active); }
+
+  .c-check { width: 30px; }
+  .c-size { width: 92px; }
+  .c-status { width: 84px; }
+  .c-speed { width: 62px; }
+  .c-time { width: 62px; }
+  .c-date { width: 104px; }
+
+  table.downloads th.th-l { text-align: left; }
+  table.downloads th.th-r { text-align: right; }
+
+  .checkbox { width: 13px; height: 13px; border: 1.5px solid var(--border); border-radius: 3px; cursor: pointer; display: inline-flex; align-items: center; justify-content: center; vertical-align: middle; transition: all 0.12s; }
+  .checkbox:hover { border-color: var(--text-muted); }
+  .checkbox svg { width: 8px; height: 8px; opacity: 0; color: #fff; }
+  .checkbox.checked { background: var(--accent); border-color: var(--accent); }
+  .checkbox.checked svg { opacity: 1; }
+
+  .name-cell { display: flex; align-items: center; gap: 10px; min-width: 0; }
+  .name-icon { width: 20px; height: 20px; display: flex; align-items: center; justify-content: center; flex-shrink: 0; }
+  .name-icon svg { width: 100%; height: 100%; display: block; }
+  .name-text { display: flex; flex-direction: column; gap: 1px; min-width: 0; flex: 1; }
+  .name-title { font-size: 11px; color: var(--text-primary); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .name-sub { font-size: 9px; color: var(--text-muted); }
+
+  td.c-size, td.c-speed, td.c-time, td.c-date { text-align: right; }
+  td.c-status { text-align: right; }
+  td.c-size { font-size: 11px; color: var(--text-secondary); }
+  td.c-speed, td.c-time { font-size: 10px; color: var(--text-muted); }
+  td.c-date { font-size: 10px; color: var(--text-muted); }
+
+  .status-badge { display: inline-block; padding: 2px 8px; border-radius: 10px; font-size: 9px; font-weight: 500; }
+  .status-finished { background: #22c55e22; color: var(--success); }
+
+  .status-bar { display: flex; align-items: center; justify-content: space-between; padding: 6px 14px; border: 1px solid var(--border); border-top: none; border-radius: 0 0 12px 12px; font-size: 10px; color: var(--text-muted); }
+</style>
+<script>
+  document.addEventListener('DOMContentLoaded', () => {
+    // Collapsible sidebar sections
+    document.querySelectorAll('.sidebar-section').forEach(section => {
+      section.addEventListener('click', () => {
+        section.classList.toggle('collapsed');
+        let el = section.nextElementSibling;
+        while (el && !el.classList.contains('sidebar-section') && !el.classList.contains('sidebar-footer')) {
+          el.classList.toggle('hidden', section.classList.contains('collapsed'));
+          el = el.nextElementSibling;
+        }
+      });
+    });
+
+    // Row checkboxes toggle their own state
+    const rowBoxes = Array.from(document.querySelectorAll('tbody .checkbox'));
+    rowBoxes.forEach(cb => cb.addEventListener('click', () => cb.classList.toggle('checked')));
+
+    // Select-all checkbox
+    const allBox = document.querySelector('thead .checkbox');
+    allBox.addEventListener('click', () => {
+      const checked = !allBox.classList.contains('checked');
+      allBox.classList.toggle('checked', checked);
+      rowBoxes.forEach(cb => cb.classList.toggle('checked', checked));
+    });
+
+    // Column resizing — writes to <col> widths, so header and body can never drift
+    const table = document.querySelector('table.downloads');
+    const cols = Array.from(table.querySelectorAll('colgroup col'));
+    const ths = Array.from(table.querySelectorAll('thead th'));
+    const MIN = 44;
+
+    ths.forEach((th, idx) => {
+      if (idx === 0) return; // checkbox column stays fixed
+      const handle = document.createElement('div');
+      handle.className = 'resizer';
+      th.appendChild(handle);
+
+      handle.addEventListener('mousedown', (e) => {
+        e.preventDefault();
+        e.stopPropagation();
+        const startX = e.pageX;
+        const startW = ths[idx].getBoundingClientRect().width;
+        th.classList.add('resizing');
+        document.body.style.cursor = 'col-resize';
+
+        const onMove = (ev) => {
+          const next = Math.max(MIN, startW + ev.pageX - startX);
+          cols[idx].style.width = next + 'px';
+        };
+        const onUp = () => {
+          th.classList.remove('resizing');
+          document.body.style.cursor = '';
+          document.removeEventListener('mousemove', onMove);
+          document.removeEventListener('mouseup', onUp);
+        };
+        document.addEventListener('mousemove', onMove);
+        document.addEventListener('mouseup', onUp);
+      });
+    });
+  });
+
+  // Preview zoom — the app window is 960px wide; the mockup pane may be narrower.
+  const WIN_W = 960;
+  let zoomMode = 'fit';
+  function applyZoom(mode) {
+    zoomMode = mode;
+    const scale = mode === 'fit'
+      ? Math.min(1, (document.documentElement.clientWidth - 48) / WIN_W)
+      : 1;
+    document.querySelector('.window').style.zoom = scale;
+    document.querySelectorAll('.view-btn').forEach(b => b.classList.toggle('active', b.dataset.z === mode));
+  }
+  window.addEventListener('resize', () => applyZoom(zoomMode));
+  document.addEventListener('DOMContentLoaded', () => applyZoom('fit'));
+</script>
+</head>
+<body>
+
+<h1>Download Craft</h1>
+<p class="subtitle">File / Tasks menus moved into the title bar</p>
+
+<div class="view-bar">
+  <span class="view-label">Preview</span>
+  <button class="view-btn active" data-z="fit" onclick="applyZoom('fit')">Fit</button>
+  <button class="view-btn" data-z="100" onclick="applyZoom('100')">100%</button>
+</div>
+
+<div class="window">
+
+  <!-- ===== ONE ROW: brand · menus · taskbar · search · window controls ===== -->
+  <div class="title-bar">
+    <div class="brand">
+      <div class="title-icon"><svg viewBox="0 0 24 24" fill="none"><circle cx="12" cy="12" r="10" stroke="#3b82f6" stroke-width="2"/><path d="M8 12l3 3 5-6" stroke="#3b82f6" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg></div>
+      <span class="title-text">Download Craft</span>
+    </div>
+
+    <div class="v-sep"></div>
+
+    <nav class="menus">
+      <span class="menu-item">File</span>
+      <span class="menu-item">Tasks</span>
+      <span class="menu-item">Tools</span>
+      <span class="menu-item">Theme</span>
+      <span class="menu-item">Help</span>
+    </nav>
+
+    <div class="v-sep"></div>
+
+    <div class="title-spacer"></div>
+
+    <div class="search-box">
+      <svg class="search-icon" viewBox="0 0 24 24" fill="none"><circle cx="11" cy="11" r="7" stroke="currentColor" stroke-width="2.2"/><path d="M21 21l-4-4" stroke="currentColor" stroke-width="2.2" stroke-linecap="round"/></svg>
+      <input placeholder="Search in the List">
+    </div>
+
+    <button class="update-btn" title="Update available">
+      <span class="update-label">Update</span>
+      <svg viewBox="0 0 24 24" fill="none"><path d="M12 3.5v10M7.5 9l4.5 4.5L16.5 9" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/><path d="M5 19.5h14" stroke="currentColor" stroke-width="2" stroke-linecap="round"/></svg>
+    </button>
+
+    <div class="win-controls">
+      <div class="title-btn" title="Minimize"><svg width="10" height="10" viewBox="0 0 24 24" fill="none"><path d="M5 12h14" stroke="currentColor" stroke-width="2" stroke-linecap="round"/></svg></div>
+      <div class="title-btn" title="Maximize"><svg width="10" height="10" viewBox="0 0 24 24" fill="none"><rect x="5" y="5" width="14" height="14" rx="1" stroke="currentColor" stroke-width="2"/></svg></div>
+      <div class="title-btn close" title="Close"><svg width="10" height="10" viewBox="0 0 24 24" fill="none"><path d="M6 6l12 12M18 6L6 18" stroke="currentColor" stroke-width="2" stroke-linecap="round"/></svg></div>
+    </div>
+  </div>
+
+  <div class="main-content">
+    <!-- LEFT PANEL -->
+    <div class="sidebar">
+      <div class="sidebar-item active"><svg viewBox="0 0 24 24" fill="none"><rect x="3" y="3" width="18" height="18" rx="4" stroke="currentColor" stroke-width="2"/><circle cx="8.5" cy="8.5" r="1.5" fill="currentColor"/><circle cx="15.5" cy="8.5" r="1.5" fill="currentColor"/><circle cx="8.5" cy="15.5" r="1.5" fill="currentColor"/><circle cx="15.5" cy="15.5" r="1.5" fill="currentColor"/></svg>All<span class="sidebar-count">11</span></div>
+
+      <div class="sidebar-section">Categories</div>
+      <div class="sidebar-item"><svg viewBox="0 0 24 24" fill="none"><rect x="3" y="5" width="18" height="14" rx="4" stroke="currentColor" stroke-width="2"/><circle cx="9" cy="10" r="2" stroke="currentColor" stroke-width="1.5"/><path d="M3 17l5-5 4 4 3-3 6 6" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg>Pictures<span class="sidebar-count">1</span></div>
+      <div class="sidebar-item"><svg viewBox="0 0 24 24" fill="none"><rect x="2" y="4" width="20" height="16" rx="5" stroke="currentColor" stroke-width="2"/><path d="M10 9l5.5 3.5L10 16V9z" fill="currentColor"/></svg>Videos<span class="sidebar-count">3</span></div>
+      <div class="sidebar-item"><svg viewBox="0 0 24 24" fill="none"><path d="M9 18V6l10-2v12" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/><circle cx="6.5" cy="18" r="2.5" stroke="currentColor" stroke-width="2"/><circle cx="16.5" cy="16" r="2.5" stroke="currentColor" stroke-width="2"/></svg>Music<span class="sidebar-count">1</span></div>
+      <div class="sidebar-item"><svg viewBox="0 0 24 24" fill="none"><path d="M14 2H7a2 2 0 00-2 2v16a2 2 0 002 2h10a2 2 0 002-2V7l-5-5z" stroke="currentColor" stroke-width="2" stroke-linejoin="round"/><path d="M14 2v5h5" stroke="currentColor" stroke-width="2" stroke-linejoin="round"/><path d="M9 13h6M9 17h4" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/></svg>Documents<span class="sidebar-count">1</span></div>
+      <div class="sidebar-item"><svg viewBox="0 0 24 24" fill="none"><path d="M21 8l-9-5-9 5v8l9 5 9-5V8z" stroke="currentColor" stroke-width="2" stroke-linejoin="round"/><path d="M3 8l9 5 9-5M12 13v8" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg>Compressed<span class="sidebar-count">3</span></div>
+      <div class="sidebar-item"><svg viewBox="0 0 24 24" fill="none"><rect x="3" y="3" width="7" height="7" rx="2" stroke="currentColor" stroke-width="2"/><rect x="14" y="3" width="7" height="7" rx="2" stroke="currentColor" stroke-width="2"/><rect x="3" y="14" width="7" height="7" rx="2" stroke="currentColor" stroke-width="2"/><rect x="14" y="14" width="7" height="7" rx="2" stroke="currentColor" stroke-width="2"/></svg>Apps<span class="sidebar-count">1</span></div>
+
+      <div class="sidebar-section collapsed">Status</div>
+      <div class="sidebar-item hidden"><svg viewBox="0 0 24 24" fill="none"><path d="M12 3v9M7 10l5 5 5-5" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/><path d="M4 17v2a2 2 0 002 2h12a2 2 0 002-2v-2" stroke="currentColor" stroke-width="2" stroke-linecap="round"/></svg>Downloading<span class="sidebar-count">0</span></div>
+      <div class="sidebar-item hidden"><svg viewBox="0 0 24 24" fill="none"><path d="M4 6h16M4 10h16M4 14h16M4 18h10" stroke="currentColor" stroke-width="2" stroke-linecap="round"/></svg>Queued<span class="sidebar-count">0</span></div>
+      <div class="sidebar-item hidden"><svg viewBox="0 0 24 24" fill="none"><rect x="7" y="4" width="3.5" height="16" rx="1.5" fill="currentColor"/><rect x="13.5" y="4" width="3.5" height="16" rx="1.5" fill="currentColor"/></svg>Paused<span class="sidebar-count">0</span></div>
+      <div class="sidebar-item hidden"><svg viewBox="0 0 24 24" fill="none"><circle cx="12" cy="12" r="9" stroke="currentColor" stroke-width="2"/><path d="M8 12.5l2.5 2.5L16 9.5" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg>Finished<span class="sidebar-count">11</span></div>
+      <div class="sidebar-item hidden"><svg viewBox="0 0 24 24" fill="none"><circle cx="12" cy="12" r="9" stroke="currentColor" stroke-width="2"/><path d="M9.5 9.5l5 5M14.5 9.5l-5 5" stroke="currentColor" stroke-width="2" stroke-linecap="round"/></svg>Failed<span class="sidebar-count">0</span></div>
+      <div class="sidebar-item hidden"><svg viewBox="0 0 24 24" fill="none"><circle cx="12" cy="12" r="9" stroke="currentColor" stroke-width="2"/><path d="M12 7v5l3 2" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg>Unfinished<span class="sidebar-count">0</span></div>
+
+      <div class="sidebar-footer">0 active · 11 total</div>
+    </div>
+
+    <!-- RIGHT PANEL -->
+    <div class="content-area">
+      <div class="toolbar">
+        <button class="tool-btn"><svg viewBox="0 0 24 24" fill="none"><path d="M12 5v14M5 12h14" stroke="currentColor" stroke-width="2.2" stroke-linecap="round"/></svg><span>Add URL</span></button>
+        <button class="tool-btn"><svg viewBox="0 0 24 24" fill="none"><circle cx="12" cy="12" r="9" stroke="currentColor" stroke-width="1.8"/><path d="M12 7v5M9 10l3 3 3-3" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/></svg><span>Resume</span></button>
+        <button class="tool-btn"><svg viewBox="0 0 24 24" fill="none"><circle cx="12" cy="12" r="9" stroke="currentColor" stroke-width="1.8"/><rect x="8.5" y="8.5" width="7" height="7" rx="1" fill="currentColor"/></svg><span>Stop</span></button>
+        <button class="tool-btn"><svg viewBox="0 0 24 24" fill="none"><circle cx="12" cy="12" r="9" stroke="currentColor" stroke-width="1.8"/><path d="M8.5 9.5v5M15.5 9.5v5" stroke="currentColor" stroke-width="2" stroke-linecap="round"/><circle cx="12" cy="12" r="2.5" fill="currentColor"/></svg><span>Stop All</span></button>
+        <button class="tool-btn"><svg viewBox="0 0 24 24" fill="none"><path d="M4 7h16M10 4.5h4V7M6.6 7l.8 12.2a1 1 0 001 .8h7.2a1 1 0 001-.8L17.4 7" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"/></svg><span>Delete</span></button>
+        <button class="tool-btn"><svg viewBox="0 0 24 24" fill="none"><path d="M7 4.5l11 7.5-11 7.5V4.5z" fill="currentColor"/></svg><span>Start Queue</span></button>
+        <button class="tool-btn"><svg viewBox="0 0 24 24" fill="none"><rect x="6.5" y="6.5" width="11" height="11" rx="2" fill="currentColor"/></svg><span>Stop Queue</span></button>
+        <button class="tool-btn"><svg viewBox="0 0 24 24" fill="none"><path d="M3.5 6h17M3.5 12h17M3.5 18h11" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/></svg><span>Open Queue</span></button>
+        <button class="tool-btn"><svg viewBox="0 0 24 24" fill="none"><circle cx="12" cy="12" r="9" stroke="currentColor" stroke-width="1.8"/><path d="M3.4 9h17.2M3.4 15h17.2M12 3a14 14 0 010 18M12 3a14 14 0 000 18" stroke="currentColor" stroke-width="1.8"/></svg><span>Site Grabber</span></button>
+        <button class="tool-btn"><svg viewBox="0 0 24 24" fill="none"><path d="M4 8h9M17 8h3M4 16h3M11 16h9" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/><circle cx="15" cy="8" r="2.2" stroke="currentColor" stroke-width="1.8"/><circle cx="9" cy="16" r="2.2" stroke="currentColor" stroke-width="1.8"/></svg><span>Settings</span></button>
+      </div>
+
+      <div class="table-container">
+        <table class="downloads">
+          <colgroup>
+            <col class="c-check">
+            <col class="c-name">
+            <col class="c-size">
+            <col class="c-status">
+            <col class="c-speed">
+            <col class="c-time">
+            <col class="c-date">
+          </colgroup>
+          <thead>
+            <tr>
+              <th class="c-check"><div class="checkbox"><svg viewBox="0 0 24 24" fill="none"><path d="M4 12l5 5L20 6" stroke="currentColor" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"/></svg></div></th>
+              <th class="th-l">Name</th>
+              <th class="th-r">Size</th>
+              <th class="th-r">Status</th>
+              <th class="th-r">Speed</th>
+              <th class="th-r">Time Left</th>
+              <th class="th-r">Date Added</th>
+            </tr>
+          </thead>
+          <tbody>
+            <!-- Video -->
+            <tr>
+              <td class="c-check"><div class="checkbox"><svg viewBox="0 0 24 24" fill="none"><path d="M4 12l5 5L20 6" stroke="currentColor" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"/></svg></div></td>
+              <td class="c-name"><div class="name-cell"><div class="name-icon"><svg viewBox="0 0 24 24" fill="none"><rect x="2.5" y="5" width="19" height="14" rx="3.5" stroke="#3b82f6" stroke-width="1.8"/><path d="M10.5 9.3l5.2 2.7-5.2 2.7z" fill="#3b82f6"/></svg></div><div class="name-text"><span class="name-title">(1) Facebook.mp4</span><span class="name-sub">Video</span></div></div></td>
+              <td class="c-size">64.63 MB</td>
+              <td class="c-status"><span class="status-badge status-finished">Finished</span></td>
+              <td class="c-speed">-</td>
+              <td class="c-time">-</td>
+              <td class="c-date">32 minutes ago</td>
+            </tr>
+            <!-- Other -->
+            <tr>
+              <td class="c-check"><div class="checkbox"><svg viewBox="0 0 24 24" fill="none"><path d="M4 12l5 5L20 6" stroke="currentColor" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"/></svg></div></td>
+              <td class="c-name"><div class="name-cell"><div class="name-icon"><svg viewBox="0 0 24 24" fill="none"><path d="M14 3H7a2 2 0 00-2 2v14a2 2 0 002 2h10a2 2 0 002-2V8l-5-5z" stroke="#94a3b8" stroke-width="1.8" stroke-linejoin="round"/><path d="M14 3v5h5" stroke="#94a3b8" stroke-width="1.8" stroke-linejoin="round"/></svg></div><div class="name-text"><span class="name-title">jwplayer</span><span class="name-sub">Other</span></div></div></td>
+              <td class="c-size">115.00 KB</td>
+              <td class="c-status"><span class="status-badge status-finished">Finished</span></td>
+              <td class="c-speed">-</td>
+              <td class="c-time">-</td>
+              <td class="c-date">1 hours ago</td>
+            </tr>
+            <!-- Compressed -->
+            <tr>
+              <td class="c-check"><div class="checkbox"><svg viewBox="0 0 24 24" fill="none"><path d="M4 12l5 5L20 6" stroke="currentColor" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"/></svg></div></td>
+              <td class="c-name"><div class="name-cell"><div class="name-icon"><svg viewBox="0 0 24 24" fill="none"><path d="M21 8l-9-5-9 5v8l9 5 9-5V8z" stroke="#f59e0b" stroke-width="1.8" stroke-linejoin="round"/><path d="M3 8l9 5 9-5M12 13v8" stroke="#f59e0b" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/></svg></div><div class="name-text"><span class="name-title">DownloadCraft-0.9.0-windows-x64-...</span><span class="name-sub">Compressed</span></div></div></td>
+              <td class="c-size">9.25 MB</td>
+              <td class="c-status"><span class="status-badge status-finished">Finished</span></td>
+              <td class="c-speed">-</td>
+              <td class="c-time">-</td>
+              <td class="c-date">13 hours ago</td>
+            </tr>
+            <!-- Video -->
+            <tr>
+              <td class="c-check"><div class="checkbox"><svg viewBox="0 0 24 24" fill="none"><path d="M4 12l5 5L20 6" stroke="currentColor" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"/></svg></div></td>
+              <td class="c-name"><div class="name-cell"><div class="name-icon"><svg viewBox="0 0 24 24" fill="none"><rect x="2.5" y="5" width="19" height="14" rx="3.5" stroke="#3b82f6" stroke-width="1.8"/><path d="M10.5 9.3l5.2 2.7-5.2 2.7z" fill="#3b82f6"/></svg></div><div class="name-text"><span class="name-title">(32) Alan Walker, Sabrina Carpenter ...</span><span class="name-sub">Video</span></div></div></td>
+              <td class="c-size">24.58 MB</td>
+              <td class="c-status"><span class="status-badge status-finished">Finished</span></td>
+              <td class="c-speed">-</td>
+              <td class="c-time">-</td>
+              <td class="c-date">21 hours ago</td>
+            </tr>
+            <!-- Compressed -->
+            <tr>
+              <td class="c-check"><div class="checkbox"><svg viewBox="0 0 24 24" fill="none"><path d="M4 12l5 5L20 6" stroke="currentColor" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"/></svg></div></td>
+              <td class="c-name"><div class="name-cell"><div class="name-icon"><svg viewBox="0 0 24 24" fill="none"><path d="M21 8l-9-5-9 5v8l9 5 9-5V8z" stroke="#f59e0b" stroke-width="1.8" stroke-linejoin="round"/><path d="M3 8l9 5 9-5M12 13v8" stroke="#f59e0b" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/></svg></div><div class="name-text"><span class="name-title">100MB (1).zip</span><span class="name-sub">Compressed</span></div></div></td>
+              <td class="c-size">100.00 MB</td>
+              <td class="c-status"><span class="status-badge status-finished">Finished</span></td>
+              <td class="c-speed">-</td>
+              <td class="c-time">-</td>
+              <td class="c-date">1 days ago</td>
+            </tr>
+            <!-- Compressed -->
+            <tr>
+              <td class="c-check"><div class="checkbox"><svg viewBox="0 0 24 24" fill="none"><path d="M4 12l5 5L20 6" stroke="currentColor" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"/></svg></div></td>
+              <td class="c-name"><div class="name-cell"><div class="name-icon"><svg viewBox="0 0 24 24" fill="none"><path d="M21 8l-9-5-9 5v8l9 5 9-5V8z" stroke="#f59e0b" stroke-width="1.8" stroke-linejoin="round"/><path d="M3 8l9 5 9-5M12 13v8" stroke="#f59e0b" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/></svg></div><div class="name-text"><span class="name-title">500MB-CZIPtestfile.org.zip</span><span class="name-sub">Compressed</span></div></div></td>
+              <td class="c-size">500.00 MB</td>
+              <td class="c-status"><span class="status-badge status-finished">Finished</span></td>
+              <td class="c-speed">-</td>
+              <td class="c-time">-</td>
+              <td class="c-date">1 days ago</td>
+            </tr>
+            <!-- Video -->
+            <tr>
+              <td class="c-check"><div class="checkbox"><svg viewBox="0 0 24 24" fill="none"><path d="M4 12l5 5L20 6" stroke="currentColor" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"/></svg></div></td>
+              <td class="c-name"><div class="name-cell"><div class="name-icon"><svg viewBox="0 0 24 24" fill="none"><rect x="2.5" y="5" width="19" height="14" rx="3.5" stroke="#3b82f6" stroke-width="1.8"/><path d="M10.5 9.3l5.2 2.7-5.2 2.7z" fill="#3b82f6"/></svg></div><div class="name-text"><span class="name-title">Your Name _ RADWIMPS - Nandemo...</span><span class="name-sub">Video</span></div></div></td>
+              <td class="c-size">20.74 MB</td>
+              <td class="c-status"><span class="status-badge status-finished">Finished</span></td>
+              <td class="c-speed">-</td>
+              <td class="c-time">-</td>
+              <td class="c-date">3 days ago</td>
+            </tr>
+            <!-- Pictures -->
+            <tr>
+              <td class="c-check"><div class="checkbox"><svg viewBox="0 0 24 24" fill="none"><path d="M4 12l5 5L20 6" stroke="currentColor" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"/></svg></div></td>
+              <td class="c-name"><div class="name-cell"><div class="name-icon"><svg viewBox="0 0 24 24" fill="none"><rect x="3" y="4.5" width="18" height="15" rx="3" stroke="#22c55e" stroke-width="1.8"/><circle cx="8.3" cy="9.4" r="1.7" fill="#22c55e"/><path d="M4.8 17.6l4.4-4.4 3 3 3.4-3.4 4 4" stroke="#22c55e" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/></svg></div><div class="name-text"><span class="name-title">mountain-sunset-4k.jpg</span><span class="name-sub">Pictures</span></div></div></td>
+              <td class="c-size">3.42 MB</td>
+              <td class="c-status"><span class="status-badge status-finished">Finished</span></td>
+              <td class="c-speed">-</td>
+              <td class="c-time">-</td>
+              <td class="c-date">3 days ago</td>
+            </tr>
+            <!-- Music -->
+            <tr>
+              <td class="c-check"><div class="checkbox"><svg viewBox="0 0 24 24" fill="none"><path d="M4 12l5 5L20 6" stroke="currentColor" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"/></svg></div></td>
+              <td class="c-name"><div class="name-cell"><div class="name-icon"><svg viewBox="0 0 24 24" fill="none"><path d="M9 17V6.2l10-2V15" stroke="#a855f7" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/><circle cx="6.5" cy="17" r="2.5" stroke="#a855f7" stroke-width="1.8"/><circle cx="16.5" cy="15" r="2.5" stroke="#a855f7" stroke-width="1.8"/></svg></div><div class="name-text"><span class="name-title">Alan Walker - Faded.mp3</span><span class="name-sub">Music</span></div></div></td>
+              <td class="c-size">8.16 MB</td>
+              <td class="c-status"><span class="status-badge status-finished">Finished</span></td>
+              <td class="c-speed">-</td>
+              <td class="c-time">-</td>
+              <td class="c-date">4 days ago</td>
+            </tr>
+            <!-- Documents -->
+            <tr>
+              <td class="c-check"><div class="checkbox"><svg viewBox="0 0 24 24" fill="none"><path d="M4 12l5 5L20 6" stroke="currentColor" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"/></svg></div></td>
+              <td class="c-name"><div class="name-cell"><div class="name-icon"><svg viewBox="0 0 24 24" fill="none"><path d="M14 3H7a2 2 0 00-2 2v14a2 2 0 002 2h10a2 2 0 002-2V8l-5-5z" stroke="#ef4444" stroke-width="1.8" stroke-linejoin="round"/><path d="M14 3v5h5" stroke="#ef4444" stroke-width="1.8" stroke-linejoin="round"/><path d="M9 13h6M9 16.5h4" stroke="#ef4444" stroke-width="1.5" stroke-linecap="round"/></svg></div><div class="name-text"><span class="name-title">Project-Report-2026.pdf</span><span class="name-sub">Documents</span></div></div></td>
+              <td class="c-size">1.24 MB</td>
+              <td class="c-status"><span class="status-badge status-finished">Finished</span></td>
+              <td class="c-speed">-</td>
+              <td class="c-time">-</td>
+              <td class="c-date">5 days ago</td>
+            </tr>
+            <!-- Apps -->
+            <tr>
+              <td class="c-check"><div class="checkbox"><svg viewBox="0 0 24 24" fill="none"><path d="M4 12l5 5L20 6" stroke="currentColor" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"/></svg></div></td>
+              <td class="c-name"><div class="name-cell"><div class="name-icon"><svg viewBox="0 0 24 24" fill="none"><rect x="3.5" y="3.5" width="7" height="7" rx="2" stroke="#06b6d4" stroke-width="1.8"/><rect x="13.5" y="3.5" width="7" height="7" rx="2" stroke="#06b6d4" stroke-width="1.8"/><rect x="3.5" y="13.5" width="7" height="7" rx="2" stroke="#06b6d4" stroke-width="1.8"/><rect x="13.5" y="13.5" width="7" height="7" rx="2" stroke="#06b6d4" stroke-width="1.8"/></svg></div><div class="name-text"><span class="name-title">DownloadCraft-Setup-x64.exe</span><span class="name-sub">Apps</span></div></div></td>
+              <td class="c-size">27.85 MB</td>
+              <td class="c-status"><span class="status-badge status-finished">Finished</span></td>
+              <td class="c-speed">-</td>
+              <td class="c-time">-</td>
+              <td class="c-date">6 days ago</td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+    </div>
+  </div>
+
+  <div class="status-bar">
+    <span>0 active · 11 total</span>
+    <span>Ready</span>
+  </div>
+</div>
+
+</body>
+</html>

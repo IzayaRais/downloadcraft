@@ -62,6 +62,12 @@ struct Settings {
     ytdlp_source: String,
     /// The executable picked for "custom"; empty until one is chosen.
     ytdlp_custom_path: String,
+    /// ffmpeg: "managed" (fetched on demand), "path", or "custom".
+    ffmpeg_source: String,
+    /// The ffmpeg executable picked for "custom"; empty until chosen.
+    ffmpeg_custom_path: String,
+    /// Max simultaneous connections per host across all downloads (0 = off).
+    per_host_conns: usize,
     // Updates
     update_check_on: bool,
 }
@@ -95,7 +101,10 @@ impl Default for Settings {
             ytdlp_prefer_path: false,
             ytdlp_source: "managed".to_string(),
             ytdlp_custom_path: String::new(),
-            update_check_on: false,
+            ffmpeg_source: "managed".to_string(),
+            ffmpeg_custom_path: String::new(),
+            per_host_conns: 0,
+            update_check_on: true,
         }
     }
 }
@@ -152,6 +161,24 @@ fn load() -> Settings {
     }
     if let Some(x) = g("ytdlp_custom_path").and_then(|x| x.as_str()) {
         s.ytdlp_custom_path = x.to_string();
+    }
+    match g("ffmpeg_source").and_then(|x| x.as_str()) {
+        Some(v @ ("managed" | "path" | "custom")) => s.ffmpeg_source = v.to_string(),
+        // Same migration as the engine: an older install that already has
+        // ffmpeg on PATH keeps using it rather than fetching a second copy.
+        _ => {
+            s.ffmpeg_source = if crate::engine::ffmpeg_on_path().is_some() {
+                "path".to_string()
+            } else {
+                "managed".to_string()
+            }
+        }
+    }
+    if let Some(x) = g("ffmpeg_custom_path").and_then(|x| x.as_str()) {
+        s.ffmpeg_custom_path = x.to_string();
+    }
+    if let Some(n) = g("per_host_conns").and_then(|x| x.as_u64()) {
+        s.per_host_conns = (n as usize).clamp(0, 64);
     }
     if let Some(n) = g("connections_default").and_then(|x| x.as_u64()) {
         s.connections_default = (n as usize).clamp(1, 16);
@@ -231,6 +258,9 @@ fn save(s: &Settings) -> bool {
     set(obj, "ytdlp_prefer_path", s.ytdlp_prefer_path.into());
     set(obj, "ytdlp_source", s.ytdlp_source.clone().into());
     set(obj, "ytdlp_custom_path", s.ytdlp_custom_path.clone().into());
+    set(obj, "ffmpeg_source", s.ffmpeg_source.clone().into());
+    set(obj, "ffmpeg_custom_path", s.ffmpeg_custom_path.clone().into());
+    set(obj, "per_host_conns", (s.per_host_conns as u64).into());
     set(obj, "update_check_on", s.update_check_on.into());
     set(obj, "folder_rules", serde_json::to_value(&s.folder_rules).unwrap_or_default());
     set(
@@ -269,6 +299,9 @@ struct SettingsApp {
     /// ffmpeg is only used to merge separate video+audio streams; its card
     /// says whether there is one, and how new it is.
     ffmpeg: Option<crate::engine::FfmpegInfo>,
+    ffmpeg_msg: String,
+    ffmpeg_busy: bool,
+    ffmpeg_rx: Option<std::sync::mpsc::Receiver<(String, crate::engine::FfmpegInfo)>>,
     /// Which plugin cards are expanded (yt-dlp starts open, like the concept).
     plugins_open: [bool; 2],
     // Open/closed state of the Download-Engine cards. The pane is long, so every
@@ -279,6 +312,9 @@ struct SettingsApp {
     open_network: bool,
     open_complete: bool,
     open_windows: bool,
+    /// Appearance cards (the concept opens both by default).
+    open_theme: bool,
+    open_window: bool,
 }
 
 /// Probe the helper, and optionally re-download it first, off the UI thread.
@@ -302,11 +338,41 @@ fn ytdlp_probe(
     rx
 }
 
+/// Probe ffmpeg, and optionally re-fetch the app's own copy first, off the UI
+/// thread (both run a process; the fetch downloads ~60 MB).
+fn ffmpeg_probe(
+    force: bool,
+) -> std::sync::mpsc::Receiver<(String, crate::engine::FfmpegInfo)> {
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let mut msg = String::new();
+        if force {
+            msg = match crate::engine::ffmpeg_refresh_blocking() {
+                Ok(p) => format!("Fetched ffmpeg into {}", p.display()),
+                Err(e) => format!("Re-download failed: {e:#}"),
+            };
+        }
+        let info = crate::engine::ffmpeg_info();
+        let _ = tx.send((msg, info));
+    });
+    rx
+}
+
 /// The native "open file" dialog, for picking a yt-dlp executable.
 fn pick_executable() -> Option<std::path::PathBuf> {
     let picked = rfd::FileDialog::new()
         .set_title("Pick a yt-dlp executable")
         .add_filter("yt-dlp", &["exe"])
+        .add_filter("All files", &["*"])
+        .pick_file();
+    picked.filter(|p| p.is_file())
+}
+
+/// The native "open file" dialog, for picking an ffmpeg executable.
+fn pick_ffmpeg() -> Option<std::path::PathBuf> {
+    let picked = rfd::FileDialog::new()
+        .set_title("Pick an ffmpeg executable")
+        .add_filter("ffmpeg", &["exe"])
         .add_filter("All files", &["*"])
         .pick_file();
     picked.filter(|p| p.is_file())
@@ -333,12 +399,17 @@ pub fn run() -> eframe::Result<()> {
         ytdlp_busy: false,
         ytdlp_rx: None,
         ffmpeg: None,
+        ffmpeg_msg: String::new(),
+        ffmpeg_busy: false,
+        ffmpeg_rx: None,
         plugins_open: [true, false],
         open_storage: false,
         open_perf: false,
         open_network: false,
         open_complete: false,
         open_windows: false,
+        open_theme: true,
+        open_window: true,
     };
     // Separate OS window (own process via `--settings`): never embedded in
     // the main GUI. 640 wide is the concept's window width.
@@ -400,6 +471,16 @@ impl eframe::App for SettingsApp {
                 self.ffmpeg = Some(ffmpeg);
                 self.ytdlp_rx = None;
                 self.ytdlp_busy = false;
+            }
+        }
+        if let Some(rx) = &self.ffmpeg_rx {
+            if let Ok((msg, info)) = rx.try_recv() {
+                if !msg.is_empty() {
+                    self.ffmpeg_msg = msg;
+                }
+                self.ffmpeg = Some(info);
+                self.ffmpeg_rx = None;
+                self.ffmpeg_busy = false;
             }
         }
 
@@ -654,27 +735,6 @@ fn button(ui: &mut Ui, label: &str, primary: bool) -> Response {
     resp
 }
 
-/// `--theme-opt` pill: fully rounded, accent-filled when selected.
-fn pill(ui: &mut Ui, label: &str, active: bool) -> Response {
-    let t = tok();
-    let fg = if active { Color32::WHITE } else { t.text2 };
-    let galley = ui
-        .painter()
-        .layout_no_wrap(label.to_owned(), reg(11.0), fg);
-    let size = Vec2::new(galley.size().x + 28.0, 26.0);
-    let (rect, resp) = ui.allocate_exact_size(size, Sense::click());
-    let resp = resp.on_hover_cursor(egui::CursorIcon::PointingHand);
-    let (bg, bd) = if active {
-        (t.accent, t.accent)
-    } else {
-        (if resp.hovered() { t.btn_hover } else { t.btn }, t.btn_bd)
-    };
-    let p = ui.painter();
-    p.rect(rect, 13.0, bg, Stroke::new(1.0, bd), StrokeKind::Inside);
-    p.galley(rect.center() - galley.size() / 2.0, galley, fg);
-    resp
-}
-
 /// Square icon button (`--btn-icon`, 30×30 / `--rule-btn`, 28×28).
 fn icon_sq(ui: &mut Ui, glyph: &str, size: f32, radius: f32) -> Response {
     let t = tok();
@@ -770,39 +830,6 @@ fn field(ui: &mut Ui, buf: &mut String, width: Option<f32>, hint: &str) -> Respo
     out.inner
 }
 
-/// `.toggle`: 32×18 track, 14 px white thumb; the whole row is clickable.
-fn toggle(ui: &mut Ui, on: &mut bool, label: &str) -> bool {
-    let t = tok();
-    let w = ui.available_width().max(80.0);
-    let (rect, resp) = ui.allocate_exact_size(Vec2::new(w, 18.0), Sense::click());
-    let resp = resp.on_hover_cursor(egui::CursorIcon::PointingHand);
-    let anim = ui.ctx().animate_bool_with_time(resp.id, *on, 0.15);
-    let track = Rect::from_min_size(
-        egui::pos2(rect.left(), rect.center().y - 9.0),
-        Vec2::new(32.0, 18.0),
-    );
-    let p = ui.painter();
-    p.rect_filled(track, 9.0, blend(t.track, t.accent, anim));
-    p.circle_filled(
-        egui::pos2(track.left() + 9.0 + 14.0 * anim, track.center().y),
-        7.0,
-        Color32::WHITE,
-    );
-    p.text(
-        egui::pos2(track.right() + 8.0, rect.center().y),
-        Align2::LEFT_CENTER,
-        label,
-        reg(12.0),
-        t.text,
-    );
-    if resp.clicked() {
-        *on = !*on;
-        true
-    } else {
-        false
-    }
-}
-
 /// `.checkbox`: 14×14 box (12×12 compact), accent fill + tick when checked.
 /// `full` stretches the click row to the pane width, otherwise it shrinks.
 fn checkbox(
@@ -872,6 +899,287 @@ fn checkbox(
     } else {
         false
     }
+}
+
+// ---------- Appearance: theme tiles + switch row ----------
+
+/// Which preview a theme tile shows.
+#[derive(Clone, Copy)]
+enum TileKind {
+    System,
+    Dark,
+    Light,
+}
+
+/// Signed side of the directed line `a`→`b` (positive = egui's left half-plane).
+fn line_side(p: egui::Pos2, a: egui::Pos2, b: egui::Pos2) -> f32 {
+    let dx = b.x - a.x;
+    let dy = b.y - a.y;
+    dx * (p.y - a.y) - dy * (p.x - a.x)
+}
+
+/// Sutherland–Hodgman clip of the rect `r` to one half-plane of `a`→`b`. The
+/// result is convex, so it goes straight into `Shape::convex_polygon`.
+fn clip_half(r: Rect, a: egui::Pos2, b: egui::Pos2, keep_pos: bool) -> Vec<egui::Pos2> {
+    let s = |p: egui::Pos2| {
+        let v = line_side(p, a, b);
+        if keep_pos {
+            v
+        } else {
+            -v
+        }
+    };
+    let pts = [r.left_top(), r.right_top(), r.right_bottom(), r.left_bottom()];
+    let mut out = Vec::with_capacity(6);
+    for i in 0..4 {
+        let cur = pts[i];
+        let nxt = pts[(i + 1) % 4];
+        let (sc, sn) = (s(cur), s(nxt));
+        if sc >= 0.0 {
+            out.push(cur);
+        }
+        if (sc > 0.0 && sn < 0.0) || (sc < 0.0 && sn > 0.0) {
+            let t = sc / (sc - sn);
+            out.push(egui::pos2(
+                cur.x + (nxt.x - cur.x) * t,
+                cur.y + (nxt.y - cur.y) * t,
+            ));
+        }
+    }
+    out
+}
+
+/// Fill `rect` with `color`, optionally clipped to a half-plane.
+fn face_rect(
+    p: &egui::Painter,
+    rect: Rect,
+    color: Color32,
+    clip: Option<(egui::Pos2, egui::Pos2, bool)>,
+) {
+    match clip {
+        None => {
+            p.rect_filled(rect, 0.0, color);
+        }
+        Some((a, b, kp)) => {
+            let pts = clip_half(rect, a, b, kp);
+            if pts.len() >= 3 {
+                p.add(egui::Shape::convex_polygon(pts, color, Stroke::NONE));
+            }
+        }
+    }
+}
+
+/// One mini application window (the mock's `.tp`): head bar with three dots, a
+/// sidebar and four content lines, the last one accent. `clip` carves it to one
+/// half of the System tile's diagonal.
+fn draw_face(
+    p: &egui::Painter,
+    r: Rect,
+    light: bool,
+    clip: Option<(egui::Pos2, egui::Pos2, bool)>,
+) {
+    let c = |hex: u32| Color32::from_rgb((hex >> 16) as u8, (hex >> 8) as u8, hex as u8);
+    let (bg, head, hbd, side, sbd, line, dot) = if light {
+        (
+            0xffffff, 0xf8fafc, 0xe2e8f0, 0xeef2f7, 0xe2e8f0, 0xdbe3ec, 0xcbd5e1,
+        )
+    } else {
+        (
+            0x0f172a, 0x0b1220, 0x1b2637, 0x1e293b, 0x0b1220, 0x334155, 0x334155,
+        )
+    };
+    let accent = c(0x3b82f6);
+
+    face_rect(p, r, c(bg), clip);
+    let head_h = (r.height() * 0.17).clamp(7.0, 12.0);
+    face_rect(
+        p,
+        Rect::from_min_max(r.min, egui::pos2(r.max.x, r.min.y + head_h)),
+        c(head),
+        clip,
+    );
+    face_rect(
+        p,
+        Rect::from_min_max(
+            egui::pos2(r.min.x, r.min.y + head_h - 1.0),
+            egui::pos2(r.max.x, r.min.y + head_h),
+        ),
+        c(hbd),
+        clip,
+    );
+    let side_w = r.width() * 0.24;
+    face_rect(
+        p,
+        Rect::from_min_max(
+            egui::pos2(r.min.x, r.min.y + head_h),
+            egui::pos2(r.min.x + side_w, r.max.y),
+        ),
+        c(side),
+        clip,
+    );
+    face_rect(
+        p,
+        Rect::from_min_max(
+            egui::pos2(r.min.x + side_w, r.min.y + head_h),
+            egui::pos2(r.min.x + side_w + 1.0, r.max.y),
+        ),
+        c(sbd),
+        clip,
+    );
+    // Head dots are circles, so a clipped tile only keeps the ones fully inside.
+    for i in 0..3 {
+        let dc = egui::pos2(r.min.x + 4.0 + i as f32 * 4.0, r.min.y + head_h / 2.0);
+        let keep = match clip {
+            None => true,
+            Some((a, b, kp)) => {
+                let v = line_side(dc, a, b);
+                if kp {
+                    v > 1.5
+                } else {
+                    v < -1.5
+                }
+            }
+        };
+        if keep {
+            p.circle_filled(dc, 1.7, c(dot));
+        }
+    }
+    let main_x = r.min.x + side_w + 4.0;
+    let main_w = (r.max.x - 5.0 - main_x).max(6.0);
+    let top = r.min.y + head_h + 4.5;
+    let step = ((r.max.y - 4.0 - top) / 4.0).max(3.0);
+    for (i, wr) in [0.60_f32, 0.90, 0.75, 0.45].iter().enumerate() {
+        let lr = Rect::from_min_size(
+            egui::pos2(main_x, top + step * i as f32),
+            Vec2::new((main_w * wr).max(4.0), 2.5),
+        );
+        face_rect(p, lr, if i == 3 { accent } else { c(line) }, clip);
+    }
+}
+
+/// One theme tile (the mock's `.theme-tile`): a mini-window preview, the name
+/// under it and an accent check badge when it is the active theme.
+fn theme_tile(
+    ui: &mut Ui,
+    salt: &str,
+    w: f32,
+    h: f32,
+    kind: TileKind,
+    name: &str,
+    active: bool,
+) -> Response {
+    let t = tok();
+    let (rect, _) = ui.allocate_exact_size(Vec2::new(w, h), Sense::hover());
+    let resp = ui
+        .interact(rect, ui.id().with(("theme_tile", salt)), Sense::click())
+        .on_hover_cursor(egui::CursorIcon::PointingHand);
+    let p = ui.painter();
+    let pad = 4.0;
+    p.rect(
+        rect,
+        8.0,
+        t.input,
+        Stroke::new(
+            1.0,
+            if active {
+                t.accent
+            } else if resp.hovered() {
+                t.muted
+            } else {
+                t.border
+            },
+        ),
+        StrokeKind::Inside,
+    );
+    if active {
+        p.rect_stroke(rect, 8.0, Stroke::new(1.0, t.accent), StrokeKind::Inside);
+    }
+    // Preview box (`.tp`): a dark base so a clipped corner never flashes white.
+    let prev = Rect::from_min_size(
+        egui::pos2(rect.min.x + pad, rect.min.y + pad),
+        Vec2::new(w - pad * 2.0, (h - pad * 2.0 - 19.0).max(24.0)),
+    );
+    p.rect_filled(prev, 5.0, Color32::from_rgb(0x0f, 0x17, 0x2a));
+    let inner = prev.shrink(1.0);
+    match kind {
+        TileKind::System => {
+            // Light left of the diagonal, dark right of it.
+            let a = egui::pos2(inner.min.x + inner.width() * 0.62, inner.min.y);
+            let b = egui::pos2(inner.min.x + inner.width() * 0.38, inner.max.y);
+            draw_face(p, inner, true, None);
+            draw_face(p, inner, false, Some((a, b, false)));
+        }
+        TileKind::Dark => draw_face(p, inner, false, None),
+        TileKind::Light => draw_face(p, inner, true, None),
+    }
+    p.rect_stroke(prev, 5.0, Stroke::new(1.0, t.border), StrokeKind::Inside);
+    if active {
+        let bc = egui::pos2(prev.max.x - 8.0, prev.min.y + 8.0);
+        p.circle_filled(bc, 7.5, t.accent);
+        let s = Stroke::new(1.6, Color32::WHITE);
+        p.line_segment([bc + Vec2::new(-3.2, -0.2), bc + Vec2::new(-1.0, 2.2)], s);
+        p.line_segment([bc + Vec2::new(-1.0, 2.2), bc + Vec2::new(3.4, -2.6)], s);
+    }
+    p.text(
+        egui::pos2(rect.min.x + pad + 3.0, rect.max.y - pad - 2.0),
+        Align2::LEFT_BOTTOM,
+        name,
+        reg(10.5),
+        if active { t.text } else { t.text2 },
+    );
+    resp
+}
+
+/// A settings row with its label + hint on the left and a toggle on the right
+/// (the mock's `.opt-row`). Only the switch is clickable.
+fn switch_row(ui: &mut Ui, salt: &str, on: &mut bool, label: &str, hint: &str) -> bool {
+    let t = tok();
+    let w = ui.available_width().max(120.0);
+    let sw = 34.0;
+    let text_w = (w - sw - 14.0).max(80.0);
+    let lg = ui
+        .painter()
+        .layout_no_wrap(label.to_owned(), reg(11.5), t.text);
+    let hg = ui
+        .painter()
+        .layout(hint.to_owned(), reg(9.5), t.muted, text_w);
+    let h = (lg.size().y + 3.0 + hg.size().y).max(26.0);
+    let (rect, _) = ui.allocate_exact_size(Vec2::new(w, h), Sense::hover());
+    let track = Rect::from_min_size(
+        egui::pos2(rect.max.x - sw, rect.center().y - 9.5),
+        Vec2::new(sw, 19.0),
+    );
+    let id = ui.id().with(("switch", salt));
+    let resp = ui
+        .interact(
+            Rect::from_min_max(
+                egui::pos2(track.min.x - 4.0, rect.min.y),
+                egui::pos2(rect.max.x, rect.max.y),
+            ),
+            id,
+            Sense::click(),
+        )
+        .on_hover_cursor(egui::CursorIcon::PointingHand);
+    let anim = ui.ctx().animate_bool_with_time(id, *on, 0.15);
+    let p = ui.painter();
+    let top = rect.center().y - h / 2.0;
+    p.galley(egui::pos2(rect.min.x, top), lg.clone(), t.text);
+    p.galley(
+        egui::pos2(rect.min.x, top + lg.size().y + 3.0),
+        hg,
+        t.muted,
+    );
+    p.rect_filled(track, 9.5, blend(t.track, t.accent, anim));
+    p.circle_filled(
+        egui::pos2(track.left() + 9.5 + 15.0 * anim, track.center().y),
+        7.0,
+        Color32::WHITE,
+    );
+    if resp.clicked() {
+        *on = !*on;
+        return true;
+    }
+    false
 }
 
 // ---------- Download Engine: cards + field rows ----------
@@ -1851,27 +2159,52 @@ impl SettingsApp {
     // ---------- Appearance ----------
     fn pane_appearance(&mut self, ui: &mut Ui) {
         h2(ui, "Appearance");
-        lbl(ui, "Theme:");
-        ui.add_space(5.0);
-        ui.horizontal(|ui| {
-            ui.spacing_mut().item_spacing.x = 6.0;
-            for (key, name) in [("system", "System"), ("dark", "Dark"), ("light", "Light")] {
-                if pill(ui, name, self.s.theme == key).clicked() {
-                    self.s.theme = key.to_string();
-                }
-            }
-        });
-        ui.add_space(14.0);
-        toggle(
-            ui,
-            &mut self.s.close_to_tray,
-            "Minimize to system tray instead of quitting",
-        );
-        ui.add_space(10.0);
         hint(
             ui,
-            "Fonts, radius, and accent stay identical — only the palette changes.",
+            "Fonts, radius and accent stay identical — only the palette changes.",
         );
+        ui.add_space(10.0);
+
+        // ---- Theme: three mini-window tiles (the concept's visual picker) ----
+        let current = self.s.theme.clone();
+        let mut picked: Option<String> = None;
+        let mut open_theme = self.open_theme;
+        card(ui, "Theme", None, &mut open_theme, |ui| {
+            let gap = 8.0;
+            let tile_w = ((ui.available_width() - gap * 2.0) / 3.0).max(72.0);
+            let tile_h = 92.0;
+            ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing.x = gap;
+                for (key, name, kind) in [
+                    ("system", "System", TileKind::System),
+                    ("dark", "Dark", TileKind::Dark),
+                    ("light", "Light", TileKind::Light),
+                ] {
+                    if theme_tile(ui, key, tile_w, tile_h, kind, name, current == key).clicked() {
+                        picked = Some(key.to_string());
+                    }
+                }
+            });
+        });
+        self.open_theme = open_theme;
+        if let Some(k) = picked {
+            self.s.theme = k;
+        }
+
+        // ---- Window behaviour ----
+        let mut tray = self.s.close_to_tray;
+        let mut open_window = self.open_window;
+        card(ui, "Window", None, &mut open_window, |ui| {
+            switch_row(
+                ui,
+                "close_to_tray",
+                &mut tray,
+                "Minimize to system tray instead of quitting",
+                "Closing the window keeps downloads running in the background.",
+            );
+        });
+        self.open_window = open_window;
+        self.s.close_to_tray = tray;
     }
 
     // ---------- Download Engine ----------
@@ -1940,6 +2273,17 @@ impl SettingsApp {
             let mut lim = s.speed_limit_kbps as f64;
             if slider_row(&mut c, "speed_limit", &mut lim, 0.0, 10000.0) {
                 s.speed_limit_kbps = lim.round() as u64;
+            }
+            let mut c = field_row(
+                ui,
+                "per_host",
+                "Connections per server",
+                None,
+                Some("0 = no extra cap"),
+            );
+            let mut per_host = s.per_host_conns as f64;
+            if slider_row(&mut c, "per_host", &mut per_host, 0.0, 32.0) {
+                s.per_host_conns = per_host.round() as usize;
             }
         });
 
@@ -2342,6 +2686,11 @@ impl SettingsApp {
         let t = tok();
         let ff = self.ffmpeg.clone();
         let open = self.plugins_open[1];
+        let source = self.s.ffmpeg_source.clone();
+        let custom = self.s.ffmpeg_custom_path.clone();
+        let busy = self.ffmpeg_busy;
+        let msg = self.ffmpeg_msg.clone();
+        let managed_dir = crate::engine::ffmpeg_bin_dir();
         let found = ff.as_ref().and_then(|f| f.path.clone());
         let pill = match ff.as_ref().and_then(|f| f.version.as_deref()) {
             Some(v) => format!("v{v}"),
@@ -2354,7 +2703,9 @@ impl SettingsApp {
 
         let w = ui.available_width();
         let mut want_open = open;
-        let mut reveal: Option<std::path::PathBuf> = None;
+        let mut set_source: Option<&'static str> = None;
+        let mut set_custom: Option<String> = None;
+        let mut redownload = false;
 
         let edge = if open {
             blend(t.border, t.accent, 0.5)
@@ -2406,17 +2757,91 @@ impl SettingsApp {
                         capabilities(ui, &FFMPEG_CAPS);
                         ui.add_space(13.0);
 
-                        sec_head(ui, "Windows build");
-                        let (status, warn) = match (&ff, &found) {
-                            (None, _) => ("Checking what you have…".to_string(), false),
-                            (Some(_), Some(_)) => {
-                                ("Active: the ffmpeg on your PATH".to_string(), false)
+                        sec_head(ui, "ffmpeg location");
+                        let managed_sub = managed_dir
+                            .as_ref()
+                            .map(|p| p.display().to_string())
+                            .unwrap_or_else(|| "your Windows app data folder".to_string());
+                        let (hit, _) = loc_option(
+                            ui,
+                            source == "managed",
+                            "App's own copy",
+                            Some("On demand"),
+                            &managed_sub,
+                            true,
+                            None,
+                        );
+                        if hit {
+                            set_source = Some("managed");
+                        }
+                        ui.add_space(6.0);
+
+                        let path_sub = match ff.as_ref().and_then(|f| f.on_path.as_deref()) {
+                            Some(p) => p.display().to_string(),
+                            None => "no ffmpeg found on PATH".to_string(),
+                        };
+                        let (hit, _) = loc_option(
+                            ui,
+                            source == "path",
+                            "System PATH",
+                            None,
+                            &path_sub,
+                            true,
+                            None,
+                        );
+                        if hit {
+                            set_source = Some("path");
+                        }
+                        ui.add_space(6.0);
+
+                        let custom_missing =
+                            !custom.trim().is_empty() && !std::path::Path::new(&custom).is_file();
+                        let custom_sub = if custom.trim().is_empty() {
+                            "pick any ffmpeg.exe on this PC".to_string()
+                        } else if custom_missing {
+                            format!("{custom}  — not there any more")
+                        } else {
+                            custom.clone()
+                        };
+                        let (hit, browse) = loc_option(
+                            ui,
+                            source == "custom",
+                            "Custom path",
+                            None,
+                            &custom_sub,
+                            true,
+                            Some("Browse…"),
+                        );
+                        if browse {
+                            if let Some(p) = pick_ffmpeg() {
+                                set_custom = Some(p.to_string_lossy().to_string());
+                                set_source = Some("custom");
                             }
-                            (Some(_), None) => (
-                                "Not found — run \u{201c}winget install ffmpeg\u{201d}, then reopen this window"
-                                    .to_string(),
-                                true,
-                            ),
+                        } else if hit {
+                            set_source = Some("custom");
+                        }
+                        ui.add_space(9.0);
+
+                        let (status, warn) = match &ff {
+                            None => ("Checking what you have…".to_string(), false),
+                            Some(f) => {
+                                let from = if f.managed {
+                                    "App's own copy"
+                                } else if f.path.is_some() {
+                                    "ffmpeg on PATH"
+                                } else {
+                                    "Nothing installed yet"
+                                };
+                                let what = match (&f.version, f.path.is_some()) {
+                                    (Some(v), true) => format!(" — ffmpeg {v} detected"),
+                                    (None, true) => " — it did not answer -version".to_string(),
+                                    _ => " — the app fetches one on the next merge".to_string(),
+                                };
+                                (
+                                    format!("Active: {from}{what}"),
+                                    f.path.is_none() || custom_missing,
+                                )
+                            }
                         };
                         loc_status(ui, &status, warn);
                         if let Some(p) = &found {
@@ -2432,29 +2857,64 @@ impl SettingsApp {
 
                         ui.horizontal(|ui| {
                             ui.spacing_mut().item_spacing.x = 8.0;
-                            ui.add_enabled_ui(found.is_some(), |ui| {
-                                if btn_icon(ui, "\u{e2c7}", "Show in folder", false).clicked() {
-                                    reveal = found.clone();
+                            ui.add_enabled_ui(!busy, |ui| {
+                                if btn_icon(ui, "\u{e5d5}", "Re-download", true).clicked() {
+                                    redownload = true;
                                 }
                             });
+                            if btn_icon(ui, "\u{e2c7}", "Show in folder", false).clicked() {
+                                if let Some(dir) = crate::engine::ffmpeg_bin_dir() {
+                                    let _ = std::fs::create_dir_all(&dir);
+                                    crate::app::open_path(&dir, false);
+                                }
+                            }
+                            if busy {
+                                ui.add(egui::Spinner::new().size(14.0));
+                            }
                             ui.with_layout(
                                 egui::Layout::right_to_left(egui::Align::Center),
                                 |ui| {
                                     txt(
                                         ui,
-                                        "used only to merge video + audio",
+                                        "merges video + audio; no re-encoding",
                                         reg(9.0),
                                         t.muted,
                                     );
                                 },
                             );
                         });
+                        if !msg.is_empty() {
+                            ui.add_space(7.0);
+                            wrapped(ui, msg.as_str(), reg(10.0), t.accent);
+                        }
                     });
             });
 
         self.plugins_open[1] = want_open;
-        if let Some(p) = reveal {
-            crate::app::open_path(&p, true);
+        if let Some(src) = set_source {
+            if set_custom.is_none() {
+                self.s.ffmpeg_source = src.to_string();
+                self.ffmpeg_rx = Some(ffmpeg_probe(false));
+                self.ffmpeg_busy = true;
+                self.ffmpeg_msg.clear();
+            }
+        }
+        if let Some(p) = set_custom {
+            self.s.ffmpeg_source = "custom".to_string();
+            self.s.ffmpeg_custom_path = p;
+            self.ffmpeg_rx = Some(ffmpeg_probe(false));
+            self.ffmpeg_busy = true;
+            self.ffmpeg_msg.clear();
+        }
+        if redownload {
+            // Re-download means "use the copy this app keeps up to date", so
+            // the choice is committed now (the probe and the engine both read
+            // ui.json, not this form's unsaved state).
+            self.s.ffmpeg_source = "managed".to_string();
+            crate::model::ui_pref_set_str("ffmpeg_source", "managed");
+            self.ffmpeg_rx = Some(ffmpeg_probe(true));
+            self.ffmpeg_busy = true;
+            self.ffmpeg_msg.clear();
         }
     }
 

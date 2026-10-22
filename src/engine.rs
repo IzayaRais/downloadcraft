@@ -44,6 +44,9 @@ pub struct SharedState {
     /// frame size read back with ffprobe. Empty while unknown, so the UI can
     /// show what really landed instead of the browser's guess.
     pub resolution: std::sync::Mutex<String>,
+    /// Set once a live HLS playlist is being recorded. The UI uses it to treat
+    /// Stop as "finish the recording" instead of "pause for later".
+    pub live: AtomicBool,
 }
 
 impl SharedState {
@@ -64,6 +67,7 @@ impl SharedState {
             error: std::sync::Mutex::new(None),
             note: std::sync::Mutex::new(None),
             resolution: std::sync::Mutex::new(String::new()),
+            live: AtomicBool::new(false),
         }
     }
 
@@ -168,6 +172,10 @@ pub struct EngineOpts {
     /// Live scheduler override (speed windows): when present, the rate
     /// limiter honors it over `speed_limit_bps` without restarts.
     pub global_limit: Option<std::sync::Arc<std::sync::atomic::AtomicU64>>,
+    /// Maximum concurrent connections to ONE host across every download
+    /// (Queue v2). 0 = no extra cap. Enforced process-wide, so three
+    /// simultaneous jobs cannot open 3×8 sockets to the same server.
+    pub per_host_conns: usize,
 }
 
 impl Default for EngineOpts {
@@ -187,6 +195,7 @@ impl Default for EngineOpts {
             overwrite_existing: false,
             quality_pref: String::new(),
             global_limit: None,
+            per_host_conns: 0,
         }
     }
 }
@@ -210,6 +219,7 @@ impl EngineOpts {
             .redirect(reqwest::redirect::Policy::limited(10))
             .local_address(std::net::IpAddr::from([0, 0, 0, 0]))
             .http1_only()
+            .tcp_nodelay(true)
             .pool_idle_timeout(std::time::Duration::from_secs(30))
             .pool_max_idle_per_host(16)
             .tcp_keepalive(std::time::Duration::from_secs(60));
@@ -297,6 +307,12 @@ impl EngineOpts {
         r
     }
 }
+
+/// Streaming write buffer for the network loops. `tokio::fs::File` turns
+/// every `write_all` into a blocking-pool round trip, so a stream that yields
+/// 8–16 KiB chunks pays one dispatch per chunk; a 1 MiB buffer cuts that ~64×
+/// and keeps the socket drain loop off the disk path.
+const WRITE_BUF: usize = 1 << 20;
 
 pub(crate) async fn wait_if_paused(shared: &Arc<SharedState>) -> Result<()> {
     loop {
@@ -496,6 +512,47 @@ impl RateLimiter {
 /// into every UI poll and engine task — take the guard anyway).
 pub(crate) fn mutex_guard<'a, T>(m: &'a std::sync::Mutex<T>) -> std::sync::MutexGuard<'a, T> {
     m.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+// ---- per-host connection cap (Queue v2) ------------------------------------
+//
+// IDM-style "max connections per server": one process-wide semaphore per host,
+// shared by every download, so a burst of jobs cannot hammer a CDN with more
+// sockets than the user allows. 0 = no extra cap (opt-in in Settings).
+
+type HostSlotMap = std::collections::HashMap<String, (usize, Arc<tokio::sync::Semaphore>)>;
+static HOST_SLOTS: std::sync::OnceLock<std::sync::Mutex<HostSlotMap>> = std::sync::OnceLock::new();
+
+fn host_of(url: &str) -> String {
+    url::Url::parse(url)
+        .ok()
+        .and_then(|u| u.host_str().map(|h| h.trim_start_matches("www.").to_ascii_lowercase()))
+        .unwrap_or_default()
+}
+
+/// Hold a connection slot for `url`'s host until the permit is dropped.
+async fn host_slot(url: &str, cap: usize) -> Option<tokio::sync::OwnedSemaphorePermit> {
+    if cap == 0 {
+        return None;
+    }
+    let host = host_of(url);
+    if host.is_empty() {
+        return None;
+    }
+    let sem = {
+        let map = HOST_SLOTS.get_or_init(|| std::sync::Mutex::new(HostSlotMap::new()));
+        let mut g = mutex_guard(map);
+        match g.get(&host) {
+            // A changed cap gets a fresh semaphore; old permits die with it.
+            Some((c, s)) if *c == cap => s.clone(),
+            _ => {
+                let s = Arc::new(tokio::sync::Semaphore::new(cap));
+                g.insert(host, (cap, s.clone()));
+                s
+            }
+        }
+    };
+    sem.acquire_owned().await.ok()
 }
 
 /// Marker for HTTP refusals that must NOT be retried (401/403): the same
@@ -2510,6 +2567,22 @@ fn hls_media_sequence(text: &str) -> u64 {
     0
 }
 
+/// `#EXT-X-TARGETDURATION` — how often a live playlist gains a segment.
+fn hls_target_duration(text: &str) -> u64 {
+    for line in text.lines() {
+        let t = line.trim();
+        if let Some(rest) = t.strip_prefix("#EXT-X-TARGETDURATION:") {
+            let raw = rest.trim();
+            return raw
+                .split(['.', ',', ' '])
+                .next()
+                .and_then(|n| n.parse::<u64>().ok())
+                .unwrap_or(6);
+        }
+    }
+    6
+}
+
 fn parse_hex_iv(s: &str) -> Option<[u8; 16]> {
     let t = s.trim().strip_prefix("0x").or_else(|| s.trim().strip_prefix("0X")).unwrap_or(s.trim());
     if t.len() != 32 || !t.bytes().all(|b| b.is_ascii_hexdigit()) {
@@ -2533,8 +2606,10 @@ fn aes128_cbc_decrypt(data: &[u8], key: &[u8; 16], iv: &[u8; 16]) -> Result<Vec<
 /// best variant, fetch segments in parallel (4–8), decrypt AES-128 when
 /// present (incl. key rotation, one fetch per distinct key URI), prepend
 /// the EXT-X-MAP init section when present, resume via a sidecar map,
-/// concat in order. Live, oversize, and SAMPLE-AES playlists are rejected
-/// with guidance — and DRM (Widevine/FairPlay) is never bypassed.
+/// concat in order. Live playlists (no ENDLIST) are recorded by
+/// [`record_live_hls`] until the stream ends or the user stops it; oversize and
+/// SAMPLE-AES playlists are rejected with guidance — and DRM
+/// (Widevine/FairPlay) is never bypassed.
 async fn download_hls(
     playlist_url: &str,
     dest: &PathBuf,
@@ -2580,19 +2655,19 @@ async fn download_hls(
     let schedule = hls_key_schedule(&text, &pl_url)?;
     let seq0 = hls_media_sequence(&text);
     let segs = hls_segments(&text, &pl_url);
+    // Live first: its window is short, sometimes empty right at the start, and
+    // it grows instead of carrying a total.
+    let is_live = !text.contains("#EXT-X-ENDLIST") && text.contains("#EXT-X-MEDIA-SEQUENCE");
+    if is_live {
+        return record_live_hls(&client, opts, &pl_url, dest, shared, &text).await;
+    }
     if segs.is_empty() {
-        return Err(anyhow!("playlist has no media segments — it may be live or expired"));
+        return Err(anyhow!("playlist has no media segments — it may have expired"));
     }
     if segs.len() > MAX_SEGS {
         return Err(anyhow!(
-            "playlist too large ({} segments) — live streams are not supported",
+            "playlist has too many segments ({} for a finished stream)",
             segs.len()
-        ));
-    }
-    let is_live = !text.contains("#EXT-X-ENDLIST") && text.contains("#EXT-X-MEDIA-SEQUENCE");
-    if is_live {
-        return Err(anyhow!(
-            "this looks like a live stream (no ENDLIST) — live capture is not supported; only finished VOD playlists"
         ));
     }
     // 2. Key bytes for AES-128, including rotations (P3): every distinct
@@ -2770,6 +2845,7 @@ async fn download_hls(
         let key_map = key_map.clone();
         handles.push(tokio::spawn(async move {
             let _permit = sem.acquire_owned().await.map_err(|e| anyhow!("semaphore: {e}"))?;
+            let _host_slot = host_slot(&url, opts.per_host_conns).await;
             // Per-segment key from the schedule (P3 rotation): explicit IV
             // when the playlist gives one, else the sequence number.
             let kb: Option<[u8; 16]> = match &seg_key {
@@ -2966,6 +3042,309 @@ async fn download_hls(
         }
     }
     Ok(())
+}
+
+/// Live HLS capture (clean-room, no IDM code): refresh the media playlist,
+/// append every new segment to the destination the moment it appears, and keep
+/// going until the stream ends (`EXT-X-ENDLIST`) or the user presses Stop.
+///
+/// Written incrementally on purpose: a stopped capture is still a playable
+/// file. No total is known, so the row shows a growing size instead of a
+/// percentage. MPEG-TS playlists land as `.ts` (the bytes really are TS; naming
+/// them `.mp4` would make Windows players refuse the file); fragmented-MP4
+/// playlists (`EXT-X-MAP`) keep their `.mp4` name.
+async fn record_live_hls(
+    client: &reqwest::Client,
+    opts: &EngineOpts,
+    pl_url: &str,
+    dest: &PathBuf,
+    shared: &Arc<SharedState>,
+    initial_text: &str,
+) -> Result<()> {
+    shared.live.store(true, Ordering::SeqCst);
+    shared.set_phase("Recording live");
+    shared.has_total.store(false, Ordering::SeqCst);
+    shared.total.store(0, Ordering::SeqCst);
+    let mut text = initial_text.to_string();
+    let has_map = hls_map_init(&text, pl_url)?.is_some();
+    let mut target = dest.clone();
+    if !has_map && opts.allow_rename && !dest.exists() {
+        target = dest.with_extension("ts");
+        if let Some(name) = target.file_name().map(|s| s.to_string_lossy().to_string()) {
+            mutex_guard(&shared.resolved_name).replace(name);
+        }
+    }
+    if let Some(parent) = target.parent() {
+        tokio::fs::create_dir_all(parent).await?;
+    }
+    shared.set_note(if has_map {
+        "Live stream: recording until you press Stop (or the stream ends). Saved as fragmented MP4."
+    } else {
+        "Live stream: recording until you press Stop (or the stream ends). Saved as MPEG-TS (.ts) — playable in VLC/MPC."
+    });
+    let existing = tokio::fs::metadata(&target).await.map(|m| m.len()).unwrap_or(0);
+    {
+        // Resume a stopped capture by appending, never by truncating what the
+        // user already recorded.
+        let cur = shared.downloaded.load(Ordering::SeqCst);
+        shared.downloaded.store(cur.max(existing), Ordering::SeqCst);
+    }
+    let mut out = tokio::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&target)
+        .await
+        .map_err(|e| anyhow!(io_message(&e)))?;
+    let limiter = std::sync::Arc::new(
+        RateLimiter::new(opts.speed_limit_bps).with_global(opts.global_limit.clone()),
+    );
+    let mut keys: std::collections::HashMap<String, [u8; 16]> =
+        std::collections::HashMap::new();
+    let mut last_seq: Option<u64> = None;
+    let mut init_done: Option<String> = None;
+    let mut refresh_fails = 0u32;
+    let mut written: u64 = 0;
+    let mut missed: u64 = 0;
+
+    loop {
+        wait_if_paused(shared).await?;
+        let segs = hls_segments(&text, pl_url);
+        let seq0 = hls_media_sequence(&text);
+        // A restarted encoder rewinds the sequence; start following it again.
+        if let Some(last) = last_seq {
+            let max_seq = seq0.saturating_add(segs.len().saturating_sub(1) as u64);
+            if segs.is_empty() || max_seq < last {
+                last_seq = None;
+            }
+        }
+        let schedule = hls_key_schedule(&text, pl_url)?;
+        // Fragmented MP4: the init section leads the stream (and again after a
+        // map change).
+        if let Some(uri) = hls_map_init(&text, pl_url)? {
+            if init_done.as_deref() != Some(uri.as_str()) {
+                let Some(blob) = fetch_live_segment(client, opts, &uri, opts.max_retries).await?
+                else {
+                    return Err(anyhow!(
+                        "the stream's init section (EXT-X-MAP) is gone from the server — cannot continue this fragmented-MP4 capture"
+                    ));
+                };
+                out.write_all(&blob)
+                    .await
+                    .map_err(|e| anyhow!(io_message(&e)))?;
+                shared.downloaded.fetch_add(blob.len() as u64, Ordering::SeqCst);
+                written = written.saturating_add(blob.len() as u64);
+                limiter.consume(blob.len() as u64).await;
+                init_done = Some(uri);
+            }
+        }
+        for (i, seg_url) in segs.iter().enumerate() {
+            wait_if_paused(shared).await?;
+            let seq = seq0.saturating_add(i as u64);
+            if let Some(last) = last_seq {
+                if seq <= last {
+                    continue;
+                }
+            }
+            let slot = schedule.get(i).cloned().flatten();
+            let kb = match &slot {
+                Some(k) => Some(hls_key_bytes(client, opts, &k.uri, &mut keys).await?),
+                None => None,
+            };
+            let iv = match (&kb, &slot) {
+                (Some(_), Some(k)) => match k.iv_hex.as_deref() {
+                    Some(hex) => Some(parse_hex_iv(hex).ok_or_else(|| anyhow!("bad EXT-X-IV"))?),
+                    None => Some((seq as u128).to_be_bytes()),
+                },
+                _ => None,
+            };
+            match fetch_live_segment(client, opts, seg_url, opts.max_retries).await? {
+                Some(data) => {
+                    let plain = match (&kb, iv) {
+                        (Some(k), Some(v)) => aes128_cbc_decrypt(&data, k, &v)?,
+                        _ => data,
+                    };
+                    out.write_all(&plain)
+                        .await
+                        .map_err(|e| anyhow!(io_message(&e)))?;
+                    // Flush per segment: an aborted capture must leave every
+                    // complete segment on disk.
+                    out.flush().await.map_err(|e| anyhow!(io_message(&e)))?;
+                    shared.downloaded.fetch_add(plain.len() as u64, Ordering::SeqCst);
+                    written = written.saturating_add(plain.len() as u64);
+                    limiter.consume(plain.len() as u64).await;
+                }
+                None => {
+                    // The live window moved past this one; skip it instead of
+                    // killing a long recording.
+                    missed = missed.saturating_add(1);
+                }
+            }
+            last_seq = Some(seq);
+        }
+        if text.contains("#EXT-X-ENDLIST") {
+            break;
+        }
+        let wait = (hls_target_duration(&text) / 2).clamp(1, 5);
+        sleep_live(shared, wait).await?;
+        match fetch_playlist_text(client, opts, pl_url).await {
+            Ok(t) => {
+                text = t;
+                refresh_fails = 0;
+            }
+            Err(e) => {
+                refresh_fails += 1;
+                if refresh_fails > 4 {
+                    return Err(anyhow!(
+                        "live playlist refresh failed after {refresh_fails} tries: {e:#} — {} already recorded stays on disk",
+                        crate::model::format_bytes(written)
+                    ));
+                }
+                sleep_live(shared, 1u64 << refresh_fails.min(3)).await?;
+            }
+        }
+    }
+    out.flush().await.map_err(|e| anyhow!(io_message(&e)))?;
+    drop(out);
+    let final_len = tokio::fs::metadata(&target).await.map(|m| m.len()).unwrap_or(0);
+    shared.total.store(final_len, Ordering::SeqCst);
+    shared.has_total.store(true, Ordering::SeqCst);
+    if final_len == 0 {
+        return Err(anyhow!(
+            "the live stream ended before any media was recorded — nothing to save"
+        ));
+    }
+    if missed > 0 {
+        eprintln!("[dbg] live capture skipped {missed} expired segment(s)");
+    }
+    if !opts.expected_sha256.trim().is_empty() {
+        if let Err(e) = verify_checksum(&target, &opts.expected_sha256).await {
+            let _ = tokio::fs::remove_file(&target).await;
+            return Err(e);
+        }
+    }
+    Ok(())
+}
+
+/// One playlist GET with the row's headers (cookies/referer/proxy).
+async fn fetch_playlist_text(
+    client: &reqwest::Client,
+    opts: &EngineOpts,
+    url: &str,
+) -> Result<String> {
+    opts.get(client, url)
+        .send()
+        .await
+        .map_err(|e| anyhow!("playlist fetch: {e}"))?
+        .error_for_status()
+        .map_err(|e| anyhow!("playlist HTTP: {e}"))?
+        .text()
+        .await
+        .map_err(|e| anyhow!("playlist read: {e}"))
+}
+
+/// AES-128 key for a live segment, fetched once per distinct URI.
+async fn hls_key_bytes(
+    client: &reqwest::Client,
+    opts: &EngineOpts,
+    uri: &str,
+    cache: &mut std::collections::HashMap<String, [u8; 16]>,
+) -> Result<[u8; 16]> {
+    if let Some(k) = cache.get(uri) {
+        return Ok(*k);
+    }
+    let kb = opts
+        .get(client, uri)
+        .send()
+        .await
+        .map_err(|e| anyhow!("key fetch: {e}"))?
+        .error_for_status()
+        .map_err(|e| anyhow!("key HTTP: {e}"))?
+        .bytes()
+        .await
+        .map_err(|e| anyhow!("key read: {e}"))?;
+    if kb.len() != 16 {
+        return Err(anyhow!("HLS key is not 16 bytes — refusing"));
+    }
+    let mut k = [0u8; 16];
+    k.copy_from_slice(&kb);
+    cache.insert(uri.to_string(), k);
+    Ok(k)
+}
+
+/// One live segment. `Ok(None)` = the segment is gone (expired from the live
+/// window) and should be skipped; `Err` = retries exhausted on a real error.
+async fn fetch_live_segment(
+    client: &reqwest::Client,
+    opts: &EngineOpts,
+    url: &str,
+    max_retries: u32,
+) -> Result<Option<Vec<u8>>> {
+    let _host_slot = host_slot(url, opts.per_host_conns).await;
+    let max = max_retries.max(1);
+    let mut attempt = 0u32;
+    loop {
+        attempt += 1;
+        match opts.get(client, url).send().await {
+            Ok(resp) => {
+                let status = resp.status();
+                if status == reqwest::StatusCode::NOT_FOUND
+                    || status == reqwest::StatusCode::GONE
+                {
+                    return Ok(None);
+                }
+                match resp.error_for_status() {
+                    Ok(r) => {
+                        let expect = r.content_length();
+                        match r.bytes().await {
+                            Ok(body) => {
+                                if let Some(n) = expect {
+                                    if body.len() as u64 != n && attempt < max {
+                                        tokio::time::sleep(std::time::Duration::from_secs(
+                                            1 << attempt.min(3),
+                                        ))
+                                        .await;
+                                        continue;
+                                    }
+                                }
+                                return Ok(Some(body.to_vec()));
+                            }
+                            Err(e) => {
+                                if attempt >= max {
+                                    return Err(anyhow!("segment network: {e}"));
+                                }
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        let m = http_status_err(url, e);
+                        if is_final_http_error(&m) || attempt >= max {
+                            return Err(m);
+                        }
+                    }
+                }
+            }
+            Err(e) => {
+                if attempt >= max {
+                    return Err(anyhow!("segment fetch: {e}"));
+                }
+            }
+        }
+        tokio::time::sleep(std::time::Duration::from_secs(1 << attempt.min(3))).await;
+    }
+}
+
+/// Sleep in short slices so Pause/Stop react immediately during a live wait.
+async fn sleep_live(shared: &Arc<SharedState>, secs: u64) -> Result<()> {
+    let end = std::time::Instant::now() + std::time::Duration::from_secs(secs.max(1));
+    loop {
+        wait_if_paused(shared).await?;
+        let now = std::time::Instant::now();
+        if now >= end {
+            return Ok(());
+        }
+        let left = end.saturating_duration_since(now);
+        tokio::time::sleep(left.min(std::time::Duration::from_millis(200))).await;
+    }
 }
 
 /// Entry point used by the UI. Downloads `url` to `dest` with N connections.
@@ -3531,8 +3910,20 @@ pub async fn download(
     Ok(())
 }
 
-/// Locate `ffmpeg` on PATH (with `.exe` on Windows). `None` = not installed.
+/// Locate `ffmpeg` (with `.exe` on Windows). `None` = not installed.
+///
+/// Source preference comes from Settings → Plugins → ffmpeg: the app's own
+/// copy, PATH, or a file the user picked.
 pub fn ffmpeg_path() -> Option<std::path::PathBuf> {
+    match FfmpegSource::from_settings() {
+        FfmpegSource::Custom => ffmpeg_custom_path(),
+        FfmpegSource::Path => ffmpeg_on_path(),
+        FfmpegSource::Managed => ffmpeg_local_path().filter(|p| p.is_file()),
+    }
+}
+
+/// `ffmpeg` found on PATH only (the app never touches that copy).
+pub fn ffmpeg_on_path() -> Option<std::path::PathBuf> {
     let names: &[&str] = if cfg!(windows) {
         &["ffmpeg.exe", "ffmpeg"]
     } else {
@@ -3712,11 +4103,9 @@ pub async fn ffmpeg_mux(
     audio: Option<&std::path::Path>,
     dest: &PathBuf,
 ) -> Result<()> {
-    let ff = ffmpeg_path().ok_or_else(|| {
-        anyhow!(
-            "ffmpeg not found — install it (https://ffmpeg.org/download.html, or `winget install ffmpeg`) and put it on PATH to merge video+audio qualities; progressive ≤720p rows download as single files without it"
-        )
-    })?;
+    let ff = ensure_ffmpeg(&reqwest::Client::new())
+        .await
+        .map_err(|e| anyhow!("cannot merge video + audio: {e:#}"))?;
     if let Some(parent) = dest.parent() {
         tokio::fs::create_dir_all(parent).await?;
     }
@@ -3971,6 +4360,10 @@ pub struct FfmpegInfo {
     pub path: Option<std::path::PathBuf>,
     pub version: Option<String>,
     pub size: Option<u64>,
+    /// `path` is the copy this app fetched and keeps in its own folder.
+    pub managed: bool,
+    /// A copy found on PATH (the app never touches that one).
+    pub on_path: Option<std::path::PathBuf>,
 }
 
 impl FfmpegInfo {
@@ -3979,7 +4372,11 @@ impl FfmpegInfo {
         if self.path.is_none() {
             return "not installed".to_string();
         }
-        let mut bits = vec!["on PATH".to_string()];
+        let mut bits = vec![if self.managed {
+            "own copy".to_string()
+        } else {
+            "on PATH".to_string()
+        }];
         if let Some(sz) = self.size {
             bits.push(crate::model::format_bytes(sz));
         }
@@ -4068,8 +4465,8 @@ pub fn ytdlp_managed_path() -> Option<std::path::PathBuf> {
     ytdlp_local_path()
 }
 
-/// ffmpeg, if there is one on PATH. Blocking (it runs `ffmpeg -version` to
-/// learn the version): call it from a worker thread.
+/// ffmpeg, as resolved by the Settings source choice. Blocking (it runs
+/// `ffmpeg -version` to learn the version): call it from a worker thread.
 pub fn ffmpeg_info() -> FfmpegInfo {
     let path = ffmpeg_path();
     let version = path.as_deref().and_then(ffmpeg_version);
@@ -4077,7 +4474,17 @@ pub fn ffmpeg_info() -> FfmpegInfo {
         .as_deref()
         .and_then(|p| std::fs::metadata(p).ok())
         .map(|m| m.len());
-    FfmpegInfo { path, version, size }
+    let managed = match (&path, ffmpeg_local_path()) {
+        (Some(p), Some(local)) => *p == local,
+        _ => false,
+    };
+    FfmpegInfo {
+        path,
+        version,
+        size,
+        managed,
+        on_path: ffmpeg_on_path(),
+    }
 }
 
 /// `ffmpeg -version` opens with "ffmpeg version 7.1-full_build-www.gyan.dev
@@ -4101,7 +4508,228 @@ fn ffmpeg_version(exe: &std::path::Path) -> Option<String> {
         return None;
     }
     let v = words.next()?.to_string();
+    // Gyan/BtbN builds append their own build id ("9.0.2-full_build-www…");
+    // the card only needs the version proper.
+    let short = v.split('-').next().unwrap_or(&v);
+    let v = if short.starts_with(|c: char| c.is_ascii_digit()) && short.contains('.') {
+        short.to_string()
+    } else {
+        v
+    };
     (!v.is_empty()).then_some(v)
+}
+
+// ---------------------------------------------------------------- ffmpeg ----
+//
+// Merging separate video + audio legs is the one thing the built-in engine
+// cannot do itself. Like yt-dlp, ffmpeg can now be the app's own copy: fetched
+// once (static build, ~30 MB gzip → ~80 MB exe), then reused. A copy the user
+// installed keeps winning when they choose PATH or pick one themselves.
+
+/// Static builds the app fetches. They are single-file executables (gzip
+/// compressed), so no archive extraction and no DLLs next to them.
+const FFMPEG_GZ_URL: &str = if cfg!(windows) {
+    "https://github.com/eugeneware/ffmpeg-static/releases/latest/download/ffmpeg-win32-x64.gz"
+} else if cfg!(target_os = "macos") {
+    "https://github.com/eugeneware/ffmpeg-static/releases/latest/download/ffmpeg-darwin-arm64.gz"
+} else {
+    "https://github.com/eugeneware/ffmpeg-static/releases/latest/download/ffmpeg-linux-x64.gz"
+};
+const FFPROBE_GZ_URL: &str = if cfg!(windows) {
+    "https://github.com/eugeneware/ffmpeg-static/releases/latest/download/ffprobe-win32-x64.gz"
+} else if cfg!(target_os = "macos") {
+    "https://github.com/eugeneware/ffmpeg-static/releases/latest/download/ffprobe-darwin-arm64.gz"
+} else {
+    "https://github.com/eugeneware/ffmpeg-static/releases/latest/download/ffprobe-linux-x64.gz"
+};
+const FFMPEG_BIN: &str = if cfg!(windows) { "ffmpeg.exe" } else { "ffmpeg" };
+const FFPROBE_BIN: &str = if cfg!(windows) { "ffprobe.exe" } else { "ffprobe" };
+
+/// How the user wants ffmpeg sourced — same three-way choice as yt-dlp.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FfmpegSource {
+    Managed,
+    Path,
+    Custom,
+}
+
+impl Default for FfmpegSource {
+    fn default() -> Self {
+        // Matches `Settings::default()`.
+        FfmpegSource::Managed
+    }
+}
+
+impl FfmpegSource {
+    fn from_settings() -> Self {
+        match crate::model::ui_pref_str("ffmpeg_source", "").as_str() {
+            "path" => FfmpegSource::Path,
+            "custom" => FfmpegSource::Custom,
+            "managed" => FfmpegSource::Managed,
+            // Installs that predate the three-way choice: keep using the
+            // ffmpeg they already have on PATH instead of fetching 60 MB.
+            _ => {
+                if ffmpeg_on_path().is_some() {
+                    FfmpegSource::Path
+                } else {
+                    FfmpegSource::Managed
+                }
+            }
+        }
+    }
+}
+
+/// The user's own ffmpeg, when they picked one *and* it is still on disk.
+fn ffmpeg_custom_path() -> Option<std::path::PathBuf> {
+    let raw = crate::model::ui_pref_str("ffmpeg_custom_path", "");
+    let raw = raw.trim();
+    if raw.is_empty() {
+        return None;
+    }
+    let p = std::path::PathBuf::from(raw);
+    p.is_file().then_some(p)
+}
+
+/// Where a self-fetched ffmpeg lives (same `bin` folder as yt-dlp).
+fn ffmpeg_local_path() -> Option<std::path::PathBuf> {
+    let base = if cfg!(windows) {
+        std::path::PathBuf::from(std::env::var_os("LOCALAPPDATA")?)
+    } else {
+        std::path::PathBuf::from(std::env::var_os("HOME")?)
+            .join(".local")
+            .join("share")
+    };
+    Some(base.join("download_craft").join("bin").join(FFMPEG_BIN))
+}
+
+/// Where the app's own ffmpeg lives, for Settings.
+pub fn ffmpeg_bin_dir() -> Option<std::path::PathBuf> {
+    ffmpeg_local_path().and_then(|p| p.parent().map(|d| d.to_path_buf()))
+}
+
+/// A usable ffmpeg, fetching the app's own copy when the source allows it and
+/// nothing else is present. Called right before a merge, so a first 1080p
+/// download sets itself up instead of failing with "install ffmpeg".
+pub async fn ensure_ffmpeg(client: &reqwest::Client) -> Result<std::path::PathBuf> {
+    if let Some(p) = ffmpeg_path() {
+        return Ok(p);
+    }
+    match FfmpegSource::from_settings() {
+        FfmpegSource::Custom => Err(anyhow!(
+            "the custom ffmpeg path in Settings no longer exists — pick it again under Settings → Download Engine"
+        )),
+        FfmpegSource::Path => Err(anyhow!(
+            "no ffmpeg on PATH — install it, or switch Settings → Download Engine to \u{201c}App's own copy\u{201d} and the app fetches one"
+        )),
+        FfmpegSource::Managed => {
+            // Unit tests never reach the network: the managed fetch belongs to
+            // the app, and a test box without ffmpeg must not download 60 MB.
+            #[cfg(test)]
+            {
+                let _ = client;
+                return Err(anyhow!(
+                    "managed ffmpeg is not fetched in tests"
+                ));
+            }
+            #[cfg(not(test))]
+            {
+                fetch_ffmpeg(client, false).await
+            }
+        }
+    }
+}
+
+/// Fetch (or refresh) the app's own ffmpeg + ffprobe. ffprobe is best-effort:
+/// without it the file still plays, only the frame-size read-back is lost.
+async fn fetch_ffmpeg(client: &reqwest::Client, force: bool) -> Result<std::path::PathBuf> {
+    let dst = ffmpeg_local_path().ok_or_else(|| anyhow!("no LOCALAPPDATA to keep ffmpeg in"))?;
+    fetch_gz_binary(client, FFMPEG_GZ_URL, &dst, "ffmpeg").await.map_err(|e| {
+        anyhow!("{e:#} — check the connection, or pick a copy in Settings → Download Engine")
+    })?;
+    if let Some(dir) = dst.parent() {
+        let probe = dir.join(FFPROBE_BIN);
+        // A refresh replaces the pair together; a lazy first fetch only needs
+        // ffprobe when it is not already there.
+        if force || !probe.is_file() {
+            let _ = fetch_gz_binary(client, FFPROBE_GZ_URL, &probe, "ffprobe").await;
+        }
+    }
+    Ok(dst)
+}
+
+/// Download a gzip-compressed static executable and unpack it next to `dst`.
+/// The payload lands in a sidecar first and is only renamed into place after
+/// the decompressed file is verified, so a half-written binary is never run.
+async fn fetch_gz_binary(
+    client: &reqwest::Client,
+    url: &str,
+    dst: &std::path::Path,
+    label: &str,
+) -> Result<()> {
+    if let Some(dir) = dst.parent() {
+        tokio::fs::create_dir_all(dir).await?;
+    }
+    let resp = client
+        .get(url)
+        .send()
+        .await
+        .map_err(|e| anyhow!("{label} fetch: {e}"))?;
+    if !resp.status().is_success() {
+        return Err(anyhow!("{label} fetch: HTTP {}", resp.status()));
+    }
+    let bytes = resp
+        .bytes()
+        .await
+        .map_err(|e| anyhow!("{label} fetch: {e}"))?;
+    // Compressed builds are tens of MB; anything tiny is an error page.
+    if bytes.len() < 5_000_000 {
+        return Err(anyhow!(
+            "{label} fetch: suspicious payload ({} bytes)",
+            bytes.len()
+        ));
+    }
+    let dst = dst.to_path_buf();
+    let label_owned = label.to_string();
+    tokio::task::spawn_blocking(move || -> Result<()> {
+        use std::io::{Read, Write};
+        let tmp = dst.with_extension("part");
+        let mut dec = flate2::read::GzDecoder::new(&bytes[..]);
+        let mut out = std::fs::File::create(&tmp)?;
+        std::io::copy(&mut dec, &mut out)?;
+        out.flush()?;
+        drop(out);
+        let mut head = [0u8; 2];
+        let mut f = std::fs::File::open(&tmp)?;
+        let n = f.read(&mut head)?;
+        let ok_magic = if cfg!(windows) {
+            n == 2 && &head == b"MZ"
+        } else {
+            n == 2 && &head == b"\x7fE"
+        };
+        if !ok_magic || std::fs::metadata(&tmp).map(|m| m.len()).unwrap_or(0) < 10_000_000 {
+            let _ = std::fs::remove_file(&tmp);
+            return Err(anyhow!(
+                "{label_owned} unpack: payload is not a static executable"
+            ));
+        }
+        std::fs::rename(&tmp, &dst)?;
+        Ok(())
+    })
+    .await
+    .map_err(|e| anyhow!("{label} unpack: {e}"))??;
+    Ok(())
+}
+
+/// Re-fetch the app's own ffmpeg now (the Settings "Re-download" button).
+/// Blocking: call it from a worker thread.
+pub fn ffmpeg_refresh_blocking() -> Result<std::path::PathBuf> {
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()?;
+    rt.block_on(async {
+        let client = EngineOpts::default().build_client()?;
+        fetch_ffmpeg(&client, true).await
+    })
 }
 
 /// Replace the app's own copy of yt-dlp now — the Settings "Re-download"
@@ -4387,7 +5015,20 @@ async fn download_with_ytdlp(
     }
     // One lookup decides both the selector and whether yt-dlp may ask for a
     // merge at all (no ffmpeg = only a single muxed file can be delivered).
-    let merge_ffmpeg = ffmpeg_path();
+    // The app's own copy is fetched here when nothing else exists, so a first
+    // 1080p download sets itself up instead of quietly capping at 720p.
+    let mut merge_ffmpeg = ffmpeg_path();
+    if merge_ffmpeg.is_none() {
+        if let Ok(c) = opts.build_client() {
+            shared.set_phase("Fetching ffmpeg");
+            match ensure_ffmpeg(&c).await {
+                Ok(p) => merge_ffmpeg = Some(p),
+                Err(e) => shared.set_note(format!(
+                    "ffmpeg is unavailable ({e:#}) — downloading the best single-file quality instead"
+                )),
+            }
+        }
+    }
     cmd.arg("--no-playlist")
         .arg("--no-warnings")
         .arg("--newline")
@@ -4531,7 +5172,7 @@ async fn download_with_ytdlp(
         // broken link. Say what actually helps.
         if merge_ffmpeg.is_none() {
             msg.push_str(
-                " (this video has no single-file format at the quality you asked for - install ffmpeg to merge video+audio: Settings \u{25b8} Plugins \u{25b8} ffmpeg)",
+                " (this video has no single-file format at the quality you asked for - ffmpeg merges video+audio; pick \u{201c}App's own copy\u{201d} under Settings \u{25b8} Plugins \u{25b8} ffmpeg and the app fetches one)",
             );
         }
         return Err(anyhow!(msg));
@@ -4678,17 +5319,20 @@ pub async fn download_adaptive(
     let _job = claim_dest_job(&dest).ok_or_else(|| {
         anyhow!("this destination is already downloading elsewhere — wait for it or remove the duplicate queue entry")
     })?;
-    // Merging needs ffmpeg: fail BEFORE any bytes move, not after two
-    // quarter-gigabyte legs finish. Progressive (single-file) qualities
-    // never reach this path, so this only gates real merges.
+    let client = opts.build_client()?;
+    // Merging needs ffmpeg: resolve (and, for the app's own copy, fetch it)
+    // BEFORE any bytes move, not after two quarter-gigabyte legs finish.
+    // Progressive (single-file) qualities never reach this path.
     if audio_url.as_deref().map(|u| u.starts_with("http")).unwrap_or(false)
         && ffmpeg_path().is_none()
     {
-        return Err(anyhow!(
-            "this quality needs merging (video-only + audio) but ffmpeg was not found — install it (`winget install ffmpeg`), restart the app so it lands on PATH, then resume; 720p and below download as single files without it"
-        ));
+        shared.set_phase("Fetching ffmpeg");
+        ensure_ffmpeg(&client).await.map_err(|e| {
+            anyhow!(
+                "this quality needs merging (video-only + audio), and {e:#}; 720p and below download as single files without it"
+            )
+        })?;
     }
-    let client = opts.build_client()?;
     if let Some(parent) = dest.parent() {
         tokio::fs::create_dir_all(parent).await?;
     }
@@ -5275,6 +5919,7 @@ async fn dash_fetch_blob(
     shared: &Arc<SharedState>,
     max_retries: u32,
 ) -> Result<Vec<u8>> {
+    let _host_slot = host_slot(&url, opts.per_host_conns).await;
     let mut attempt = 0u32;
     loop {
         attempt += 1;
@@ -5485,6 +6130,14 @@ pub async fn download_dash(
         .ok_or_else(|| anyhow!("DASH manifest has no video track"))?
         .clone();
     let a = audios.iter().max_by_key(|r| r.bandwidth).cloned();
+    // Two representations mean a mux: make sure a merger exists before
+    // spending the bandwidth (the app's own copy is fetched on demand).
+    if a.is_some() && ffmpeg_path().is_none() {
+        shared.set_phase("Fetching ffmpeg");
+        ensure_ffmpeg(&client).await.map_err(|e| {
+            anyhow!("this DASH stream has separate video + audio, and {e:#}")
+        })?;
+    }
     // Container follows codecs (mp4 unless VP9/AV1/Opus → mkv), like pairs.
     let webmish = v.codecs.to_ascii_lowercase().contains("vp09")
         || v.codecs.to_ascii_lowercase().contains("av01")
@@ -5862,16 +6515,17 @@ async fn single_stream_once(
 
     // Open for resume: keep existing bytes (seek/append below), no truncate.
     #[allow(clippy::suspicious_open_options)]
-    let mut file = tokio::fs::OpenOptions::new()
+    let mut raw = tokio::fs::OpenOptions::new()
         .create(true)
         .write(true)
         .open(&tmp)
         .await?;
     if start_at > 0 && is_partial {
-        file.seek(std::io::SeekFrom::Start(start_at)).await?;
+        raw.seek(std::io::SeekFrom::Start(start_at)).await?;
     } else if start_at > 0 {
-        file.set_len(0).await?;
+        raw.set_len(0).await?;
     }
+    let mut file = tokio::io::BufWriter::with_capacity(WRITE_BUF, raw);
 
     let per_conn_limit = opts.speed_limit_bps; // single connection gets full budget
     let _ = per_conn_limit;
@@ -5881,18 +6535,36 @@ async fn single_stream_once(
     // Clamped 15–120 s so slow-but-moving trickles are never killed.
     let stall_timeout = (opts.timeout_secs.max(15)).min(120);
     let mut stream = resp.bytes_stream();
+    // Any early exit still flushes what landed: the retry loop measures
+    // progress by the file's length, so buffered bytes must not be lost.
+    let mut failure: Option<anyhow::Error> = None;
     loop {
-        let next = tokio::time::timeout(
+        let next = match tokio::time::timeout(
             std::time::Duration::from_secs(stall_timeout),
             stream.next(),
         )
         .await
-        .map_err(|_| {
-            anyhow!("stalled (no data for {stall_timeout}s) — resuming")
-        })?;
+        {
+            Ok(n) => n,
+            Err(_) => {
+                failure = Some(anyhow!(
+                    "stalled (no data for {stall_timeout}s) — resuming"
+                ));
+                break;
+            }
+        };
         let Some(chunk) = next else { break };
-        wait_if_paused(&shared).await?;
-        let bytes = chunk.map_err(|e| anyhow!("network: {e}"))?;
+        if let Err(e) = wait_if_paused(&shared).await {
+            failure = Some(e);
+            break;
+        }
+        let bytes = match chunk {
+            Ok(b) => b,
+            Err(e) => {
+                failure = Some(anyhow!("network: {e}"));
+                break;
+            }
+        };
         file.write_all(&bytes)
             .await
             .map_err(|e| anyhow!(io_message(&e)))?;
@@ -5906,6 +6578,9 @@ async fn single_stream_once(
     }
     file.flush().await.map_err(|e| anyhow!(io_message(&e)))?;
     drop(file);
+    if let Some(e) = failure {
+        return Err(e);
+    }
     // A clean-but-early socket close yields a short stream with NO error —
     // the classic Facebook/IG CDN failure ("connection ended early" in the
     // UI). When the total is known, verify the landed bytes and fail so the
@@ -6174,29 +6849,53 @@ async fn chunked_once(
     // body vs a cut 206 mean very different things (see probe_range_once).
     let resp_status = resp.status();
     let resp_len = resp.content_length();
-    let mut file = tokio::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(tmp)
-        .await?;
+    let mut file = tokio::io::BufWriter::with_capacity(
+        WRITE_BUF,
+        tokio::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(tmp)
+            .await?,
+    );
     // Bytes to skip when slicing a 200 response down to our window.
     let mut to_skip = if is_partial { 0 } else { offset };
     let mut to_take = want;
     let mut wrote = 0u64;
     let mut stream = resp.bytes_stream();
+    // Any early exit still flushes what landed: the retry loops measure
+    // progress by the file's length, so buffered bytes must never be lost
+    // (a cut would otherwise replay the same offset forever).
+    let mut failure: Option<anyhow::Error> = None;
     loop {
         if to_take == 0 {
             break;
         }
-        let next = tokio::time::timeout(
+        let next = match tokio::time::timeout(
             std::time::Duration::from_secs(stall_timeout),
             stream.next(),
         )
         .await
-        .map_err(|_| anyhow!("stalled (no data for {stall_timeout}s) — resuming"))?;
+        {
+            Ok(n) => n,
+            Err(_) => {
+                failure = Some(anyhow!(
+                    "stalled (no data for {stall_timeout}s) — resuming"
+                ));
+                break;
+            }
+        };
         let Some(chunk) = next else { break };
-        wait_if_paused(shared).await?;
-        let bytes = chunk.map_err(|e| anyhow!("network: {e}"))?;
+        if let Err(e) = wait_if_paused(shared).await {
+            failure = Some(e);
+            break;
+        }
+        let bytes = match chunk {
+            Ok(b) => b,
+            Err(e) => {
+                failure = Some(anyhow!("network: {e}"));
+                break;
+            }
+        };
         let mut data = &bytes[..];
         if to_skip > 0 {
             let cut = (to_skip as usize).min(data.len());
@@ -6226,6 +6925,9 @@ async fn chunked_once(
     }
     file.flush().await.map_err(|e| anyhow!(io_message(&e)))?;
     drop(file);
+    if let Some(e) = failure {
+        return Err(e);
+    }
     if wrote != want {
         // Zero-byte ranges name the cause: an empty/ignored range (200, no
         // body) means resume is impossible on this URL; a cut 206 means
@@ -6328,20 +7030,32 @@ async fn segmented(
         return Err(e);
     }
 
-    // Merge parts in order.
+    // Merge parts in order. A 1 MiB buffer on both sides keeps `copy` from
+    // paying an 8 KiB blocking-pool round trip per chunk (a 2 GB file is
+    // ~250k of them at the default size).
     let tmp = dest.with_extension("dcpart");
-    let mut out = tokio::fs::OpenOptions::new()
-        .create(true)
-        .write(true)
-        .truncate(true)
-        .open(&tmp)
-        .await?;
+    let mut out = tokio::io::BufWriter::with_capacity(
+        WRITE_BUF,
+        tokio::fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(true)
+            .open(&tmp)
+            .await?,
+    );
+    let mut buf = vec![0u8; WRITE_BUF];
     for i in 0..connections {
         let part = dest.with_extension(format!("dcpart{}", i));
         let mut f = tokio::fs::File::open(&part).await?;
-        tokio::io::copy(&mut f, &mut out).await?;
+        loop {
+            let n = tokio::io::AsyncReadExt::read(&mut f, &mut buf).await?;
+            if n == 0 {
+                break;
+            }
+            tokio::io::AsyncWriteExt::write_all(&mut out, &buf[..n]).await?;
+        }
     }
-    out.flush().await?;
+    tokio::io::AsyncWriteExt::flush(&mut out).await?;
     drop(out);
     for i in 0..connections {
         let part = dest.with_extension(format!("dcpart{}", i));
@@ -6364,6 +7078,9 @@ async fn download_range(
     part_idx: usize,
     shared: Arc<SharedState>,
 ) -> Result<()> {
+    // One host-wide slot per open connection (Queue v2): with the cap set,
+    // three jobs to the same CDN can never open 3×8 sockets.
+    let _host_slot = host_slot(url, opts.per_host_conns).await;
     let max_retries = opts.max_retries.max(1);
     // Attempts that made ANY progress don't count toward the retry budget
     // (throttled CDNs drip-feed: each 1 MB trickle resets the stall count).
@@ -6469,18 +7186,37 @@ async fn download_range_once(
     if !is_partial && have > 0 {
         let _ = tokio::fs::remove_file(part).await;
     }
-    let mut file = tokio::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(part)
-        .await?;
+    let mut file = tokio::io::BufWriter::with_capacity(
+        WRITE_BUF,
+        tokio::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(part)
+            .await?,
+    );
     let mut stream = resp.bytes_stream();
     // Bytes to skip/take when slicing a 200 response down to our window.
     let mut to_skip = if is_partial { 0 } else { start };
     let mut to_take = range_len;
-    while let Some(chunk) = stream.next().await {
-        wait_if_paused(shared).await?;
-        let bytes = chunk.map_err(|e| anyhow!("network: {e}"))?;
+    // Any early exit still flushes what landed: the retry loop measures
+    // progress by the part file's length, so buffered bytes must not be lost.
+    let mut failure: Option<anyhow::Error> = None;
+    loop {
+        let next = match stream.next().await {
+            Some(n) => n,
+            None => break,
+        };
+        if let Err(e) = wait_if_paused(shared).await {
+            failure = Some(e);
+            break;
+        }
+        let bytes = match next {
+            Ok(b) => b,
+            Err(e) => {
+                failure = Some(anyhow!("network: {e}"));
+                break;
+            }
+        };
         let mut data = &bytes[..];
         if to_skip > 0 {
             let cut = (to_skip as usize).min(data.len());
@@ -6514,6 +7250,9 @@ async fn download_range_once(
     }
     file.flush().await.map_err(|e| anyhow!(io_message(&e)))?;
     drop(file);
+    if let Some(e) = failure {
+        return Err(e);
+    }
     // A clean-but-early socket close yields a short stream with no error —
     // never accept a short part (the retry loop re-fetches the range).
     let wrote = tokio::fs::metadata(part).await.map(|m| m.len()).unwrap_or(0);
@@ -8249,5 +8988,151 @@ mod tests {
 
         srv.abort();
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Live HLS: the recorder follows a playlist that grows, appends each new
+    /// segment exactly once, stops at ENDLIST, and lands the bytes as `.ts`
+    /// (the name the container really is).
+    #[tokio::test]
+    async fn live_hls_records_until_endlist() {
+        use std::sync::atomic::AtomicUsize;
+        let calls = std::sync::Arc::new(AtomicUsize::new(0));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind live fixture");
+        let addr = listener.local_addr().expect("live fixture addr");
+        let c = calls.clone();
+        let srv = tokio::spawn(async move {
+            loop {
+                let Ok((mut s, _)) = listener.accept().await else {
+                    break;
+                };
+                let c = c.clone();
+                tokio::spawn(async move {
+                    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                    let mut buf = vec![0u8; 2048];
+                    let n = s.read(&mut buf).await.unwrap_or(0);
+                    let req = String::from_utf8_lossy(&buf[..n]).to_string();
+                    let path = req
+                        .split_whitespace()
+                        .nth(1)
+                        .unwrap_or("/")
+                        .trim_start_matches('/')
+                        .to_string();
+                    let (body, ctype) = if path.starts_with("live.m3u8") {
+                        let call = c.fetch_add(1, Ordering::SeqCst);
+                        let pl = if call == 0 {
+                            "#EXTM3U\n#EXT-X-VERSION:3\n#EXT-X-TARGETDURATION:2\n#EXT-X-MEDIA-SEQUENCE:0\n#EXTINF:2.0,\ns0.ts\n#EXTINF:2.0,\ns1.ts\n"
+                        } else {
+                            "#EXTM3U\n#EXT-X-VERSION:3\n#EXT-X-TARGETDURATION:2\n#EXT-X-MEDIA-SEQUENCE:2\n#EXTINF:2.0,\ns2.ts\n#EXTINF:2.0,\ns3.ts\n#EXT-X-ENDLIST\n"
+                        };
+                        (pl.as_bytes().to_vec(), "application/vnd.apple.mpegurl")
+                    } else {
+                        (
+                            format!("SEG:{path};").into_bytes(),
+                            "video/mp2t",
+                        )
+                    };
+                    let head = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: {ctype}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                        body.len()
+                    );
+                    let _ = s.write_all(head.as_bytes()).await;
+                    let _ = s.write_all(&body).await;
+                    let _ = s.flush().await;
+                });
+            }
+        });
+
+        let dir = std::env::temp_dir().join(format!("dc_live_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let dest = dir.join("stream.mp4");
+        let shared = Arc::new(SharedState::new());
+        let opts = EngineOpts {
+            timeout_secs: 5,
+            max_retries: 2,
+            ..Default::default()
+        };
+        download_hls(
+            &format!("http://{addr}/live.m3u8"),
+            &dest,
+            1,
+            &opts,
+            &shared,
+        )
+        .await
+        .expect("live capture finishes on ENDLIST");
+
+        assert!(shared.live.load(Ordering::SeqCst), "row must know it is live");
+        // MPEG-TS bytes keep an honest extension, and the row follows it.
+        let ts = dest.with_extension("ts");
+        assert!(ts.is_file(), "expected {}", ts.display());
+        assert!(!dest.exists(), "the .mp4 name must not lie");
+        let got = String::from_utf8_lossy(&std::fs::read(&ts).unwrap()).to_string();
+        assert_eq!(got, "SEG:s0.ts;SEG:s1.ts;SEG:s2.ts;SEG:s3.ts;");
+        assert_eq!(
+            mutex_guard(&shared.resolved_name).as_deref(),
+            Some("stream.ts")
+        );
+        assert!(shared.has_total.load(Ordering::SeqCst));
+        assert_eq!(
+            shared.total.load(Ordering::SeqCst),
+            std::fs::metadata(&ts).unwrap().len()
+        );
+
+        srv.abort();
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Live playlists refresh with the target duration, so the wait must be
+    /// parsed from the tag and stay in a sane range.
+    #[test]
+    fn live_helpers() {
+        assert_eq!(hls_target_duration("#EXT-X-TARGETDURATION:9\n"), 9);
+        assert_eq!(hls_target_duration("#EXT-X-TARGETDURATION:2.0\n"), 2);
+        assert_eq!(hls_target_duration("#EXTM3U\n"), 6);
+        assert_eq!(host_of("https://www.Example.com:8443/a.m3u8"), "example.com");
+        assert_eq!(host_of("not a url"), "");
+    }
+
+    /// Queue v2: "connections per server" is one process-wide allowance per
+    /// host, so a burst of jobs aimed at the same server can never hold more
+    /// sockets than the user allows — and another host is never blocked by it.
+    #[tokio::test]
+    async fn per_host_cap_limits_concurrency() {
+        // 0 is the default and means "no extra cap": no permit at all.
+        assert!(host_slot("https://capoff.test/a", 0).await.is_none());
+
+        let held = host_slot("https://capone.test/a", 1)
+            .await
+            .expect("first connection takes the only slot");
+        let blocked = tokio::time::timeout(
+            std::time::Duration::from_millis(120),
+            host_slot("https://capone.test/b", 1),
+        )
+        .await;
+        assert!(blocked.is_err(), "a second connection must wait its turn");
+
+        // Finishing the first hands the slot to the waiting one.
+        drop(held);
+        let next = tokio::time::timeout(
+            std::time::Duration::from_millis(500),
+            host_slot("https://capone.test/c", 1),
+        )
+        .await
+        .expect("the freed slot lets the next connection in")
+        .expect("permit");
+        drop(next);
+
+        // A cap on one host never throttles a different host.
+        let a = host_slot("https://host-a.test/x", 1).await.expect("h1");
+        let b = tokio::time::timeout(
+            std::time::Duration::from_millis(300),
+            host_slot("https://host-b.test/x", 1),
+        )
+        .await
+        .expect("another host is not blocked")
+        .expect("h2 permit");
+        drop((a, b));
     }
 }

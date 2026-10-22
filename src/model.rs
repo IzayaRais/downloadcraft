@@ -1,4 +1,4 @@
-use chrono::{DateTime, Local};
+use chrono::{DateTime, Local, Timelike};
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -196,6 +196,13 @@ pub struct DownloadItem {
     /// a persistently corrupt source fails loudly instead of looping.
     #[serde(default)]
     pub checksum_repaired: bool,
+    /// Queue v2 ordering: higher runs first; ties keep creation order.
+    #[serde(default)]
+    pub priority: i64,
+    /// Queue v2 scheduled start, "HH:MM" local. Empty = as soon as the queue
+    /// can take it. A time already past starts immediately.
+    #[serde(default)]
+    pub start_at: String,
 }
 
 impl DownloadItem {
@@ -228,6 +235,8 @@ impl DownloadItem {
             max_retries: None,
             timeout_secs: None,
             checksum_repaired: false,
+            priority: 0,
+            start_at: String::new(),
         }
     }
 
@@ -257,8 +266,24 @@ impl DownloadItem {
     }
 }
 
-pub fn category_of(filename: &str) -> &'static str {
-    let ext = filename
+/// Queue v2: whether a row's "start at" time has arrived. Blank = now.
+/// A time already past also means now (set it and it runs), and an
+/// unparsable value never blocks a download forever.
+pub fn start_at_due(s: &str, now: DateTime<Local>) -> bool {
+    let t = s.trim();
+    if t.is_empty() {
+        return true;
+    }
+    match parse_hhmm(t) {
+        Some(mins) => {
+            let now_secs = now.hour() * 3600 + now.minute() * 60 + now.second();
+            mins as u32 * 60 <= now_secs
+        }
+        None => true,
+    }
+}
+
+pub fn category_of(filename: &str) -> &'static str {    let ext = filename
         .rsplit('.')
         .next()
         .unwrap_or("")
@@ -266,7 +291,7 @@ pub fn category_of(filename: &str) -> &'static str {
     match ext.as_str() {
         "png" | "jpg" | "jpeg" | "gif" | "webp" | "svg" | "bmp" | "ico" => "Image",
         "mp3" | "wav" | "flac" | "ogg" | "m4a" => "Music",
-        "mp4" | "mkv" | "avi" | "mov" | "webm" => "Video",
+        "mp4" | "mkv" | "avi" | "mov" | "webm" | "ts" | "m4s" => "Video",
         "pdf" | "doc" | "docx" | "txt" | "epub" => "Document",
         "zip" | "rar" | "7z" | "tar" | "gz" => "Compressed",
         "exe" | "msi" => "Apps",
@@ -587,6 +612,25 @@ pub fn ui_pref_set_bool(key: &str, value: bool) {
         return;
     };
     obj.insert(key.to_string(), serde_json::Value::Bool(value));
+    if let Ok(json) = serde_json::to_string_pretty(&v) {
+        let _ = atomic_write(&p, json.as_bytes());
+    }
+}
+
+/// Merge one string into ui.json (used when an action commits a helper choice
+/// right away, e.g. "Re-download" switching to the app's own ffmpeg).
+pub fn ui_pref_set_str(key: &str, value: &str) {
+    let Some(p) = config_dir().map(|d| d.join("ui.json")) else {
+        return;
+    };
+    let mut v: serde_json::Value = std::fs::read_to_string(&p)
+        .ok()
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_else(|| serde_json::json!({}));
+    let Some(obj) = v.as_object_mut() else {
+        return;
+    };
+    obj.insert(key.to_string(), serde_json::Value::String(value.to_string()));
     if let Ok(json) = serde_json::to_string_pretty(&v) {
         let _ = atomic_write(&p, json.as_bytes());
     }
@@ -1059,6 +1103,20 @@ pub fn pick_windows_asset(v: &serde_json::Value) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn queue_start_times() {
+        use chrono::TimeZone;
+        let at = |h, m| Local.with_ymd_and_hms(2026, 10, 21, h, m, 0).unwrap();
+        // Blank means now; a time already past also means now.
+        assert!(start_at_due("", at(10, 0)));
+        assert!(start_at_due("08:30", at(10, 0)));
+        assert!(start_at_due("10:00", at(10, 0)));
+        // A later clock time holds the row back.
+        assert!(!start_at_due("23:30", at(10, 0)));
+        // Garbage never blocks a download forever.
+        assert!(start_at_due("later", at(10, 0)));
+    }
 
     #[test]
     fn categories() {

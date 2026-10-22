@@ -108,9 +108,13 @@ fn main() -> eframe::Result<()> {
             .build()
             .expect("tokio runtime"),
     );
+    // No OS caption: the app paints its own title bar (brand, menus, search,
+    // update chip, window buttons — `main_window_titlebar.html`). Drag, resize,
+    // snap and double-click still go through the OS (`StartDrag` / `BeginResize`).
     let mut viewport = egui::ViewportBuilder::default()
         .with_inner_size([920.0, 500.0])
-        .with_min_inner_size([840.0, 480.0]);
+        .with_min_inner_size([840.0, 480.0])
+        .with_decorations(false);
     if let Ok(icon) = eframe::icon_data::from_png_bytes(include_bytes!("../assets/icon.png")) {
         viewport = viewport.with_icon(std::sync::Arc::new(icon));
     }

@@ -1,6 +1,6 @@
 [package]
 name = "download_craft"
-version = "0.9.6"
+version = "0.9.7"
 edition = "2021"
 description = "Download Craft — a lightweight, offline-first download manager (egui GUI + CLI)"
 license = "MIT"
@@ -28,3 +28,4 @@ raw-window-handle = "0.6"
 image = { version = "0.25", default-features = false, features = ["png"] }
 rustybuzz = "0.20.1"
 unicode-segmentation = "1.13.3"
+flate2 = "1"

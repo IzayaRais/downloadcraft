@@ -18,52 +18,55 @@ use crate::model::{claim_window, config_dir, format_bytes, DownloadItem};
 use std::time::{Duration, Instant};
 
 // ================= concept geometry =================
-// `complete_window.html` (measured in Chrome, border-box):
-//   card     502x291    (500x289 content + 2x1px border), bg #1b1b1b, r4
-//   header   1..34      check-in-circle 14 at x=13, title 13/600 at x=33,
-//                       controls 12 at x 429/453/477 (12px gaps, 12 off right)
-//   content  34..290    padding 14/16, content x 17..485
-//   summary  48..88     40px doc icon, "Download complete" 14/600, bytes 11
-//   address  102..149   label 11 at y=102, box (17,121,468,28)
-//   saved    161..208   label 11 at y=161, box (17,180,468,28)
-//   buttons  222..250   four 111x28 buttons, 8px gaps
-//   opt-out  262..276   14px checkbox at x=17, 10px label at x=37
-const CW: f32 = 502.0;
-const CH: f32 = 291.0;
+// `complete_window.html` (measured in Chrome, border-box), tightened: the
+// concept's generous vertical rhythm left ~20 px of dead space between every
+// block, so the card is both narrower and shorter while keeping the same
+// proportions.
+//   card     460x236    (458x234 content + 2x1px border), bg #1b1b1b, r4
+//   header   1..32      check-in-circle 14 at x=13, title 13/600 at x=33,
+//                       controls 12, right-aligned (13 off right, 24 apart)
+//   content  32..235    padding 15/16, content x 16..444
+//   summary  40..72     32px doc icon, "Download complete" 13/600, bytes 10
+//   address  82..123    label 10 at y=82, box (16,97,428,26)
+//   saved    128..169   label 10 at y=128, box (16,143,428,26)
+//   buttons  178..204   four 101x26 buttons, 8px gaps
+//   opt-out  212..226   14px checkbox at x=16, 10px label at x=34
+const CW: f32 = 460.0;
+const CH: f32 = 236.0;
 const RAD: f32 = 4.0;
 
-const HDR_H: f32 = 34.0;
+const HDR_H: f32 = 32.0;
 /// Vertical centre of the title bar (and of its controls).
-const HDR_CY: f32 = 17.5;
+const HDR_CY: f32 = 16.0;
 const MARK_X: f32 = 13.0;
 const MARK_S: f32 = 14.0;
 const TITLE_X: f32 = 33.0;
-const CTLS_X: [f32; 3] = [429.0, 453.0, 477.0];
+const CTLS_X: [f32; 3] = [387.0, 411.0, 435.0];
 const CTL_S: f32 = 12.0;
 
 /// Content gutter and right edge (padding 16 inside the 1px border).
-const PAD_X: f32 = 17.0;
-const IN_R: f32 = 485.0;
-const DOC_S: f32 = 40.0;
-const DOC_Y: f32 = 48.0;
-/// Left edge of the summary's two text lines (17 + 40 + 12).
-const SUM_X: f32 = 69.0;
-const SUM_SUB_Y: f32 = 71.0;
+const PAD_X: f32 = 16.0;
+const IN_R: f32 = 444.0;
+const DOC_S: f32 = 32.0;
+const DOC_Y: f32 = 40.0;
+/// Left edge of the summary's two text lines (16 + 32 + 12).
+const SUM_X: f32 = 60.0;
+const SUM_SUB_Y: f32 = 58.0;
 
-/// Field blocks: 11px label, then a 28px box 19px below it (label 15 + gap 4).
-const LBL_1_Y: f32 = 102.0;
-const LBL_2_Y: f32 = 161.0;
-const LBL_BOX_GAP: f32 = 19.0;
-const BOX_H: f32 = 28.0;
+/// Field blocks: 10px label, then a 26px box 15px below it (label 11 + gap 4).
+const LBL_1_Y: f32 = 82.0;
+const LBL_2_Y: f32 = 128.0;
+const LBL_BOX_GAP: f32 = 15.0;
+const BOX_H: f32 = 26.0;
 const BOX_PAD: f32 = 10.0;
 
-const BTN_Y: f32 = 222.0;
-const BTN_H: f32 = 28.0;
+const BTN_Y: f32 = 178.0;
+const BTN_H: f32 = 26.0;
 const BTN_GAP: f32 = 8.0;
 
-const CHK_Y: f32 = 262.0;
+const CHK_Y: f32 = 212.0;
 const CHK_S: f32 = 14.0;
-const CHK_LBL_X: f32 = 37.0;
+const CHK_LBL_X: f32 = 34.0;
 const CHK_TXT: &str = "Don't show this dialog again";
 
 /// The dialog's own palette (the concept is a neutral dark card, not the
@@ -128,7 +131,7 @@ impl CompleteApp {
             egui::pos2(o.x + SUM_X, o.y + DOC_Y),
             egui::Align2::LEFT_TOP,
             "Download complete".to_string(),
-            semi(14.0),
+            semi(13.0),
             pl().cg_txt,
         );
         p.text(
@@ -148,7 +151,7 @@ impl CompleteApp {
                     item.resolution
                 )
             },
-            reg(11.0),
+            reg(10.0),
             pl().cg_dim,
         );
 
@@ -314,7 +317,7 @@ fn field(p: &egui::Painter, o: egui::Pos2, y: f32, label: &str, value: &str) {
         egui::pos2(o.x + PAD_X, o.y + y),
         egui::Align2::LEFT_TOP,
         label.to_string(),
-        reg(11.0),
+        reg(10.0),
         pl().cg_dim,
     );
     let r = at(o, PAD_X, y + LBL_BOX_GAP, IN_R - PAD_X, BOX_H);
@@ -350,7 +353,7 @@ fn dlg_btn(p: &egui::Painter, r: egui::Rect, hov: bool, label: &str) {
         r.center(),
         egui::Align2::CENTER_CENTER,
         label.to_string(),
-        reg(11.0),
+        reg(10.5),
         pl().cg_txt,
     );
 }
