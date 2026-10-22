@@ -11,14 +11,16 @@ function setup({accept=true,enabled=true,blocked=false,seen=false,firefox=true}=
  const calls=[],listeners=[];
  const context={DCRank:R,settings:async()=>({autoCapture:enabled,minSizeKB:100}),freshSeen:()=>seen,hostBlocked:()=>blocked,
  sendToHost:async(...a)=>{calls.push(a);return accept;},markSeen:(...a)=>calls.push(['seen',...a]),hostOk:false,setBadge(){}};
- if(firefox)context.browser={webRequest:{onHeadersReceived:{addListener:(...a)=>listeners.push(a)}}};
+ context.browser={runtime:firefox?{getBrowserInfo:()=>Promise.resolve({name:'Firefox'})}:{},
+   webRequest:{onHeadersReceived:{addListener:(...a)=>listeners.push(a)}}};
  vm.createContext(context);
  vm.runInContext(source.slice(source.indexOf('async function captureAttachmentResponse('),source.indexOf('// ---- popup / content-script messages ----')),context);
  return {context,calls,listeners,run:details=>context.captureAttachmentResponse(details)};
 }
-test('Firefox registers a blocking response listener; Chromium does not',()=>{
+test('Firefox registers a blocking response listener; Chromium browser namespace does not',()=>{
  assert.equal(setup().listeners.length,1);
  assert.deepEqual(Array.from(setup().listeners[0][2]),['blocking','responseHeaders']);
+ // Chrome 148+ exposes `browser` too, but it must never register the Firefox-only listener.
  assert.equal(setup({firefox:false}).listeners.length,0);
 });
 test('attachment parsing handles opaque URLs, UTF-8 names and unsafe server paths',()=>{
@@ -52,6 +54,7 @@ test('every browser package uses the same overlay and takeover code on every OS'
   assert.equal(manifest.content_scripts[0].all_frames,true);
   assert.ok(manifest.permissions.includes('nativeMessaging'));
   assert.ok(manifest.permissions.includes('downloads'));
+  if(browser==='chrome') assert.ok(!manifest.permissions.includes('webRequestBlocking'));
  }
 });
 test('download bar follows fullscreen and X dismisses the associated menu',()=>{

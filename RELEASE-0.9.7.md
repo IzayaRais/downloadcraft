@@ -77,6 +77,9 @@ including browser video takeover and draggable video controls, improved download
 handling, and macOS/Linux support. The integration also preserves Download Craft
 0.9.7 and includes the conflict resolutions reviewed for this release.
 
+The browser extension compatibility fix is version 0.9.7.1; the desktop app remains
+version 0.9.7. Chrome now skips Firefox-only blocking webRequest registration.
+
 - Preserve helper/custom paths when the main window saves its state.
 - Apply settings changes before subsequent main-window saves.
 - Match helper status to the actual downloader's selection and check executable permissions.

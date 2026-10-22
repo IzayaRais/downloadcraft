@@ -11,13 +11,13 @@ let lastFallbackError = "";
 // Must match manifest version + content.js EXT_VER. Tabs running an older
 // content script are rejected with a "reload the tab" error instead of
 // failing mysteriously (their extension APIs are gone after a reload).
-const EXT_VER = "0.9.7";
+const EXT_VER = "0.9.7.1";
 
 // Promise-style calls (the `await api.*` ones below) go through this handle so
 // one file serves both engines: Firefox exposes the promise-returning
-// `browser` namespace, while Chrome only has `chrome` (promise-capable under
-// MV3). Callback-style calls keep using `chrome`, which Firefox also provides
-// as its callback flavour of the same APIs.
+// `browser` namespace, while recent Chrome versions expose it as well. Use
+// Firefox's runtime.getBrowserInfo API (not the namespace name) when enabling
+// Firefox-only blocking webRequest behavior.
 const api = (typeof browser !== "undefined" && browser.runtime) ? browser : chrome;
 
 // Shared ranking (P4): playlist/segment/file kinds, scores, duplicate
@@ -615,7 +615,9 @@ async function captureAttachmentResponse(details) {
   } catch (e) { return {}; }
 }
 try {
-  if (typeof browser !== "undefined" && browser.webRequest && browser.webRequest.onHeadersReceived) {
+  if (typeof browser !== "undefined" && browser.runtime
+      && typeof browser.runtime.getBrowserInfo === "function"
+      && browser.webRequest && browser.webRequest.onHeadersReceived) {
     browser.webRequest.onHeadersReceived.addListener(captureAttachmentResponse,
       {urls:["http://*/*", "https://*/*"], types:["main_frame", "sub_frame", "other"]},
       ["blocking", "responseHeaders"]);
