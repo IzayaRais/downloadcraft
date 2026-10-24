@@ -1379,7 +1379,7 @@ fn cell_text(
 /// Widths come from `shaped` so the measurement matches what is drawn for the
 /// scripts egui cannot shape itself, and the cut lands on grapheme boundaries:
 /// slicing a Bengali consonant away from its matra leaves a dangling mark.
-fn truncate_to_width(
+pub(crate) fn truncate_to_width(
     p: &egui::Painter,
     text: &str,
     font: egui::FontId,
