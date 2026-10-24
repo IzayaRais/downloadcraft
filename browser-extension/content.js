@@ -74,10 +74,12 @@
           media.push({ url: el.src, text: "Page media (source)", thumb: posterOf(el) });
         }
       });
+      const found = [...media, ...links].slice(0, 50);
       if (IS_TOP) chrome.storage.local.set({
-        downloadCraftLinks: [...media, ...links].slice(0, 50),
+        downloadCraftLinks: found,
         downloadCraftPage: location.href,
       });
+      return found;
     } catch (e) {
       if (ctxInvalidated(e)) { markDead(); return; }
       /* page CSP may block storage; popup manual URL still works */
@@ -1166,7 +1168,7 @@
     const fullscreen=document.fullscreenElement;
     const parent=fullscreen || document.documentElement;
     if(host.parentNode!==parent)parent.appendChild(host);
-    const width=Math.max(0,Math.min(240,window.innerWidth-16));
+    const width=Math.max(0,Math.min(barWidth(host),window.innerWidth-16));
     host.style.position="fixed";host.style.width=width+"px";
     host.style.right="auto";host.style.bottom="auto";
     host.style.left=(8+barPosition.x*Math.max(0,window.innerWidth-width-16))+"px";
@@ -1209,7 +1211,7 @@
       if(suppressClick){suppressClick=false;ev.preventDefault();ev.stopImmediatePropagation();}
     },true);
     const update=(left,top)=>{
-      const width=Math.min(240,window.innerWidth-16);
+      const width=Math.min(barWidth(host),window.innerWidth-16);
       barPosition={x:Math.max(0,Math.min(1,(left-8)/Math.max(1,window.innerWidth-width-16))),
         y:Math.max(0,Math.min(1,(top-8)/Math.max(1,window.innerHeight-44)))};
       positionRevision++;applySavedBarPosition(host);
@@ -1449,34 +1451,64 @@
 
   // One isolated toolbar: the primary action and dismiss button never overlap.
   // Shadow DOM keeps player/site button and SVG rules out of these controls.
+  // Colors come from the panel theme (the app's Light/Dark/System choice), and
+  // the bar is see-through until pointed at, IDM-style, so it never hides
+  // the video. Width is its content's: icon + label, no padding to spare.
+  function paintBar(host) {
+    const bar = host && host.shadowRoot && host.shadowRoot.querySelector(".bar");
+    if (!bar) return;
+    const T = dcPanelTokens();
+    const light = T.mode === "light";
+    const set = (k, v) => bar.style.setProperty(k, v);
+    set("--bg", T.card);
+    set("--fg", T.text);
+    set("--line", T.border);
+    set("--hover", T.hover);
+    set("--dim", T.dim);
+    set("--ok", light ? "#168047" : "#4ade80");
+    set("--shadow", light ? "0 1px 5px rgba(15,23,42,.18)" : "0 2px 8px rgba(0,0,0,.45)");
+    set("--x-bg", light ? "#ffe9ec" : "rgba(239,68,68,.18)");
+    set("--x-fg", light ? "#a91d2b" : "#fca5a5");
+    host.style.colorScheme = light ? "light" : "dark";
+  }
+  // The bar's natural width, measured once it is in the page.
+  function barWidth(host) {
+    if (!host.__dcW) {
+      const b = host.shadowRoot && host.shadowRoot.querySelector(".bar");
+      const w = b ? Math.ceil(b.scrollWidth) : 0;
+      if (w > 0) host.__dcW = w + 2;
+    }
+    return host.__dcW || 200;
+  }
   function videoDownloadBar(title) {
     const host = document.createElement("div");
     host.title = title;
-    host.style.cssText = "all:initial;display:block;width:240px;height:28px;margin:0;padding:0;border:0;box-sizing:border-box;z-index:2147483647;";
+    host.style.cssText = "all:initial;display:block;height:28px;margin:0;padding:0;border:0;box-sizing:border-box;z-index:2147483647;";
     const root = host.attachShadow({mode:"open"});
     const style = document.createElement("style");
     style.textContent = `
-      :host { color-scheme:light; }
       * { box-sizing:border-box; }
-      .bar { display:flex;width:100%;height:28px;overflow:hidden;border:1px solid #aab7c4;
-        border-radius:5px;background:#f8fafc;box-shadow:0 1px 5px #0003;font:12px/1.2 system-ui,sans-serif; }
+      .bar { display:inline-flex;width:max-content;max-width:100%;height:28px;overflow:hidden;
+        border:1px solid var(--line);border-radius:6px;background:var(--bg);box-shadow:var(--shadow);
+        font:12px/1.2 system-ui,sans-serif;opacity:.55;transition:opacity .15s ease; }
+      :host(:hover) .bar, .bar:focus-within { opacity:1; }
       button { all:unset;box-sizing:border-box;display:flex;align-items:center;justify-content:center;cursor:pointer;
-        color:#243444;background:#f8fafc;font:600 12px/1.2 system-ui,sans-serif; }
-      button:hover { background:#e7eff7; }
-      button:focus-visible { outline:2px solid #2563eb;outline-offset:-3px; }
-      .grip { flex:0 0 18px;width:18px;cursor:grab;color:#7b8794;touch-action:none; }
+        color:var(--fg);background:transparent;font:600 12px/1.2 system-ui,sans-serif; }
+      button:hover { background:var(--hover); }
+      button:focus-visible { outline:2px solid #3b82f6;outline-offset:-3px; }
+      .grip { flex:0 0 16px;width:16px;cursor:grab;color:var(--dim);touch-action:none; }
       .grip:active { cursor:grabbing; }
-      .download { touch-action:none;flex:1;min-width:0;gap:6px;padding:0 8px; }
-      .label { white-space:nowrap;overflow:hidden;text-overflow:ellipsis; }
-      .close { flex:0 0 25px;width:25px;border-left:1px solid #d5dee7; }
-      .close:hover { color:#a91d2b;background:#ffe9ec; }
+      .download { touch-action:none;flex:0 0 auto;gap:5px;padding:0 7px 0 3px; }
+      .label { white-space:nowrap; }
+      .close { flex:0 0 24px;width:24px;border-left:1px solid var(--line);color:var(--dim); }
+      .close:hover { color:var(--x-fg);background:var(--x-bg); }
       [hidden] { display:none !important; }
       svg { display:block;flex:none;width:14px;height:14px;pointer-events:none; }
     `;
     const bar = document.createElement("div");bar.className="bar";
     const main = document.createElement("button");main.type="button";main.className="download";
     main.title=title;main.setAttribute("aria-label","Download this video");
-    const arrow=svgIcon(14,ICON_DOWN,2.5);arrow.style.color="#168047";
+    const arrow=svgIcon(14,ICON_DOWN,2.5);arrow.style.color="var(--ok)";
     main.appendChild(arrow);
     const label=document.createElement("span");label.className="label";label.textContent="Download this video";
     main.appendChild(label);
@@ -1492,8 +1524,35 @@
     bar.append(grip,main,close);root.append(style,bar);
     installBarDrag(host,main,grip);
     host.__dcMain=main;host.__dcClose=close;
+    host.setAttribute("data-dc-bar","1");
+    paintBar(host);
     return host;
   }
+
+  // Theme follows the app (Light / Dark / System, sent by the native host);
+  // System tracks the OS. Repaint every bar and panel when either changes.
+  function repaintTheme() {
+    try { document.querySelectorAll("[data-dc-bar]").forEach(paintBar); } catch (e) {}
+    try { allPanels().forEach(paintDcPanel); } catch (e) {}
+  }
+  function applyAppTheme(mode) {
+    try {
+      if (mode === "light" || mode === "dark") window.__dcTheme = mode;
+      else delete window.__dcTheme;
+      if (typeof globalThis !== "undefined") {
+        if (mode === "light" || mode === "dark") globalThis.__dcTheme = mode;
+        else delete globalThis.__dcTheme;
+      }
+    } catch (e) {}
+    repaintTheme();
+  }
+  try {
+    chrome.storage.local.get({ appTheme: "system" }, (r) => { if (!chrome.runtime.lastError) applyAppTheme(r && r.appTheme); });
+    chrome.storage.onChanged.addListener((ch, area) => {
+      if (area === "local" && ch.appTheme && alive()) applyAppTheme(ch.appTheme.newValue);
+    });
+    window.matchMedia && window.matchMedia("(prefers-color-scheme: light)").addEventListener("change", () => { if (alive()) repaintTheme(); });
+  } catch (e) { /* theme sync is cosmetic */ }
 
   // Theme: tokens + painter live in rank.js (node-tested); these wrappers
   // fall back to the dark mock when rank.js failed to load.
@@ -1999,7 +2058,7 @@
       if(host.parentNode!==parent)parent.appendChild(host);
       const r=video.getBoundingClientRect();
       const vw=window.innerWidth, vh=window.innerHeight;
-      const width=Math.min(240,r.width-16,vw-16);
+      const width=Math.min(barWidth(host),r.width-16,vw-16);
       host.style.display=r.width>=120 && r.height>=70 && r.bottom>0 && r.top<vh && r.right>0 && r.left<vw ? "block" : "none";
       if(activeBarDrag===host || applySavedBarPosition(host))return;
       host.style.position="fixed";host.style.right="auto";host.style.bottom="auto";
@@ -2582,28 +2641,36 @@
       if (!msg || msg.type !== "peekState") return false;
       if (!alive()) return false;
       (async () => {
+        // Answer from this page directly (not via storage, which incognito
+        // pages and frames never write): its links and its YouTube video.
+        let links = [];
+        let videos = [];
         try {
-          collectLinks();
+          links = collectLinks() || [];
           refreshYouTube();
+          const id = ytVideoId();
+          if (id) {
+            const info = ytStreams();
+            if (info) videos = [{ ...info, pageUrl: location.href }];
+          }
         } catch (e) { /* best effort */ }
         let net = [];
         try {
           const r = await api.runtime.sendMessage({ type: "getMedia", pageUrl: location.href });
           net = (r && r.items) || [];
         } catch (e) { /* ignore */ }
-        let cur = {};
+        // Page thumbnail for network rows (og:image or the player's poster).
+        let thumb = "";
         try {
-          cur = await new Promise((resolve) => {
-            chrome.storage.local.get(
-              ["downloadCraftVideos", "downloadCraftLinks"],
-              (c) => resolve(c || {})
-            );
-          });
+          const og = document.querySelector('meta[property="og:image"]');
+          const v = document.querySelector("video[poster]");
+          thumb = (og && og.content) || (v && v.poster) || "";
+          if (!/^https?:\/\//i.test(thumb)) thumb = "";
         } catch (e) { /* ignore */ }
         sendResponse({
-          videos: cur.downloadCraftVideos || [],
-          links: cur.downloadCraftLinks || [],
-          net,
+          videos,
+          links,
+          net: net.map((n) => (n.thumb ? n : { ...n, thumb })),
           page: location.href,
           title: document.title || "",
         });

@@ -62,7 +62,7 @@ test('download bar follows fullscreen and X dismisses the associated menu',()=>{
  const element=()=>({isConnected:true,style:{},remove(){this.isConnected=false;},getBoundingClientRect(){return {width:640,height:360,right:700,left:60,top:20,bottom:380};},appendChild(e){e.parentNode=this;}});
  const root=element(),fullscreen=element(),button=element(),video=element(),panel=element();
  button.__dcVideo=video;button.__dcClose=element();fullscreen.contains=x=>x===video;
- const context={activeBarDrag:null,applySavedBarPosition:()=>false,Set,DCRank:R,location:{href:'https://h/v'},button,panel,fullscreen,
+ const context={activeBarDrag:null,applySavedBarPosition:()=>false,barWidth:()=>200,Set,DCRank:R,location:{href:'https://h/v'},button,panel,fullscreen,
  document:{documentElement:root,fullscreenElement:null,querySelectorAll:s=>s==='[data-dc-pill]'?[button]:[],addEventListener(){}},window:{innerWidth:1000,innerHeight:800,addEventListener(){}}};
  vm.createContext(context);vm.runInContext(content.slice(content.indexOf('  const dismissedVideos ='),content.indexOf('  function ensureButton(')),context);
  vm.runInContext("addDismissControl(button,'v',panel);syncDismissControls()",context);assert.equal(button.parentNode,root);

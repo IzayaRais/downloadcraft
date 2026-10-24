@@ -666,6 +666,11 @@ async function sendToHostPing() {
   try {
     const res = await api.runtime.sendNativeMessage(HOST, { type: "ping" });
     hostOk = !!res && res.type === "pong";
+    // The app's Light/Dark/System choice, for the in-page bar and panels.
+    if (res && /^(light|dark|system)$/.test(res.theme || "")) {
+      const cur = await api.storage.local.get({ appTheme: "system" });
+      if (cur.appTheme !== res.theme) await api.storage.local.set({ appTheme: res.theme });
+    }
     if (!hostOk) lastHostError = "ping answered, but no pong (old host version?)";
     console.log(
       "[download-craft] native host '" + HOST + "': " +

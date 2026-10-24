@@ -1,49 +1,110 @@
 <!doctype html>
 <html>
 <head><meta charset="utf-8"><style>
-body { width: 320px; font: 13px system-ui, sans-serif; margin: 10px; background: #1e1f22; color: #e0e0e0; }
-h3 { margin: 0 0 8px; }
-.row { display: flex; gap: 6px; margin-bottom: 8px; align-items: center; }
-input[type=text] { flex: 1; padding: 5px; background: #2a2b2f; border: 1px solid #3a3b44; color: #e0e0e0; border-radius: 6px; }
-button { padding: 5px 10px; cursor: pointer; background: #2a2b2f; color: #e0e0e0; border: 1px solid #3a3b44; border-radius: 6px; }
-button:hover { background: #35363e; }
-.item { border-top: 1px solid #333; padding: 6px 0; }
-.item a { word-break: break-all; color: #60a6d9; }
-#status { color: #45b36b; min-height: 1.2em; }
-label.toggle { display: flex; gap: 6px; align-items: center; margin-bottom: 8px; }
-/* Light mode follows the OS (matches the in-page light card). */
-@media (prefers-color-scheme: light) {
-  body { background: #ffffff; color: #202124; }
-  input[type=text] { background: #f1f3f4; border-color: #e1e3e6; color: #202124; }
-  button { background: #ffffff; color: #202124; border-color: #e1e3e6; }
-  button:hover { background: #f1f3f4; }
-  .item { border-top-color: #e1e3e6; }
-  .item a { color: #1a73e8; }
-  #status { color: #1e8e3e; }
+/* Colors are set from the panel theme (app Light/Dark/System) by popup.js. */
+:root {
+  --bg:#0f172a; --card:#1e293b; --hover:#334155; --line:#334155; --text:#f1f5f9;
+  --dim:#94a3b8; --muted:#64748b; --accent:#3b82f6; --accent-soft:rgba(59,130,246,.16);
+  --ok:#22c55e; --bad:#ef4444; --thumb:linear-gradient(135deg,#667eea,#764ba2);
 }
+* { box-sizing:border-box; }
+body { width:410px; margin:0; background:var(--bg); color:var(--text);
+  font:13px/1.35 system-ui,-apple-system,"Segoe UI",sans-serif; }
+button, input, select { font:inherit; color:inherit; }
+.top { display:flex; align-items:center; gap:8px; padding:12px 12px 8px; }
+.logo { width:22px; height:22px; border-radius:6px; background:var(--accent); display:grid; place-items:center; flex:none; }
+.logo svg { width:14px; height:14px; }
+.brand { font-weight:700; font-size:14px; flex:1; }
+.conn { font-size:11px; padding:2px 8px; border-radius:99px; background:var(--card); color:var(--dim); white-space:nowrap; }
+.conn.ok { color:var(--ok); } .conn.bad { color:var(--bad); }
+.tabs { display:flex; gap:4px; margin:0 12px 10px; padding:3px; background:var(--card); border-radius:10px; }
+.tab { all:unset; flex:1; text-align:center; padding:6px 0; border-radius:8px; cursor:pointer; color:var(--dim); font-weight:600; }
+.tab.on { background:var(--accent); color:#fff; }
+.tab .n { display:inline-block; min-width:18px; padding:0 5px; margin-left:4px; border-radius:99px; font-size:11px; background:rgba(255,255,255,.22); }
+.tab:not(.on) .n { background:var(--accent-soft); color:var(--accent); }
+.view { padding:0 12px 12px; max-height:470px; overflow-y:auto; }
+.view[hidden] { display:none; }
+.sec { display:flex; align-items:center; justify-content:space-between; margin:10px 0 6px; color:var(--dim); font-weight:700; font-size:12px; }
+.sec .n { color:var(--muted); font-weight:600; }
+.card { display:flex; gap:10px; padding:8px; background:var(--card); border:1px solid var(--line); border-radius:10px; margin-bottom:8px; }
+.thumb { position:relative; flex:none; width:92px; height:54px; border-radius:7px; overflow:hidden; background:var(--thumb); }
+.thumb img { width:100%; height:100%; object-fit:cover; display:block; }
+.thumb .dur { position:absolute; right:4px; bottom:4px; padding:0 4px; border-radius:4px; background:rgba(0,0,0,.72); color:#fff; font-size:10px; font-weight:600; }
+.thumb .ph { position:absolute; inset:0; display:grid; place-items:center; color:#fff; opacity:.85; }
+.body { flex:1; min-width:0; display:flex; flex-direction:column; gap:6px; }
+.title { font-weight:600; display:-webkit-box; -webkit-line-clamp:2; -webkit-box-orient:vertical; overflow:hidden; word-break:break-word; }
+.meta { display:flex; align-items:center; gap:6px; color:var(--dim); font-size:11px; }
+.tag { padding:0 6px; border-radius:5px; background:var(--accent-soft); color:var(--accent); font-weight:700; font-size:10px; letter-spacing:.02em; }
+.queued { color:var(--ok); font-weight:600; }
+.row { display:flex; gap:6px; align-items:center; }
+select { flex:1; min-width:0; height:30px; padding:0 8px; background:var(--bg); border:1px solid var(--line); border-radius:7px; cursor:pointer; }
+.dl { all:unset; box-sizing:border-box; height:30px; padding:0 10px; border-radius:7px; background:var(--accent); color:#fff; font-weight:700; cursor:pointer; display:flex; align-items:center; gap:5px; }
+.dl:hover { filter:brightness(1.08); }
+.dl svg { width:13px; height:13px; }
+.more { all:unset; box-sizing:border-box; width:26px; height:30px; border-radius:7px; display:grid; place-items:center; cursor:pointer; color:var(--dim); position:relative; }
+.more:hover { background:var(--hover); }
+.menu { position:absolute; right:0; top:32px; z-index:5; min-width:150px; padding:4px; background:var(--card); border:1px solid var(--line); border-radius:8px; box-shadow:0 8px 24px rgba(0,0,0,.35); }
+.menu button { all:unset; display:block; width:100%; box-sizing:border-box; padding:6px 8px; border-radius:6px; cursor:pointer; color:var(--text); font-size:12px; }
+.menu button:hover { background:var(--hover); }
+.empty { text-align:center; color:var(--dim); padding:28px 12px; }
+.empty b { display:block; color:var(--text); margin-bottom:4px; }
+.manual { display:flex; gap:6px; margin-top:8px; }
+input[type=text] { flex:1; min-width:0; height:32px; padding:0 9px; background:var(--card); border:1px solid var(--line); border-radius:7px; }
+.btn { all:unset; box-sizing:border-box; height:32px; padding:0 12px; border-radius:7px; background:var(--card); border:1px solid var(--line); cursor:pointer; font-weight:600; display:flex; align-items:center; }
+.btn:hover { background:var(--hover); }
+.btn.primary { background:var(--accent); border-color:var(--accent); color:#fff; }
+.opt { display:flex; align-items:center; gap:10px; padding:10px; background:var(--card); border:1px solid var(--line); border-radius:10px; margin-bottom:8px; }
+.opt .txt { flex:1; }
+.opt .txt b { display:block; font-weight:600; }
+.opt .txt span { color:var(--dim); font-size:11px; }
+.sw { position:relative; width:34px; height:19px; flex:none; }
+.sw input { opacity:0; width:0; height:0; }
+.sw i { position:absolute; inset:0; border-radius:99px; background:var(--hover); cursor:pointer; transition:background .15s; }
+.sw i::after { content:""; position:absolute; left:2px; top:2px; width:15px; height:15px; border-radius:50%; background:#fff; transition:left .15s; }
+.sw input:checked + i { background:var(--accent); }
+.sw input:checked + i::after { left:17px; }
+.sw input:disabled + i { opacity:.45; cursor:default; }
+.opt input[type=text] { display:block; width:100%; }
+label.fl { display:block; color:var(--dim); font-size:11px; margin:2px 0 4px; }
+#status { min-height:16px; padding:0 12px 10px; color:var(--dim); font-size:11px; }
+#status.ok { color:var(--ok); } #status.bad { color:var(--bad); }
 </style></head>
 <body>
-<h3>Download Craft</h3>
-<label class="toggle"><input type="checkbox" id="auto"> Capture downloads automatically</label>
-<label class="toggle"><input type="checkbox" id="deep"> Deep video detection</label>
-<div style="font-size:11px;opacity:.75;margin-bottom:10px">Reads the first 4 KB of unlabeled responses to find streams and videos hidden behind generic file types.</div>
-<label class="toggle"><input type="checkbox" id="hideUI"> Hide browser download bubble</label>
-<div style="font-size:11px;opacity:.75;margin-bottom:10px">Affects all browser downloads while automatic capture is on and the app is connected. Does not hide Save As dialogs.</div>
-<div class="row">
-  <input type="text" id="minSize" placeholder="Min KB (e.g. 100)" style="max-width:110px">
-  <button id="saveFilters" title="Save capture filters">Save filters</button>
+<div class="top">
+  <div class="logo"><svg viewBox="0 0 24 24" fill="none" stroke="#fff" stroke-width="2.6" stroke-linecap="round" stroke-linejoin="round"><path d="M12 4v11M7 10l5 5 5-5M5 20h14"/></svg></div>
+  <div class="brand">Download Craft</div>
+  <div class="conn" id="conn">Checking…</div>
 </div>
-<div class="row">
-  <input type="text" id="block" placeholder="Blocked hosts, comma separated">
+<div class="tabs">
+  <button class="tab on" id="tabVideos">Videos<span class="n" id="count">0</span></button>
+  <button class="tab" id="tabSettings">Settings</button>
 </div>
-<div class="row">
-  <input type="text" id="url" placeholder="https://…/file.zip">
-  <button id="send">Send</button>
+
+<div class="view" id="viewVideos">
+  <div id="videos"></div>
+  <div class="manual">
+    <input type="text" id="url" placeholder="Paste a link to download…">
+    <button class="btn primary" id="send">Send</button>
+  </div>
 </div>
-<div class="row"><button id="restoreVideoButtons">Show video download buttons again</button></div>
+
+<div class="view" id="viewSettings" hidden>
+  <div class="opt"><div class="txt"><b>Capture browser downloads</b><span>Hand every download to Download Craft.</span></div>
+    <label class="sw"><input type="checkbox" id="auto"><i></i></label></div>
+  <div class="opt"><div class="txt"><b>Deep video detection</b><span>Reads the first 4 KB of unlabeled responses to find hidden streams.</span></div>
+    <label class="sw"><input type="checkbox" id="deep"><i></i></label></div>
+  <div class="opt"><div class="txt"><b>Hide browser download bubble</b><span>While capture is on and the app is connected.</span></div>
+    <label class="sw"><input type="checkbox" id="hideUI"><i></i></label></div>
+  <div class="opt" style="display:block">
+    <label class="fl" for="minSize">Ignore files smaller than (KB)</label>
+    <input type="text" id="minSize" placeholder="100">
+    <label class="fl" for="block" style="margin-top:8px">Never capture from these sites</label>
+    <input type="text" id="block" placeholder="example.com, other.org">
+    <div class="row" style="margin-top:8px;justify-content:flex-end"><button class="btn primary" id="saveFilters">Save filters</button></div>
+  </div>
+  <div class="row"><button class="btn" id="restoreVideoButtons">Show hidden video buttons again</button></div>
+</div>
 <div id="status"></div>
-<div id="videos"></div>
-<div id="list"></div>
 <script src="rank.js"></script>
 <script src="popup.js"></script>
 </body>

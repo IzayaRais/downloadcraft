@@ -71,14 +71,27 @@ struct Reply {
     error: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     urls: Option<Vec<String>>,
+    /// The app's theme ("light" | "dark" | "system") on pong, so the
+    /// extension's in-page controls match it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    theme: Option<String>,
 }
 
 impl Reply {
     fn ok() -> Self {
-        Reply { kind: "ok".into(), version: None, queued: Some(true), error: None, urls: None }
+        Reply { kind: "ok".into(), version: None, queued: Some(true), error: None, urls: None, theme: None }
     }
     fn err(e: impl Into<String>) -> Self {
-        Reply { kind: "error".into(), version: None, queued: None, error: Some(e.into()), urls: None }
+        Reply { kind: "error".into(), version: None, queued: None, error: Some(e.into()), urls: None, theme: None }
+    }
+}
+
+/// The app theme as the extension understands it.
+fn app_theme() -> String {
+    match crate::model::ui_pref_str("theme", "system").as_str() {
+        "light" => "light".to_string(),
+        "dark" | "black" => "dark".to_string(),
+        _ => "system".to_string(),
     }
 }
 
@@ -365,6 +378,7 @@ pub fn run() -> eframe::Result<()> {
                 queued: None,
                 error: None,
                 urls: None,
+                theme: Some(app_theme()),
             }),
             "query" => {
                 // Presence check only: no queueing, no dialogs, no locks held
@@ -377,6 +391,7 @@ pub fn run() -> eframe::Result<()> {
                     queued: None,
                     error: None,
                     urls: Some(hits),
+                    theme: None,
                 });
             }
             "download" => {

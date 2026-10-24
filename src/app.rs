@@ -4510,6 +4510,31 @@ pub(crate) fn install_native_host(browser: &str) -> Result<String, String> {
 #[cfg(not(windows))]
 pub(crate) fn install_native_host(browser: &str) -> Result<String,String> { crate::platform::install_native_host(browser) }
 
+/// Whether `browser` has this app registered as its native host: the
+/// registration exists and its manifest file is still on disk.
+#[cfg(windows)]
+pub(crate) fn native_host_status(browser: &str) -> bool {
+    let mut rc = std::process::Command::new("reg");
+    rc.args(["query", native_host_key(browser), "/ve"]);
+    quiet(&mut rc);
+    let Ok(out) = rc.output() else { return false };
+    if !out.status.success() {
+        return false;
+    }
+    // "(Default)    REG_SZ    C:\…\chrome.json"
+    String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .find_map(|l| l.split("REG_SZ").nth(1).map(|p| p.trim().to_string()))
+        .is_some_and(|p| std::path::Path::new(&p).is_file())
+}
+
+#[cfg(not(windows))]
+pub(crate) fn native_host_status(browser: &str) -> bool {
+    crate::platform::native_host_directory(browser)
+        .map(|d| d.join("com.download_craft.json").is_file())
+        .unwrap_or(false)
+}
+
 /// Registry key for a Chromium-family / Firefox native host (HKCU, no admin).
 /// Opera / Brave / Vivaldi share the Chromium layout with vendor keys.
 fn native_host_key(browser: &str) -> &'static str {

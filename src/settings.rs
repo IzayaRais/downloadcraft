@@ -321,6 +321,14 @@ struct SettingsApp {
     /// Appearance cards (the concept opens both by default).
     open_theme: bool,
     open_window: bool,
+    /// Browser Integration cards (Chromium family, Firefox) expanded.
+    browser_open: [bool; 2],
+    /// Native host registered per browser, asked when the pane first opens
+    /// (and again after a repair).
+    host_status: Option<Vec<(&'static str, bool)>>,
+    /// Updates page cards expanded.
+    open_updates: bool,
+    open_version: bool,
 }
 
 /// Probe the helper, and optionally re-download it first, off the UI thread.
@@ -444,6 +452,10 @@ pub fn run() -> eframe::Result<()> {
         open_windows: false,
         open_theme: true,
         open_window: true,
+        browser_open: [true, false],
+        host_status: None,
+        open_updates: true,
+        open_version: true,
     };
     // Separate OS window (own process via `--settings`): never embedded in
     // the main GUI. 640 wide is the concept's window width.
@@ -487,6 +499,11 @@ impl eframe::App for SettingsApp {
             crate::app::apply_theme(ctx, &self.s.theme);
             crate::tray::set_titlebar_dark(crate::app::theme_is_dark(ctx, &self.s.theme));
             self.theme_applied = resolved;
+        }
+        // Come to the front while placing: opened from the main window, the
+        // new process otherwise stayed behind it (as the complete dialog did).
+        if !self.centered {
+            ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
         }
         if !self.centered && crate::model::center_window(ctx, egui::vec2(640.0, 520.0)) {
             self.centered = true;
@@ -723,11 +740,6 @@ fn lbl(ui: &mut Ui, s: &str) {
 /// 10 px muted hint.
 fn hint(ui: &mut Ui, s: &str) {
     wrapped(ui, s, reg(10.0), tok().muted);
-}
-
-/// 11 px secondary paragraph.
-fn para(ui: &mut Ui, s: &str) {
-    wrapped(ui, s, reg(11.0), tok().text2);
 }
 
 /// Plain button: `--btn-bg` / `--btn-border`, 5 px radius, 6×16 padding.
@@ -2940,6 +2952,9 @@ impl SettingsApp {
 
                         ui.add_enabled_ui(!self.ytdlp_busy,|ui| {
                             ui.horizontal_wrapped(|ui| {
+                                // Same gaps as the action row below (these
+                                // buttons were drawn touching each other).
+                                ui.spacing_mut().item_spacing = egui::vec2(8.0, 8.0);
                                 if crate::helpers::install_supported() && button(ui,"Download tools",true).clicked(){install=true;}
                                 if button(ui,"Choose FFmpeg…",false).clicked(){custom_pick=pick_tool("FFmpeg");}
                                 if button(ui,"Check again",false).clicked(){recheck=true;}
@@ -3037,38 +3052,159 @@ impl SettingsApp {
         }
     }
 
-    // ---------- Browser Integration ----------
+    // ---------- Browser Integration (one card per extension, like Plugins) ----------
     fn pane_browser(&mut self, ui: &mut Ui) {
         let t = tok();
         h2(ui, "Browser Integration");
-        para(
+        hint(
             ui,
-            "Chrome/Brave: load browser-extension. Firefox: load browser-extension-firefox. Launch the app once from its permanent location.",
+            "The extension catches videos and downloads; the app's connection repairs itself on every launch.",
         );
-        ui.add_space(6.0);
-        para(
-            ui,
-            "One-time setup: host auto-repairs on every launch — buttons below are manual repair only.",
-        );
-        ui.add_space(6.0);
-        ui.horizontal_wrapped(|ui| {
-            for (firefox,label) in [(false,"Open Chrome/Brave extension folder"),(true,"Open Firefox extension folder")] {
-                if button(ui,label,false).clicked(){match crate::platform::extension_directory(firefox){Ok(dir)=>crate::app::open_path(&dir,false),Err(e)=>self.browser_msg=e}}
-            }
-        });
-        para(ui, &format!("Chrome/Brave extension ID: {}", crate::app::EXTENSION_ID));
-        ui.add_space(16.0);
-        ui.horizontal_wrapped(|ui| {
-            ui.spacing_mut().item_spacing = Vec2::new(8.0, 8.0);
-            for b in ["chrome", "edge", "firefox", "brave", "opera"] {
-                if button(ui, &format!("Install {b}"), false).clicked() {
-                    self.browser_msg = install_one(b);
-                }
-            }
-        });
+        ui.add_space(12.0);
+        if self.host_status.is_none() {
+            self.host_status = Some(
+                ["chrome", "edge", "brave", "opera", "firefox"]
+                    .iter()
+                    .map(|b| (*b, crate::app::native_host_status(b)))
+                    .collect(),
+            );
+        }
+        self.browser_card(ui, 0);
+        ui.add_space(10.0);
+        self.browser_card(ui, 1);
         if !self.browser_msg.is_empty() {
-            ui.add_space(8.0);
+            ui.add_space(10.0);
             wrapped(ui, self.browser_msg.as_str(), reg(10.0), t.muted);
+        }
+    }
+
+    /// Card 0: Chrome, Edge, Brave and Opera (one Chromium extension).
+    /// Card 1: Firefox.
+    fn browser_card(&mut self, ui: &mut Ui, idx: usize) {
+        let t = tok();
+        let firefox = idx == 1;
+        let browsers: &[(&str, &str)] = if firefox {
+            &[("firefox", "Firefox")]
+        } else {
+            &[("chrome", "Chrome"), ("edge", "Edge"), ("brave", "Brave"), ("opera", "Opera")]
+        };
+        let status = self.host_status.clone().unwrap_or_default();
+        let connected = browsers
+            .iter()
+            .filter(|(k, _)| status.iter().any(|(b, ok)| b == k && *ok))
+            .count();
+        let open = self.browser_open[idx];
+        let (glyph, brand, name) = if firefox {
+            ("\u{e80b}", Color32::from_rgb(0xff, 0x8a, 0x3d), "Firefox")
+        } else {
+            ("\u{e87b}", t.accent, "Chrome · Edge · Brave · Opera")
+        };
+        let pill = if connected > 0 { "connected" } else { "not set up" };
+        let meta = format!("{connected} of {} linked", browsers.len());
+        let w = ui.available_width();
+        let mut want_open = open;
+        let mut repair: Option<&'static str> = None;
+        let mut open_folder = false;
+        let mut copy_id = false;
+        let edge = if open { blend(t.border, t.accent, 0.5) } else { t.border };
+        egui::Frame::new()
+            .fill(t.card)
+            .stroke(Stroke::new(1.0, edge))
+            .corner_radius(12.0)
+            .inner_margin(egui::Margin::ZERO)
+            .show(ui, |ui| {
+                ui.set_width(w);
+                ui.spacing_mut().item_spacing = Vec2::ZERO;
+                let inner = ui.max_rect();
+                if plugin_head(ui, inner.width(), glyph, brand, name, pill, &meta, open).clicked() {
+                    want_open = !open;
+                }
+                if !open {
+                    return;
+                }
+                let y = ui.cursor().top();
+                ui.painter().hline(
+                    inner.left()..=inner.right(),
+                    y,
+                    Stroke::new(1.0, blend(t.card, t.border, 0.6)),
+                );
+                egui::Frame::new()
+                    .inner_margin(egui::Margin { left: 13, right: 13, top: 12, bottom: 16 })
+                    .show(ui, |ui| {
+                        ui.set_width(inner.width() - 26.0);
+                        ui.spacing_mut().item_spacing = Vec2::new(8.0, 6.0);
+                        sec_head(ui, "Extension");
+                        wrapped(
+                            ui,
+                            if firefox {
+                                "about:debugging → This Firefox → Load Temporary Add-on, then pick manifest.json in this folder (or install the .xpi)."
+                            } else {
+                                "chrome://extensions → turn on Developer mode → Load unpacked, then pick this folder. The same folder works in Edge, Brave and Opera."
+                            },
+                            reg(10.0),
+                            t.text2,
+                        );
+                        if !firefox {
+                            ui.add(
+                                egui::Label::new(
+                                    egui::RichText::new(format!("ID  {}", crate::app::EXTENSION_ID))
+                                        .font(egui::FontId::monospace(9.0))
+                                        .color(t.muted),
+                                )
+                                .selectable(true),
+                            );
+                        }
+                        ui.add_space(4.0);
+                        ui.horizontal_wrapped(|ui| {
+                            ui.spacing_mut().item_spacing = Vec2::new(8.0, 8.0);
+                            if btn_icon(ui, "\u{e2c7}", "Open extension folder", true).clicked() {
+                                open_folder = true;
+                            }
+                            if !firefox && btn_icon(ui, "\u{e14d}", "Copy extension ID", false).clicked() {
+                                copy_id = true;
+                            }
+                        });
+                        ui.add_space(12.0);
+                        sec_head(ui, "Connection to the app");
+                        for (key, label) in browsers {
+                            let ok = status.iter().any(|(b, s)| b == key && *s);
+                            loc_status(
+                                ui,
+                                &if ok {
+                                    format!("{label} — linked to Download Craft")
+                                } else {
+                                    format!("{label} — not linked yet")
+                                },
+                                !ok,
+                            );
+                        }
+                        ui.add_space(6.0);
+                        ui.horizontal_wrapped(|ui| {
+                            ui.spacing_mut().item_spacing = Vec2::new(8.0, 8.0);
+                            for (key, label) in browsers {
+                                if btn_icon(ui, "\u{e869}", &format!("Repair {label}"), false).clicked() {
+                                    repair = Some(*key);
+                                }
+                            }
+                        });
+                        ui.add_space(6.0);
+                        hint(ui, "Repair re-registers the app for that browser; restart the browser afterwards.");
+                    });
+            });
+        self.browser_open[idx] = want_open;
+        if open_folder {
+            match crate::platform::extension_directory(firefox) {
+                Ok(dir) => crate::app::open_path(&dir, false),
+                Err(e) => self.browser_msg = e,
+            }
+        }
+        if copy_id {
+            ui.ctx().copy_text(crate::app::EXTENSION_ID.to_string());
+            self.browser_msg = "Extension ID copied.".to_string();
+        }
+        if let Some(b) = repair {
+            self.browser_msg = install_one(b);
+            self.host_status = None; // re-check on the next frame
         }
     }
 
@@ -3155,20 +3291,41 @@ impl SettingsApp {
     fn pane_updates(&mut self, ui: &mut Ui) {
         let t = tok();
         h2(ui, "Updates");
-        checkbox(
-            ui,
-            &mut self.s.update_check_on,
-            "Check for updates on launch",
-            14.0,
-            12.0,
-            true,
-        );
+        hint(ui, "Download Craft itself, and the helpers it keeps for you.");
         ui.add_space(10.0);
-        wrapped(
-            ui,
-            "Checks GitHub releases; never downloads automatically.",
-            reg(11.0),
-            t.muted,
-        );
+
+        let mut open_updates = self.open_updates;
+        let mut check = self.s.update_check_on;
+        card(ui, "Download Craft", Some(&format!("v{}", crate::model::APP_VERSION)), &mut open_updates, |ui| {
+            switch_row(
+                ui,
+                "update_check_on",
+                &mut check,
+                "Check for updates on launch",
+                "Asks GitHub for a newer release; never downloads one by itself.",
+            );
+        });
+        self.open_updates = open_updates;
+        self.s.update_check_on = check;
+
+        let mut open_version = self.open_version;
+        let mut go_plugins = false;
+        card(ui, "Helpers", None, &mut open_version, |ui| {
+            ui.spacing_mut().item_spacing = Vec2::new(8.0, 6.0);
+            wrapped(
+                ui,
+                "yt-dlp and ffmpeg are checked against their latest releases whenever Plugins opens; the copies this app keeps are updated in place, your own copies are only reported.",
+                reg(9.5),
+                t.muted,
+            );
+            ui.add_space(2.0);
+            if btn_icon(ui, "\u{e9b0}", "Open Plugins", false).clicked() {
+                go_plugins = true;
+            }
+        });
+        self.open_version = open_version;
+        if go_plugins {
+            self.pane = PANE_YTDLP;
+        }
     }
 }
