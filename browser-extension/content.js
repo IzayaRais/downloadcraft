@@ -743,6 +743,8 @@
     t = t.replace(/\r?\n/g, " ").replace(/\s+/g, " ").trim();
     t = t.replace(/^\(\d+\)\s*/, "");
     t = t.replace(/\s*[|·]\s*Facebook\s*$/i, "").replace(/\s+on Facebook\b.*$/i, "").trim();
+    // The collapsed caption's "… See more" link is page chrome, not title.
+    t = t.replace(/\s*(?:…|\.\.\.)?\s*See more\s*$/i, "").trim();
     return t;
   }
   // Site chrome, audio lines and counters are not a caption.

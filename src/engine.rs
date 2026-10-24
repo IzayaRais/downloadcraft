@@ -1211,17 +1211,26 @@ pub fn sanitize_filename(s: &str) -> String {
         out = "download.bin".to_string();
     }
     if out.len() > 120 {
-        // keep the extension (char-boundary safe)
+        // Keep the extension, and a closing quality tag (" [1080p]") with it:
+        // a long title in a 3-byte script (Bengali) used to cut the tag to
+        // " [1" and the 1080p and 720p copies of a reel then shared a name.
         if let Some(dot) = out.rfind('.') {
             let (stem, ext) = out.split_at(dot);
-            let keep = 120usize.saturating_sub(ext.len());
+            let tag_at = stem
+                .rfind(" [")
+                .filter(|&i| stem.ends_with(']') && stem.len() - i <= 24);
+            let (stem, tag) = match tag_at {
+                Some(i) => stem.split_at(i),
+                None => (stem, ""),
+            };
+            let keep = 120usize.saturating_sub(ext.len() + tag.len());
             let cut = stem
                 .char_indices()
-                .take_while(|(i, _)| *i < keep)
+                .take_while(|(i, c)| i + c.len_utf8() <= keep)
                 .last()
                 .map(|(i, c)| i + c.len_utf8())
                 .unwrap_or(0);
-            out = format!("{}{}", &stem[..cut], ext);
+            out = format!("{}{}{}", stem[..cut].trim_end(), tag, ext);
         } else {
             let cut = out
                 .char_indices()
@@ -8203,6 +8212,11 @@ mod tests {
     fn sanitize_names() {
         assert_eq!(sanitize_filename("a/b\\c:d.mp4"), "a_b_c_d.mp4");
         assert_eq!(sanitize_filename("   "), "download.bin");
+        // A long Bengali title (3 bytes a letter) keeps its quality tag.
+        let long = format!("{} [1080p].mp4", "খেজুর আর হুজুরের মধ্যে পার্থক্য কি ".repeat(3));
+        let short = sanitize_filename(&long);
+        assert!(short.len() <= 120, "{}", short.len());
+        assert!(short.ends_with(" [1080p].mp4"), "{short}");
         // multibyte truncation must not panic or split chars
         let long = format!("{}.mp4", "ف".repeat(200));
         let out = sanitize_filename(&long);

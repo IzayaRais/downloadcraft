@@ -109,6 +109,8 @@ struct LinksApp {
     by_category: bool,
     one_dir: String,
     prefs: crate::confirm::UiPrefs,
+    /// Widths of the sized columns (see `COLS`), dragged by their dividers.
+    cols: [f32; 4],
     probe_rx: Option<Receiver<(usize, Option<u64>, Option<String>, Option<String>)>>,
     probes_left: usize,
     _rt: std::sync::Arc<tokio::runtime::Runtime>,
@@ -281,27 +283,64 @@ impl LinksApp {
 
     fn table(&mut self, ui: &mut egui::Ui) {
         let visible: Vec<usize> = (0..self.rows.len()).filter(|&i| self.visible(&self.rows[i])).collect();
-        let w = ui.available_width();
-        let (cb, ty, sz, tx) = (26.0, 110.0, 80.0, 170.0);
-        let rest = (w - cb - ty - sz - tx - 24.0).max(200.0);
-        let (nm, url) = (rest * 0.42, rest * 0.58);
+        let cb = 26.0;
         let row_h = 22.0;
+        let widths = col_widths(&self.cols, ui.available_width() - cb - 14.0);
         let strong = ui.visuals().strong_text_color();
         let weak = ui.visuals().weak_text_color();
-        // Fixed-width, left-aligned cell (add_sized centers its widget).
+        let line = ui.visuals().widgets.noninteractive.bg_stroke.color;
+        let accent = crate::dm::DM_ACC;
+        // Fixed-width, left-aligned cell (add_sized centers its widget), with
+        // a little room before the next column's divider.
         fn cell(ui: &mut egui::Ui, w: f32, h: f32, add: impl FnOnce(&mut egui::Ui) -> egui::Response) -> egui::Response {
             ui.allocate_ui_with_layout(egui::vec2(w, h), egui::Layout::left_to_right(egui::Align::Center), |ui| {
                 ui.set_min_size(egui::vec2(w, h));
+                ui.set_max_width(w - 8.0);
                 add(ui)
             })
             .inner
         }
-        ui.horizontal(|ui| {
-            ui.add_space(cb);
-            for (label, width) in [("File name", nm), ("Type", ty), ("Size", sz), ("Download from", url), ("Link text", tx)] {
-                cell(ui, width, row_h, |ui| ui.add(egui::Label::new(egui::RichText::new(label).strong().color(strong)).truncate()));
+        // ---- header: labels, and a divider after every column but the last
+        // that can be dragged (a faint line always, accent while in use) ----
+        let (hdr, _) = ui.allocate_exact_size(egui::vec2(ui.available_width(), row_h), egui::Sense::hover());
+        let p = ui.painter().clone();
+        let mut x = hdr.min.x + cb;
+        for (i, label) in COLS.iter().enumerate() {
+            p.text(
+                egui::pos2(x + 2.0, hdr.center().y),
+                egui::Align2::LEFT_CENTER,
+                *label,
+                egui::FontId::proportional(13.0),
+                strong,
+            );
+            x += widths[i];
+            if i + 1 == COLS.len() {
+                break;
             }
-        });
+            let zone = egui::Rect::from_center_size(egui::pos2(x - 4.0, hdr.center().y), egui::vec2(8.0, row_h));
+            let r = ui
+                .interact(zone, egui::Id::new(("links-col", i)), egui::Sense::drag())
+                .on_hover_cursor(egui::CursorIcon::ResizeColumn)
+                .on_hover_text("Drag to resize");
+            let active = r.hovered() || r.dragged();
+            p.rect_filled(
+                egui::Rect::from_center_size(
+                    zone.center(),
+                    egui::vec2(if active { 3.0 } else { 1.0 }, row_h - if active { 6.0 } else { 10.0 }),
+                ),
+                1.5,
+                if active { accent } else { line },
+            );
+            if r.dragged() {
+                let dx = r.drag_delta().x;
+                if dx != 0.0 {
+                    self.cols = drag_divider(&self.cols, i, dx);
+                }
+            }
+            if r.drag_stopped() {
+                save_cols(&self.cols);
+            }
+        }
         ui.separator();
         egui::ScrollArea::vertical()
             .auto_shrink([false, false])
@@ -310,8 +349,9 @@ impl LinksApp {
                 for &i in &visible[range] {
                     let r = &mut self.rows[i];
                     ui.horizontal(|ui| {
+                        ui.spacing_mut().item_spacing.x = 0.0;
                         ui.add_sized([cb, row_h], egui::Checkbox::without_text(&mut r.checked));
-                        let name = cell(ui, nm, row_h, |ui| {
+                        let name = cell(ui, widths[0], row_h, |ui| {
                             ui.add(egui::Label::new(&r.name).truncate().sense(egui::Sense::click()))
                         });
                         if name.on_hover_text(&r.name).clicked() {
@@ -321,20 +361,113 @@ impl LinksApp {
                             Probe::Pending => egui::RichText::new(format!("{}…", r.kind)).color(weak),
                             _ => egui::RichText::new(&r.kind),
                         };
-                        cell(ui, ty, row_h, |ui| ui.add(egui::Label::new(kind).truncate()));
+                        cell(ui, widths[1], row_h, |ui| ui.add(egui::Label::new(kind).truncate()));
                         let size = match (r.size, r.probe) {
                             (Some(s), _) => format_bytes(s),
                             (None, Probe::Pending) => "…".into(),
                             _ => String::new(),
                         };
-                        cell(ui, sz, row_h, |ui| ui.add(egui::Label::new(size).truncate()));
-                        cell(ui, url, row_h, |ui| ui.add(egui::Label::new(egui::RichText::new(&r.url).color(weak)).truncate()))
+                        cell(ui, widths[2], row_h, |ui| ui.add(egui::Label::new(size).truncate()));
+                        cell(ui, widths[3], row_h, |ui| ui.add(egui::Label::new(egui::RichText::new(&r.url).color(weak)).truncate()))
                             .on_hover_text(&r.url);
-                        cell(ui, tx, row_h, |ui| ui.add(egui::Label::new(&r.text).truncate()));
+                        cell(ui, widths[4], row_h, |ui| ui.add(egui::Label::new(&r.text).truncate()));
                     });
                 }
             });
     }
+}
+
+/// Column titles, left to right. "Download from" takes whatever room the
+/// others leave.
+const COLS: [&str; 5] = ["File name", "Type", "Size", "Download from", "Link text"];
+const COL_MIN: f32 = 50.0;
+/// Stored widths of the four sized columns (name, type, size, link text).
+const COLS_DEFAULT: [f32; 4] = [300.0, 110.0, 80.0, 170.0];
+
+/// All five widths for a table `avail` wide: the stored four, and the rest
+/// for "Download from" (never under 120).
+fn col_widths(stored: &[f32; 4], avail: f32) -> [f32; 5] {
+    let [n, t, s, x] = *stored;
+    let flex = (avail - (n + t + s + x)).max(120.0);
+    [n, t, s, flex, x]
+}
+
+/// Drag the divider after column `i` by `dx`: it follows the pointer, so the
+/// column on its left grows by what the one on its right loses; the flexible
+/// "Download from" column absorbs the change when it is one of the two.
+fn drag_divider(stored: &[f32; 4], i: usize, dx: f32) -> [f32; 4] {
+    // A column (0..5) to its slot in `stored`; "Download from" has none.
+    let slot = |c: usize| match c {
+        0..=2 => Some(c),
+        4 => Some(3),
+        _ => None,
+    };
+    let mut out = *stored;
+    match (slot(i), slot(i + 1)) {
+        (Some(l), None) => out[l] = (out[l] + dx).clamp(COL_MIN, 900.0),
+        (None, Some(r)) => out[r] = (out[r] - dx).clamp(COL_MIN, 900.0),
+        (Some(l), Some(r)) => {
+            let dx = dx.clamp(COL_MIN - out[l], out[r] - COL_MIN);
+            out[l] += dx;
+            out[r] -= dx;
+        }
+        (None, None) => {}
+    }
+    out
+}
+
+/// Column widths kept in ui.json (`links_cols`), so the window reopens as left.
+fn load_cols() -> [f32; 4] {
+    let v: serde_json::Value = config_dir()
+        .and_then(|d| std::fs::read_to_string(d.join("ui.json")).ok())
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or(serde_json::Value::Null);
+    let mut out = COLS_DEFAULT;
+    if let Some(a) = v.get("links_cols").and_then(|x| x.as_array()) {
+        for (i, w) in a.iter().take(4).enumerate() {
+            if let Some(w) = w.as_f64().filter(|w| w.is_finite()) {
+                out[i] = (w as f32).clamp(COL_MIN, 900.0);
+            }
+        }
+    }
+    out
+}
+
+fn save_cols(cols: &[f32; 4]) {
+    let Some(path) = config_dir().map(|d| d.join("ui.json")) else { return };
+    let mut v: serde_json::Value = std::fs::read_to_string(&path)
+        .ok()
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_else(|| serde_json::json!({}));
+    if let Some(obj) = v.as_object_mut() {
+        obj.insert("links_cols".into(), serde_json::json!(cols.iter().map(|w| w.round()).collect::<Vec<_>>()));
+        if let Ok(json) = serde_json::to_string_pretty(&v) {
+            let _ = crate::model::atomic_write(&path, json.as_bytes());
+        }
+    }
+}
+
+/// A name for a link whose URL names no file (a folder listing, a page):
+/// its link text, else the last part of the URL, as an .html page.
+fn page_name(url: &str, text: &str) -> String {
+    let from_url = || {
+        let u = reqwest::Url::parse(url).ok()?;
+        let tail = u
+            .query_pairs()
+            .last()
+            .map(|(_, v)| v.into_owned())
+            .or_else(|| u.path_segments().and_then(|mut s| s.next_back().map(|x| x.to_string())))
+            .filter(|t| !t.trim().is_empty())
+            .or_else(|| u.host_str().map(|h| h.to_string()))?;
+        Some(tail.rsplit('/').find(|p| !p.trim().is_empty()).unwrap_or(&tail).to_string())
+    };
+    let t = text.trim();
+    let base = if !t.is_empty() && t.chars().count() <= 80 && !t.contains('{') {
+        t.to_string()
+    } else {
+        from_url().unwrap_or_else(|| "page".into())
+    };
+    engine::sanitize_filename(&format!("{base}.html"))
 }
 
 /// Entry point for `--links <file>`.
@@ -358,7 +491,10 @@ pub fn run() -> eframe::Result<()> {
         .links
         .into_iter()
         .map(|l| {
-            let name = engine::sanitize_filename(&filename_from_url(&l.url));
+            let mut name = engine::sanitize_filename(&filename_from_url(&l.url));
+            if crate::model::is_fallback_filename(&name) {
+                name = page_name(&l.url, &l.text);
+            }
             let (kind, html, image) = type_of(&name, None);
             Row { url: l.url, text: l.text, name, guessed_name: true, kind, size: None, html, image, checked: false, probe: Probe::Pending }
         })
@@ -380,6 +516,7 @@ pub fn run() -> eframe::Result<()> {
         hide_images: true,
         by_category: true,
         one_dir: prefs.save_dir.clone(),
+        cols: load_cols(),
         prefs,
         probe_rx: None,
         probes_left: 0,
@@ -525,6 +662,28 @@ mod tests {
         assert!(type_of("photo", Some("image/jpeg")).2);
         assert_eq!(type_of("file.bin", Some("application/octet-stream")).0, "BIN file");
         assert_eq!(type_of("watch", Some("video/mp4")).0, "video/mp4");
+    }
+
+    #[test]
+    fn dividers_follow_the_pointer_and_name_pages() {
+        let c = COLS_DEFAULT;
+        // Name | Type: both sized, sum kept.
+        let d = drag_divider(&c, 0, 40.0);
+        assert_eq!((d[0], d[1]), (c[0] + 40.0, c[1] - 40.0));
+        // Size | Download from: Size grows, the flexible column gives way.
+        assert_eq!(drag_divider(&c, 2, 30.0)[2], c[2] + 30.0);
+        // Download from | Link text: dragging right narrows the link text.
+        assert_eq!(drag_divider(&c, 3, 30.0)[3], c[3] - 30.0);
+        // Minimums hold.
+        assert_eq!(drag_divider(&c, 0, 900.0)[1], COL_MIN);
+        let w = col_widths(&c, 1000.0);
+        assert_eq!(w.iter().sum::<f32>(), 1000.0);
+        assert_eq!(col_widths(&c, 100.0)[3], 120.0);
+        // Folder links name a page, not "download_<time>.bin".
+        assert_eq!(page_name("https://d.example/?dir=Series/English/A", "A"), "A.html");
+        assert_eq!(page_name("https://d.example/?dir=Series/English/A", ""), "A.html");
+        assert_eq!(page_name("https://d.example/", ".cls-1{fill:url(#g);}"), "d.example.html");
+        assert!(type_of(&page_name("https://d.example/?dir=S01", "S01"), None).1);
     }
 
     #[test]

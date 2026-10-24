@@ -1466,6 +1466,23 @@ fn col_w_of(map: &std::collections::HashMap<SortCol, f32>, c: SortCol) -> f32 {
     map.get(&c).copied().unwrap_or(col_default(c))
 }
 
+/// New widths while the divider between `left` and `right` is dragged by
+/// `dx`: the divider follows the pointer, so one side grows by what the other
+/// loses. Name takes whatever room the others leave, so its own width is
+/// never stored - only its neighbour changes.
+fn divider_widths(left: SortCol, right: SortCol, start_l: f32, start_r: f32, dx: f32) -> Vec<(SortCol, f32)> {
+    const MAX: f32 = 900.0;
+    if left == SortCol::Name {
+        return vec![(right, (start_r - dx).clamp(col_min(right), MAX))];
+    }
+    if right == SortCol::Name {
+        return vec![(left, (start_l + dx).clamp(col_min(left), MAX))];
+    }
+    // Both fixed: the move is limited by whichever side hits its minimum.
+    let dx = dx.clamp(col_min(left) - start_l, start_r - col_min(right));
+    vec![(left, start_l + dx), (right, start_r - dx)]
+}
+
 /// Uniform toolbar metrics: every action button shares one height.
 const TOOL_H: f32 = 46.0;
 /// Gap between toolbar buttons (`.toolbar { gap: 4px }`).
@@ -1643,7 +1660,7 @@ struct ActiveTask {
     last_bytes: u64,
 }
 
-#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 enum SortCol {
     Name,
     Size,
@@ -1719,7 +1736,8 @@ enum HitKind {
     Row(u64),
     HdrCol(SortCol),
     HdrCheck,
-    ResizeCol(SortCol),
+    /// The divider between a column and its right neighbour.
+    ResizeCol(SortCol, SortCol),
     CtxItem(RowAct, u64),
     Btn(ButtonId),
     Check(CheckId),
@@ -1732,11 +1750,15 @@ enum HitKind {
 
 /// Active manual divider drag: table column resize (window edges are the
 /// OS's job now that the app uses native decorations).
+#[derive(Clone, Copy)]
 enum ResizeCap {
+    /// Dragging the divider between `col` and its right neighbour `right`.
     Col {
         col: SortCol,
+        right: SortCol,
         start_x: f32,
         start_w: f32,
+        start_right: f32,
     },
 }
 
@@ -1881,6 +1903,9 @@ pub struct CraftApp {
     drop_menu: Option<u8>,
     finish_open: bool,
     resize_cap: Option<ResizeCap>,
+    /// The press that is down (or just released) began on a column divider:
+    /// its release must not also count as a click that sorts the column.
+    col_drag_used: bool,
     slider_cap: Option<SliderCap>,
     // Add-dialog advanced fields (kept on self so manual buttons in
     // process_hits can commit without dialog locals).
@@ -2033,6 +2058,7 @@ impl CraftApp {
             drop_menu: None,
             finish_open: false,
             resize_cap: None,
+            col_drag_used: false,
             slider_cap: None,
             add_referer: String::new(),
             add_cookie: String::new(),
@@ -3870,8 +3896,15 @@ impl CraftApp {
                         .map(|m| m.len())
                         .unwrap_or(0);
                     let adaptive = d.pair_url.starts_with("http");
+                    // A merge the engine finished (both legs at their servers'
+                    // own lengths, file muxed) is done even when the expected
+                    // total was a little off: a Facebook reel failed with
+                    // "got 3.22 MB of 3.23 MB" while every byte had arrived.
+                    let merged_ok = adaptive
+                        && landed > 0
+                        && task.shared.succeeded.load(Ordering::SeqCst);
                     let complete = match d.total_bytes {
-                        Some(t) if adaptive => t > 0 && dl >= t,
+                        Some(t) if adaptive => (t > 0 && dl >= t) || merged_ok,
                         Some(t) => t > 0 && dl >= t && landed >= t,
                         // unknown size: only a clean end WITH bytes counts
                         None => !cancelled && dl > 0,
@@ -5613,22 +5646,35 @@ impl eframe::App for CraftApp {
                             self.hits.push((HitKind::HdrCol(*col), r));
                             if ci + 1 < cols.len() {
                                 // Divider grab strip on the column's right edge
-                                // (`.resizer`), a hairline until hovered.
+                                // (`.resizer`): a faint line always, so it can
+                                // be found, and an accent bar while hovered or
+                                // dragged.
                                 let zr = egui::Rect::from_min_size(
-                                    egui::pos2(r.max.x - 3.5, r.min.y),
-                                    egui::vec2(7.0, HDR_H),
+                                    egui::pos2(r.max.x - 4.0, r.min.y),
+                                    egui::vec2(8.0, HDR_H),
                                 );
-                                if self.man.hover(&zr) {
+                                let dragging = matches!(self.resize_cap,
+                                    Some(ResizeCap::Col { col: c, .. }) if c == *col);
+                                if self.man.hover(&zr) || dragging {
                                     ui.painter().rect_filled(
                                         egui::Rect::from_min_size(
-                                            egui::pos2(r.max.x - 1.5, r.min.y + 6.0),
-                                            egui::vec2(3.0, HDR_H - 12.0),
+                                            egui::pos2(r.max.x - 1.5, r.min.y + 5.0),
+                                            egui::vec2(3.0, HDR_H - 10.0),
                                         ),
                                         1.5,
                                         pl().primary,
                                     );
+                                } else {
+                                    ui.painter().rect_filled(
+                                        egui::Rect::from_min_size(
+                                            egui::pos2(r.max.x - 0.5, r.min.y + 8.0),
+                                            egui::vec2(1.0, HDR_H - 16.0),
+                                        ),
+                                        0.0,
+                                        pl().card_bd,
+                                    );
                                 }
-                                self.hits.push((HitKind::ResizeCol(*col), zr));
+                                self.hits.push((HitKind::ResizeCol(*col, cols[ci + 1]), zr));
                             }
                         }
                     });
@@ -8139,17 +8185,22 @@ impl CraftApp {
     /// Match recorded hit rects (reverse = topmost first) against manual
     /// pointer state and dispatch. The single place anything "clicks".
     fn process_hits(&mut self, ctx: &egui::Context) {
-        // Active divider drag continuation (movement, not clicks).
+        // A divider drag is over once the button is up and its release frame
+        // (which still holds the capture) has passed.
+        if self.resize_cap.is_none() && !self.man.down_left() {
+            self.col_drag_used = false;
+        }
         // Active divider drag continues here (movement, not clicks).
         if let Some(cap) = self.resize_cap.take() {
             match cap {
-                ResizeCap::Col { col, start_x, start_w } => {
+                ResizeCap::Col { col, right, start_x, start_w, start_right } => {
                     if self.man.down_left() {
                         if let Some(p) = self.man.pos() {
-                            let nw = (start_w + (p.x - start_x)).clamp(col_min(col), 900.0);
-                            self.col_w.insert(col, nw);
+                            for (c, w) in divider_widths(col, right, start_w, start_right, p.x - start_x) {
+                                self.col_w.insert(c, w);
+                            }
                         }
-                        self.resize_cap = Some(ResizeCap::Col { col, start_x, start_w });
+                        self.resize_cap = Some(cap);
                     } else {
                         self.save_ui_state();
                     }
@@ -8202,7 +8253,7 @@ impl CraftApp {
                     HitKind::RowCheck(id) => format!("check:#{id}"),
                     HitKind::HdrCol(c) => format!("hdr:{}", c.key()),
                     HitKind::HdrCheck => "hdrcheck".to_string(),
-                    HitKind::ResizeCol(c) => format!("rz:{}", c.key()),
+                    HitKind::ResizeCol(c, _) => format!("rz:{}", c.key()),
                     HitKind::MenuBtn(m) => format!("menu:{m}"),
                     HitKind::MenuItem(a) => format!("menuitem:{a}"),
                     HitKind::CtxItem(_, id) => format!("ctx:#{id}"),
@@ -8376,7 +8427,7 @@ impl CraftApp {
                     }
                 }
                 HitKind::HdrCol(c) => {
-                    if clk {
+                    if clk && !self.col_drag_used {
                         if self.sort_col == c {
                             self.sort_asc = !self.sort_asc;
                         } else {
@@ -8405,16 +8456,19 @@ impl CraftApp {
                         }
                     }
                 }
-                HitKind::ResizeCol(c) => {
+                HitKind::ResizeCol(c, right) => {
                     if hov {
                         zone_cursor = Some(egui::CursorIcon::ResizeColumn);
                     }
                     if self.man.press_started_in(&rect) {
                         if let Some(p) = self.man.pos() {
+                            self.col_drag_used = true;
                             self.resize_cap = Some(ResizeCap::Col {
                                 col: c,
+                                right,
                                 start_x: p.x,
                                 start_w: col_w_of(&self.col_w, c),
+                                start_right: col_w_of(&self.col_w, right),
                             });
                         }
                     }
@@ -8518,6 +8572,21 @@ fn task_can_complete(shared: &SharedState, bytes_landed: bool) -> bool {
 }
 #[cfg(test)]
 mod audit_completion_tests {
+    #[test]
+    fn column_dividers_follow_the_pointer() {
+        use super::{divider_widths, col_min, SortCol};
+        // Name | Size: Name takes the rest, so only Size changes, and
+        // dragging right gives Name more room.
+        assert_eq!(divider_widths(SortCol::Name, SortCol::Size, 300.0, 90.0, 20.0), vec![(SortCol::Size, 70.0)]);
+        // Size | Status: one grows by what the other loses (sum unchanged).
+        let w = divider_widths(SortCol::Size, SortCol::Status, 90.0, 110.0, 15.0);
+        assert_eq!(w, vec![(SortCol::Size, 105.0), (SortCol::Status, 95.0)]);
+        // Never below a minimum on either side.
+        let w = divider_widths(SortCol::Size, SortCol::Status, 90.0, 110.0, 500.0);
+        assert_eq!(w[1], (SortCol::Status, col_min(SortCol::Status)));
+        let w = divider_widths(SortCol::Size, SortCol::Status, 90.0, 110.0, -500.0);
+        assert_eq!(w[0], (SortCol::Size, col_min(SortCol::Size)));
+    }
     use super::*;
     #[test]
     fn validation_failure_never_becomes_completed_from_full_byte_count() {
