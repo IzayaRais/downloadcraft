@@ -362,6 +362,27 @@ fn ffmpeg_probe(
     rx
 }
 
+/// Status plus a latest-release check (and in-place update of the app's own
+/// copy), off the UI thread.
+fn ytdlp_update_probe(
+) -> std::sync::mpsc::Receiver<(String, crate::engine::YtdlpInfo, crate::engine::FfmpegInfo)> {
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let msg = crate::engine::ytdlp_update_check_blocking();
+        let _ = tx.send((msg, crate::engine::ytdlp_info(), crate::engine::ffmpeg_info()));
+    });
+    rx
+}
+
+fn ffmpeg_update_probe() -> std::sync::mpsc::Receiver<(String, crate::engine::FfmpegInfo)> {
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let msg = crate::engine::ffmpeg_update_check_blocking();
+        let _ = tx.send((msg, crate::engine::ffmpeg_info()));
+    });
+    rx
+}
+
 /// The native "open file" dialog, for picking a yt-dlp executable.
 fn pick_executable() -> Option<std::path::PathBuf> {
     pick_tool("yt-dlp")
@@ -467,10 +488,16 @@ impl eframe::App for SettingsApp {
         if !self.centered && crate::model::center_window(ctx, egui::vec2(640.0, 520.0)) {
             self.centered = true;
         }
-        // The helper's status is asked for when the pane is first opened.
+        // The helpers' status is asked for when the pane is first opened,
+        // together with a check against their latest releases (the app's own
+        // copies are updated in place; the user's copies are only reported).
         if self.pane == PANE_YTDLP && self.ytdlp.is_none() && self.ytdlp_rx.is_none() {
-            self.ytdlp_rx = Some(ytdlp_probe(false));
+            self.ytdlp_rx = Some(ytdlp_update_probe());
             self.ytdlp_busy = true;
+            if self.ffmpeg_rx.is_none() {
+                self.ffmpeg_rx = Some(ffmpeg_update_probe());
+                self.ffmpeg_busy = true;
+            }
         }
         if let Some(rx) = &self.ytdlp_rx {
             if let Ok((msg, info, ffmpeg)) = rx.try_recv() {

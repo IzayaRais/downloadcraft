@@ -39,17 +39,38 @@ fn parse_target(url: &str) -> Result<FtpTarget> {
     if host.is_empty() {
         return Err(anyhow!("ftp URL has no host: {url}"));
     }
+    // The URL parser hands back percent-encoded text; the server wants the
+    // real names (`ftp://h/My%20File.zip` is the file "My File.zip").
     Ok(FtpTarget {
         host,
         port: u.port().unwrap_or(21),
         user: if u.username().is_empty() {
             "anonymous".to_string()
         } else {
-            u.username().to_string()
+            percent_decode(u.username())
         },
-        pass: u.password().unwrap_or("anonymous@").to_string(),
-        path: if u.path().is_empty() { "/".to_string() } else { u.path().to_string() },
+        pass: u.password().map(percent_decode).unwrap_or_else(|| "anonymous@".to_string()),
+        path: if u.path().is_empty() { "/".to_string() } else { percent_decode(u.path()) },
     })
+}
+
+/// `%XX` escapes only (a URL path keeps a literal `+`, unlike form data).
+fn percent_decode(s: &str) -> String {
+    let b = s.as_bytes();
+    let mut out = Vec::with_capacity(b.len());
+    let mut i = 0;
+    while i < b.len() {
+        if b[i] == b'%' && i + 2 < b.len() {
+            if let Ok(v) = u8::from_str_radix(&s[i + 1..i + 3], 16) {
+                out.push(v);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(b[i]);
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
 }
 
 /// Read one reply (single- or multi-line `code-…code …`) from the control
@@ -179,6 +200,8 @@ pub async fn download_ftp(
 
     let tmp = dest.with_extension("dcpart");
     let mut stalled = 0u32;
+    // The "REST rejected → restart from zero" fallback runs once per job.
+    let mut restarted_from_zero = false;
     let mut attempt = 0u32;
     loop {
         attempt += 1;
@@ -221,7 +244,11 @@ pub async fn download_ftp(
                 if msg.contains("REST rejected") {
                     // Server forgot our offset (or never resumes): one clean
                     // restart from zero, never a second.
-                    if start_at > 0 || len_before > 0 {
+                    // `start_at || len_before` alone let every later cut
+                    // restart again (the restart writes bytes): a server that
+                    // never resumes looped forever instead of failing.
+                    if (start_at > 0 || len_before > 0) && !restarted_from_zero {
+                        restarted_from_zero = true;
                         let _ = tokio::fs::remove_file(&tmp).await;
                         shared.downloaded.store(0, Ordering::SeqCst);
                         if let Ok(mut g) = shared.part_done.lock() {
@@ -290,6 +317,12 @@ async fn transfer_once(
         return Err(anyhow!("ftp PASV refused ({code} {text})"));
     }
     let (ip, port) = parse_pasv(&text)?;
+    // Open the data connection as soon as PASV names it, before RETR: some
+    // servers (vsftpd, ProFTPD) wait for it before sending "150", while we
+    // used to wait for "150" before connecting, so both sides waited.
+    let mut data = tokio::net::TcpStream::connect((ip.as_str(), port))
+        .await
+        .map_err(|e| anyhow!("ftp data connect: {e}"))?;
     if offset > 0 {
         let (code, text) = cmd(w, r, &format!("REST {offset}")).await?;
         if !(300..400).contains(&code) {
@@ -300,9 +333,6 @@ async fn transfer_once(
     if !(100..200).contains(&code) {
         return Err(anyhow!("ftp retrieve refused ({code} {text})"));
     }
-    let mut data = tokio::net::TcpStream::connect((ip.as_str(), port))
-        .await
-        .map_err(|e| anyhow!("ftp data connect: {e}"))?;
     #[allow(clippy::suspicious_open_options)]
     let mut file = tokio::fs::OpenOptions::new()
         .create(true)
@@ -351,6 +381,15 @@ async fn transfer_once(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn url_parts_are_percent_decoded() {
+        let t = parse_target("ftp://us%40er:p%20w@h.example/My%20File+1.zip").unwrap();
+        assert_eq!(t.user, "us@er");
+        assert_eq!(t.pass, "p w");
+        assert_eq!(t.path, "/My File+1.zip", "a URL path keeps a literal '+'");
+        assert_eq!(percent_decode("bad%zz%4"), "bad%zz%4");
+    }
 
     /// Minimal in-process FTP server (localhost only): one canned file,
     /// optional login gate, REST offsets, PASV data sends. Pending data

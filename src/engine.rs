@@ -235,6 +235,19 @@ fn site_of_url(url: &str) -> Option<String> {
     if host.parse::<std::net::IpAddr>().is_ok() || !host.contains('.') {
         return Some(host);
     }
+    // Multi-tenant hosting: every customer has its own subdomain, so the
+    // site is the whole host (d111.cloudfront.net is not d222's).
+    const SHARED_SUFFIXES: &[&str] = &[
+        "cloudfront.net", "akamaized.net", "akamaihd.net", "edgesuite.net", "azureedge.net",
+        "blob.core.windows.net", "fastly.net", "b-cdn.net", "r2.dev", "r2.cloudflarestorage.com",
+        "workers.dev", "pages.dev", "github.io", "githubusercontent.com", "gitlab.io",
+        "herokuapp.com", "appspot.com", "web.app", "firebaseapp.com", "netlify.app",
+        "vercel.app", "amazonaws.com", "storage.googleapis.com", "googleusercontent.com",
+        "digitaloceanspaces.com", "backblazeb2.com", "onrender.com", "fly.dev",
+    ];
+    if SHARED_SUFFIXES.iter().any(|s| host.ends_with(&format!(".{s}"))) {
+        return Some(host);
+    }
     let labels: Vec<&str> = host.split('.').collect();
     let n = labels.len();
     let keep = if n >= 3 && labels[n - 1].len() == 2 && labels[n - 2].len() <= 3 { 3 } else { 2 };
@@ -280,9 +293,28 @@ impl EngineOpts {
         // dozens of short requests per file) + TCP keepalives so throttled
         // CDN idle sockets don't die mid-range. H2/IPv6 stay OFF until a
         // live CDN proof run clears them (see P2 in docs/ENGINE_ROADMAP.md).
+        // Captured headers ride on every request, and on a redirect reqwest
+        // strips only Authorization/Cookie: an x-* token or Origin would
+        // follow a redirect to any host. Refuse redirects that leave the
+        // captured site instead (the browser already resolved its own).
+        let redirect = match self.captured_headers.headers.is_empty() {
+            true => reqwest::redirect::Policy::limited(10),
+            false => {
+                let site = self.captured_headers.site.clone();
+                reqwest::redirect::Policy::custom(move |attempt| {
+                    if attempt.previous().len() >= 10 {
+                        attempt.error("too many redirects")
+                    } else if site_of_url(attempt.url().as_str()).as_deref() != Some(site.as_str()) {
+                        attempt.error("redirected to another site while carrying captured browser headers; capture the video again from its page")
+                    } else {
+                        attempt.follow()
+                    }
+                })
+            }
+        };
         let mut b = reqwest::Client::builder()
             .user_agent(self.user_agent.clone())
-            .redirect(reqwest::redirect::Policy::limited(10))
+            .redirect(redirect)
             .local_address(std::net::IpAddr::from([0, 0, 0, 0]))
             .http1_only()
             .tcp_nodelay(true)
@@ -2878,7 +2910,17 @@ fn parse_hex_iv(s: &str) -> Option<[u8; 16]> {
 /// block-aligned by the packager). Backed by the vendored FIPS-197
 /// implementation (`crate::aes128`, zero new dependencies).
 fn aes128_cbc_decrypt(data: &[u8], key: &[u8; 16], iv: &[u8; 16]) -> Result<Vec<u8>> {
-    crate::aes128::cbc_decrypt(key, iv, data).map_err(|e| anyhow!("AES: {e}"))
+    let mut out = crate::aes128::cbc_decrypt(key, iv, data).map_err(|e| anyhow!("AES: {e}"))?;
+    // RFC 8216 §4.3.2.4: AES-128 segments carry PKCS7 padding. Leaving it
+    // put 1–16 junk bytes after every segment (breaking TS packet sync and
+    // fMP4 box chains in the merged file).
+    if let Some(&n) = out.last() {
+        let n = n as usize;
+        if (1..=16).contains(&n) && n <= out.len() && out[out.len() - n..].iter().all(|b| *b as usize == n) {
+            out.truncate(out.len() - n);
+        }
+    }
+    Ok(out)
 }
 
 /// HLS VOD download (clean-room, no IDM code): fetch playlist, follow the
@@ -2897,6 +2939,24 @@ async fn download_hls(
     shared: &Arc<SharedState>,
 ) -> Result<()> {
     const MAX_SEGS: usize = 2000;
+    // An existing file is kept (numbered copy) unless overwrite was chosen,
+    // as on the progressive path; the final rename used to replace it
+    // silently. A resumable job (segment map or parts at this name) stays.
+    let renamed;
+    let dest: &PathBuf = if opts.allow_rename
+        && dest.exists()
+        && !opts.overwrite_existing
+        && !dest.with_extension("hlsmap").exists()
+        && !dest.with_extension("hls0").exists()
+    {
+        renamed = crate::model::conflict_free_dest(dest);
+        if let Some(name) = renamed.file_name().map(|s| s.to_string_lossy().to_string()) {
+            mutex_guard(&shared.resolved_name).replace(name);
+        }
+        &renamed
+    } else {
+        dest
+    };
     let _job = claim_dest_job(dest).ok_or_else(|| {
         anyhow!("this destination is already downloading elsewhere — wait for it or remove the duplicate queue entry")
     })?;
@@ -3034,16 +3094,13 @@ async fn download_hls(
             let same = v.get("playlist").and_then(|x| x.as_str()) == Some(pl_url.as_str())
                 && v.get("count").and_then(|x| x.as_u64()) == Some(segs.len() as u64);
             if same {
-                if let Some(arr) = v.get("done").and_then(|x| x.as_array()) {
-                    for x in arr {
-                        if let Some(i) = x.as_u64() {
-                            let i = i as usize;
-                            if i < segs.len()
-                                && dest.with_extension(format!("hls{i}")).exists()
-                            {
-                                done.insert(i);
-                            }
-                        }
+                // Segment files are written via rename, so one that exists
+                // is complete: every one of them counts, not only those the
+                // map listed (it is only rewritten at the end, so a stopped
+                // run listed none and resume re-fetched everything).
+                for i in 0..segs.len() {
+                    if dest.with_extension(format!("hls{i}")).exists() {
+                        done.insert(i);
                     }
                 }
             }
@@ -3058,6 +3115,9 @@ async fn download_hls(
         let j = serde_json::json!({ "playlist": pl_url, "count": segs.len(), "done": v });
         std::fs::write(&map_path, serde_json::to_string_pretty(&j).unwrap_or_default()).ok();
     };
+    // The map names this playlist before any segment arrives, so a run that
+    // stops midway resumes from the segment files it already finished.
+    save_map(&done);
     // 4. Byte totals via concurrent ranged HEADs (best-effort).
     let parallel = connections.clamp(4, 8);
     let sem = std::sync::Arc::new(tokio::sync::Semaphore::new(parallel));
@@ -3284,7 +3344,12 @@ async fn download_hls(
                     },
                     _ => data,
                 };
-                tokio::fs::write(&part, &plain).await.map_err(|e| anyhow!(io_message(&e)))?;
+                // Temp file + rename: a segment file exists only when whole,
+                // so resume can trust any it finds (an abort mid-write used to
+                // leave a short file behind).
+                let staging = part.with_extension(format!("hls{idx}tmp"));
+                tokio::fs::write(&staging, &plain).await.map_err(|e| anyhow!(io_message(&e)))?;
+                tokio::fs::rename(&staging, &part).await.map_err(|e| anyhow!(io_message(&e)))?;
                 let got = attempt_bytes.max(1);
                 set_segment_progress(&shared, idx, got, Some(got));
                 return Ok::<(), anyhow::Error>(());
@@ -4313,10 +4378,14 @@ fn tool_dirs() -> Vec<std::path::PathBuf> {
 /// Source preference comes from Settings → Plugins → ffmpeg: the app's own
 /// copy, PATH, or a file the user picked.
 pub fn ffmpeg_path() -> Option<std::path::PathBuf> {
+    let managed = || ffmpeg_local_path().filter(|p| p.is_file());
+    // The chosen source first; when it is gone (a custom file moved or
+    // deleted, PATH changed) any other working ffmpeg beats none at all,
+    // which failed every merged 1080p+ download. yt-dlp falls back the same.
     match FfmpegSource::from_settings() {
-        FfmpegSource::Custom => ffmpeg_custom_path(),
-        FfmpegSource::Path => ffmpeg_on_path(),
-        FfmpegSource::Managed => ffmpeg_local_path().filter(|p| p.is_file()),
+        FfmpegSource::Custom => ffmpeg_custom_path().or_else(ffmpeg_on_path).or_else(managed),
+        FfmpegSource::Path => ffmpeg_on_path().or_else(managed),
+        FfmpegSource::Managed => managed().or_else(ffmpeg_on_path),
     }
 }
 
@@ -5121,6 +5190,108 @@ pub fn ffmpeg_refresh_blocking() -> Result<std::path::PathBuf> {
     }
 }
 
+/// Dotted numbers of a version or release tag ("2026.08.19" → [2026, 8, 19],
+/// "b6.1.1" → [6, 1, 1], "9.0.2-full_build" → [9, 0, 2]).
+fn version_parts(v: &str) -> Vec<u64> {
+    let start = v.find(|c: char| c.is_ascii_digit()).unwrap_or(v.len());
+    let core = v[start..].split(|c: char| !(c.is_ascii_digit() || c == '.')).next().unwrap_or("");
+    core.split('.').filter_map(|p| p.parse().ok()).collect()
+}
+
+/// True when `have` is an older release than `latest` (missing parts count
+/// as 0, so "2026.08.19" < "2026.08.19.1"). Unparseable input is never
+/// called older: no update is better than a wrong one.
+pub fn version_older(have: &str, latest: &str) -> bool {
+    let (a, b) = (version_parts(have), version_parts(latest));
+    if a.is_empty() || b.is_empty() {
+        return false;
+    }
+    let n = a.len().max(b.len());
+    let at = |v: &[u64], i: usize| v.get(i).copied().unwrap_or(0);
+    (0..n).map(|i| (at(&a, i), at(&b, i))).find(|(x, y)| x != y).is_some_and(|(x, y)| x < y)
+}
+
+/// Newest release tag of a GitHub repo ("yt-dlp/yt-dlp"), or `None` offline.
+async fn latest_release_tag(client: &reqwest::Client, repo: &str) -> Option<String> {
+    let v: serde_json::Value = client
+        .get(format!("https://api.github.com/repos/{repo}/releases/latest"))
+        // GitHub's API rejects requests without a User-Agent.
+        .header(reqwest::header::USER_AGENT, format!("download_craft/{}", crate::model::APP_VERSION))
+        .header(reqwest::header::ACCEPT, "application/vnd.github+json")
+        .timeout(std::time::Duration::from_secs(15))
+        .send()
+        .await
+        .ok()?
+        .error_for_status()
+        .ok()?
+        .json()
+        .await
+        .ok()?;
+    v.get("tag_name").and_then(|t| t.as_str()).map(str::to_string)
+}
+
+/// Settings → Plugins on open: compare yt-dlp with its latest release and
+/// replace the app's own copy when it is older. A copy the user chose (PATH
+/// or custom) is theirs: it is reported, never overwritten. Returns the line
+/// the card shows ("" when nothing could be checked).
+pub fn ytdlp_update_check_blocking() -> String {
+    let info = ytdlp_info();
+    let Some(have) = info.version.clone() else { return String::new() };
+    let rt = match tokio::runtime::Builder::new_current_thread().enable_all().build() {
+        Ok(rt) => rt,
+        Err(_) => return String::new(),
+    };
+    rt.block_on(async {
+        let Ok(client) = EngineOpts::default().build_client() else { return String::new() };
+        let Some(latest) = latest_release_tag(&client, "yt-dlp/yt-dlp").await else {
+            return "Could not check for a newer yt-dlp (offline?).".to_string();
+        };
+        if !version_older(&have, &latest) {
+            return format!("yt-dlp {have} is the latest release.");
+        }
+        if !info.managed {
+            return format!(
+                "yt-dlp {latest} is available; this copy is {have}. Pick \"App-managed\" to have it kept up to date, or update your own copy."
+            );
+        }
+        let Some(dst) = ytdlp_local_path() else { return String::new() };
+        match fetch_ytdlp(&client, &dst).await {
+            Ok(()) => format!("Updated yt-dlp {have} → {latest}."),
+            Err(e) => format!("yt-dlp {latest} is available, but the update failed: {e:#}"),
+        }
+    })
+}
+
+/// Same for the app's own ffmpeg. Only a managed copy is compared: its
+/// releases come from the static-build project the app fetches from, which
+/// says nothing about a build the user installed (Gyan, BtbN, a package
+/// manager), so those are left alone.
+pub fn ffmpeg_update_check_blocking() -> String {
+    let info = ffmpeg_info();
+    if !info.managed {
+        return String::new();
+    }
+    let Some(have) = info.version.clone() else { return String::new() };
+    let rt = match tokio::runtime::Builder::new_current_thread().enable_all().build() {
+        Ok(rt) => rt,
+        Err(_) => return String::new(),
+    };
+    let latest = rt.block_on(async {
+        let client = EngineOpts::default().build_client().ok()?;
+        latest_release_tag(&client, "eugeneware/ffmpeg-static").await
+    });
+    let Some(latest) = latest else {
+        return "Could not check for a newer ffmpeg (offline?).".to_string();
+    };
+    if !version_older(&have, &latest) {
+        return format!("ffmpeg {have} is the latest build.");
+    }
+    match ffmpeg_refresh_blocking() {
+        Ok(_) => format!("Updated ffmpeg {have} → {}.", latest.trim_start_matches('b')),
+        Err(e) => format!("A newer ffmpeg is available, but the update failed: {e:#}"),
+    }
+}
+
 /// Replace the app's own copy of yt-dlp now — the Settings "Re-download"
 /// button. Works whether or not a copy is on PATH, and whether or not the
 /// existing one looks stale; the fetched file is parsed-checked by size only
@@ -5511,8 +5682,20 @@ async fn download_with_ytdlp(
         tokio::fs::create_dir_all(parent).await?;
     }
     // A file already sitting at the destination makes yt-dlp report
-    // "already downloaded" and exit without fetching anything.
-    let _ = tokio::fs::remove_file(dest).await;
+    // "already downloaded" and exit without fetching anything. It is the
+    // user's file though: unless overwrite was chosen, save a numbered copy
+    // (as the progressive path does) instead of deleting it.
+    let renamed;
+    let dest: &PathBuf = if opts.allow_rename && dest.exists() && !opts.overwrite_existing {
+        renamed = crate::model::conflict_free_dest(dest);
+        if let Some(name) = renamed.file_name().map(|s| s.to_string_lossy().to_string()) {
+            mutex_guard(&shared.resolved_name).replace(name);
+        }
+        &renamed
+    } else {
+        let _ = tokio::fs::remove_file(dest).await;
+        dest
+    };
     let jar = write_cookie_jar(&opts.cookie, &cookie_domain(url)).await?;
     let mut cmd = tokio::process::Command::new(exe);
     cmd.kill_on_drop(true);
@@ -5959,6 +6142,19 @@ async fn download_adaptive_inner(
     );
     let sv = Arc::new(SharedState::new());
     let sa = Arc::new(SharedState::new());
+    // The legs have their own state, so the job's Pause/Cancel must reach
+    // them: Pause is mirrored by the aggregator below, and this guard
+    // cancels both legs when the job ends or is aborted (the app's Cancel
+    // aborts this future, which used to leave the legs' detached range
+    // tasks downloading the whole stream).
+    struct CancelLegs(Arc<SharedState>, Arc<SharedState>);
+    impl Drop for CancelLegs {
+        fn drop(&mut self) {
+            self.0.cancelled.store(true, Ordering::SeqCst);
+            self.1.cancelled.store(true, Ordering::SeqCst);
+        }
+    }
+    let _cancel_legs = CancelLegs(sv.clone(), sa.clone());
     let v_done = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let a_done = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let has_audio = audio_url.is_some();
@@ -5999,6 +6195,14 @@ async fn download_adaptive_inner(
     };
     let agg = async {
         loop {
+            let paused = shared.paused.load(Ordering::SeqCst);
+            let cancelled = shared.cancelled.load(Ordering::SeqCst);
+            for leg in [&sv, &sa] {
+                leg.paused.store(paused, Ordering::SeqCst);
+                if cancelled {
+                    leg.cancelled.store(true, Ordering::SeqCst);
+                }
+            }
             let sum = sv.downloaded.load(Ordering::SeqCst)
                 .saturating_add(sa.downloaded.load(Ordering::SeqCst));
             shared.downloaded.store(sum, Ordering::SeqCst);
@@ -6085,6 +6289,8 @@ struct DashRep {
     /// Exact segment count from a uniform SegmentTimeline (P3), preferred
     /// over duration math when present.
     timeline_count: Option<usize>,
+    /// (t0, d) of that timeline, for `$Time$` media templates.
+    timeline_origin: Option<(u64, u64)>,
 }
 
 fn xml_attr(tag: &str, name: &str) -> Option<String> {
@@ -6100,12 +6306,23 @@ fn xml_attr(tag: &str, name: &str) -> Option<String> {
             let q = rest.chars().next()?;
             if q == '"' || q == '\'' {
                 let end = rest[1..].find(q)?;
-                return Some(rest[1..1 + end].to_string());
+                // Attribute values are XML-escaped: a tokenized template
+                // "?a=1&amp;b=2" must be requested as "?a=1&b=2".
+                return Some(xml_unescape(&rest[1..1 + end]));
             }
         }
         search = &search[p + name.len()..];
     }
     None
+}
+
+/// The five predefined XML entities (`&amp;` last, so "&amp;lt;" stays "&lt;").
+fn xml_unescape(s: &str) -> String {
+    s.replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&quot;", "\"")
+        .replace("&apos;", "'")
+        .replace("&amp;", "&")
 }
 
 fn xml_child(block: &str, tag: &str) -> Option<String> {
@@ -6114,7 +6331,7 @@ fn xml_child(block: &str, tag: &str) -> Option<String> {
     let s = block.find(&open)?;
     let body = block[s..].find('>')? + s + 1;
     let e = block[body..].find(&close)? + body;
-    let t = block[body..e].trim().replace("&amp;", "&");
+    let t = xml_unescape(block[body..e].trim());
     if t.is_empty() {
         None
     } else {
@@ -6266,8 +6483,26 @@ fn timeline_count(block: &str, timescale: f64, period_dur_secs: Option<f64>) -> 
     Ok(Some(total))
 }
 
+/// Start time and duration (timeline units) of a uniform SegmentTimeline's
+/// first entry: segment `i` starts at `t0 + i·d`, which is what `$Time$`
+/// templates name. `timeline_count` has already rejected gaps and varying
+/// durations, so the first entry describes them all.
+fn timeline_origin(block: &str) -> Option<(u64, u64)> {
+    let p = block.find("<S ").or_else(|| block.find("<S/"))?;
+    let end = block[p..].find('>').map(|e| p + e).unwrap_or(block.len());
+    let tag = &block[p..end];
+    let d = xml_attr(tag, "d")?.parse::<u64>().ok().filter(|d| *d > 0)?;
+    let t0 = xml_attr(tag, "t").and_then(|v| v.parse::<u64>().ok()).unwrap_or(0);
+    Some((t0, d))
+}
+
 fn dash_expand(tpl: &str, number: u64, rep_id: &str, bw: u64) -> String {
-    // $Number$, $Number%0Nd$, $RepresentationID$, $Bandwidth$.
+    dash_expand_at(tpl, number, rep_id, bw, None)
+}
+
+/// `dash_expand` plus `$Time$` (and `$Time%0Nd$`) for timeline templates.
+fn dash_expand_at(tpl: &str, number: u64, rep_id: &str, bw: u64, time: Option<u64>) -> String {
+    // $Number$, $Number%0Nd$, $RepresentationID$, $Bandwidth$, $Time$.
     // Byte-walk would corrupt multibyte template text, so iterate chars.
     let mut out = String::new();
     let chars: Vec<char> = tpl.chars().collect();
@@ -6287,6 +6522,11 @@ fn dash_expand(tpl: &str, number: u64, rep_id: &str, bw: u64) -> String {
                         out.push_str(&format!("{number:0>w$}"));
                     } else {
                         out.push_str(&number.to_string());
+                    }
+                } else if let (Some(t), true) = (time, tok == "Time" || tok.starts_with("Time%0")) {
+                    match tok.strip_prefix("Time%0").and_then(|f| f.strip_suffix('d')).and_then(|w| w.parse::<usize>().ok()) {
+                        Some(w) => out.push_str(&format!("{t:0>w$}")),
+                        None => out.push_str(&t.to_string()),
                     }
                 } else if tok == "RepresentationID" {
                     out.push_str(rep_id);
@@ -6444,6 +6684,13 @@ fn parse_mpd(xml: &str) -> Result<(Vec<DashRep>, Vec<DashRep>)> {
                     .and_then(|t| tpl_secs(t))
                     .or(set_dur),
                 timeline_count: rep_tl.or(set_tl),
+                timeline_origin: if rep_tl.is_some() {
+                    timeline_origin(rblock)
+                } else if set_tl.is_some() {
+                    timeline_origin(&set_scan)
+                } else {
+                    None
+                },
             };
             if rep.mime.starts_with("video/") {
                 videos.push(rep);
@@ -6546,10 +6793,13 @@ async fn dash_rep_download(
         // Templated representation: initialization segment (track headers)
         // first; the numbered media segments follow below.
         if let Some(init_tpl) = rep.seg_init.clone() {
-            let u = if init_tpl.starts_with("http") {
-                init_tpl
+            // Init templates use the same tokens ("$RepresentationID$/init.mp4");
+            // requesting them literally 404'd.
+            let init = dash_expand(&init_tpl, rep.start_number, rep_id, rep.bandwidth);
+            let u = if init.starts_with("http") {
+                init
             } else {
-                hls_abs(mpd_url, &init_tpl)
+                hls_abs(mpd_url, &init)
             };
             let blob = dash_fetch_blob(client, opts, u, shared, max_retries).await?;
             out.write_all(&blob).await.map_err(|e| anyhow!(io_message(&e)))?;
@@ -6568,7 +6818,8 @@ async fn dash_rep_download(
         let mut handles = Vec::with_capacity(n);
         for i in 0..n {
             let num = rep.start_number.saturating_add(i as u64);
-            let seg = dash_expand(&media_tpl, num, rep_id, rep.bandwidth);
+            let time = rep.timeline_origin.map(|(t0, d)| t0.saturating_add(d.saturating_mul(i as u64)));
+            let seg = dash_expand_at(&media_tpl, num, rep_id, rep.bandwidth, time);
             let u = if seg.starts_with("http") { seg } else { hls_abs(mpd_url, &seg) };
             let part = dest.with_extension(format!("dashpart{i}"));
             let client = client.clone();
@@ -7080,7 +7331,11 @@ async fn single_stream_once(
         .await?;
     if start_at > 0 && is_partial {
         raw.seek(std::io::SeekFrom::Start(start_at)).await?;
-    } else if start_at > 0 {
+    } else {
+        // Not resuming (fresh start, or the server ignored Range and
+        // `start_at` was reset to 0 above): drop the old bytes. Testing
+        // `start_at > 0` here could never be true after that reset, so a
+        // restart overwrote the front of the old part file and kept its tail.
         raw.set_len(0).await?;
     }
     let mut file = tokio::io::BufWriter::with_capacity(WRITE_BUF, raw);
@@ -7229,6 +7484,10 @@ async fn chunked_stream(
         totals.push((0, total));
         dones.push(have_now);
     }
+    // Progress restarts from what is really on disk: after a failed parallel
+    // run (its parts deleted) the counter still held those bytes and this
+    // stream added its own on top (40 MB + 50 MB on a 50 MB file).
+    shared.downloaded.store(have_now, Ordering::SeqCst);
     loop {
         attempt += 1;
         let offset = tokio::fs::metadata(&tmp).await.map(|m| m.len()).unwrap_or(0);
@@ -8551,6 +8810,11 @@ mod tests {
         assert_eq!(dash_expand("seg-$Number$.m4s", 7, "v1", 8000), "seg-7.m4s");
         assert_eq!(dash_expand("seg-$Number%05d$.m4s", 7, "v1", 8000), "seg-00007.m4s");
         assert_eq!(dash_expand("$RepresentationID$/$Bandwidth$/s.m4s", 1, "vid", 8000), "vid/8000/s.m4s");
+        // $Time$ timelines and escaped query strings.
+        assert_eq!(dash_expand_at("v/$Time$.m4s", 3, "v1", 8000, Some(540000)), "v/540000.m4s");
+        assert_eq!(dash_expand_at("v/$Time%010d$.m4s", 3, "v1", 8000, Some(42)), "v/0000000042.m4s");
+        assert_eq!(timeline_origin(r#"<SegmentTimeline><S t="1000" d="180" r="9"/></SegmentTimeline>"#), Some((1000, 180)));
+        assert_eq!(xml_attr(r#"<SegmentTemplate media="s-$Number$.m4s?a=1&amp;b=2">"#, "media").as_deref(), Some("s-$Number$.m4s?a=1&b=2"));
         // MPD structure parse.
         let mpd = r#"<?xml version="1.0"?><MPD mediaPresentationDuration="PT60S" type="static"><Period><AdaptationSet mimeType="video/mp4"><SegmentTemplate timescale="30" duration="180" startNumber="1" media="v-$Number$.m4s" initialization="v-init.mp4"/><Representation id="v1" bandwidth="5000000" width="1920" height="1080" codecs="avc1.640028"></Representation></AdaptationSet><AdaptationSet mimeType="audio/mp4"><SegmentTemplate timescale="44" duration="100" media="a-$Number$.m4s" initialization="a-init.mp4"/><Representation id="a1" bandwidth="128000" codecs="mp4a.40.2"></Representation></AdaptationSet></Period></MPD>"#;
         let (vv, aa) = parse_mpd(mpd).expect("mpd");
@@ -8597,6 +8861,18 @@ mod tests {
     }
 
     #[test]
+    fn helper_versions_compare_as_release_numbers() {
+        assert!(version_older("2026.08.19", "2026.10.07"));
+        assert!(version_older("2026.08.19", "2026.08.19.1"));
+        assert!(!version_older("2026.10.07", "2026.08.19"));
+        assert!(!version_older("2026.08.19", "2026.08.19"));
+        assert!(version_older("6.0", "b6.1.1"));
+        assert!(!version_older("9.0.2-full_build-www.gyan.dev", "b6.1.1"));
+        assert!(!version_older("unknown", "2026.10.07"));
+        assert!(!version_older("2026.08.19", "nightly"));
+    }
+
+    #[test]
     fn opaque_manifests_are_recognized_by_content() {
         assert_eq!(manifest_kind_of(b"\xef\xbb\xbf#EXTM3U\n#EXTINF:4,\ns.ts"), Some(ManifestKind::Hls));
         assert_eq!(manifest_kind_of(b"<?xml version=\"1.0\"?>\n<MPD xmlns=\"urn:mpeg:dash:schema:mpd:2011\">"), Some(ManifestKind::Dash));
@@ -8614,6 +8890,9 @@ mod tests {
         assert_eq!(site_of_url("https://a.b.example.com/x").as_deref(), Some("example.com"));
         assert_eq!(site_of_url("https://cdn.example.co.uk/x").as_deref(), Some("example.co.uk"));
         assert_eq!(site_of_url("http://127.0.0.1:8080/x").as_deref(), Some("127.0.0.1"));
+        // Shared hosting: one customer's subdomain is not another's site.
+        assert_eq!(site_of_url("https://d111.cloudfront.net/a").as_deref(), Some("d111.cloudfront.net"));
+        assert_ne!(site_of_url("https://d111.cloudfront.net/a"), site_of_url("https://d222.cloudfront.net/a"));
         let map = std::collections::BTreeMap::from([
             ("Authorization".to_string(), "Bearer t".to_string()),
             ("x-token".to_string(), "1".to_string()),
@@ -8671,10 +8950,12 @@ mod tests {
         let iv = 7u128.to_be_bytes();
         let plain: Vec<u8> = (0..256).map(|i| (i % 251) as u8).collect();
         let enc = aes_cbc_encrypt_test(&plain, &key, &iv);
-        assert_eq!(enc.len(), plain.len());
-        assert_ne!(enc, plain);
+        assert_eq!(enc.len(), plain.len() + 16, "aligned input gets a full padding block");
+        assert_ne!(&enc[..plain.len()], &plain[..]);
         let dec = aes128_cbc_decrypt(&enc, &key, &iv).expect("decrypt");
-        assert_eq!(dec, plain);
+        assert_eq!(dec, plain, "PKCS7 padding is removed");
+        let short: Vec<u8> = (0..250).map(|i| i as u8).collect();
+        assert_eq!(aes128_cbc_decrypt(&aes_cbc_encrypt_test(&short, &key, &iv), &key, &iv).unwrap(), short);
         assert!(aes128_cbc_decrypt(&enc[..enc.len() - 1], &key, &iv).is_err());
         assert!(aes128_cbc_decrypt(&enc, &[0u8; 16], &iv).is_ok()); // wrong key still yields blocks
     }
@@ -8715,8 +8996,13 @@ mod tests {
     /// endpoint, and a flaky endpoint that fails its first requests.
     /// Exercises the real engine over real sockets — no external network.
     /// Extra: HLS playlists/segments (plain + AES-128) and DASH manifests.
+    /// Encrypts like real HLS packagers: PKCS7-padded (a full block when the
+    /// input is already aligned), as RFC 8216 requires.
     fn aes_cbc_encrypt_test(plain: &[u8], key: &[u8; 16], iv: &[u8; 16]) -> Vec<u8> {
-        crate::aes128::cbc_encrypt(key, iv, plain)
+        let pad = 16 - plain.len() % 16;
+        let mut padded = plain.to_vec();
+        padded.extend(std::iter::repeat_n(pad as u8, pad));
+        crate::aes128::cbc_encrypt(key, iv, &padded)
     }
 
     async fn serve_conn(

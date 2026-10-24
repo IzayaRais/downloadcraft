@@ -930,7 +930,7 @@ pub fn queued_entry(url: &str, quality: &str) -> Option<(u64, bool)> {
 /// Two requests for one page URL are the same download only at the same
 /// quality: a YouTube watch page queued at 1080p and again at 720p is two
 /// files.
-fn same_quality(a: &str, b: &str) -> bool {
+pub fn same_quality(a: &str, b: &str) -> bool {
     a.trim().eq_ignore_ascii_case(b.trim())
 }
 
@@ -964,6 +964,22 @@ pub fn append_to_queue(item: &mut DownloadItem) -> AppendResult {
         None => return AppendResult::Error("no config directory".to_string()),
     };
     append_to_queue_at(&path, item)
+}
+
+/// Next queue id. Ids are never reused, even after the newest row is
+/// removed: the main window treats an id it has seen disappear as deleted
+/// and silently drops a later row that reuses it (a dialog's "starting it"
+/// then started nothing). A high-water mark beside the queue file keeps the
+/// counter moving. Callers must hold the queue lock.
+pub fn next_queue_id(queue_path: &std::path::Path, items: &[DownloadItem]) -> u64 {
+    let mark = queue_path.with_extension("lastid");
+    let last = std::fs::read_to_string(&mark)
+        .ok()
+        .and_then(|s| s.trim().parse::<u64>().ok())
+        .unwrap_or(0);
+    let id = items.iter().map(|d| d.id).max().unwrap_or(0).max(last) + 1;
+    let _ = std::fs::write(&mark, id.to_string());
+    id
 }
 
 /// Path-injected core of `append_to_queue` (unit-tested without touching the
@@ -1049,7 +1065,7 @@ fn append_to_queue_at(path: &std::path::Path, item: &mut DownloadItem) -> Append
             Err(e) => AppendResult::Error(e),
         };
     }
-    let id = items.iter().map(|d| d.id).max().unwrap_or(0) + 1;
+    let id = next_queue_id(path, &items);
     item.id = id;
     item.status = Status::Queued;
     items.push(item.clone());
@@ -1338,6 +1354,25 @@ mod tests {
         assert_eq!(items[1].filename, "Video (1).mp4");
         // The same quality again is still a duplicate.
         assert_eq!(append_to_queue_at(&p, &mut item("720P")), AppendResult::AlreadyQueued(2));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn removed_ids_are_never_reused() {
+        let dir = std::env::temp_dir().join("dc_append_ids_test");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = dir.join("queue.json");
+        std::fs::write(&p, "[]").unwrap();
+        let item = |n: &str| DownloadItem::new(0, format!("https://e.com/{n}"), n.into(), dir.to_string_lossy().into(), 8);
+        assert_eq!(append_to_queue_at(&p, &mut item("a.zip")), AppendResult::Added(1));
+        assert_eq!(append_to_queue_at(&p, &mut item("b.zip")), AppendResult::Added(2));
+        // The newest row is removed (CLI `remove`, main window delete)…
+        let mut items = read_queue_items(&p).unwrap();
+        items.retain(|d| d.id != 2);
+        write_queue(&p, &items).unwrap();
+        // …and the next capture must not inherit its id.
+        assert_eq!(append_to_queue_at(&p, &mut item("c.zip")), AppendResult::Added(3));
         let _ = std::fs::remove_dir_all(&dir);
     }
 

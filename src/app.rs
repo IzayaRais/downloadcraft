@@ -3222,7 +3222,13 @@ impl CraftApp {
         if let Ok(data) = std::fs::read_to_string(&path) {
             if let Ok(disk) = serde_json::from_str::<Vec<DownloadItem>>(&data) {
                 for it in disk {
-                    if items.iter().any(|d| d.id == it.id || d.url == it.url) {
+                    // Same row = same id, or same URL at the same quality: one
+                    // page queued at 1080p and 720p is two downloads.
+                    if items.iter().any(|d| {
+                        d.id == it.id
+                            || (d.url == it.url
+                                && crate::model::same_quality(&d.quality_pref, &it.quality_pref))
+                    }) {
                         continue;
                     }
                     if self.known_ids.contains(&it.id) {
@@ -4065,15 +4071,21 @@ impl CraftApp {
         };
         let mut keep: Vec<crate::native_host::InboxItem> = Vec::new();
         let mut next: Option<crate::native_host::InboxItem> = None;
+        // Already queued = same URL at the same quality (another quality of
+        // one page is a new download).
+        let queued = |i: &crate::native_host::InboxItem, downloads: &[DownloadItem]| {
+            let q = i.quality.as_deref().unwrap_or("");
+            downloads.iter().any(|d| d.url == i.url && crate::model::same_quality(&d.quality_pref, q))
+        };
         for i in items.into_iter() {
             if next.is_none()
                 && is_download_url(&i.url)
-                && !self.downloads.iter().any(|d| d.url == i.url)
+                && !queued(&i, &self.downloads)
                 && age_secs(&i.received_at) >= CONFIRM_GRACE_SECS
             {
                 next = Some(i);
             } else if is_download_url(&i.url)
-                && !self.downloads.iter().any(|d| d.url == i.url)
+                && !queued(&i, &self.downloads)
             {
                 // Young (dialog likely opening) or a later old entry: keep.
                 keep.push(i);
@@ -4155,11 +4167,10 @@ impl CraftApp {
         };
         let (items, _) = Self::parse_queue_items(&data);
         for mut it in items {
-            if self
-                .downloads
-                .iter()
-                .any(|d| d.id == it.id || d.url == it.url)
-            {
+            if self.downloads.iter().any(|d| {
+                d.id == it.id
+                    || (d.url == it.url && crate::model::same_quality(&d.quality_pref, &it.quality_pref))
+            }) {
                 continue;
             }
             // Foreign entry for a file we already track (fresh capture):
