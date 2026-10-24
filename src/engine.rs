@@ -10558,7 +10558,7 @@ mod audit_helper_tests {
         // `--print` makes yt-dlp quiet; without `--progress` the window showed
         // 0 B until the end. The fake refuses to run without the flag.
         let temp=Temp::new();let dest=temp.0.join("clip.mp4");
-        let exe=temp.script("import sys,pathlib,json\nif '--progress' not in sys.argv: sys.exit(3)\np=pathlib.Path(sys.argv[sys.argv.index('-o')+1]).with_suffix('.mp4')\np.write_bytes(b'video bytes')\nprint('dcfile@'+json.dumps(str(p)))");
+        let exe=temp.script("import sys,pathlib,json\nif '--progress' not in sys.argv: sys.exit(3)\np=(pathlib.Path(next((a[5:] for a in sys.argv if a.startswith('home:')),'.'))/sys.argv[sys.argv.index('-o')+1]).with_suffix('.mp4')\np.write_bytes(b'video bytes')\nprint('dcfile@'+json.dumps(str(p)))");
         download_with_ytdlp(&exe,"https://example.com/media",&dest,1,&EngineOpts::default(),&Arc::new(SharedState::new())).await.unwrap();
         assert_eq!(std::fs::read(&dest).unwrap(),b"video bytes");
     }
@@ -10566,12 +10566,12 @@ mod audit_helper_tests {
     async fn exact_reported_output_is_used_and_neighboring_files_are_untouched() {
         let temp=Temp::new();let dest=temp.0.join("clip.mp4");
         let neighbor=temp.0.join("clip-notes.txt");std::fs::write(&neighbor,b"keep me").unwrap();
-        let exe=temp.script("import sys,pathlib,json\np=pathlib.Path(sys.argv[sys.argv.index('-o')+1]).with_suffix('.mkv')\np.write_bytes(b'video bytes')\nprint('dcfile@'+json.dumps(str(p)))");
+        let exe=temp.script("import sys,pathlib,json\np=(pathlib.Path(next((a[5:] for a in sys.argv if a.startswith('home:')),'.'))/sys.argv[sys.argv.index('-o')+1]).with_suffix('.mkv')\np.write_bytes(b'video bytes')\nprint('dcfile@'+json.dumps(str(p)))");
         download_with_ytdlp(&exe,"https://example.com/media",&dest,1,&EngineOpts::default(),&Arc::new(SharedState::new())).await.unwrap();
         assert_eq!(std::fs::read(&dest).unwrap(),b"video bytes");
         assert_eq!(std::fs::read(&neighbor).unwrap(),b"keep me");
         std::fs::remove_file(&dest).unwrap();
-        let exe=temp.script("import sys,pathlib,json\np=pathlib.Path(sys.argv[sys.argv.index('-o')+1]).with_name('clip-notes.txt')\nprint('dcfile@'+json.dumps(str(p)))");
+        let exe=temp.script("import sys,pathlib,json\np=(pathlib.Path(next((a[5:] for a in sys.argv if a.startswith('home:')),'.'))/sys.argv[sys.argv.index('-o')+1]).with_name('clip-notes.txt')\nprint('dcfile@'+json.dumps(str(p)))");
         assert!(download_with_ytdlp(&exe,"https://example.com/media",&dest,1,&EngineOpts::default(),&Arc::new(SharedState::new())).await.is_err());
         assert!(!dest.exists());assert_eq!(std::fs::read(&neighbor).unwrap(),b"keep me");
     }
