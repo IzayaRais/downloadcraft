@@ -55,18 +55,18 @@ fn claim_inbox_at(path:&std::path::Path,url:&str) -> Option<crate::native_host::
 }
 
 #[derive(Debug, Default)]
-struct UiPrefs {
-    save_dir: String,
-    connections: usize,
-    category_folders: bool,
-    user_agent: String,
-    proxy_url: String,
-    timeout_secs: u64,
-    rename_template: String,
-    folder_rules: Vec<crate::model::FolderRule>,
+pub(crate) struct UiPrefs {
+    pub(crate) save_dir: String,
+    pub(crate) connections: usize,
+    pub(crate) category_folders: bool,
+    pub(crate) user_agent: String,
+    pub(crate) proxy_url: String,
+    pub(crate) timeout_secs: u64,
+    pub(crate) rename_template: String,
+    pub(crate) folder_rules: Vec<crate::model::FolderRule>,
 }
 
-fn load_prefs() -> UiPrefs {
+pub(crate) fn load_prefs() -> UiPrefs {
     let mut p = UiPrefs {
         connections: 8,
         category_folders: true,
@@ -642,37 +642,41 @@ impl ConfirmApp {
         self.done = true;
     }
 
-    /// Ask the main app to start these ids (consumed on its next poll, or at
-    /// startup when we launch it below).
     fn wake_targets(&self, targets: &[u64]) {
-        if let Some(p) = wake_path() {
-            let _guard = crate::model::fs_lock("wake");
-            if !_guard.owned() { return; }
-            let mut ids: Vec<u64> = std::fs::read_to_string(&p)
-                .ok()
-                .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
-                .and_then(|v| v.get("start").cloned())
-                .and_then(|v| serde_json::from_value::<Vec<u64>>(v).ok())
-                .unwrap_or_default();
-            for id in targets {
-                if !ids.contains(id) {
-                    ids.push(*id);
-                }
-            }
-            if let Ok(json) =
-                serde_json::to_string_pretty(&serde_json::json!({ "start": ids }))
-            {
-                let _ = atomic_write(&p, json.as_bytes());
+        wake_ids(targets);
+    }
+}
+
+/// Ask the main app to start these ids (consumed on its next poll, or at
+/// startup when we launch it below).
+pub(crate) fn wake_ids(targets: &[u64]) {
+    if let Some(p) = wake_path() {
+        let _guard = crate::model::fs_lock("wake");
+        if !_guard.owned() { return; }
+        let mut ids: Vec<u64> = std::fs::read_to_string(&p)
+            .ok()
+            .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
+            .and_then(|v| v.get("start").cloned())
+            .and_then(|v| serde_json::from_value::<Vec<u64>>(v).ok())
+            .unwrap_or_default();
+        for id in targets {
+            if !ids.contains(id) {
+                ids.push(*id);
             }
         }
-        // tasklist + cold-start spawn can take seconds (debug builds
-        // especially) — never block the dialog on it; close at once.
-        std::thread::spawn(|| {
-            if !main_app_running() {
-                launch_main_app();
-            }
-        });
+        if let Ok(json) =
+            serde_json::to_string_pretty(&serde_json::json!({ "start": ids }))
+        {
+            let _ = atomic_write(&p, json.as_bytes());
+        }
     }
+    // tasklist + cold-start spawn can take seconds (debug builds
+    // especially) — never block the dialog on it; close at once.
+    std::thread::spawn(|| {
+        if !main_app_running() {
+            launch_main_app();
+        }
+    });
 }
 
 /// Entry point for `--confirm-download`. Never returns normally
@@ -713,12 +717,12 @@ pub fn run() -> eframe::Result<()> {
         std::process::exit(2);
     }
     let page_mime = get("--mime").filter(|s| !s.trim().is_empty()).unwrap_or_default();
-    let named_by_caller = get("--filename").filter(|f| !f.trim().is_empty()).is_some();
-    let filename = get("--filename")
-        .filter(|f| !f.trim().is_empty())
-        .unwrap_or_else(|| {
-            crate::model::filename_from_url_with_mime(&url, Some(page_mime.as_str()))
-        });
+    // `get` consumes the flag, so read it once.
+    let caller_name = get("--filename").filter(|f| !f.trim().is_empty());
+    let named_by_caller = caller_name.is_some();
+    let filename = caller_name.unwrap_or_else(|| {
+        crate::model::filename_from_url_with_mime(&url, Some(page_mime.as_str()))
+    });
     let referer = get("--referer").unwrap_or_default();
     let mut cookie = get("--cookie").unwrap_or_default();
     let pair_url = get("--pair-url").filter(|s| s.starts_with("http")).unwrap_or_default();

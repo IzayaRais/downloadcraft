@@ -14,6 +14,7 @@ mod engine;
 mod fonts;
 mod ftp;
 mod grabber;
+mod links;
 mod manual;
 mod model;
 mod native_host;
@@ -63,6 +64,10 @@ fn main() -> eframe::Result<()> {
     // captured download, always on top). Spawned by the native host.
     if args.iter().any(|a| a == "--confirm-download") {
         return confirm::run();
+    }
+    // IDM-style "Download all links" picker (spawned by the native host).
+    if args.iter().any(|a| a == "--links") {
+        return links::run();
     }
     // IDM-style standalone per-download progress window.
     if args.iter().any(|a| a == "--progress") {

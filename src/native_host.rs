@@ -57,6 +57,106 @@ struct Incoming {
     pub dur: Option<u64>,
     #[serde(default, alias = "audioExpected")]
     pub audio_expected: bool,
+    /// "Download all links" (`{"type":"links"}`): every link on a page.
+    #[serde(default)]
+    pub links: Option<Vec<PageLink>>,
+    /// Page title for the links window.
+    #[serde(default)]
+    pub title: Option<String>,
+}
+
+/// One link from a page ("Download all links").
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+pub struct PageLink {
+    pub url: String,
+    #[serde(default)]
+    pub text: String,
+}
+
+/// What `--links <file>` reads: written by the host, deleted by the window.
+#[derive(Debug, Serialize, Deserialize, Default)]
+pub struct LinksBatch {
+    pub page_url: String,
+    #[serde(default)]
+    pub title: String,
+    /// The page's cookies; the window applies them to same-host links only.
+    #[serde(default)]
+    pub cookie: String,
+    pub links: Vec<PageLink>,
+}
+
+/// Validate a page's links and keep the downloadable ones (http/https,
+/// sane lengths, no duplicates), capped like the extension's collector.
+pub fn links_batch(page_url: &str, title: &str, cookie: &str, links: &[PageLink]) -> LinksBatch {
+    let mut seen = std::collections::HashSet::new();
+    let kept = links
+        .iter()
+        .filter(|l| crate::model::is_download_url(&l.url) && l.url.len() <= 4096)
+        .filter(|l| seen.insert(l.url.clone()))
+        .take(5000)
+        .map(|l| PageLink {
+            url: l.url.clone(),
+            text: l.text.chars().filter(|c| !c.is_control()).take(200).collect(),
+        })
+        .collect();
+    LinksBatch {
+        page_url: page_url.to_string(),
+        title: title.chars().filter(|c| !c.is_control()).take(200).collect(),
+        cookie: cookie.to_string(),
+        links: kept,
+    }
+}
+
+fn spawn_links(msg: &Incoming) -> Result<(), String> {
+    let page = msg.page_url.clone().unwrap_or_default();
+    let batch = links_batch(
+        &page,
+        msg.title.as_deref().unwrap_or(""),
+        msg.cookie.as_deref().unwrap_or(""),
+        msg.links.as_deref().unwrap_or(&[]),
+    );
+    if batch.links.is_empty() {
+        return Err("no downloadable links on this page".into());
+    }
+    let dir = crate::model::config_dir().ok_or_else(|| "no config dir".to_string())?;
+    std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+    let path = dir.join(format!("links_{}.json", chrono::Local::now().timestamp_millis()));
+    let json = serde_json::to_string(&batch).map_err(|e| e.to_string())?;
+    crate::model::atomic_write(&path, json.as_bytes()).map_err(|e| e.to_string())?;
+    let exe = crate::platform::launch_path().map_err(|e| e.to_string())?;
+    let mut cmd = std::process::Command::new(exe);
+    cmd.arg("--links").arg(&path);
+    spawn_detached(cmd);
+    Ok(())
+}
+
+/// Spawn a window that outlives this short-lived host.
+fn spawn_detached(mut cmd: std::process::Command) {
+    // Never hand our stdio to the window: an inherited stdout keeps the
+    // browser's pipe open after this host exits.
+    cmd.stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        const DETACHED_PROCESS: u32 = 0x0000_0008;
+        const CREATE_BREAKAWAY_FROM_JOB: u32 = 0x0100_0000;
+        // DETACHED_PROCESS so the window outlives this short-lived host, and
+        // BREAKAWAY_FROM_JOB because Firefox runs native hosts inside a job
+        // object it kills when the host exits: children inherit that job, so a
+        // plain detached dialog was being torn down the moment Firefox closed
+        // our stdin (verified live — Chrome does not use such a job, which is
+        // why only Firefox looked like it did nothing). A job that forbids
+        // breaking away makes the spawn fail, and a plain detached window
+        // still beats none at all.
+        cmd.creation_flags(DETACHED_PROCESS | CREATE_BREAKAWAY_FROM_JOB);
+        if cmd.spawn().is_ok() {
+            return;
+        }
+        cmd.creation_flags(DETACHED_PROCESS);
+    }
+    let _ = cmd.spawn();
 }
 
 #[derive(Debug, Serialize)]
@@ -339,26 +439,7 @@ fn spawn_confirm(msg: &Incoming) {
     if let Some(d) = msg.dur.filter(|s| *s > 0) {
         cmd.arg("--dur").arg(d.to_string());
     }
-    #[cfg(windows)]
-    {
-        use std::os::windows::process::CommandExt;
-        const DETACHED_PROCESS: u32 = 0x0000_0008;
-        const CREATE_BREAKAWAY_FROM_JOB: u32 = 0x0100_0000;
-        // DETACHED_PROCESS so the dialog outlives this short-lived host, and
-        // BREAKAWAY_FROM_JOB because Firefox runs native hosts inside a job
-        // object it kills when the host exits: children inherit that job, so a
-        // plain detached dialog was being torn down the moment Firefox closed
-        // our stdin (verified live — Chrome does not use such a job, which is
-        // why only Firefox looked like it did nothing). A job that forbids
-        // breaking away makes the spawn fail, and a plain detached dialog
-        // still beats no dialog at all.
-        cmd.creation_flags(DETACHED_PROCESS | CREATE_BREAKAWAY_FROM_JOB);
-        if cmd.spawn().is_ok() {
-            return;
-        }
-        cmd.creation_flags(DETACHED_PROCESS);
-    }
-    let _ = cmd.spawn();
+    spawn_detached(cmd);
 }
 
 /// Entry point when launched with `--native-host`. Never returns normally.
@@ -423,6 +504,10 @@ pub fn run() -> eframe::Result<()> {
                     Err(e) => write_message(&Reply::err(e)),
                 }
             }
+            "links" => match spawn_links(&msg) {
+                Ok(()) => write_message(&Reply::ok()),
+                Err(e) => write_message(&Reply::err(e)),
+            },
             _ => write_message(&Reply::err("unknown message")),
             }
         }
@@ -456,5 +541,18 @@ mod media_tests {
         assert!(replayable_headers(None).is_none());
         let none = std::collections::BTreeMap::from([("cookie".to_string(), "a=b".to_string())]);
         assert!(replayable_headers(Some(&none)).is_none());
+    }
+
+    #[test]
+    fn page_links_keep_only_unique_web_urls() {
+        let msg: Incoming = serde_json::from_str(r#"{"type":"links","pageUrl":"https://site.example/dir/",
+            "links":[{"url":"https://site.example/a.mp4","text":"A\u0007 video"},
+                     {"url":"https://site.example/a.mp4","text":"again"},
+                     {"url":"javascript:alert(1)"},{"url":"file:///c:/x"},
+                     {"url":"http://other.example/b.zip"}]}"#).unwrap();
+        let b = links_batch("https://site.example/dir/", "", "", msg.links.as_deref().unwrap());
+        assert_eq!(b.links.len(), 2);
+        assert_eq!(b.links[0].text, "A video");
+        assert_eq!(b.links[1].url, "http://other.example/b.zip");
     }
 }

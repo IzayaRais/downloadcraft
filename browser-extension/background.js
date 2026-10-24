@@ -695,6 +695,13 @@ chrome.runtime.onInstalled.addListener(() => {
       title: "Download with Download Craft",
       contexts: ["link", "video", "audio"],
     });
+    // IDM's "Download all links": every link on the page (or in the
+    // selection) into the app's pick-and-queue list.
+    chrome.contextMenus.create({
+      id: "download-all-links",
+      title: "Download all links with Download Craft",
+      contexts: ["page", "selection"],
+    });
   });
   sendToHostPing();
   // Push the current page script into every open tab. Content scripts in
@@ -725,7 +732,82 @@ async function refreshOpenTabs() {
   }
 }
 
+// Runs in the page (scripting.executeScript), so it must be self-contained.
+// Returns [{url, text}] for every http(s) link and media source, fragments
+// dropped and duplicates merged. selectionOnly = links the selection touches.
+function pageLinks(selectionOnly) {
+  const sel = selectionOnly ? window.getSelection() : null;
+  const inSel = (el) => !sel || sel.isCollapsed || sel.containsNode(el, true);
+  const out = [];
+  const seen = new Map();
+  const add = (raw, text) => {
+    let u;
+    try { u = new URL(raw, document.baseURI); } catch (e) { return; }
+    if (u.protocol !== "http:" && u.protocol !== "https:") return;
+    u.hash = "";
+    const url = u.href;
+    if (url.length > 4096) return;
+    const t = String(text || "").replace(/\s+/g, " ").trim().slice(0, 200);
+    if (seen.has(url)) {
+      const row = seen.get(url);
+      if (!row.text && t) row.text = t;
+      return;
+    }
+    if (out.length >= 5000) return;
+    const row = { url, text: t };
+    seen.set(url, row);
+    out.push(row);
+  };
+  // innerText, not textContent: an inline <style>/<script> (SVG logos) is
+  // not link text.
+  const textOf = (a) => {
+    const img = a.querySelector && a.querySelector("img[alt]");
+    return (a.innerText || "").trim() || a.getAttribute("title") || a.getAttribute("aria-label")
+      || a.getAttribute("alt") || (img && img.getAttribute("alt")) || "";
+  };
+  for (const a of document.querySelectorAll("a[href], area[href]")) {
+    if (inSel(a)) add(a.getAttribute("href"), textOf(a));
+  }
+  for (const m of document.querySelectorAll("video[src], audio[src], source[src]")) {
+    if (inSel(m)) add(m.getAttribute("src"), m.getAttribute("title") || "");
+  }
+  return out;
+}
+
+async function sendAllLinks(tab, selectionOnly) {
+  if (!tab || tab.id === undefined || !/^https?:\/\//i.test(tab.url || "")) return;
+  let links = [];
+  try {
+    const results = await api.scripting.executeScript({
+      target: { tabId: tab.id },
+      func: pageLinks,
+      args: [!!selectionOnly],
+    });
+    links = (results && results[0] && results[0].result) || [];
+  } catch (e) {
+    lastHostError = "this page cannot be read (" + ((e && e.message) || e) + ")";
+    return;
+  }
+  if (!links.length) return;
+  try {
+    // The page's own cookies only: the app applies them to same-host links.
+    const cookie = await cookiesFor(tab.url);
+    const res = await api.runtime.sendNativeMessage(HOST, {
+      type: "links", pageUrl: tab.url, title: tab.title || "", cookie, links,
+    });
+    hostOk = !!res && res.type === "ok";
+  } catch (e) {
+    lastHostError = (e && e.message) || String(e);
+    hostOk = false;
+  }
+  setBadge();
+}
+
 chrome.contextMenus.onClicked.addListener((info, tab) => {
+  if (info.menuItemId === "download-all-links") {
+    sendAllLinks(tab, !!info.selectionText);
+    return;
+  }
   const url = info.linkUrl || info.srcUrl;
   if (url && /^https?:\/\//i.test(url)) {
     markSeen(url, null);

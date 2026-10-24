@@ -24,3 +24,18 @@ test('invalid video-bar coordinates never overwrite session position',async()=>{
  }
  assert.deepEqual(session.videoBarPosition,{x:.5,y:.5});
 });
+test('a saved bar spot applies in a normal window but never in fullscreen',()=>{
+ const content=fs.readFileSync(__dirname+'/content.js','utf8');
+ const fn=content.slice(content.indexOf('function applySavedBarPosition'),content.indexOf('function positionDraggedPanel'));
+ const root={appendChild(){}};
+ const document={fullscreenElement:null,documentElement:root};
+ const context={document,window:{innerWidth:1000,innerHeight:600},barWidth:()=>200,Math,barPosition:{x:.5,y:.1}};
+ vm.createContext(context);vm.runInContext(fn+';this.apply=applySavedBarPosition;',context);
+ const host={parentNode:root,style:{}};
+ assert.equal(context.apply(host),true);
+ assert.equal(host.style.left,'400px');
+ document.fullscreenElement={appendChild(){}};
+ const fsHost={parentNode:root,style:{}};
+ assert.equal(context.apply(fsHost),false);
+ assert.equal(fsHost.style.left,undefined);
+});

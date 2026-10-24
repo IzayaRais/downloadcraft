@@ -1177,9 +1177,11 @@
     return p && Number.isFinite(p.x) && Number.isFinite(p.y) && p.x >= 0 && p.x <= 1 && p.y >= 0 && p.y <= 1;
   }
   function applySavedBarPosition(host) {
-    if (!barPosition) return false;
-    const fullscreen=document.fullscreenElement;
-    const parent=fullscreen || document.documentElement;
+    // The saved spot is a fraction of the window: just right of the player
+    // in a normal window is mid-screen in fullscreen, so fullscreen always
+    // anchors to the player's top-right corner instead.
+    if (!barPosition || document.fullscreenElement) return false;
+    const parent=document.documentElement;
     if(host.parentNode!==parent)parent.appendChild(host);
     const width=Math.max(0,Math.min(barWidth(host),window.innerWidth-16));
     host.style.position="fixed";host.style.width=width+"px";
@@ -1225,6 +1227,13 @@
     },true);
     const update=(left,top)=>{
       const width=Math.min(barWidth(host),window.innerWidth-16);
+      if(document.fullscreenElement){
+        // Moves for this fullscreen session only; the saved spot is for
+        // the normal window (see applySavedBarPosition).
+        host.style.left=Math.max(8,Math.min(window.innerWidth-width-8,left))+"px";
+        host.style.top=Math.max(8,Math.min(window.innerHeight-36,top))+"px";
+        return;
+      }
       barPosition={x:Math.max(0,Math.min(1,(left-8)/Math.max(1,window.innerWidth-width-16))),
         y:Math.max(0,Math.min(1,(top-8)/Math.max(1,window.innerHeight-44)))};
       positionRevision++;applySavedBarPosition(host);
@@ -1253,7 +1262,7 @@
       window.removeEventListener("pointerup",onUp,true);
       window.removeEventListener("pointercancel",onCancel,true);
       if(cancel){if(moved){barPosition=previous;positionRevision++;syncDismissControls();}}
-      else if(moved){suppressClick=true;setTimeout(()=>{suppressClick=false;},0);rememberBarPosition();ev.preventDefault();ev.stopPropagation();}
+      else if(moved){suppressClick=true;setTimeout(()=>{suppressClick=false;},0);if(!document.fullscreenElement)rememberBarPosition();ev.preventDefault();ev.stopPropagation();}
     };
     const onUp=ev=>finish(ev,false);
     const onCancel=ev=>finish(ev,true);
@@ -1278,7 +1287,7 @@
       if(!delta)return;
       ev.preventDefault();ev.stopPropagation();hidePanels();
       const r=host.getBoundingClientRect(),step=ev.shiftKey?24:8;
-      update(r.left+delta[0]*step,r.top+delta[1]*step);rememberBarPosition();
+      update(r.left+delta[0]*step,r.top+delta[1]*step);if(!document.fullscreenElement)rememberBarPosition();
     });
   }
 
@@ -1312,11 +1321,16 @@
       btn.style.top = "12px";
       btn.style.right = "12px";
       btn.style.bottom = "auto";
+      // Clear what a saved (dragged) placement left behind: a stale left or
+      // width would pin the bar mid-player once the player grows.
+      btn.style.left = "auto";
+      btn.style.width = "";
       if (panel) {
         panel.style.position = "absolute";
         panel.style.top = "56px";
         panel.style.right = "12px";
         panel.style.bottom = "auto";
+        panel.style.left = "auto";
         if (panel.parentElement !== player) player.appendChild(panel);
       }
       setArrow("top");
