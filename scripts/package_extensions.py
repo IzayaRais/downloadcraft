@@ -8,13 +8,18 @@ import zipfile
 
 def stage_extensions(repo, destination):
     source=repo/'browser-extension'
-    ignore=shutil.ignore_patterns('*.test.js','*.md')
+    # Tests, their fixtures and the Firefox build script are not part of the
+    # extension; offscreen.* is Chrome-only (Firefox runs that in its
+    # background page).
+    ignore=shutil.ignore_patterns('*.test.js','*.md','testdata','*.ps1')
     chrome=destination/'browser-extension'
     firefox=destination/'browser-extension-firefox'
     for folder in [chrome,firefox]:
         shutil.copytree(source,folder,ignore=ignore,dirs_exist_ok=True)
     shutil.copy2(source/'manifest-firefox.json',firefox/'manifest.json')
     (firefox/'manifest-firefox.json').unlink(missing_ok=True)
+    for chrome_only in ['offscreen.html','offscreen.js']:
+        (firefox/chrome_only).unlink(missing_ok=True)
     version=json.loads((firefox/'manifest.json').read_text())['version']
     xpi=destination/f'DownloadCraft-Firefox-{version}.xpi'
     with zipfile.ZipFile(xpi,'w',zipfile.ZIP_DEFLATED) as z:

@@ -1,99 +1,61 @@
-# Download Craft 0.9.6.1 — bug-fix development build
+# Download Craft 0.9.8 — download in the browser, Download all links, a new popup
 
-This release keeps the requested public version 0.9.6.1 and includes all
-the previously validated deep-review fixes. It fixes verified defects;
-product and feature proposals in REVIEW-0.9.6.1.md have not been implemented.
+## What's new
 
-## Changes
+**Browser extension**
+- **Download in the browser — no app needed.** Every video card has a second home under
+  *Download in browser*. Plain files use the browser's own downloader; a separate video + audio pair
+  (Facebook 720p+, many players) is fetched and joined into one MP4 without re-encoding; HLS and DASH
+  streams are fetched piece by piece (standard AES-128 HLS decrypted) and joined. DRM and live streams
+  are named as such instead of failing. Saved files go to the app's category folders inside the
+  browser's Downloads folder, under their real names, and appear in the app's list when it runs.
+- **New popup**: toolbar (type filter, title search, auto-send, detection on/off, pause all app
+  downloads, rescan, clear), *Download with Download Craft* and *Download in browser* sections, and a
+  **Downloads** tab with browser jobs (progress, cancel, history) and the app's queue (pause, resume,
+  cancel).
+- **Download all links**: right-click a page → *Download all links with Download Craft*.
+- **Facebook reels**: one card per reel from Facebook's own data — every quality with its sound track,
+  duration, thumbnail and size, H.264 preferred so files play everywhere.
+- The video bar waits for the page ("Resolving…") when clicked early, shows once per Facebook reel,
+  and stays at the player's corner in fullscreen.
+- YouTube refuses downloads made by the browser itself (its links only work inside YouTube's player),
+  so its cards hand the video to the app.
 
-- Require a successful engine result before the main window marks a download
-  Completed. Audio, duration, merge and checksum failures cannot be overridden
-  by full byte counters. Keep the resolved filename available to final checks.
-- Use OS-held file locks rather than expiring a live owner's lock after 20
-  seconds. Stop shared-file writes if lock acquisition fails.
-- Assign and persist new GUI queue IDs together. CLI commands release their
-  queue lock before running a download and re-lock before updating its result;
-  unreadable queue JSON produces an error rather than being overwritten.
-- Create a separate private cookie jar for each helper invocation, with Unix
-  permissions 0600 and automatic deletion on success, failure or cancellation.
-  Protect saved queue/inbox/preferences with private state files and a Unix
-  configuration directory accessible only to its owner. The native host passes
-  captured cookies through that inbox rather than child-process arguments.
-- Stop external helpers when their async task is aborted. Supervise yt-dlp's
-  descendant merger processes with Windows jobs / Unix process groups. Pause
-  stops yt-dlp; Resume restarts it using whatever partial files remain.
-- Use the final redirect URL received during browser capture. Retain observed
-  non-GET downloads in the browser because their request body cannot be replayed
-  by Download Craft. This guard is best effort: it depends on webRequest events.
-- Use yt-dlp's reported final path rather than scanning similarly named files.
-  Escape percent characters in literal output paths.
-- Avoid pipe deadlock during helper version checks; retain the five-second
-  timeout and bound the captured version prefix in memory.
-- Discover the previous FFmpeg/ffprobe pair after an interrupted installation,
-  and recover it before attempting a subsequent replacement.
-- Match HTTP client platform hints to the configured user agent. Remove a
-  Windows-only FFmpeg instruction and the duplicate Unix Open with action.
-- Parse the optional after-download executable and arguments before inserting
-  the filename; no implicit shell interprets downloaded filenames. Templates
-  using shell operators must be moved into an explicitly chosen script.
-- Bump both desktop and extension to 0.9.6.1. Packaging reads RELEASE-NOTES.md;
-  the Linux CI smoke command no longer hardcodes the previous version.
+**App**
+- **Download all links window**: types, sizes, type chips, search, sortable and resizable columns,
+  Shift-click ranges, category folders or one folder.
+- **Streams show honest progress**: HLS/DASH downloads through yt-dlp count fragments instead of a size
+  estimate that keeps changing; pausing and resuming no longer inflates the downloaded size; temporary
+  pieces stay in a hidden `.download_craft_parts` folder.
+- **One-click JavaScript runtime** (portable Deno) for yt-dlp in Settings → Plugins.
+- Resizable list columns with visible dividers; the Download File Info dialog keeps the browser's file
+  name; long names in Bengali and other scripts keep their quality tag; a finished video + audio merge is
+  never reported as "connection ended early".
 
-## Updating Windows
+## Install
 
-Close all Download Craft windows and exit its tray process. Extract the whole
-Windows ZIP to a permanent folder and run download_craft.exe. Reload the bundled
-extension in Chrome/Brave/Firefox and refresh open video tabs. Both the native
-app and the extension need updating for all fixes. Existing preferences and
-queue data stay in their usual per-user locations.
+**Windows 10/11.** Extract `DownloadCraft-0.9.8-windows-x64-portable.zip` and run `download_craft.exe` —
+nothing to install. Your queue and settings in `%APPDATA%\download_craft` carry over.
 
-Keep the packaged extension folders alongside the executable when registering
-browser integration. The included Firefox XPI is a development build; it is not
-Mozilla-signed. No release has been published upstream by this task.
+**macOS 12+.** Unzip `DownloadCraft-0.9.8-macos-Universal.zip` and move `Download Craft.app` into
+Applications. This development build is not notarized: right-click → Open the first time.
 
-## Packages
+**Linux (x86-64, glibc 2.28+).**
+- Ubuntu, Debian, Mint, Pop!_OS: `sudo apt install ./downloadcraft_0.9.8_amd64.deb`
+- Fedora: `sudo dnf install ./downloadcraft-0.9.8-1.x86_64.rpm`
+- Other distributions: `DownloadCraft-0.9.8-x86_64.AppImage` (mark it executable; without FUSE run it
+  with `--appimage-extract-and-run`).
 
-The app, UI, updater checks, command line, both browser extensions and download
-filenames use the requested public version **0.9.6.1**. The fixes are retained.
-Cargo internally stores the SemVer equivalent `0.9.6+1`; `VERSION` is the public
-version source. Apple's numeric bundle-build field has three components, while
-its display version and the app itself retain 0.9.6.1.
+**Browser extension (0.9.8).**
+- Chrome / Edge / Brave: extract `DownloadCraft-Chrome-0.9.8.zip`, open `chrome://extensions`, enable
+  Developer mode, **Load unpacked** → the `browser-extension` folder. Already installed? Press reload on
+  the extension and refresh open tabs.
+- Firefox: `about:debugging#/runtime/this-firefox` → **Load Temporary Add-on…** →
+  `DownloadCraft-Firefox-0.9.8.xpi` (unsigned).
+- Then in the app: Settings → Browser Integration → **Install** for your browser.
 
-- Windows x64: extract the entire ZIP into a permanent folder and run the EXE.
-- Mac: the universal ZIP contains `Download Craft.app` for Apple Silicon and
-  Intel. Move the app to Applications and launch it before browser setup.
-- Fedora: install the RPM with your software installer or `sudo dnf install ./downloadcraft-0.9.6.1-1.x86_64.rpm`.
-- Debian, Ubuntu, Mint, Pop!_OS: install the DEB through your software installer
-  or `sudo apt install ./downloadcraft_0.9.6.1_amd64.deb`.
-- Other compatible Linux x64 desktops: make the AppImage executable. If FUSE
-  is unavailable, launch it with `--appimage-extract-and-run`.
+## Media helpers
 
-Linux artifacts target glibc 2.28. Mac targets macOS 12+. Windows and Mac builds
-are cross-compiled here. The Mac bundle is ad-hoc signed, not Apple-notarized;
-macOS may require approval in Privacy & Security.
-
-If a numerically newer package is already installed, the requested version is
-an explicit downgrade: use your package manager's downgrade/reinstall operation
-or replace the portable ZIP/AppImage. This release still contains the latest fixes.
-
-## Browser and helper setup
-
-Reload the bundled `browser-extension` folder in Chrome/Brave. In Firefox use
-`about:debugging` and the `browser-extension-firefox` folder or included XPI.
-Both extension variants report 0.9.6.1. Refresh existing video tabs after updating.
-The Firefox development add-on is unsigned; permanent distribution needs signing.
-
-In Settings → Plugins, Mac/Linux Download tools installs the native FFmpeg and
-ffprobe pair into per-user storage without administrator access. yt-dlp download,
-system/custom tools and supported JavaScript runtime detection remain available.
-Windows retains its existing FFmpeg workflow. Minimize the Mac/Linux main window
-while work runs; closing it exits the application.
-
-Snap/Flatpak browsers may need their distribution's native-messaging integration.
-Normal native browser host manifests are installed into per-user locations.
-
-## Validation
-
-See VALIDATION.txt in the source bundle for the exact checks on these artifacts.
-Feature proposals in REVIEW-0.9.6.1.md remain unimplemented. No upstream publication
-has been performed.
+Settings → Plugins downloads and updates **yt-dlp**, **FFmpeg + ffprobe** and now a portable
+**JavaScript runtime** (Deno) into the app's own folder — no installers, no PATH changes, no sudo.
+System copies on PATH or a custom file can be chosen instead.

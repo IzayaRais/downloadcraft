@@ -431,8 +431,17 @@ fn install_one(browser: &str) -> String {
 
 /// Entry point for `--settings`.
 pub fn run() -> eframe::Result<()> {
+    // `--pane <n>` opens a page directly (e.g. 2 = Plugins).
+    let args: Vec<String> = std::env::args().collect();
+    let pane = args
+        .iter()
+        .position(|a| a == "--pane")
+        .and_then(|i| args.get(i + 1))
+        .and_then(|s| s.parse::<usize>().ok())
+        .filter(|p| *p < PANES.len())
+        .unwrap_or(0);
     let app = SettingsApp {
-        pane: 0,
+        pane,
         s: load(),
         centered: false,
         notice: String::new(),
