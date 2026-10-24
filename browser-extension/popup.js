@@ -224,7 +224,10 @@ function card(item, mode) {
   // In the browser section a quality the browser cannot fetch itself stays
   // listed (greyed, "needs app") so it is clear why it cannot be saved here.
   const options = item.options;
-  if (mode === "browser" && !options.some((o) => o.browser)) return null;
+  // YouTube cannot be saved by the browser itself: its card stays in the
+  // browser section, but hands the video to the app.
+  const viaApp = mode === "browser" && item.tag === "YOUTUBE";
+  if (mode === "browser" && !viaApp && !options.some((o) => o.browser)) return null;
   const el = document.createElement("div");
   el.className = "card";
   const th = document.createElement("div");
@@ -261,11 +264,11 @@ function card(item, mode) {
   options.forEach((o, i) => {
     const op = document.createElement("option");
     op.value = String(i);
-    op.textContent = mode === "browser" && !o.browser ? `${o.label} — needs app` : o.label;
-    if (mode === "browser" && !o.browser) op.disabled = true;
+    op.textContent = mode === "browser" && !viaApp && !o.browser ? `${o.label} — needs app` : o.label;
+    if (mode === "browser" && !viaApp && !o.browser) op.disabled = true;
     sel.appendChild(op);
   });
-  if (mode === "browser") sel.value = String(options.findIndex((o) => o.browser));
+  if (mode === "browser" && !viaApp) sel.value = String(options.findIndex((o) => o.browser));
   if (options.length < 2) sel.disabled = true;
   const showSize = () => {
     const o = options[Number(sel.value)] || {};
@@ -278,13 +281,16 @@ function card(item, mode) {
   sel.onchange = showSize;
   (item.refresh = item.refresh || []).push(showSize);
   const dl = document.createElement("button");
-  dl.className = mode === "browser" ? "dl br" : "dl";
-  dl.innerHTML = SVG.down + `<span>${mode === "browser" ? "Save" : "Download"}</span>`;
-  dl.title = mode === "browser" ? "Download in this browser — no app needed" : "Download with Download Craft";
+  const inBrowser = mode === "browser" && !viaApp;
+  dl.className = inBrowser ? "dl br" : "dl";
+  dl.innerHTML = SVG.down + `<span>${inBrowser ? "Save" : viaApp ? "Use app" : "Download"}</span>`;
+  dl.title = inBrowser ? "Download in this browser — no app needed"
+    : viaApp ? "YouTube only lets the app download it — hands this quality to Download Craft"
+    : "Download with Download Craft";
   dl.onclick = () => {
     const o = options[Number(sel.value)];
     if (!o) return;
-    if (mode === "browser") sendBrowser({ ...o.browser, title: item.title, pageUrl: item.page });
+    if (inBrowser) sendBrowser({ ...o.browser, title: item.title, pageUrl: item.page });
     else send(o.msg);
   };
   const more = document.createElement("button");
@@ -300,17 +306,17 @@ function card(item, mode) {
     if (link) add("Copy link", async () => { try { await navigator.clipboard.writeText(link); status("Link copied", "ok"); } catch (e) { status("Could not copy", "bad"); } });
     if (link) add("Open link in new tab", () => api.tabs.create({ url: link }));
     if (mode === "app" && o.browser) add("Download in browser instead", () => sendBrowser({ ...o.browser, title: item.title, pageUrl: item.page }));
-    if (mode === "browser") add("Send to Download Craft instead", () => send(o.msg));
+    if (inBrowser) add("Send to Download Craft instead", () => send(o.msg));
     if (item.page && mode === "app") add("Send page link instead", () => send({ type: "download", url: item.page, pageUrl: item.page }));
     more.appendChild(m);
     openMenu = m;
   };
   row.append(sel, dl, more);
   body.append(title, meta, row);
-  if (mode === "browser" && item.tag === "YOUTUBE" && options.some((o) => !o.browser)) {
+  if (viaApp) {
     const hint = document.createElement("div");
     hint.className = "meta";
-    hint.textContent = "YouTube hides its HD links from the browser — HD needs the app.";
+    hint.textContent = "YouTube refuses downloads made by the browser itself (its links only work inside YouTube's player). The app downloads it — it starts on its own.";
     body.appendChild(hint);
   }
   el.append(th, body);
@@ -331,8 +337,6 @@ function youtubeItem(v, pageUrl) {
     return bn(b) - bn(a);
   })[0] || null;
   const bestA = best(v.audio);
-  // The browser joins MP4 video with MP4 (m4a) audio only.
-  const bestMp4A = best((v.audio || []).filter((a) => /mp4/i.test(a.mime || "")));
   const opts = [];
   const height = (l) => parseInt(String(l || "").match(/^(\d+)/) ? String(l).match(/^(\d+)/)[1] : "0", 10) || 0;
   const pushStream = (st, kind) => {
@@ -343,12 +347,11 @@ function youtubeItem(v, pageUrl) {
       ? `Audio · ${contOf(st.mime)}${st.br ? ` · ${Math.round(st.br / 1000)}k` : ""}`
       : `${st.label} · ${(st.disp || contOf(st.mime)).toUpperCase()}${kind === "v" ? " + audio" : ""}`;
     const exact = st._size > 0 ? st._size + (pair && bestA._size > 0 ? bestA._size : 0) : 0;
-    const mp4Video = /mp4/i.test(st.mime || "");
-    let browser = null;
-    if (st.url && !st.ciphered) {
-      if (kind === "v") browser = mp4Video && bestMp4A ? browserJob(st.url, name.replace(/\.webm$/i, ".mp4"), { pairUrl: bestMp4A.url }) : null;
-      else browser = browserJob(st.url, name);
-    }
+    // No browser job: YouTube's links are refused (403) outside its own
+    // player, even in the user's session - they need the player's "n"
+    // transform and a proof-of-origin token, which is what yt-dlp in the app
+    // provides. Checked live: the page's own 360p link answers 403.
+    const browser = null;
     opts.push({
       h: kind === "a" ? -1 : height(st.label),
       label,
