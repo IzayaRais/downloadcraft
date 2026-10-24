@@ -207,6 +207,19 @@
     return id ? `https://i.ytimg.com/vi/${id}/hqdefault.jpg` : "";
   }
 
+  // The title on screen. YouTube A/B-tests titles, so videoDetails.title in
+  // the page JSON can differ from what the user sees (and would name the
+  // file after a title they never saw). Only trusted when the watch page's
+  // own video-id matches — during SPA navigation the heading is stale.
+  function ytShownTitle(id) {
+    try {
+      const flexy = document.querySelector("ytd-watch-flexy[video-id]");
+      if (!flexy || flexy.getAttribute("video-id") !== id) return "";
+      const h1 = document.querySelector("ytd-watch-metadata h1");
+      return ((h1 && h1.textContent) || "").trim();
+    } catch (e) { return ""; }
+  }
+
   function ytStreams() {
     const id = ytVideoId();
     if (!id) return null;
@@ -223,7 +236,7 @@
     if (!pr || !pr.streamingData) {
       return { videoId: id, title: docTitle || "youtube_video", thumb: ytThumb(pr, id), streams: [], videoOnly: [], audio: [], subs: [] };
     }
-    const title = (pr.videoDetails && pr.videoDetails.title) || docTitle || "youtube_video";
+    const title = ytShownTitle(id) || (pr.videoDetails && pr.videoDetails.title) || docTitle || "youtube_video";
     // Stream URLs carry `expire=<unix>` and are session-locked: rows older
     // than ~2 min 403 in the app (IDM re-grabs instead of offering dead
     // links), so drop them here and let the sniffer/menu refresh refill.
