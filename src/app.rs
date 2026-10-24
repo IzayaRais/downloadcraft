@@ -1889,6 +1889,10 @@ pub struct CraftApp {
     /// Captured request headers of the browser capture being added (not
     /// editable; consumed by the next commit).
     add_headers: std::collections::BTreeMap<String, String>,
+    /// Details dialog "Start at" text while it is being typed, per row id:
+    /// only a complete HH:MM is saved to the row, so reloading the field
+    /// from the row every frame threw away each keystroke of "02:30".
+    det_start_draft: (u64, String),
     add_user: String,
     add_pass: String,
     /// Preferred quality from the extension menu (used by the size probe so
@@ -2033,6 +2037,7 @@ impl CraftApp {
             add_referer: String::new(),
             add_cookie: String::new(),
             add_headers: std::collections::BTreeMap::new(),
+            det_start_draft: (u64::MAX, String::new()),
             add_user: String::new(),
             add_pass: String::new(),
             add_quality: String::new(),
@@ -2526,6 +2531,7 @@ impl CraftApp {
                 self.add_file.clear();
                 self.add_checksum.clear();
                 self.add_quality.clear();
+                self.clear_add_credentials();
                 self.show_add = true;
             }
             2 => {
@@ -2936,7 +2942,8 @@ impl CraftApp {
 
     /// Recompute the live scheduler cap from speed windows (P3.4).
     /// u64::MAX = no window active (per-download caps apply as usual).
-    fn refresh_speed_limit(&self) {        let v = if self.speed_windows_on {
+    fn refresh_speed_limit(&self) {
+        let window = if self.speed_windows_on {
             let now = chrono::Local::now();
             let now_min = (now.format("%H").to_string().parse::<u16>().unwrap_or(0)) * 60
                 + now.format("%M").to_string().parse::<u16>().unwrap_or(0);
@@ -2944,9 +2951,19 @@ impl CraftApp {
                 .iter()
                 .find(|w| w.active_at(now_min))
                 .map(|w| w.limit_kbps * 1024)
-                .unwrap_or(u64::MAX)
+                .filter(|v| *v > 0)
         } else {
-            u64::MAX
+            None
+        };
+        // The global limit travels live too: tasks start without a frozen
+        // copy of it, so changing it (progress window, slider, Unlimited)
+        // reaches downloads already running instead of only the next ones.
+        let global = Some(self.speed_limit_kbps * 1024).filter(|v| *v > 0);
+        let v = match (global, window) {
+            (Some(g), Some(w)) => g.min(w),
+            (Some(g), None) => g,
+            (None, Some(w)) => w,
+            (None, None) => u64::MAX, // no cap at all
         };
         self.speed_limit_live.store(v, Ordering::SeqCst);
     }
@@ -3107,9 +3124,32 @@ impl CraftApp {
         let fname = filename
             .filter(|f| !f.trim().is_empty())
             .unwrap_or_else(|| filename_from_url(&url));
-        let fname = crate::model::apply_rename_template(&self.rename_template, &fname, &url);
+        let mut fname = crate::model::apply_rename_template(&self.rename_template, &fname, &url);
         let dir = self.save_dir_for(&fname);
-        let dest = std::path::Path::new(&dir).join(&fname);
+        let mut dest = std::path::Path::new(&dir).join(&fname);
+        // A row that is running or paused keeps its download: a different
+        // link that wants the same file name gets a numbered name instead.
+        // Taking it over swapped the URL and deleted partial files mid-transfer.
+        if let Some(pos) = crate::model::find_dest_clash(&self.downloads, &dest) {
+            let busy = self.tasks.contains_key(&self.downloads[pos].id)
+                || matches!(self.downloads[pos].status, Status::Downloading | Status::Paused);
+            if busy && self.downloads[pos].url != url {
+                let free = crate::model::conflict_free_dest(&dest);
+                let taken = |p: &std::path::Path| self.downloads.iter().any(|d| d.dest_path() == p);
+                let mut n = 1;
+                let mut cand = free;
+                while taken(&cand) && n < 1000 {
+                    let stem = dest.file_stem().map(|s| s.to_string_lossy().to_string()).unwrap_or_default();
+                    let ext = dest.extension().map(|e| format!(".{}", e.to_string_lossy())).unwrap_or_default();
+                    cand = std::path::Path::new(&dir).join(format!("{stem} ({n}){ext}"));
+                    n += 1;
+                }
+                if let Some(name) = cand.file_name() {
+                    fname = name.to_string_lossy().to_string();
+                }
+                dest = cand;
+            }
+        }
         // Same file, fresh URL (re-capture): refresh in place instead of a
         // colliding duplicate (two tasks on one dest fail loudly and can
         // corrupt resume state across different URLs).
@@ -3220,7 +3260,7 @@ impl CraftApp {
         // basket / CLI). Our own deletions stay deleted: ids we have ever
         // seen but no longer hold are dropped, unknown ids are merged in.
         if let Ok(data) = std::fs::read_to_string(&path) {
-            if let Ok(disk) = serde_json::from_str::<Vec<DownloadItem>>(&data) {
+            if let Ok(disk) = serde_json::from_str::<Vec<DownloadItem>>(data.trim_start_matches('\u{feff}')) {
                 for it in disk {
                     // Same row = same id, or same URL at the same quality: one
                     // page queued at 1080p and 720p is two downloads.
@@ -3273,6 +3313,12 @@ impl CraftApp {
     /// Parse queue items tolerantly: one bad entry (schema drift, partial
     /// write) must not nuke the whole queue. Returns (good, had_bad).
     fn parse_queue_items(data: &str) -> (Vec<DownloadItem>, bool) {
+        // A BOM (Notepad/PowerShell saves) made the whole queue unreadable:
+        // it loaded empty and the next save wrote "[]" over it.
+        let data = data.trim_start_matches('\u{feff}');
+        if data.trim().is_empty() {
+            return (Vec::new(), false);
+        }
         if let Ok(items) = serde_json::from_str::<Vec<DownloadItem>>(data) {
             return (items, false);
         }
@@ -3347,6 +3393,8 @@ impl CraftApp {
         // slot, so a start while one is already open never stacks duplicates,
         // while a window the user closed comes straight back on Retry.
         Self::spawn_progress(id);
+        // The live limit is the task's only cap: make it current first.
+        self.refresh_speed_limit();
         let item = self.downloads[idx].clone();
         let shared = Arc::new(SharedState::new());
         if let Some(t) = item.total_bytes {
@@ -3360,7 +3408,9 @@ impl CraftApp {
         let dest = item.dest_path();
         let conns = item.connections;
         let opts = EngineOpts {
-            speed_limit_bps: self.speed_limit_kbps * 1024,
+            // The global limit is applied live through `global_limit` (see
+            // refresh_speed_limit), not frozen into the task at start.
+            speed_limit_bps: 0,
             timeout_secs: item.eff_timeout(self.timeout_secs),
             max_retries: item.eff_retries(self.max_retries),
             user_agent: if self.user_agent.trim().is_empty() {
@@ -3438,6 +3488,10 @@ impl CraftApp {
                 .downloads
                 .iter()
                 .filter(|d| matches!(d.status, Status::Queued))
+                // A Queued row whose task still runs (a refresh re-queued it)
+                // is not startable: `start` returns without changing it, and
+                // picking it again looped forever and froze the window.
+                .filter(|d| !self.tasks.contains_key(&d.id))
                 // Queue v2: a row scheduled for later waits even when a slot
                 // is free, and priority decides who goes first.
                 .filter(|d| crate::model::start_at_due(&d.start_at, chrono::Local::now()))
@@ -3597,8 +3651,16 @@ impl CraftApp {
         self.save_queue();
     }
 
+    /// Checked rows the user can see. A row checked under another filter or
+    /// search stays checked but is not acted on: toolbar Delete removed rows
+    /// the current view was hiding.
     fn selected_ids(&self) -> Vec<u64> {
-        self.downloads.iter().filter(|d| d.selected).map(|d| d.id).collect()
+        let visible: std::collections::HashSet<u64> = self.visible_ids().into_iter().collect();
+        self.downloads
+            .iter()
+            .filter(|d| d.selected && visible.contains(&d.id))
+            .map(|d| d.id)
+            .collect()
     }
 
     fn start_queue(&mut self) {
@@ -3613,7 +3675,14 @@ impl CraftApp {
             .filter(|d| matches!(d.status, Status::Paused))
             .map(|d| d.id)
             .collect();
-        for id in ids {
+        // A paused row whose task is alive already holds its slot: resuming
+        // it costs nothing. Checking the cap first left every download that
+        // Stop All paused stuck (their tasks fill the slots).
+        let (live, idle): (Vec<u64>, Vec<u64>) = ids.into_iter().partition(|id| self.tasks.contains_key(id));
+        for id in live {
+            self.resume(id);
+        }
+        for id in idle {
             if self.tasks.len() >= cap {
                 break;
             }
@@ -4167,16 +4236,44 @@ impl CraftApp {
         };
         let (items, _) = Self::parse_queue_items(&data);
         for mut it in items {
+            // A row we hold that another process re-queued (a dialog refreshed
+            // a failed/finished row with a fresh capture, the CLI re-queued
+            // it): take the disk version. Skipping it kept the stale status,
+            // so its start order did nothing and our next save undid it.
+            if let Some(pos) = self.downloads.iter().position(|d| d.id == it.id) {
+                let local = &self.downloads[pos];
+                // Only rows another process may refresh: failed, finished with
+                // the file gone, or paused without a task. A row this window
+                // just completed (file present) is never reverted by a disk
+                // copy its own save has not overwritten yet.
+                let refreshable = match &local.status {
+                    Status::Failed(_) => true,
+                    Status::Completed => !local.dest_path().exists(),
+                    Status::Paused => true,
+                    _ => false,
+                };
+                let refreshed_elsewhere = matches!(it.status, Status::Queued)
+                    && refreshable
+                    && !self.tasks.contains_key(&it.id);
+                if refreshed_elsewhere {
+                    let selected = local.selected;
+                    it.speed_bps = 0.0;
+                    it.selected = selected;
+                    self.downloads[pos] = it;
+                }
+                continue;
+            }
             if self.downloads.iter().any(|d| {
-                d.id == it.id
-                    || (d.url == it.url && crate::model::same_quality(&d.quality_pref, &it.quality_pref))
+                d.url == it.url && crate::model::same_quality(&d.quality_pref, &it.quality_pref)
             }) {
                 continue;
             }
             // Foreign entry for a file we already track (fresh capture):
-            // refresh the local entry instead of a colliding duplicate.
+            // refresh the local entry instead of a colliding duplicate — but
+            // never a row with a live task (its download would be hijacked).
             if let Some(pos) =
                 crate::model::find_dest_clash(&self.downloads, &it.dest_path())
+                    .filter(|p| !self.tasks.contains_key(&self.downloads[*p].id))
             {
                 let local = &mut self.downloads[pos];
                 if local.url != it.url {
@@ -4225,12 +4322,20 @@ impl CraftApp {
         }
         self.merge_queue_from_disk();
         for id in ids {
-            let ready = self.downloads.iter().any(|d| {
-                d.id == id && matches!(d.status, Status::Queued) && !self.tasks.contains_key(&id)
-            });
-            if ready {
-                self.queue_running = true;
-                self.start(id);
+            let status = self.downloads.iter().find(|d| d.id == id).map(|d| d.status.clone());
+            match status {
+                Some(Status::Queued) if !self.tasks.contains_key(&id) => {
+                    self.queue_running = true;
+                    self.start(id);
+                }
+                // A dialog that found the row Paused asks to start it: resume,
+                // or its "starting it" notice promised something that never
+                // happened.
+                Some(Status::Paused) => {
+                    self.queue_running = true;
+                    self.resume(id);
+                }
+                _ => {}
             }
         }
     }
@@ -6476,7 +6581,10 @@ impl eframe::App for CraftApp {
                     let mut desc = item.description.clone();
                     let mut user = item.username.clone();
                     let mut pass = item.password.clone();
-                    let mut start_at = item.start_at.clone();
+                    if self.det_start_draft.0 != item.id {
+                        self.det_start_draft = (item.id, item.start_at.clone());
+                    }
+                    let mut start_at = self.det_start_draft.1.clone();
                     let mut sum = self.det_sum.clone();
                     let mut referer = item.referer.clone();
 
@@ -7004,6 +7112,7 @@ impl eframe::App for CraftApp {
                         });
 
                     // Persist the live edits (one write per changed field).
+                    self.det_start_draft.1 = start_at.clone();
                     let mut dirty = false;
                     if let Some(d) = self.downloads.iter_mut().find(|d| d.id == did) {
                         if d.description != desc {
@@ -7513,6 +7622,17 @@ impl CraftApp {
         }
     }
 
+    /// A manually opened Add dialog starts without the last browser
+    /// capture's session: its cookie, referer, captured headers and login
+    /// would otherwise be sent to whatever URL is typed next.
+    fn clear_add_credentials(&mut self) {
+        self.add_referer.clear();
+        self.add_cookie.clear();
+        self.add_headers.clear();
+        self.add_user.clear();
+        self.add_pass.clear();
+    }
+
     /// Manual dialog/toast button dispatcher (driven by process_hits).
     /// Validate + queue the Add dialog contents (shared by Add/Download).
     fn commit_add(&mut self, download: bool) {
@@ -7534,7 +7654,11 @@ impl CraftApp {
         let existing = self
             .downloads
             .iter()
-            .position(|d| d.url == self.add_url.trim());
+            // Same download = same URL at the same quality (one page at
+            // 1080p and 720p is two files), as everywhere else.
+            .position(|d| {
+                d.url == self.add_url.trim() && crate::model::same_quality(&d.quality_pref, &self.add_quality)
+            });
         if let Some(pos) = existing {
             let dead = match &self.downloads[pos].status {
                 Status::Failed(_) => true,
@@ -7616,6 +7740,7 @@ impl CraftApp {
         self.add_file.clear();
         self.add_checksum.clear();
         self.add_quality.clear();
+        self.clear_add_credentials();
         if download {
             self.queue_running = true;
             self.start(id);
@@ -8070,6 +8195,7 @@ impl CraftApp {
                                 self.add_file.clear();
                                 self.add_checksum.clear();
                                 self.add_quality.clear();
+                                self.clear_add_credentials();
                                 // A link picked up from the clipboard is
                                 // pre-filled here: the lit Add URL button is
                                 // the only affordance (no banner row).

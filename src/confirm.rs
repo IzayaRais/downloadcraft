@@ -605,15 +605,18 @@ impl ConfirmApp {
             crate::model::AppendResult::AlreadyQueued(id) => {
                 // Not an error. The URL is already in the list; if the user
                 // asked to start it we wake that row, so this is never a dead
-                // end. Stay open so the notice is actually read.
-                self.notice = if start {
-                    format!("Already in the queue (#{id}) — starting it.")
-                } else {
-                    format!("Already in the queue (#{id}).")
+                // end. Stay open so the notice is actually read. The notice
+                // names what really happens to the row.
+                use crate::model::Status;
+                self.notice = match crate::model::queued_status(id) {
+                    Some(Status::Completed) => format!("Already downloaded (#{id}) — see Finished."),
+                    Some(Status::Downloading) => format!("Already downloading (#{id})."),
+                    _ if start => {
+                        self.wake_targets(&[id]);
+                        format!("Already in the queue (#{id}) — starting it.")
+                    }
+                    _ => format!("Already in the queue (#{id})."),
                 };
-                if start {
-                    self.wake_targets(&[id]);
-                }
                 return;
             }
             crate::model::AppendResult::Error(e) => {

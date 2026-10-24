@@ -927,6 +927,12 @@ pub fn queued_entry(url: &str, quality: &str) -> Option<(u64, bool)> {
     Some((d.id, entry_is_dead(&d)))
 }
 
+/// Status of queue row `id`, as the queue file has it.
+pub fn queued_status(id: u64) -> Option<Status> {
+    let path = config_dir()?.join("queue.json");
+    read_queue_items(&path).ok()?.into_iter().find(|d| d.id == id).map(|d| d.status)
+}
+
 /// Two requests for one page URL are the same download only at the same
 /// quality: a YouTube watch page queued at 1080p and again at 720p is two
 /// files.
@@ -996,17 +1002,23 @@ fn append_to_queue_at(path: &std::path::Path, item: &mut DownloadItem) -> Append
         if !entry_is_dead(&items[pos]) {
             return AppendResult::AlreadyQueued(items[pos].id);
         }
-        let id = items[pos].id;
-        let created = items[pos].created_at;
-        items[pos].downloaded_bytes = 0;
-        if item.total_bytes.is_some() {
-            items[pos].total_bytes = item.total_bytes;
-        }
-        items[pos].speed_bps = 0.0;
-        items[pos].status = Status::Queued;
-        items[pos].created_at = created;
-        let dp = items[pos].dest_path();
-        drop_resume_state(&dp);
+        // The fresh capture's data replaces the dead row's (only identity and
+        // queue settings stay): keeping the old cookie/headers/referer — the
+        // very ones that expired — made the retry fail the same way.
+        let old = &items[pos];
+        drop_resume_state(&old.dest_path());
+        let mut fresh = item.clone();
+        fresh.id = old.id;
+        fresh.created_at = old.created_at;
+        fresh.priority = old.priority;
+        fresh.start_at = old.start_at.clone();
+        fresh.downloaded_bytes = 0;
+        fresh.speed_bps = 0.0;
+        fresh.status = Status::Queued;
+        fresh.selected = false;
+        let id = fresh.id;
+        item.id = id;
+        items[pos] = fresh;
         return match write_queue(path, &items) {
             Ok(()) => AppendResult::Added(id),
             Err(e) => AppendResult::Error(e),
@@ -1015,7 +1027,13 @@ fn append_to_queue_at(path: &std::path::Path, item: &mut DownloadItem) -> Append
     // Another quality of the same page wanting the same file name gets its
     // own name instead of taking over that row.
     if let Some(pos) = find_dest_clash(&items, &item.dest_path()) {
-        if items[pos].url == item.url && !same_quality(&items[pos].quality_pref, &item.quality_pref) {
+        // A different download (another quality, or another URL while that
+        // row is running or paused) gets its own name. Taking over an active
+        // row swapped its URL and deleted its partial files mid-transfer.
+        let active = matches!(items[pos].status, Status::Downloading | Status::Paused);
+        if (items[pos].url == item.url && !same_quality(&items[pos].quality_pref, &item.quality_pref))
+            || (active && items[pos].url != item.url)
+        {
             let free = dest_free_of_queue(&items, &item.dest_path());
             if let Some(name) = free.file_name() {
                 item.filename = name.to_string_lossy().to_string();
