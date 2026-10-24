@@ -290,7 +290,8 @@ function renderLinks(list, links, net, pageUrl, pageTitle) {
     const base = isStream ? "Send stream (needs app resolve)" : isPart ? "Download part (segment)" : isSub ? "Download subtitles" : "Download stream";
     btn.textContent = n.size > 0 ? `${base} (${fmtSize(n.size)})` : base;
     btn.onclick = () => {
-      chrome.runtime.sendMessage({ type: "download", url: n.url, filename: (isStream || isSub) ? undefined : fnameFor(), pageUrl: pageUrl || undefined }, (res) => {
+      chrome.runtime.sendMessage({ type: "download", url: n.url, filename: (isStream || isSub) ? undefined : fnameFor(), pageUrl: pageUrl || undefined,
+        pairUrl: n.pairUrl || undefined, pairMime: n.pairMime || undefined, dur: n.dur || undefined }, (res) => {
         $("status").textContent = res && res.ok ? "Sent ✓" : "App not reachable.";
       });
     };

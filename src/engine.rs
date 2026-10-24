@@ -2188,6 +2188,27 @@ async fn resolve_youtube_full(
     })
 }
 
+/// Display-only progress of one HLS segment for Part Info: bytes so far, and
+/// its real size once complete (`total`).
+fn set_segment_progress(shared: &SharedState, idx: usize, done: u64, total: Option<u64>) {
+    if let Ok(mut g) = shared.part_total.lock() {
+        if let Some(slot) = g.get_mut(idx) {
+            match total {
+                Some(t) => *slot = (0, t.max(1) - 1),
+                // Still arriving: an estimate the segment has outgrown would
+                // read as "Finished", so keep the total just past the bytes.
+                None if done > 0 && done >= slot.1 + 1 => *slot = (0, done),
+                None => {}
+            }
+        }
+    }
+    if let Ok(mut g) = shared.part_done.lock() {
+        if let Some(slot) = g.get_mut(idx) {
+            *slot = done;
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ManifestKind {
     Hls,
@@ -2248,6 +2269,16 @@ async fn sniff_manifest(client: &reqwest::Client, opts: &EngineOpts, url: &str) 
         }
     }
     manifest_kind_of(&head)
+}
+
+/// An HLS/DASH manifest by URL or type. Its byte length is the playlist
+/// text, never the video's size, so dialogs must not show it as one.
+pub fn is_stream_manifest(url: &str, ctype: Option<&str>, mime_hint: &str) -> bool {
+    let is_manifest_type = |t: &str| {
+        let t = t.to_ascii_lowercase();
+        t.contains("mpegurl") || t.contains("dash+xml")
+    };
+    is_playlist_url(url) || ctype.is_some_and(is_manifest_type) || is_manifest_type(mime_hint)
 }
 
 /// True for HLS/DASH playlists: the progressive engine cannot consume these
@@ -3018,6 +3049,9 @@ async fn download_hls(
             }
         }
     }
+    // Finished segments survive a stop and are skipped on restart (the map
+    // above), so a VOD stream download does resume.
+    shared.resumable.store(true, Ordering::SeqCst);
     let save_map = |done: &std::collections::HashSet<usize>| {
         let mut v: Vec<u64> = done.iter().map(|i| *i as u64).collect();
         v.sort_unstable();
@@ -3061,15 +3095,21 @@ async fn download_hls(
             shared.has_total.store(true, Ordering::SeqCst);
         }
     }
-    // Progress: one slot per segment.
+    // Progress: one slot per segment, sized by the stream estimate until the
+    // segment's real length is known (Part Info showed "1 B" per segment).
     {
+        let est = if shared.has_total.load(Ordering::SeqCst) && !segs.is_empty() {
+            (shared.total.load(Ordering::SeqCst) / segs.len() as u64).max(1)
+        } else {
+            1
+        };
         let mut totals = mutex_guard(&shared.part_total);
         let mut dones = mutex_guard(&shared.part_done);
         totals.clear();
         dones.clear();
         for i in 0..segs.len() {
-            totals.push((i as u64, i as u64));
-            dones.push(if done.contains(&i) { 1 } else { 0 });
+            totals.push((0, est - 1));
+            dones.push(if done.contains(&i) { est } else { 0 });
         }
     }
     shared.downloaded.store(0, Ordering::SeqCst);
@@ -3169,11 +3209,24 @@ async fn download_hls(
                                 sub_saturating(&shared.downloaded, attempt_bytes);
                                 return Err(anyhow!("cancelled"));
                             }
+                            // Pause holds in-flight segments too (finishing a
+                            // dozen parallel segments kept tens of MB arriving
+                            // after Pause). Reading stops, so TCP stops the
+                            // server; nothing received is lost. A connection
+                            // the server drops meanwhile takes the retry path.
+                            if shared.paused.load(Ordering::SeqCst) {
+                                if let Err(e) = wait_if_paused(&shared).await {
+                                    sub_saturating(&shared.downloaded, attempt_bytes);
+                                    set_segment_progress(&shared, idx, 0, None);
+                                    return Err(e);
+                                }
+                            }
                             match chunk {
                                 Ok(bytes) => {
                                     buf.extend_from_slice(&bytes);
                                     attempt_bytes += bytes.len() as u64;
                                     shared.downloaded.fetch_add(bytes.len() as u64, Ordering::SeqCst);
+                                    set_segment_progress(&shared, idx, attempt_bytes, None);
                                     limiter.consume(bytes.len() as u64).await;
                                 }
                                 Err(e) => {
@@ -3184,6 +3237,7 @@ async fn download_hls(
                         }
                         if let Some(e) = bad {
                             sub_saturating(&shared.downloaded, attempt_bytes);
+                            set_segment_progress(&shared, idx, 0, None);
                             if attempt >= max_retries {
                                 abort.store(true, Ordering::SeqCst);
                                 return Err(e);
@@ -3196,6 +3250,7 @@ async fn download_hls(
                         if let Some(n) = expect_len {
                             if buf.len() as u64 != n {
                                 sub_saturating(&shared.downloaded, attempt_bytes);
+                                set_segment_progress(&shared, idx, 0, None);
                                 if attempt >= max_retries {
                                     abort.store(true, Ordering::SeqCst);
                                     return Err(anyhow!(
@@ -3230,11 +3285,8 @@ async fn download_hls(
                     _ => data,
                 };
                 tokio::fs::write(&part, &plain).await.map_err(|e| anyhow!(io_message(&e)))?;
-                if let Ok(mut g) = shared.part_done.lock() {
-                    if let Some(slot) = g.get_mut(idx) {
-                        *slot = 1;
-                    }
-                }
+                let got = attempt_bytes.max(1);
+                set_segment_progress(&shared, idx, got, Some(got));
                 return Ok::<(), anyhow::Error>(());
             }
         }));

@@ -101,43 +101,65 @@
   function playerResponses() {
     const out = [];
     try {
-      for (const s of document.scripts) {
-        const t = s.textContent || "";
-        const marker = "ytInitialPlayerResponse = ";
-        let p = t.indexOf(marker);
-        while (p >= 0) {
-          try {
-            let i = p + marker.length;
-            while (i < t.length && t[i] !== "{") i++;
-            const start = i;
-            let depth = 0;
-            let inStr = false;
-            let esc = false;
-            let end = -1;
-            for (; i < t.length; i++) {
-              const c = t[i];
-              if (inStr) {
-                if (esc) esc = false;
-                else if (c === "\\") esc = true;
-                else if (c === '"') inStr = false;
-              } else if (c === '"') {
-                inStr = true;
-              } else if (c === "{") {
-                depth++;
-              } else if (c === "}") {
-                depth--;
-                if (depth === 0) { end = i; break; }
-              }
-            }
-            if (end > start) out.push(JSON.parse(t.slice(start, end + 1)));
-          } catch (e) {
-            /* malformed block: try the next one */
-          }
-          p = t.indexOf(marker, p + 1);
-        }
-      }
+      for (const s of document.scripts) scanPlayerResponses(s.textContent || "", out);
     } catch (e) {
       /* unparseable page variant */
+    }
+    return out;
+  }
+
+  // SPA navigation (home → video, autoplay) adds no new script tag, so the
+  // current video's sizes are missing from the page. Fetch its watch page
+  // once (same origin, the user's session) and keep the parsed response.
+  const fetchedPlayer = new Map(); // videoId -> player response | "pending" | "failed"
+  function fetchPlayerResponse(id, onReady) {
+    if (fetchedPlayer.has(id)) return;
+    fetchedPlayer.set(id, "pending");
+    if (fetchedPlayer.size > 20) fetchedPlayer.delete(fetchedPlayer.keys().next().value);
+    fetch(`/watch?v=${encodeURIComponent(id)}`, { credentials: "include" })
+      .then((r) => (r.ok ? r.text() : ""))
+      .then((html) => {
+        const found = [];
+        scanPlayerResponses(html, found);
+        const pr = found.find((p) => p && p.videoDetails && p.videoDetails.videoId === id && p.streamingData);
+        fetchedPlayer.set(id, pr || "failed");
+        if (pr) onReady();
+      })
+      .catch(() => fetchedPlayer.set(id, "failed"));
+  }
+
+  function scanPlayerResponses(t, out) {
+    const marker = "ytInitialPlayerResponse = ";
+    let p = t.indexOf(marker);
+    while (p >= 0) {
+      try {
+        let i = p + marker.length;
+        while (i < t.length && t[i] !== "{") i++;
+        const start = i;
+        let depth = 0;
+        let inStr = false;
+        let esc = false;
+        let end = -1;
+        for (; i < t.length; i++) {
+          const c = t[i];
+          if (inStr) {
+            if (esc) esc = false;
+            else if (c === "\\") esc = true;
+            else if (c === '"') inStr = false;
+          } else if (c === '"') {
+            inStr = true;
+          } else if (c === "{") {
+            depth++;
+          } else if (c === "}") {
+            depth--;
+            if (depth === 0) { end = i; break; }
+          }
+        }
+        if (end > start) out.push(JSON.parse(t.slice(start, end + 1)));
+      } catch (e) {
+        /* malformed block: try the next one */
+      }
+      p = t.indexOf(marker, p + 1);
     }
     return out;
   }
@@ -179,7 +201,13 @@
     if (!id) return null;
     // Strict id match: stale SPA script tags must never win.
     const prs = playerResponses();
-    const pr = prs.find((p) => p && p.videoDetails && p.videoDetails.videoId === id) || null;
+    let pr = prs.find((p) => p && p.videoDetails && p.videoDetails.videoId === id && p.streamingData) || null;
+    if (!pr) {
+      const fetched = fetchedPlayer.get(id);
+      if (fetched && typeof fetched === "object") pr = fetched;
+      else fetchPlayerResponse(id, () => { try { if (alive() && ytVideoId() === id) refreshYouTube(); } catch (e) {} });
+    }
+    if (!pr) pr = prs.find((p) => p && p.videoDetails && p.videoDetails.videoId === id) || null;
     const docTitle = document.title.replace(/ - YouTube$/, "");
     if (!pr || !pr.streamingData) {
       return { videoId: id, title: docTitle || "youtube_video", thumb: ytThumb(pr, id), streams: [], videoOnly: [], audio: [], subs: [] };
@@ -216,6 +244,15 @@
         return ms > 0 && ms < 86400000 * 3 ? Math.round(ms / 1000) : 0;
       } catch (e) { return 0; }
     };
+    // Display-only estimate when YouTube omits contentLength (typical for the
+    // progressive 360p stream, whose HEAD also 403s off-session): bitrate ×
+    // duration. Shown as "~"; never sent to the app as the real size.
+    const estOf = (f) => {
+      if (sizeOf(f) > 0) return 0;
+      const br = Number(f.averageBitrate || f.bitrate || 0);
+      const d = durOf(f);
+      return br > 0 && d > 0 ? Math.round((br * d) / 8) : 0;
+    };
     const qlabel = (f) => {
       // qualityLabel is "1080p" but often lacks fps; append it like IDM
       // ("1080p60") when the stream is high-frame-rate.
@@ -234,12 +271,12 @@
                       : String(f.mimeType || "").startsWith("audio/")));
     const cipherRows = (arr, wantVideo, kind) => ciphered(arr, wantVideo).map((f) => {
       const mime = String(f.mimeType || "").split(";")[0];
-      return { url: null, label: qlabel(f), mime, disp: contOf(mime), kind, itag: f.itag || 0, ciphered: true, _size: sizeOf(f), _dur: durOf(f), w: f.width || 0, h: f.height || 0 };
+      return { url: null, label: qlabel(f), mime, disp: contOf(mime), kind, itag: f.itag || 0, ciphered: true, _size: sizeOf(f), _est: estOf(f), _dur: durOf(f), w: f.width || 0, h: f.height || 0 };
     });
     // Progressive = video+audio in one file (ready to play).
     const streams = direct(pr.streamingData.formats).map((f) => {
       const mime = String(f.mimeType || "").split(";")[0];
-      return { url: f.url, label: qlabel(f), mime, disp: contOf(mime), kind: "av", itag: f.itag || 0, _size: sizeOf(f), _dur: durOf(f), w: f.width || 0, h: f.height || 0 };
+      return { url: f.url, label: qlabel(f), mime, disp: contOf(mime), kind: "av", itag: f.itag || 0, _size: sizeOf(f), _est: estOf(f), _dur: durOf(f), w: f.width || 0, h: f.height || 0 };
     });
     cipherRows(pr.streamingData.formats, true, "av").forEach((s) => {
       if (!streams.some((x) => x.label === s.label && x.disp === s.disp)) streams.push(s);
@@ -252,7 +289,7 @@
       .filter((f) => String(f.mimeType || "").startsWith("video/"))
       .map((f) => {
         const mime = String(f.mimeType || "").split(";")[0];
-        return { url: f.url, label: qlabel(f), mime, disp: contOf(mime), kind: "v", itag: f.itag || 0, _size: sizeOf(f), _dur: durOf(f), w: f.width || 0, h: f.height || 0 };
+        return { url: f.url, label: qlabel(f), mime, disp: contOf(mime), kind: "v", itag: f.itag || 0, _size: sizeOf(f), _est: estOf(f), _dur: durOf(f), w: f.width || 0, h: f.height || 0 };
       })
       .filter((s) => {
         const k = `${s.label}|${s.disp}`;
@@ -1155,6 +1192,34 @@
         y:Math.max(0,Math.min(1,(top-8)/Math.max(1,window.innerHeight-44)))};
       positionRevision++;applySavedBarPosition(host);
     };
+    // The bar is only re-parented once a real drag starts. Moving it on
+    // pointerdown detached the pressed element, and Chrome then drops the
+    // click: the first click after every menu refresh did nothing.
+    const onMove=ev=>{
+      if(!drag || ev.pointerId!==drag.id)return;
+      const dx=ev.clientX-drag.x,dy=ev.clientY-drag.y;
+      if(!drag.moved && Math.hypot(dx,dy)<5)return;
+      if(!drag.moved){
+        hidePanels();
+        const parent=document.fullscreenElement || document.documentElement;
+        if(host.parentNode!==parent)parent.appendChild(host);
+        host.style.position="fixed";host.style.left=drag.left+"px";host.style.top=drag.top+"px";
+        host.style.right="auto";host.style.bottom="auto";
+      }
+      drag.moved=true;ev.preventDefault();ev.stopPropagation();update(drag.left+dx,drag.top+dy);
+    };
+    const finish=(ev,cancel)=>{
+      if(!drag || ev.pointerId!==drag.id)return;
+      const moved=drag.moved,previous=drag.previous;
+      drag=null;activeBarDrag=null;
+      window.removeEventListener("pointermove",onMove,true);
+      window.removeEventListener("pointerup",onUp,true);
+      window.removeEventListener("pointercancel",onCancel,true);
+      if(cancel){if(moved){barPosition=previous;positionRevision++;syncDismissControls();}}
+      else if(moved){suppressClick=true;setTimeout(()=>{suppressClick=false;},0);rememberBarPosition();ev.preventDefault();ev.stopPropagation();}
+    };
+    const onUp=ev=>finish(ev,false);
+    const onCancel=ev=>finish(ev,true);
     for(const control of [main,grip]) {
       control.style.touchAction="none";
       control.addEventListener("pointerdown",ev=>{
@@ -1162,31 +1227,13 @@
         const r=host.getBoundingClientRect();
         drag={id:ev.pointerId,x:ev.clientX,y:ev.clientY,left:r.left,top:r.top,moved:false,previous:barPosition};
         suppressClick=false;activeBarDrag=host;
-        // Move before capture; moving a captured node can lose pointer capture.
-        const parent=document.fullscreenElement || document.documentElement;
-        if(host.parentNode!==parent)parent.appendChild(host);
-        host.style.position="fixed";host.style.left=r.left+"px";host.style.top=r.top+"px";
-        host.style.right="auto";host.style.bottom="auto";
-        control.setPointerCapture(ev.pointerId);ev.stopPropagation();
+        // Window listeners follow the pointer off the bar without pointer
+        // capture (capturing, then re-parenting, used to cancel the drag).
+        window.addEventListener("pointermove",onMove,true);
+        window.addEventListener("pointerup",onUp,true);
+        window.addEventListener("pointercancel",onCancel,true);
+        ev.stopPropagation();
       });
-      control.addEventListener("pointermove",ev=>{
-        if(!drag || ev.pointerId!==drag.id)return;
-        const dx=ev.clientX-drag.x,dy=ev.clientY-drag.y;
-        if(!drag.moved && Math.hypot(dx,dy)<5)return;
-        if(!drag.moved)hidePanels();
-        drag.moved=true;ev.preventDefault();ev.stopPropagation();update(drag.left+dx,drag.top+dy);
-      });
-      const finish=(ev,cancel)=>{
-        if(!drag || ev.pointerId!==drag.id)return;
-        const moved=drag.moved,previous=drag.previous;
-        drag=null;activeBarDrag=null;
-        if(control.hasPointerCapture(ev.pointerId))control.releasePointerCapture(ev.pointerId);
-        if(cancel){barPosition=previous;positionRevision++;syncDismissControls();}
-        else if(moved){suppressClick=true;setTimeout(()=>{suppressClick=false;},0);rememberBarPosition();ev.preventDefault();ev.stopPropagation();}
-      };
-      control.addEventListener("pointerup",ev=>finish(ev,false));
-      control.addEventListener("pointercancel",ev=>finish(ev,true));
-      control.addEventListener("lostpointercapture",ev=>finish(ev,true));
     }
     grip.addEventListener("click",ev=>{ev.preventDefault();ev.stopPropagation();});
     grip.addEventListener("keydown",ev=>{
@@ -2000,6 +2047,8 @@
       (info.audio || []).length,
       expSig(info.streams), expSig(info.videoOnly), expSig(info.audio),
       urlSig(info.streams), urlSig(info.videoOnly), urlSig(info.audio),
+      // Sizes arrive later on SPA navigation (fetched watch page): rebuild.
+      Object.keys(info.sizes || {}).length,
     ];
     const sig = sigParts.join("|");
     // NOTE: the old button/panel were already dropped above when they
@@ -2064,9 +2113,11 @@
       const audioSz = (kind === "v" && !viaApp && bestAudio && bestAudio._size > 0)
         ? bestAudio._size
         : 0;
+      const exact = st._size > 0;
       entries.push({
         h: hh,
-        size: (st._size || 0) + audioSz,
+        size: (exact ? st._size : (st._est || 0)) + audioSz,
+        approx: !exact && st._est > 0,
         dur: st._dur || 0,
         st,
         // Ciphered/"via app" rows have no container pairing of their own —
@@ -2099,6 +2150,7 @@
         return k ? sizeByQ[k] : 0;
       };
       const haveH = new Set(entries.map((e) => e.h));
+      const ladderDur = Math.max(0, ...Object.values(info.sizes || {}).map((m) => (m && m.dur) || 0));
       for (const q of [1080, 720, 480, 360, 240, 144]) {
         if (haveH.has(q)) continue;
         const label = `${q}p`;
@@ -2106,12 +2158,12 @@
         entries.push({
           h: q,
           size: sz,
-          dur: 0,
+          dur: ladderDur,
           st: null,
           format: "MP4 via app",
           res: RES_WH[label],
           tip: `${label} · MP4 · the app resolves this quality itself`,
-          send: () => sendDownload(location.href, fname, "video/mp4", sz || null, null, label, null),
+          send: () => sendDownload(location.href, fname, "video/mp4", sz || null, null, label, ladderDur || null),
         });
       }
     }
@@ -2122,7 +2174,7 @@
     const hasDirect = entries.some((e) => e.st && e.st.url);
     const infoOf = (e) => ({
       res: e ? e.res : "",
-      size: e && e.size > 0 ? fmtSize(e.size) : "",
+      size: e && e.size > 0 ? (e.approx ? "~" : "") + fmtSize(e.size) : "",
       format: e ? e.format.split(" ")[0] : "MP4",
     });
     let api = null;
@@ -2150,7 +2202,7 @@
       const it = api.addQuality({
         format: e.format,
         res: e.res,
-        size: e.size > 0 ? fmtSize(e.size) : "",
+        size: e.size > 0 ? (e.approx ? "~" : "") + fmtSize(e.size) : "",
         tip: e.tip,
         send: e.send,
         onPick: () => api.setInfo(infoOf(e)),
@@ -2315,7 +2367,12 @@
                 const best = bestSniffed(items);
                 if (best) {
                   const base = mediaBase(best.url);
-                  sendDownload(best.url, base + ".mp4", best.mime, best.size || null);
+                  // Page readers hand over a video track with its audio pair
+                  // (merged by the app) and the player's duration.
+                  const pair = best.pairUrl ? { url: best.pairUrl, mime: best.pairMime || "audio/mp4" } : null;
+                  let vdur = best.dur || null;
+                  try { const d = Math.round(v.duration); if (!vdur && Number.isFinite(d) && d > 0 && d < 86400) vdur = d; } catch (e) {}
+                  sendDownload(best.url, base + ".mp4", best.mime, best.size || null, pair, null, vdur);
                 } else {
                   sendDownload(location.href, undefined, null);
                 }

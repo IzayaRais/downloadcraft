@@ -511,6 +511,11 @@ impl ConfirmApp {
                 Ok(client) => {
                     let (mut total, _, ctype, mut disp) =
                         engine::probe(&client, &opts, &url).await;
+                    // A playlist's length is its text, not the video: show
+                    // the duration instead (as IDM does for streams).
+                    if engine::is_stream_manifest(&url, ctype.as_deref(), &page_mime) {
+                        total = None;
+                    }
                     let is_page = ctype
                         .as_deref()
                         .map(|c| c.contains("text/html"))
@@ -709,7 +714,9 @@ pub fn run() -> eframe::Result<()> {
     // Browser-measured size (menu HEAD/Range): trust it, skip probing.
     let known_size: Option<u64> = get("--size")
         .and_then(|s| s.parse::<u64>().ok())
-        .filter(|s| *s > 0);
+        .filter(|s| *s > 0)
+        // An older extension sends a playlist's text length as its size.
+        .filter(|_| !engine::is_stream_manifest(&url, None, &page_mime));
     // Browser-known media duration in seconds (best-effort badge).
     let duration_secs: u64 = get("--dur")
         .and_then(|s| s.parse::<u64>().ok())
@@ -1066,6 +1073,9 @@ impl eframe::App for ConfirmApp {
                         format!("{} • {}", format_dur(self.duration_secs), format_bytes(sz))
                     }
                     Some(sz) => format_bytes(sz),
+                    // Streams (HLS/DASH) have no size until assembled; the
+                    // duration is the useful fact, as IDM shows it.
+                    None if self.duration_secs > 0 => format_dur(self.duration_secs),
                     None => "—".to_string(),
                 }
             };

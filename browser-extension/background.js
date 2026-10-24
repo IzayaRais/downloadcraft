@@ -148,7 +148,8 @@ async function sendToHost(url, filename, extra) {
         cookie: null, mime: null };
     }
     const observedPart = [...tabMedia.values()].some(items => items.some(m => m.url === url && m.segment));
-    if (typeof DCRank !== "undefined" && (DCRank.isSegmentUrl(url) || observedPart) && !DCRank.isPlaylistUrl(url)) {
+    const wholeCapture = [...tabMedia.values()].some(items => items.some(m => m.url === url && m.whole));
+    if (typeof DCRank !== "undefined" && !wholeCapture && (DCRank.isSegmentUrl(url) || observedPart) && !DCRank.isPlaylistUrl(url)) {
       let capture = null, items = [], tab = null;
       for (const [tabId, list] of tabMedia) {
         const hit = list.find(m => m.url === url);
@@ -271,7 +272,7 @@ function noteMedia(tabId, entry) {
   if (entry.url.length > 4000) return;
   // Sniffed verdicts (a .ts behind an opaque URL, a subtitle by content)
   // outrank URL-shape guesses.
-  const kind = entry.segment ? "segment"
+  const kind = entry.whole ? "file" : entry.segment ? "segment"
     : entry.subtitle ? "subtitle" : rankKind(entry.url, entry.mime, entry);
   if (kind === "subtitle") entry.kind = "subtitle";
   // P4: a playlist on the tab demotes loose segments — they are children
@@ -534,7 +535,8 @@ async function onMediaResponse(details) {
     master: shape.master, children: shape.children,
     url: details.url,
     mime: hit.mime || meta.mime,
-    size: meta.size || 0,
+    // A playlist's byte length is its text, not the video.
+    size: hit.kind === "playlist" ? 0 : (meta.size || 0),
     pageUrl: details.documentUrl || null,
     frameId: details.tabId >= 0 ? details.frameId : undefined,
     segment: hit.kind === "segment" || undefined,
@@ -663,6 +665,9 @@ async function refreshOpenTabs() {
           target: { tabId: t.id },
           files: ["rank.js", "content.js"],
         });
+        // Page reader: catches what the open tab loads from now on.
+        await api.scripting.executeScript({ target: { tabId: t.id, allFrames: true }, files: ["page-relay.js"] });
+        await api.scripting.executeScript({ target: { tabId: t.id, allFrames: true }, files: ["page-hook.js"], world: "MAIN" });
       } catch (e) {
         /* chrome:// pages, web store, etc. — not scriptable, skip */
       }
@@ -887,6 +892,36 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       } catch (e) {
         return { queued: [] };
       }
+    }
+    // Media URLs read from the page's own API answers and player state
+    // (page-hook.js via page-relay.js). Page-supplied, so validated hard.
+    if (msg.type === "pageMedia" && Array.isArray(msg.items)) {
+      const tabId = sender && sender.tab && sender.tab.id;
+      if (tabId === undefined || tabId < 0 || typeof DCRank === "undefined") return { ok: false };
+      const cfg = await settings();
+      if (cfg.deepDetect === false) return { ok: false };
+      const http = (u) => typeof u === "string" && u.length <= 4000 && /^https?:\/\//i.test(u);
+      for (const it of msg.items.slice(0, 30)) {
+        if (!it || !http(it.url) || hostBlocked(it.url, cfg.blockHosts)) continue;
+        const mime = typeof it.mime === "string" && it.mime.length < 100 ? it.mime : "";
+        const dur = Number(it.dur);
+        noteMedia(tabId, {
+          master: false, children: [],
+          url: it.url,
+          mime,
+          size: 0,
+          pageUrl: (sender && sender.url) || null,
+          frameId: sender && sender.frameId,
+          pairUrl: http(it.pairUrl) ? it.pairUrl : undefined,
+          // A player's full video track + its audio pair is a whole file
+          // even when the CDN names it like a fragment (Bilibili .m4s).
+          whole: http(it.pairUrl) || undefined,
+          pairMime: http(it.pairUrl) && typeof it.pairMime === "string" ? it.pairMime.slice(0, 100) : undefined,
+          dur: dur > 0 && dur < 86400 ? Math.round(dur) : undefined,
+          via: "page",
+        });
+      }
+      return { ok: true };
     }
     if (msg.type === "getMedia") {      // Popup passes its tab; content scripts arrive with sender.tab.
       const tabId = (msg.tabId !== undefined)

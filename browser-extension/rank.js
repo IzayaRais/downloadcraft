@@ -320,6 +320,7 @@
     const u = (entry && entry.url) || "";
     const mime = String(entry && entry.mime || "").toLowerCase();
     if (isPlaylistUrl(u) || /^(?:application\/(?:x-mpegurl|vnd\.apple\.mpegurl|dash\+xml)|audio\/mpegurl)(?:;|$)/i.test(mime)) return "playlist";
+    if (entry && entry.whole) return "file"; // a player's full track (+ audio pair)
     if ((entry && entry.segment) || isSegmentUrl(u)) return "segment";
     if ((entry && entry.kind === "subtitle") || SUB_MIME.test(mime.split(";")[0]) || SUB_EXT.includes(extOf(u))) return "subtitle";
     return "file";

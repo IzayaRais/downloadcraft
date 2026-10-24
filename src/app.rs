@@ -2829,6 +2829,10 @@ impl CraftApp {
                 Ok(client) => {
                     let (mut total, _, ctype, mut disp) =
                         crate::engine::probe(&client, &opts, &url).await;
+                    // A playlist's length is its text, never the video size.
+                    if crate::engine::is_stream_manifest(&url, ctype.as_deref(), "") {
+                        total = None;
+                    }
                     // Page URLs (YouTube watch / generic video pages) answer
                     // HEAD with HTML and no length → resolve the media stream
                     // first so the dialog shows the real size + title (IDM-style).
@@ -3710,7 +3714,11 @@ impl CraftApp {
                     // still arriving, so a stalled transfer cannot show a rate
                     // frozen at its last value.
                     let reported = task.shared.speed_bps.load(Ordering::SeqCst) as f64;
-                    d.speed_bps = if delta > 0.0 && reported > 0.0 {
+                    // A paused transfer has no speed, whatever its last
+                    // in-flight bytes did.
+                    d.speed_bps = if task.shared.paused.load(Ordering::SeqCst) {
+                        0.0
+                    } else if delta > 0.0 && reported > 0.0 {
                         reported
                     } else if d.speed_bps <= 0.0 {
                         raw

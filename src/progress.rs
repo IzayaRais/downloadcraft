@@ -839,8 +839,9 @@ impl ProgressApp {
         row(
             "Remaining Time:",
             match item.total_bytes {
-                Some(t) => fmt_eta(t.saturating_sub(item.downloaded_bytes), item.speed_bps),
-                None => "-".into(),
+                _ if matches!(item.status, Status::Paused) => "Paused".into(),
+                Some(t) if downloading => fmt_eta(t.saturating_sub(item.downloaded_bytes), item.speed_bps),
+                _ => "-".into(),
             },
             pl().dm_txt,
             reg(13.0),
@@ -1422,7 +1423,9 @@ impl ProgressApp {
             pc.text(
                 egui::pos2(o.x + COL_TOT_X + 80.0, y + TBL_PAD),
                 egui::Align2::RIGHT_TOP,
-                format_bytes(len),
+                // A stream segment not yet fetched has no size to show (its
+                // placeholder slot is one byte wide).
+                if len <= 1 && *d == 0 { String::new() } else { format_bytes(len) },
                 reg(10.0),
                 pl().dm_dim,
             );
