@@ -2073,7 +2073,9 @@
     const fname = safeFilename(info.title);
     const tagged = (base, st) => {
       const clean = base.replace(/\.mp4$/i, "");
-      if (st.kind === "v") return `${clean} [${st.label}].mp4`;
+      // Rows the app resolves itself share the page URL: the quality in the
+      // name keeps 1080p and 720p of one video as separate files.
+      if (st.kind === "v" || (st.ciphered && st.label)) return `${clean} [${st.label}].mp4`;
       if (st.kind === "a") return `${clean} [audio]${mimeExt(st.mime)}`;
       return base;
     };
@@ -2163,7 +2165,7 @@
           format: "MP4 via app",
           res: RES_WH[label],
           tip: `${label} · MP4 · the app resolves this quality itself`,
-          send: () => sendDownload(location.href, fname, "video/mp4", sz || null, null, label, ladderDur || null),
+          send: () => sendDownload(location.href, `${fname.replace(/\.mp4$/i, "")} [${label}].mp4`, "video/mp4", sz || null, null, label, ladderDur || null),
         });
       }
     }

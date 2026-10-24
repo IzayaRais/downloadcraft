@@ -738,7 +738,7 @@ pub fn run() -> eframe::Result<()> {
     // its file present) is reported up front. A dead row (failed, or finished
     // with the file gone) is refreshed by the capture instead, so the buttons
     // never dead-end on a stale "already in queue".
-    let initial_notice = match crate::model::queued_entry(url.trim()) {
+    let initial_notice = match crate::model::queued_entry(url.trim(), &quality_pref) {
         Some((id, false)) => format!("Already in the queue (#{id})."),
         _ => String::new(),
     };
@@ -1114,10 +1114,20 @@ impl eframe::App for ConfirmApp {
                 "Filename",
                 false,
             );
-            let r_b = ui.interact(refr_btn, egui::Id::new("popup-refresh"), egui::Sense::click());
-            let g_b = ui.interact(gear_btn, egui::Id::new("popup-gear"), egui::Sense::click());
-            icon_btn(&p, refr_btn, r_b.hovered(), DmIcon::Refresh, 14.0, 1.5, pl().dm_dim);
-            icon_btn(
+            let r_b = ui
+                .interact(refr_btn, egui::Id::new("popup-refresh"), egui::Sense::click())
+                .on_hover_text("Check the size and file name again");
+            let g_b = ui
+                .interact(gear_btn, egui::Id::new("popup-gear"), egui::Sense::click())
+                .on_hover_text(if self.show_adv {
+                    "Hide more options"
+                } else {
+                    "More options: category, description, referer, cookie"
+                });
+            // Square field-surface buttons, so they read as part of the
+            // filename row (bare glyphs looked like stray icons).
+            icon_btn_box(&p, refr_btn, r_b.hovered(), DmIcon::Refresh, 14.0, 1.5, pl().dm_dim);
+            icon_btn_box(
                 &p,
                 gear_btn,
                 g_b.hovered(),

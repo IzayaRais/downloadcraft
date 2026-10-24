@@ -920,11 +920,34 @@ fn entry_is_dead(d: &DownloadItem) -> bool {
 
 /// Look up a queued URL. Returns `(id, dead)`; `dead` mirrors what
 /// `append_to_queue` would do with a fresh capture of the same URL.
-pub fn queued_entry(url: &str) -> Option<(u64, bool)> {
+pub fn queued_entry(url: &str, quality: &str) -> Option<(u64, bool)> {
     let path = config_dir()?.join("queue.json");
     let items = read_queue_items(&path).ok()?;
-    let d = items.into_iter().find(|d| d.url == url)?;
+    let d = items.into_iter().find(|d| d.url == url && same_quality(&d.quality_pref, quality))?;
     Some((d.id, entry_is_dead(&d)))
+}
+
+/// Two requests for one page URL are the same download only at the same
+/// quality: a YouTube watch page queued at 1080p and again at 720p is two
+/// files.
+fn same_quality(a: &str, b: &str) -> bool {
+    a.trim().eq_ignore_ascii_case(b.trim())
+}
+
+/// `dest`, or "name (n).ext" when another queued row (or a file on disk)
+/// already owns that path.
+fn dest_free_of_queue(items: &[DownloadItem], dest: &std::path::Path) -> std::path::PathBuf {
+    let taken = |p: &std::path::Path| p.exists() || items.iter().any(|d| d.dest_path() == p);
+    if !taken(dest) {
+        return dest.to_path_buf();
+    }
+    let parent = dest.parent().map(|p| p.to_path_buf()).unwrap_or_default();
+    let stem = dest.file_stem().map(|s| s.to_string_lossy().to_string()).unwrap_or_else(|| "download".to_string());
+    let ext = dest.extension().map(|e| format!(".{}", e.to_string_lossy())).unwrap_or_default();
+    (1..1000)
+        .map(|n| parent.join(format!("{stem} ({n}){ext}")))
+        .find(|p| !taken(p))
+        .unwrap_or_else(|| dest.to_path_buf())
 }
 
 /// Append an item to the shared queue file with a fresh id (used by the
@@ -950,7 +973,7 @@ fn append_to_queue_at(path: &std::path::Path, item: &mut DownloadItem) -> Append
         Ok(v) => v,
         Err(e) => return AppendResult::Error(e),
     };
-    if let Some(pos) = items.iter().position(|d| d.url == item.url) {
+    if let Some(pos) = items.iter().position(|d| d.url == item.url && same_quality(&d.quality_pref, &item.quality_pref)) {
         // Same URL again. Reuse the row unless it is dead (failed, or finished
         // with the file gone) — then refresh it so "Start Download" always
         // works instead of dead-ending on "already in queue".
@@ -972,6 +995,16 @@ fn append_to_queue_at(path: &std::path::Path, item: &mut DownloadItem) -> Append
             Ok(()) => AppendResult::Added(id),
             Err(e) => AppendResult::Error(e),
         };
+    }
+    // Another quality of the same page wanting the same file name gets its
+    // own name instead of taking over that row.
+    if let Some(pos) = find_dest_clash(&items, &item.dest_path()) {
+        if items[pos].url == item.url && !same_quality(&items[pos].quality_pref, &item.quality_pref) {
+            let free = dest_free_of_queue(&items, &item.dest_path());
+            if let Some(name) = free.file_name() {
+                item.filename = name.to_string_lossy().to_string();
+            }
+        }
     }
     if let Some(pos) = find_dest_clash(&items, &item.dest_path()) {
         let id = items[pos].id;
@@ -1279,6 +1312,33 @@ mod tests {
         );
         assert_eq!(append_to_queue_at(&p, &mut again), AppendResult::AlreadyQueued(1));
         assert_eq!(read_queue_items(&p).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn other_quality_of_one_page_is_its_own_download() {
+        let dir = std::env::temp_dir().join("dc_append_quality_test");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = dir.join("queue.json");
+        std::fs::write(&p, "[]").unwrap();
+        let page = "https://www.youtube.com/watch?v=x";
+        let item = |q: &str| {
+            let mut d = DownloadItem::new(0, page.into(), "Video.mp4".into(), dir.to_string_lossy().into(), 8);
+            d.quality_pref = q.into();
+            d
+        };
+        assert_eq!(append_to_queue_at(&p, &mut item("1080p")), AppendResult::Added(1));
+        // Same page, other quality, same suggested name: a second row with
+        // its own file, never "already queued" or a takeover of row 1.
+        assert_eq!(append_to_queue_at(&p, &mut item("720p")), AppendResult::Added(2));
+        let items = read_queue_items(&p).unwrap();
+        assert_eq!(items.len(), 2);
+        assert_eq!(items[0].quality_pref, "1080p");
+        assert_eq!(items[0].filename, "Video.mp4");
+        assert_eq!(items[1].filename, "Video (1).mp4");
+        // The same quality again is still a duplicate.
+        assert_eq!(append_to_queue_at(&p, &mut item("720P")), AppendResult::AlreadyQueued(2));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

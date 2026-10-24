@@ -5546,6 +5546,9 @@ async fn download_with_ytdlp(
         .arg("before_dl:dcinfo@{\"duration\":%(duration)j,\"acodec\":%(acodec)j}")
         .arg("--print").arg("after_move:dcfile@%(filepath)j")
         .arg("--newline")
+        // `--print` implies quiet mode, which hides progress: without this
+        // the window sat at 0 B / "Getting info" until the file was done.
+        .arg("--progress")
         .arg("--progress-template")
         .arg(ytdlp_progress_template())
         .arg("--retries")
@@ -9918,6 +9921,15 @@ mod audit_helper_tests {
         }
     }
     impl Drop for Temp { fn drop(&mut self) {let _=std::fs::remove_dir_all(&self.0);} }
+    #[tokio::test]
+    async fn helper_progress_stays_visible_despite_print_quiet_mode() {
+        // `--print` makes yt-dlp quiet; without `--progress` the window showed
+        // 0 B until the end. The fake refuses to run without the flag.
+        let temp=Temp::new();let dest=temp.0.join("clip.mp4");
+        let exe=temp.script("import sys,pathlib,json\nif '--progress' not in sys.argv: sys.exit(3)\np=pathlib.Path(sys.argv[sys.argv.index('-o')+1]).with_suffix('.mp4')\np.write_bytes(b'video bytes')\nprint('dcfile@'+json.dumps(str(p)))");
+        download_with_ytdlp(&exe,"https://example.com/media",&dest,1,&EngineOpts::default(),&Arc::new(SharedState::new())).await.unwrap();
+        assert_eq!(std::fs::read(&dest).unwrap(),b"video bytes");
+    }
     #[tokio::test]
     async fn exact_reported_output_is_used_and_neighboring_files_are_untouched() {
         let temp=Temp::new();let dest=temp.0.join("clip.mp4");
