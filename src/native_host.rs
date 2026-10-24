@@ -165,9 +165,15 @@ fn read_message() -> HostFrame {
         return HostFrame::Eof; // clean close
     }
     if len > 4 * 1024 * 1024 {
-        // Length prefix is corrupt; the stream cannot be resynced, so the
-        // only honest action is to exit rather than misparse everything.
-        return HostFrame::Eof;
+        // Bigger than any real request. The length itself is valid framing,
+        // so skip exactly that many bytes and keep serving: exiting dropped
+        // every later capture on this port. Only a stream that ends early
+        // (a corrupt prefix) closes the host.
+        let skipped = std::io::copy(&mut std::io::stdin().take(len as u64), &mut std::io::sink());
+        return match skipped {
+            Ok(n) if n == len as u64 => HostFrame::Bad(format!("message too large ({len} bytes)")),
+            _ => HostFrame::Eof,
+        };
     }
     let mut buf = vec![0u8; len];
     if std::io::stdin().read_exact(&mut buf).is_err() {
@@ -284,9 +290,20 @@ fn spawn_confirm(msg: &Incoming) {
     if let Some(f) = msg.filename.clone().filter(|s| !s.trim().is_empty()) {
         cmd.arg("--filename").arg(f);
     }
-    if let Some(r) = msg.page_url.clone().filter(|s| !s.trim().is_empty()) {
-        cmd.arg("--referer").arg(r);
-    } else if let Some(r) = msg.referer.clone().filter(|s| !s.trim().is_empty()) {
+    // The engine reads this as both the Referer and "the page the media came
+    // from" (YouTube fresh-link retry, social page fallback), so the page
+    // wins over an origin-only Referer ("https://www.youtube.com/"). A
+    // Referer with a real path is an embedded player's page, which the CDN
+    // checks (sending the article URL instead got 403s): that one wins.
+    let page = msg.page_url.clone().filter(|s| !s.trim().is_empty());
+    let captured = msg.referer.clone().filter(|s| !s.trim().is_empty());
+    let has_path = |u: &str| reqwest::Url::parse(u).map(|x| x.path() != "/" && !x.path().is_empty()).unwrap_or(false);
+    let pick = match (page, captured) {
+        (Some(p), Some(r)) if r != p && has_path(&r) => Some(r),
+        (Some(p), _) => Some(p),
+        (None, r) => r,
+    };
+    if let Some(r) = pick {
         cmd.arg("--referer").arg(r);
     }
     // The dialog claims credentials from the owner-only inbox.

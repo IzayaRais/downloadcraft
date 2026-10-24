@@ -201,20 +201,33 @@ async fn fetch_html(
     opts: &EngineOpts,
     url: &str,
 ) -> Option<String> {
-    let text = opts
-        .get(client, url)
-        .send()
-        .await
-        .ok()?
-        .error_for_status()
-        .ok()?
-        .text()
-        .await
-        .ok()?;
-    if text.len() > 4 * 1024 * 1024 {
+    const MAX_PAGE: usize = 4 * 1024 * 1024;
+    let resp = opts.get(client, url).send().await.ok()?.error_for_status().ok()?;
+    // Crawled links without an extension are often the files themselves
+    // (/download?id=5): only pages are read, and never past the cap. The
+    // whole body used to be loaded first, so a multi-GB file filled RAM.
+    let ctype = resp
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    if !ctype.is_empty() && !(ctype.contains("html") || ctype.contains("xml") || ctype.starts_with("text/")) {
         return None;
     }
-    Some(text)
+    if resp.content_length().is_some_and(|n| n > MAX_PAGE as u64) {
+        return None;
+    }
+    use futures_util::StreamExt;
+    let mut body = Vec::new();
+    let mut stream = resp.bytes_stream();
+    while let Some(chunk) = stream.next().await {
+        body.extend_from_slice(&chunk.ok()?);
+        if body.len() > MAX_PAGE {
+            return None;
+        }
+    }
+    Some(String::from_utf8_lossy(&body).into_owned())
 }
 
 /// Crawl one page (depth 0) or the page + same-host linked pages (depth 1,

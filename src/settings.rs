@@ -305,6 +305,8 @@ struct SettingsApp {
     ffmpeg: Option<crate::engine::FfmpegInfo>,
     ffmpeg_msg: String,
     ffmpeg_busy: bool,
+    /// The tools install (run on the yt-dlp channel) is writing ffmpeg.
+    ffmpeg_installing: bool,
     ffmpeg_rx: Option<std::sync::mpsc::Receiver<(String, crate::engine::FfmpegInfo)>>,
     /// Which plugin cards are expanded (yt-dlp starts open, like the concept).
     plugins_open: [bool; 2],
@@ -432,6 +434,7 @@ pub fn run() -> eframe::Result<()> {
         ffmpeg: None,
         ffmpeg_msg: String::new(),
         ffmpeg_busy: false,
+        ffmpeg_installing: false,
         ffmpeg_rx: None,
         plugins_open: [true, false],
         open_storage: false,
@@ -508,6 +511,7 @@ impl eframe::App for SettingsApp {
                 self.ffmpeg = Some(ffmpeg);
                 self.ytdlp_rx = None;
                 self.ytdlp_busy = false;
+                self.ffmpeg_installing = false;
             }
         }
         if let Some(rx) = &self.ffmpeg_rx {
@@ -569,7 +573,7 @@ impl eframe::App for SettingsApp {
                 foot_ui.spacing_mut().item_spacing = Vec2::new(8.0, 0.0);
                 if button(&mut foot_ui, "Save", false).clicked() {
                     let saved=save(&self.s);
-                    if saved {self.ytdlp_rx=Some(ytdlp_probe(false));self.ytdlp_busy=true;}
+                    if saved && self.ytdlp_rx.is_none() {self.ytdlp_rx=Some(ytdlp_probe(false));self.ytdlp_busy=true;}
                     self.notice = if saved {
                         "Saved ✓ (the main app picks it up live)".to_string()
                     } else {
@@ -613,7 +617,7 @@ impl eframe::App for SettingsApp {
 
         // The plugin probe runs on a worker thread: keep repainting while it
         // is pending so its answer appears without a mouse move.
-        if self.ytdlp_busy {
+        if self.ytdlp_busy || self.ffmpeg_busy {
             ctx.request_repaint_after(std::time::Duration::from_millis(200));
         }
     }
@@ -2702,26 +2706,57 @@ impl SettingsApp {
             if set_custom.is_none() {
                 self.s.ytdlp_source = src.to_string();
                 // Keep the old switch truthful for anything still reading it,
-                // then re-ask so the status line matches the new choice.
+                // then re-ask so the status line matches the new choice. The
+                // probe reads ui.json, so the choice is committed first (as
+                // the ffmpeg card does); otherwise it described the old one
+                // until Save.
                 self.s.ytdlp_prefer_path = src == "path";
-                self.ytdlp_rx = Some(ytdlp_probe(false));
-                self.ytdlp_busy = true;
-                self.ytdlp_msg.clear();
+                crate::model::ui_pref_set_str("ytdlp_source", src);
+                self.run_ytdlp_job(|| ytdlp_probe(false));
             }
         }
         if let Some(p) = set_custom {
             self.s.ytdlp_custom_path = p;
             self.s.ytdlp_source = "custom".to_string();
             self.s.ytdlp_prefer_path = false;
-            self.ytdlp_rx = Some(ytdlp_probe(false));
-            self.ytdlp_busy = true;
-            self.ytdlp_msg.clear();
+            crate::model::ui_pref_set_str("ytdlp_source", "custom");
+            crate::model::ui_pref_set_str("ytdlp_custom_path", &self.s.ytdlp_custom_path);
+            self.run_ytdlp_job(|| ytdlp_probe(false));
         }
         if redownload {
-            self.ytdlp_rx = Some(ytdlp_probe(true));
-            self.ytdlp_busy = true;
-            self.ytdlp_msg.clear();
+            self.run_ytdlp_job(|| ytdlp_probe(true));
         }
+    }
+
+    /// Start a yt-dlp card job unless one still runs: replacing its receiver
+    /// dropped that job's result ("Updated yt-dlp X → Y") and cleared the
+    /// busy state while it was still writing the executable.
+    fn run_ytdlp_job(
+        &mut self,
+        job: impl FnOnce() -> std::sync::mpsc::Receiver<(String, crate::engine::YtdlpInfo, crate::engine::FfmpegInfo)>,
+    ) {
+        if self.ytdlp_rx.is_some() {
+            self.ytdlp_msg = "Still finishing the previous step — try again in a moment.".to_string();
+            return;
+        }
+        self.ytdlp_rx = Some(job());
+        self.ytdlp_busy = true;
+        self.ytdlp_msg.clear();
+    }
+
+    /// Same for the ffmpeg card; the tools install (which runs on the yt-dlp
+    /// channel) also writes ffmpeg, so it blocks these too.
+    fn run_ffmpeg_job(
+        &mut self,
+        job: impl FnOnce() -> std::sync::mpsc::Receiver<(String, crate::engine::FfmpegInfo)>,
+    ) {
+        if self.ffmpeg_rx.is_some() || self.ffmpeg_installing {
+            self.ffmpeg_msg = "Still finishing the previous step — try again in a moment.".to_string();
+            return;
+        }
+        self.ffmpeg_rx = Some(job());
+        self.ffmpeg_busy = true;
+        self.ffmpeg_msg.clear();
     }
 
     /// ffmpeg: the concept's second card, closed by default — with real
@@ -2958,9 +2993,7 @@ impl SettingsApp {
             if set_custom.is_none() {
                 self.s.ffmpeg_source = src.to_string();
                 crate::model::ui_pref_set_str("ffmpeg_source", src);
-                self.ffmpeg_rx = Some(ffmpeg_probe(false));
-                self.ffmpeg_busy = true;
-                self.ffmpeg_msg.clear();
+                self.run_ffmpeg_job(|| ffmpeg_probe(false));
             }
         }
         if let Some(p) = set_custom {
@@ -2968,21 +3001,16 @@ impl SettingsApp {
             self.s.ffmpeg_custom_path = p;
             crate::model::ui_pref_set_str("ffmpeg_source", "custom");
             crate::model::ui_pref_set_str("ffmpeg_custom_path", &self.s.ffmpeg_custom_path);
-            self.ffmpeg_rx = Some(ffmpeg_probe(false));
-            self.ffmpeg_busy = true;
-            self.ffmpeg_msg.clear();
+            self.run_ffmpeg_job(|| ffmpeg_probe(false));
         }
-        if install {
+        if install && self.ytdlp_rx.is_none() && self.ffmpeg_rx.is_none() {
             self.s.ffmpeg_source = "managed".to_string();
             crate::model::ui_pref_set_str("ffmpeg_source", "managed");
-            self.ytdlp_rx = Some(ffmpeg_install_probe());
-            self.ytdlp_busy = true;
-            self.ytdlp_msg.clear();
+            self.ffmpeg_installing = true;
+            self.run_ytdlp_job(ffmpeg_install_probe);
         }
         if recheck {
-            self.ffmpeg_rx = Some(ffmpeg_probe(false));
-            self.ffmpeg_busy = true;
-            self.ffmpeg_msg.clear();
+            self.run_ffmpeg_job(|| ffmpeg_probe(false));
         }
         if let Some(path) = custom_pick {
             let path = path.to_string_lossy().into_owned();
@@ -2990,18 +3018,14 @@ impl SettingsApp {
             self.s.ffmpeg_custom_path = path.clone();
             crate::model::ui_pref_set_str("ffmpeg_source", "custom");
             crate::model::ui_pref_set_str("ffmpeg_custom_path", &path);
-            self.ffmpeg_rx = Some(ffmpeg_probe(false));
-            self.ffmpeg_busy = true;
-            self.ffmpeg_msg.clear();
+            self.run_ffmpeg_job(|| ffmpeg_probe(false));
         }
         if clear_custom {
             self.s.ffmpeg_source = "path".to_string();
             self.s.ffmpeg_custom_path.clear();
             crate::model::ui_pref_set_str("ffmpeg_source", "path");
             crate::model::ui_pref_set_str("ffmpeg_custom_path", "");
-            self.ffmpeg_rx = Some(ffmpeg_probe(false));
-            self.ffmpeg_busy = true;
-            self.ffmpeg_msg.clear();
+            self.run_ffmpeg_job(|| ffmpeg_probe(false));
         }
         if redownload {
             // Re-download means "use the copy this app keeps up to date", so
@@ -3009,9 +3033,7 @@ impl SettingsApp {
             // ui.json, not this form's unsaved state).
             self.s.ffmpeg_source = "managed".to_string();
             crate::model::ui_pref_set_str("ffmpeg_source", "managed");
-            self.ffmpeg_rx = Some(ffmpeg_probe(true));
-            self.ffmpeg_busy = true;
-            self.ffmpeg_msg.clear();
+            self.run_ffmpeg_job(|| ffmpeg_probe(true));
         }
     }
 

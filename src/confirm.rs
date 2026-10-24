@@ -197,6 +197,12 @@ struct ConfirmApp {
     folder_rules: Vec<crate::model::FolderRule>,
     probing: bool,
     probe_size: Option<u64>,
+    /// Size the browser measured in its own session (`--size`): what a
+    /// refused off-session re-probe falls back to instead of "—".
+    browser_size: Option<u64>,
+    /// The name the dialog made up itself (no `--filename`), while the user
+    /// has not changed it: a server/title name may replace exactly that.
+    auto_name: Option<String>,
     probe_rx: Option<Receiver<(Option<u64>, Option<String>)>>,
     rt: Option<std::sync::Arc<tokio::runtime::Runtime>>,
     centered: bool,
@@ -502,6 +508,9 @@ impl ConfirmApp {
             timeout_secs: self.timeout_secs,
             proxy_url: self.proxy_url.clone(),
             referer,
+            // The browser session claimed from the inbox: without it a
+            // login-gated file probes as 403 or as the login page's size.
+            cookie: self.cookie.clone(),
             quality_pref,
             captured_headers: engine::CapturedHeaders::for_url(&url, &self.headers),
             ..Default::default()
@@ -704,6 +713,7 @@ pub fn run() -> eframe::Result<()> {
         std::process::exit(2);
     }
     let page_mime = get("--mime").filter(|s| !s.trim().is_empty()).unwrap_or_default();
+    let named_by_caller = get("--filename").filter(|f| !f.trim().is_empty()).is_some();
     let filename = get("--filename")
         .filter(|f| !f.trim().is_empty())
         .unwrap_or_else(|| {
@@ -752,9 +762,12 @@ pub fn run() -> eframe::Result<()> {
             .build()
             .expect("tokio runtime"),
     );
+    let start_name = crate::model::apply_rename_template(&prefs.rename_template, &engine::sanitize_filename(&filename), url.trim());
     let mut app = ConfirmApp {
+        auto_name: (!named_by_caller).then(|| start_name.clone()),
+        browser_size: known_size,
         url: url.trim().to_string(),
-        filename: crate::model::apply_rename_template(&prefs.rename_template, &engine::sanitize_filename(&filename), url.trim()),
+        filename: start_name,
         category,
         remember_path: prefs.category_folders,
         save_base: prefs.save_dir,
@@ -852,12 +865,17 @@ impl eframe::App for ConfirmApp {
         if let Some(rx) = self.probe_rx.as_ref() {
             while let Ok((sz, nm)) = rx.try_recv() {
                 self.probing = false;
-                self.probe_size = sz;
+                // A refused re-probe (off-session 403) must not erase the
+                // size the browser measured in its own session.
+                self.probe_size = sz.or(self.browser_size);
                 if let Some(n) = nm {
-                    // Prefer the server/video title when our name is a bare
-                    // URL guess (or a last-resort fallback whose timestamp
-                    // drifted since dialog open).
-                    if self.filename == filename_from_url(&self.url)
+                    // Prefer the server/video title while our name is still a
+                    // guess we made (or a last-resort fallback whose timestamp
+                    // drifted since dialog open) — never over a name the
+                    // extension chose or the user typed.
+                    let untouched_guess = self.auto_name.as_deref() == Some(self.filename.as_str());
+                    if untouched_guess
+                        || self.filename == filename_from_url(&self.url)
                         || crate::model::is_fallback_filename(&self.filename)
                     {
                         self.filename = crate::model::apply_rename_template(
@@ -866,6 +884,9 @@ impl eframe::App for ConfirmApp {
                             &self.url,
                         );
                         self.category = category_of(&self.filename).to_string();
+                        if untouched_guess {
+                            self.auto_name = Some(self.filename.clone());
+                        }
                     }
                 }
             }

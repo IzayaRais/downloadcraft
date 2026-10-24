@@ -4154,12 +4154,15 @@ impl CraftApp {
             {
                 next = Some(i);
             } else if is_download_url(&i.url)
-                && !queued(&i, &self.downloads)
+                && (!queued(&i, &self.downloads) || age_secs(&i.received_at) < CONFIRM_GRACE_SECS)
             {
                 // Young (dialog likely opening) or a later old entry: keep.
+                // A young entry for an already-queued row is kept too: it
+                // carries the re-capture's fresh cookie/headers, which its
+                // dialog claims to refresh a failed row.
                 keep.push(i);
             }
-            // Invalid URLs and already-queued duplicates are dropped.
+            // Invalid URLs and old already-queued duplicates are dropped.
         }
         // Cap the inbox (newest first by received_at) so a stuck producer
         // can't grow it without bound.
