@@ -549,7 +549,7 @@
           const list = mime.startsWith("audio/") ? e.audio : mime.startsWith("video/") ? e.video : null;
           if (!list || list.some((x) => x.url === r.base_url)) continue;
           list.push({ url: r.base_url, mime, bw: Number(r.bandwidth) || 0,
-            w: Number(r.width) || 0, h: Number(r.height) || 0 });
+            w: Number(r.width) || 0, h: Number(r.height) || 0, codecs: String(r.codecs || "") });
         }
       }
     }
@@ -592,8 +592,12 @@
       const u = o && o.image && o.image.uri;
       if (!e.thumb && typeof u === "string" && /^https:\/\//i.test(u)) e.thumb = u;
     });
+    // Per quality, H.264 first: Facebook also serves AV1/VP9 copies, which
+    // many players (Windows' own) cannot open - the joined file then looked
+    // like it had no picture or no sound.
+    const h264 = (c) => (/^(avc1|avc3|h264)/i.test(c || "") ? 1 : 0);
     for (const e of byId.values()) {
-      e.video.sort((a, b) => (b.h * b.w - a.h * a.w) || (b.bw - a.bw));
+      e.video.sort((a, b) => (b.h * b.w - a.h * a.w) || (h264(b.codecs) - h264(a.codecs)) || (b.bw - a.bw));
       e.audio.sort((a, b) => b.bw - a.bw);
     }
     return [...byId.values()].filter((e) => e.video.length || e.progressive.length

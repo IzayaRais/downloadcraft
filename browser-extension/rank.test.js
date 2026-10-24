@@ -257,3 +257,13 @@ describe("Facebook videos from the page JSON", () => {
     assert.equal(DCRank.fbPathOf("not a url"), "");
   });
 });
+
+describe("Facebook quality order", () => {
+  it("puts the H.264 copy of a quality before AV1/VP9", () => {
+    const rep = (id, codecs) => `{"mime_type":"video/mp4","codecs":"${codecs}","base_url":"https:\/\/s.fbcdn.net\/v\/${id}.mp4","bandwidth":1,"width":720,"height":1280}`;
+    const t = `"all_video_dash_prefetch_representations":[{"video_id":"9999999","representations":[${rep("av1", "av01.0.05M.08")},${rep("avc", "avc1.64001F")},${rep("vp9", "vp09.00.31.08")}]}]`;
+    const [v] = DCRank.fbVideos(t);
+    assert.match(v.video[0].url, /avc\.mp4$/);
+    assert.equal(v.video[0].codecs, "avc1.64001F");
+  });
+});

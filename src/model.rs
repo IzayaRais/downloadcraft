@@ -972,6 +972,32 @@ pub fn append_to_queue(item: &mut DownloadItem) -> AppendResult {
     append_to_queue_at(&path, item)
 }
 
+/// Add a download that already finished elsewhere (the browser extension's
+/// "Download in browser") as a Completed row, so it shows in the app's list
+/// with Open file / Open folder. A row for the same file is not added twice.
+pub fn record_finished(item: &mut DownloadItem) -> AppendResult {
+    let _guard = fs_lock("queue");
+    if !_guard.owned() { return AppendResult::Error("Queue is busy; retry shortly".into()); }
+    let path = match config_dir() {
+        Some(d) => d.join("queue.json"),
+        None => return AppendResult::Error("no config directory".to_string()),
+    };
+    let mut items = match read_queue_items(&path) {
+        Ok(v) => v,
+        Err(e) => return AppendResult::Error(e),
+    };
+    if let Some(d) = items.iter().find(|d| d.dest_path() == item.dest_path()) {
+        return AppendResult::AlreadyQueued(d.id);
+    }
+    item.id = next_queue_id(&path, &items);
+    item.status = Status::Completed;
+    items.push(item.clone());
+    match write_queue(&path, &items) {
+        Ok(()) => AppendResult::Added(item.id),
+        Err(e) => AppendResult::Error(e),
+    }
+}
+
 /// Next queue id. Ids are never reused, even after the newest row is
 /// removed: the main window treats an id it has seen disappear as deleted
 /// and silently drops a later row that reuses it (a dialog's "starting it"

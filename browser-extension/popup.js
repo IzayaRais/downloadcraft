@@ -51,6 +51,25 @@ let hostOk = false;
 // Re-renders the Videos tab with what was last found (filters, state changes).
 let lastRender = null;
 let filterKind = prefs.filter || "all";
+// 🗑 Clear: cards hidden for this tab and page until ⟳ Rescan (or the page
+// changes). Kept in session storage, so reopening the popup keeps them gone.
+let hidden = { key: "", keys: new Set() };
+let shownKeys = [];
+async function loadHidden(tab) {
+  hidden = { key: tab && tab.id !== undefined ? `hidden:${tab.id}` : "", keys: new Set(), url: (tab && tab.url) || "" };
+  if (!hidden.key || !chrome.storage.session) return;
+  try {
+    const got = (await chrome.storage.session.get(hidden.key))[hidden.key];
+    if (got && got.url === hidden.url) hidden.keys = new Set(got.keys || []);
+  } catch (e) { /* session storage unavailable */ }
+}
+async function saveHidden() {
+  if (!hidden.key || !chrome.storage.session) return;
+  try {
+    if (hidden.keys.size) await chrome.storage.session.set({ [hidden.key]: { url: hidden.url, keys: [...hidden.keys] } });
+    else await chrome.storage.session.remove(hidden.key);
+  } catch (e) { /* ignore */ }
+}
 
 // ---------- tabs ----------
 let pollTimer = 0;
@@ -202,8 +221,10 @@ document.addEventListener("click", () => { if (openMenu) { openMenu.remove(); op
 // mode "app": every option, sent to the app; "browser": only options the
 // browser can fetch itself (a page link only the app can resolve is left out).
 function card(item, mode) {
-  const options = mode === "browser" ? item.options.filter((o) => o.browser) : item.options;
-  if (!options.length) return null;
+  // In the browser section a quality the browser cannot fetch itself stays
+  // listed (greyed, "needs app") so it is clear why it cannot be saved here.
+  const options = item.options;
+  if (mode === "browser" && !options.some((o) => o.browser)) return null;
   const el = document.createElement("div");
   el.className = "card";
   const th = document.createElement("div");
@@ -240,9 +261,11 @@ function card(item, mode) {
   options.forEach((o, i) => {
     const op = document.createElement("option");
     op.value = String(i);
-    op.textContent = o.label;
+    op.textContent = mode === "browser" && !o.browser ? `${o.label} — needs app` : o.label;
+    if (mode === "browser" && !o.browser) op.disabled = true;
     sel.appendChild(op);
   });
+  if (mode === "browser") sel.value = String(options.findIndex((o) => o.browser));
   if (options.length < 2) sel.disabled = true;
   const showSize = () => {
     const o = options[Number(sel.value)] || {};
@@ -284,6 +307,12 @@ function card(item, mode) {
   };
   row.append(sel, dl, more);
   body.append(title, meta, row);
+  if (mode === "browser" && item.tag === "YOUTUBE" && options.some((o) => !o.browser)) {
+    const hint = document.createElement("div");
+    hint.className = "meta";
+    hint.textContent = "YouTube hides its HD links from the browser — HD needs the app.";
+    body.appendChild(hint);
+  }
   el.append(th, body);
   showSize();
   return el;
@@ -349,7 +378,7 @@ function youtubeItem(v, pageUrl) {
   (v.audio || []).forEach((st) => pushStream(st, "a"));
   opts.sort((a, b) => b.h - a.h);
   const firstDur = (v.streams || []).concat(v.videoOnly || []).map((s) => s._dur).find((x) => x > 0) || dur;
-  return { kind: "videos", title: v.title || v.videoId, thumb: v.thumb, dur: firstDur, tag: "YOUTUBE", link: page, page, options: opts };
+  return { key: `yt:${v.videoId}`, kind: "videos", title: v.title || v.videoId, thumb: v.thumb, dur: firstDur, tag: "YOUTUBE", link: page, page, options: opts };
 }
 
 // A Facebook video from its own JSON (content.js fbStoredVideos): every
@@ -390,7 +419,7 @@ function facebookItem(e, pageUrl) {
       msg: { type: "download", url: a.url, filename: `${stem} [audio].m4a`, pageUrl, dur: dur || null },
     });
   }
-  return { kind: "videos", title: e.title || "Facebook video", thumb: e.thumb, dur, tag: "FACEBOOK", link: pageUrl, page: pageUrl, options: opts };
+  return { key: `fb:${e.id}`, kind: "videos", title: e.title || "Facebook video", thumb: e.thumb, dur, tag: "FACEBOOK", link: pageUrl, page: pageUrl, options: opts };
 }
 
 // Everything the page offers, as cards: [{kind: "videos"|"streams"|"other", ...}].
@@ -420,6 +449,7 @@ function collectItems(peek, pageUrl) {
     const name = isStream || isSub ? undefined : safeName(pageTitle || "video", /^audio\//i.test(n.mime || "") ? ".m4a" : ".mp4");
     const streamName = safeName(pageTitle || "video", ".mp4");
     items.push({
+      key: `net:${n.url}`,
       kind: isStream ? "streams" : isSub || kind === "segment" ? "other" : "videos",
       title: pageTitle || "Video",
       thumb: n.thumb, dur: n.dur, tag, link: n.url, page: pageUrl,
@@ -434,6 +464,7 @@ function collectItems(peek, pageUrl) {
   for (const l of (peek.links || [])) {
     if (!/^https?:\/\//i.test(l.url)) continue; // defense-in-depth: never offer odd schemes
     items.push({
+      key: `link:${l.url}`,
       kind: "other",
       title: l.text || l.url, thumb: l.thumb, tag: tagOf(l.url, ""), link: l.url, page: pageUrl,
       options: [{ label: "File", url: l.url, browser: browserJob(l.url, ""), msg: { type: "download", url: l.url, pageUrl: pageUrl || undefined } }],
@@ -469,7 +500,8 @@ function render(peek, pageUrl) {
   lastRender = () => render(peek, pageUrl);
   const box = $("videos");
   box.textContent = "";
-  const all = collectItems(peek, pageUrl);
+  const all = collectItems(peek, pageUrl).filter((it) => !hidden.keys.has(it.key));
+  shownKeys = collectItems(peek, pageUrl).map((it) => it.key);
   const q = $("q").value.trim().toLowerCase();
   const items = all.filter((it) => (filterKind === "all" || it.kind === filterKind)
     && (!q || String(it.title || "").toLowerCase().includes(q) || String(it.tag || "").toLowerCase().includes(q)));
@@ -479,7 +511,9 @@ function render(peek, pageUrl) {
     e.className = "empty";
     e.innerHTML = all.length
       ? "<b>Nothing matches</b>Clear the filter or the search to see everything."
-      : "<b>No videos found yet</b>Play the video on this page, then open this again.";
+      : hidden.keys.size
+        ? "<b>List cleared</b>Press ⟳ to look for videos on this page again."
+        : "<b>No videos found yet</b>Play the video on this page, then open this again.";
     box.appendChild(e);
     return;
   }
@@ -692,6 +726,7 @@ async function activeTab() {
 
 async function loadVideos() {
   const tab = await activeTab();
+  await loadHidden(tab);
   const tabUrl = (tab && tab.url && /^https?:\/\//i.test(tab.url)) ? tab.url : null;
   if (tab && tab.id !== undefined) {
     try {
@@ -721,10 +756,23 @@ async function loadVideos() {
     }
   );
 }
-$("refreshBtn").onclick = () => { status("Looking again…"); loadVideos().then(() => status("")); };
+// ⟳ Rescan: show everything again, freshly read from the page.
+$("refreshBtn").onclick = async () => {
+  status("Looking again…");
+  hidden.keys.clear();
+  await saveHidden();
+  await loadVideos();
+  status("");
+};
+// 🗑 Clear: drop what was found (the sniffer's list and the cards the page
+// itself reports) until ⟳ Rescan.
 $("clearBtn").onclick = async () => {
   const tab = await activeTab();
+  for (const k of shownKeys) hidden.keys.add(k);
+  await saveHidden();
   if (tab && tab.id !== undefined) chrome.runtime.sendMessage({ type: "clearMedia", tabId: tab.id }, () => loadVideos());
+  else if (lastRender) lastRender();
+  status("Cleared — press ⟳ to look for videos again", "ok");
 };
 
 loadVideos();

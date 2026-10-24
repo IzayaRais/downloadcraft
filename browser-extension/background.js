@@ -927,6 +927,16 @@ function captureBrowserDownload(item) {
 chrome.downloads.onCreated.addListener(item => { void captureBrowserDownload(item); });
 if (chrome.downloads.onDeterminingFilename) {
   chrome.downloads.onDeterminingFilename.addListener((item,suggest) => {
+    // Our own "Download in browser" files: while any extension listens here,
+    // Chrome drops the name given to downloads.download() unless it is
+    // suggested again - which is how joined videos were saved as the blob's
+    // random id ("b26cd39c-….mp4") in the bare Downloads folder.
+    const ours = item.byExtensionId === chrome.runtime.id
+      && (bdlNames.get(item.url) || bdlNames.get(item.finalUrl));
+    if (ours) {
+      try { suggest({ filename: ours, conflictAction: "uniquify" }); } catch (e) {}
+      return false;
+    }
     captureBrowserDownload(item).finally(() => { try { suggest(); } catch (e) {} });
     return true;
   });
@@ -971,8 +981,33 @@ try {
 // file is then saved through chrome.downloads as well.
 const bdlJobs = new Map(); // id -> job record (this session)
 const bdlCtl = new Map(); // id -> AbortController (Firefox in-page runs)
+const bdlNames = new Map(); // download URL -> relative path to save it under
 let bdlSeq = 0;
 const BDL_HISTORY_MAX = 50;
+
+// The app's category folders (model::category_of), inside the browser's
+// Downloads folder - the browser cannot save anywhere else - so a file
+// saved in the browser lands where the app would put it by default.
+function bdlCategory(name) {
+  const ext = String(name || "").split(".").pop().toLowerCase();
+  if (["mp4", "mkv", "avi", "mov", "webm", "ts", "m4s"].includes(ext)) return "Video";
+  if (["mp3", "wav", "flac", "ogg", "m4a"].includes(ext)) return "Music";
+  if (["png", "jpg", "jpeg", "gif", "webp", "svg", "bmp", "ico"].includes(ext)) return "Image";
+  if (["pdf", "doc", "docx", "txt", "epub"].includes(ext)) return "Document";
+  if (["zip", "rar", "7z", "tar", "gz"].includes(ext)) return "Compressed";
+  if (["exe", "msi"].includes(ext)) return "Apps";
+  return "Other";
+}
+// downloads.download() with the name (and category folder) Chrome must use.
+async function bdlDownload(url, name) {
+  const path = `${bdlCategory(name)}/${name}`;
+  bdlNames.set(url, path);
+  try {
+    return await api.downloads.download({ url, filename: path, conflictAction: "uniquify" });
+  } finally {
+    setTimeout(() => bdlNames.delete(url), 60000);
+  }
+}
 
 function bdlSafeName(name, fallbackUrl) {
   let n = String(name || "").trim();
@@ -1020,7 +1055,7 @@ async function bdlSaveBlob(j, blobUrl, ext, note, bytes) {
   j.blobUrl = blobUrl;
   if (note) j.note = note;
   try {
-    j.downloadId = await api.downloads.download({ url: blobUrl, filename: name, conflictAction: "uniquify" });
+    j.downloadId = await bdlDownload(blobUrl, name);
     j.filename = name;
   } catch (e) {
     await bdlRelease(j);
@@ -1047,7 +1082,7 @@ async function startBrowserDownload(msg) {
   const j = {
     id, kind, title: String(msg.title || "").slice(0, 200), filename: bdlSafeName(msg.filename, url),
     state: "running", bytes: 0, done: 0, total: 0, phase: "Starting", error: "", note: "",
-    startedAt: Date.now(), page: msg.pageUrl || "", size: 0,
+    startedAt: Date.now(), page: msg.pageUrl || "", size: 0, src: url,
   };
   bdlJobs.set(id, j);
   if (kind === "file") {
@@ -1055,7 +1090,7 @@ async function startBrowserDownload(msg) {
     // seen so automatic capture does not hand it to the app instead.
     markSeen(url, null);
     try {
-      j.downloadId = await api.downloads.download({ url, filename: j.filename, conflictAction: "uniquify" });
+      j.downloadId = await bdlDownload(url, j.filename);
       j.phase = "Downloading";
       return { ok: true, id };
     } catch (e) {
@@ -1099,9 +1134,17 @@ try {
     if (!j || !delta.state) return;
     if (delta.state.current === "complete") {
       let size = j.size;
-      try { const [d] = await api.downloads.search({ id: delta.id }); if (d) size = d.fileSize || d.totalBytes || size; } catch (e) {}
+      let path = "";
+      try {
+        const [d] = await api.downloads.search({ id: delta.id });
+        if (d) { size = d.fileSize || d.totalBytes || size; path = d.filename || ""; }
+      } catch (e) {}
       await bdlRelease(j);
-      await bdlFinish(j, "done", { size, phase: "Done" });
+      await bdlFinish(j, "done", { size, phase: "Done", path });
+      // List it in the app too (finished, with Open file / folder).
+      if (path) {
+        try { await api.runtime.sendNativeMessage(HOST, { type: "record", url: j.src, filename: path, pageUrl: j.page || null }); } catch (e) { /* app not installed */ }
+      }
     } else if (delta.state.current === "interrupted") {
       await bdlRelease(j);
       const why = (delta.error && delta.error.current) || "interrupted";

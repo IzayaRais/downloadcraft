@@ -240,6 +240,28 @@ fn app_downloads() -> Vec<serde_json::Value> {
         .collect()
 }
 
+/// A file the extension saved itself ("Download in browser"): list it in the
+/// app as finished. `filename` is the saved file's full path; it must exist.
+fn record_browser_download(msg: &Incoming) -> Result<(), String> {
+    let url = msg.url.clone().filter(|u| u.starts_with("http")).unwrap_or_default();
+    let path = std::path::PathBuf::from(msg.filename.clone().unwrap_or_default());
+    if !path.is_absolute() || !path.is_file() {
+        return Err("the saved file was not found".into());
+    }
+    let name = path.file_name().map(|n| n.to_string_lossy().to_string()).ok_or("no file name")?;
+    let dir = path.parent().map(|d| d.to_string_lossy().to_string()).ok_or("no folder")?;
+    let len = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+    let mut item = crate::model::DownloadItem::new(0, if url.is_empty() { format!("file:///{}", path.display()) } else { url }, name, dir, 1);
+    item.total_bytes = Some(len);
+    item.downloaded_bytes = len;
+    item.referer = msg.page_url.clone().unwrap_or_default();
+    item.description = "Downloaded in the browser".into();
+    match crate::model::record_finished(&mut item) {
+        crate::model::AppendResult::Error(e) => Err(e),
+        _ => Ok(()),
+    }
+}
+
 /// Queue a pause/resume/cancel order for the app (the same cmd.json the
 /// progress windows use).
 fn app_control(id: Option<u64>, action: &str) -> Result<(), String> {
@@ -595,6 +617,10 @@ pub fn run() -> eframe::Result<()> {
                 theme: None,
                 items: Some(app_downloads()),
             }),
+            "record" => match record_browser_download(&msg) {
+                Ok(()) => write_message(&Reply::ok()),
+                Err(e) => write_message(&Reply::err(e)),
+            },
             "control" => match app_control(msg.id, msg.action.as_deref().unwrap_or("")) {
                 Ok(()) => write_message(&Reply::ok()),
                 Err(e) => write_message(&Reply::err(e)),

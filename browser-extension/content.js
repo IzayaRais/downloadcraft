@@ -1647,10 +1647,48 @@
     grip.appendChild(svgIcon(12,"M8 5h.01M8 12h.01M8 19h.01M16 5h.01M16 12h.01M16 19h.01",3));
     bar.append(grip,main,close);root.append(style,bar);
     installBarDrag(host,main,grip);
-    host.__dcMain=main;host.__dcClose=close;
+    host.__dcMain=main;host.__dcClose=close;host.__dcLabel=label;
     host.setAttribute("data-dc-bar","1");
     paintBar(host);
     return host;
+  }
+
+  // A click that came before the page had loaded its video data waits for it:
+  // the bar says so ("Resolving…") instead of sending a half-known link.
+  function barBusy(host, text) {
+    try {
+      const lab = host && host.__dcLabel;
+      if (!lab) return;
+      if (host.__dcIdleText === undefined) host.__dcIdleText = lab.textContent;
+      lab.textContent = text || host.__dcIdleText;
+      host.__dcMain.style.cursor = text ? "progress" : "";
+      host.__dcBusy = !!text;
+      syncDismissControls();
+    } catch (e) { /* best effort */ }
+  }
+  // Retry `probe` every `every` ms until it returns something truthy or
+  // `tries` run out; `done` gets the result (or null).
+  function waitFor(probe, done, tries = 16, every = 600) {
+    let n = 0;
+    const step = () => {
+      let v = null;
+      try { v = probe(); } catch (e) { v = null; }
+      Promise.resolve(v).then((r) => {
+        if (r || ++n >= tries || !alive()) done(r || null);
+        else setTimeout(step, every);
+      }, () => done(null));
+    };
+    step();
+  }
+  function sniffedNow() {
+    return new Promise((resolve) => {
+      try {
+        chrome.runtime.sendMessage({ type: "getMedia", pageUrl: location.href }, (res) => {
+          if (chrome.runtime.lastError) return resolve([]);
+          resolve((res && res.items) || []);
+        });
+      } catch (e) { resolve([]); }
+    });
   }
 
   // Theme follows the app (Light / Dark / System, sent by the native host);
@@ -2227,6 +2265,8 @@
   window.addEventListener("resize",syncDismissControls);
   document.addEventListener("fullscreenchange",syncDismissControls);
 
+  // The video whose bar was clicked before its qualities were known.
+  let ytOpenWhenReady = "";
   function ensureButton(info) {
     const key = dismissalKey(null,info.videoId);
     if (dismissedVideos.has(key)) {
@@ -2464,19 +2504,46 @@
       ...(info.videoOnly || []).map((s) => s.url),
       ...(info.audio || []).map((s) => s.url),
     ]), sizePairs, bestAudio, fname);
+    // Ready = the page has handed over this video's qualities. A click before
+    // that waits ("Resolving…"): each refresh rebuilds the bar, and the first
+    // rebuild that is ready opens its own menu.
+    const ready = (info.streams || []).length + (info.videoOnly || []).length > 0
+      || Object.keys(info.sizes || {}).length > 0;
+    btn.dataset.ready = ready ? "1" : "";
+    const open = () => {
+      barBusy(btn, null);
+      hidePanels();
+      api.show();
+      positionDraggedPanel(btn, api.panel);
+    };
+    btn.__dcOpen = open;
     btn.onclick = (ev) => {
       ev.stopPropagation();
-      if (api.panel.style.display === "none") {
-        hidePanels();
-        api.show();
-        positionDraggedPanel(btn,api.panel);
-      } else {
-        api.hide();
-      }
+      if (btn.__dcBusy) return;
+      if (api.panel.style.display !== "none") { api.hide(); return; }
+      if (ready) { open(); return; }
+      ytOpenWhenReady = info.videoId;
+      barBusy(btn, "Resolving…");
+      waitFor(() => {
+        refreshYouTube();
+        const cur = document.getElementById("dc-yt-btn");
+        return cur && cur.dataset.ready === "1" ? cur : null;
+      }, (cur) => {
+        if (ytOpenWhenReady !== info.videoId) return; // opened already
+        ytOpenWhenReady = "";
+        // Still nothing after the wait: the menu can still hand the page to
+        // the app, which resolves the video itself.
+        const now = cur || document.getElementById("dc-yt-btn");
+        if (now && now.__dcOpen) now.__dcOpen();
+      });
     };
     installDcCloser();
     placeInPlayer(btn, api.panel);
     addDismissControl(btn,key,api.panel);
+    if (ytOpenWhenReady === info.videoId) {
+      if (ready) { ytOpenWhenReady = ""; setTimeout(open, 0); }
+      else barBusy(btn, "Resolving…");
+    }
   }
 
   // The popup's ⏻ switch: with detection off no bar is shown anywhere.
@@ -2604,33 +2671,27 @@
           } else {
             // Ask background for sniffed media URLs for this tab first.
             // (Facebook reels render as blob: players — the real fbcdn/mp4
-            // URL only exists in the sniffed network traffic.)
-            try {
-              chrome.runtime.sendMessage({ type: "getMedia", pageUrl: location.href }, (res) => {
-                if (chrome.runtime.lastError) {
-                  if (ctxInvalidated(chrome.runtime.lastError)) markDead();
-                  sendDownload(location.href, undefined, null);
-                  return;
-                }
-                const items = (res && res.items) || [];
-                const src = String((v && (v.currentSrc || v.src)) || "");
-                const best = bestSniffed(items, { streamPlayer: /^blob:/i.test(src) || !!(v && v.srcObject) });
-                if (best) {
-                  const base = mediaBase(best.url);
-                  // Page readers hand over a video track with its audio pair
-                  // (merged by the app) and the player's duration.
-                  const pair = best.pairUrl ? { url: best.pairUrl, mime: best.pairMime || "audio/mp4" } : null;
-                  let vdur = best.dur || null;
-                  try { const d = Math.round(v.duration); if (!vdur && Number.isFinite(d) && d > 0 && d < 86400) vdur = d; } catch (e) {}
-                  sendDownload(best.url, base + ".mp4", best.mime, best.size || null, pair, null, vdur);
-                } else {
-                  sendDownload(location.href, undefined, null);
-                }
-              });
-            } catch (e) {
-              if (ctxInvalidated(e)) markDead();
-              sendDownload(location.href, undefined, null);
-            }
+            // URL only exists in the sniffed network traffic.) Clicked before
+            // the player fetched anything: wait for it ("Capturing…") rather
+            // than sending the bare page.
+            if (pill.__dcBusy) return;
+            const src = String((v && (v.currentSrc || v.src)) || "");
+            const pick = (items) => bestSniffed(items, { streamPlayer: /^blob:/i.test(src) || !!(v && v.srcObject) });
+            barBusy(pill, "Capturing…");
+            waitFor(() => sniffedNow().then(pick), (best) => {
+              barBusy(pill, null);
+              if (best) {
+                const base = mediaBase(best.url);
+                // Page readers hand over a video track with its audio pair
+                // (merged by the app) and the player's duration.
+                const pair = best.pairUrl ? { url: best.pairUrl, mime: best.pairMime || "audio/mp4" } : null;
+                let vdur = best.dur || null;
+                try { const d = Math.round(v.duration); if (!vdur && Number.isFinite(d) && d > 0 && d < 86400) vdur = d; } catch (e) {}
+                sendDownload(best.url, base + ".mp4", best.mime, best.size || null, pair, null, vdur);
+              } else {
+                sendDownload(location.href, undefined, null);
+              }
+            }, 14, 600);
           }
         };
         try {
@@ -2707,35 +2768,36 @@
   }
 
   function handleFbPill(pill) {
-    const info = fbInfo();
-    try {
-      chrome.runtime.sendMessage({ type: "getMedia", pageUrl: location.href }, (res) => {
-        if (chrome.runtime.lastError) {
-          if (ctxInvalidated(chrome.runtime.lastError)) markDead();
-          sendDownload(location.href, fbFilename(info.title), null, null, null, null, info.durSec || null);
-          return;
-        }
-        const items = (res && res.items) || [];
-        const data = fbMenuRows(info, items);
-        // The reel's own qualities from Facebook's JSON beat the pieces the
-        // sniffer caught (each piece used to become its own row).
-        const stored = fbStoredVideos(items)[0];
-        const rows = stored ? fbStoredRows(stored, info) : data.rows;
-        if (stored && !rows.length) rows.push(...data.rows);
-        const audio = data.audio;
-        if (!rows.length) {
-          sendDownload(location.href, fbFilename(info.title), null, null, null, null, info.durSec || null);
-        } else if (rows.length === 1 && !audio.length) {
-          const r0 = rows[0];
-          sendDownload(r0.url, r0.fname, "video/mp4", r0._size || null, r0.pair || ((data.pair && !r0.fromJson) ? data.pair : null), r0.q || null, r0.dur || info.durSec || null);
-        } else {
-          openFbMenu(pill, rows, info.title, info.thumb, audio, data.pair);
-        }
-      });
-    } catch (e) {
-      if (ctxInvalidated(e)) markDead();
-      sendDownload(location.href, fbFilename(info.title), null, null, null, null, info.durSec || null);
-    }
+    if (pill.__dcBusy) return;
+    // The reel's own qualities from Facebook's JSON beat the pieces the
+    // sniffer caught (each piece used to become its own row). Clicked before
+    // either exists: wait for them ("Resolving…").
+    const gather = async () => {
+      const info = fbInfo();
+      const items = await sniffedNow();
+      const data = fbMenuRows(info, items);
+      const stored = fbStoredVideos(items)[0];
+      const rows = stored ? fbStoredRows(stored, info) : data.rows.slice();
+      if (stored && !rows.length) rows.push(...data.rows);
+      return rows.length ? { info, data, rows } : null;
+    };
+    barBusy(pill, "Resolving…");
+    waitFor(gather, (got) => {
+      barBusy(pill, null);
+      if (!got) {
+        const info = fbInfo();
+        sendDownload(location.href, fbFilename(info.title), null, null, null, null, info.durSec || null);
+        return;
+      }
+      const { info, data, rows } = got;
+      const audio = data.audio;
+      if (rows.length === 1 && !audio.length) {
+        const r0 = rows[0];
+        sendDownload(r0.url, r0.fname, "video/mp4", r0._size || null, r0.pair || ((data.pair && !r0.fromJson) ? data.pair : null), r0.q || null, r0.dur || info.durSec || null);
+      } else {
+        openFbMenu(pill, rows, info.title, info.thumb, audio, data.pair);
+      }
+    }, 14, 600);
   }
   function pullNetworkMedia() {
     try {
