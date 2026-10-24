@@ -26,6 +26,11 @@ const api = (typeof browser !== "undefined" && browser.runtime) ? browser : chro
 try {
   if (typeof importScripts === "function") importScripts("rank.js");
 } catch (e) { /* RANK stays null -> legacy paths */ }
+// "Download in browser": stream readers, MP4 joiner and the runner (the
+// runner itself works in the offscreen document on Chrome, here on Firefox).
+try {
+  if (typeof importScripts === "function") importScripts("streams.js", "mp4merge.js", "browserdl.js");
+} catch (e) { /* browser downloads of plain files still work */ }
 
 function markSeen(url, filename) {
   seen.set(url + "|" + (filename || ""), Date.now());
@@ -279,7 +284,17 @@ function canonKey(url) {
   return String(url || "").split("#")[0];
 }
 
+// Popup's ⏻: video detection on/off (kept in storage, mirrored here).
+let detectionOn = true;
+try {
+  api.storage.local.get({ detection: true }).then((r) => { detectionOn = r.detection !== false; }, () => {});
+  chrome.storage.onChanged.addListener((ch, area) => {
+    if (area === "local" && ch.detection) detectionOn = ch.detection.newValue !== false;
+  });
+} catch (e) { /* storage unavailable: stay on */ }
+
 function noteMedia(tabId, entry) {
+  if (!detectionOn) return;
   if (tabId === undefined || tabId < 0) return;
   if (!entry || !entry.url || !/^https?:\/\//i.test(entry.url)) return;
   const whole = stripFbSlice(entry.url);
@@ -833,6 +848,8 @@ async function performBrowserCapture(item) {
   const url = item.finalUrl || item.url;
   if (!url || !/^https?:\/\//i.test(url)) return; // blobs/data stay in browser
   if (!cfg.autoCapture) return;
+  // The user chose "Download in browser" for this one: never hand it back.
+  if (item.byExtensionId && item.byExtensionId === chrome.runtime.id) return;
   // DownloadItem omits the original HTTP method. Replaying a form's POST as
   // a GET loses the request body, so leave observed non-GET downloads intact.
   if (nonReplayableDownload(item.url) || nonReplayableDownload(url)) return;
@@ -946,8 +963,166 @@ try {
   }
 } catch (e) { /* downloads.onCreated remains the fallback */ }
 
+// ---- "Download in browser" (works without the app, like MAX) ----
+// A plain file goes to the browser's own downloader. A video + audio pair,
+// an HLS or a DASH stream is fetched and joined by DCBrowserDL - in Chrome's
+// offscreen document (a service worker can neither hold a long download nor
+// make a Blob URL), in Firefox's background page directly - and the joined
+// file is then saved through chrome.downloads as well.
+const bdlJobs = new Map(); // id -> job record (this session)
+const bdlCtl = new Map(); // id -> AbortController (Firefox in-page runs)
+let bdlSeq = 0;
+const BDL_HISTORY_MAX = 50;
+
+function bdlSafeName(name, fallbackUrl) {
+  let n = String(name || "").trim();
+  if (!n) {
+    try { n = decodeURIComponent(new URL(fallbackUrl).pathname.split("/").pop() || ""); } catch (e) { n = ""; }
+  }
+  n = n.replace(/[<>:"/\\|?*\u0000-\u001f]/g, "_").replace(/^\.+/, "").trim().slice(0, 150);
+  return n || "video.mp4";
+}
+function bdlPublic(j) {
+  const { id, title, filename, kind, state, bytes, done, total, phase, error, note, startedAt, endedAt, downloadId, size, page } = j;
+  return { id, title, filename, kind, state, bytes, done, total, phase, error, note, startedAt, endedAt, downloadId, size, page };
+}
+async function bdlHistory() {
+  try { return (await api.storage.local.get({ bdlHistory: [] })).bdlHistory || []; } catch (e) { return []; }
+}
+async function bdlFinish(j, state, extra) {
+  Object.assign(j, extra || {}, { state, endedAt: Date.now() });
+  const hist = await bdlHistory();
+  hist.unshift(bdlPublic(j));
+  await api.storage.local.set({ bdlHistory: hist.slice(0, BDL_HISTORY_MAX) });
+  bdlJobs.delete(j.id);
+}
+async function ensureOffscreen() {
+  if (!chrome.offscreen) return false;
+  try {
+    if (chrome.offscreen.hasDocument && await chrome.offscreen.hasDocument()) return true;
+    await chrome.offscreen.createDocument({
+      url: "offscreen.html",
+      reasons: ["BLOBS"],
+      justification: "Assemble videos downloaded in the browser into one file",
+    });
+  } catch (e) {
+    // "Only a single offscreen document" = it already exists.
+    if (!/single offscreen/i.test(String(e && e.message))) throw e;
+  }
+  return true;
+}
+// Save an assembled Blob URL under the job's name (extension fixed to what
+// was actually built: .mp4, .ts or .m4a).
+async function bdlSaveBlob(j, blobUrl, ext, note, bytes) {
+  const name = j.filename.replace(/\.(mp4|ts|m4a|webm|mkv)$/i, "") + (ext || ".mp4");
+  j.phase = "Saving";
+  j.size = bytes || 0;
+  j.blobUrl = blobUrl;
+  if (note) j.note = note;
+  try {
+    j.downloadId = await api.downloads.download({ url: blobUrl, filename: name, conflictAction: "uniquify" });
+    j.filename = name;
+  } catch (e) {
+    await bdlRelease(j);
+    await bdlFinish(j, "failed", { error: String((e && e.message) || e) });
+  }
+}
+async function bdlRelease(j) {
+  if (!j.blobUrl) return;
+  if (chrome.offscreen) {
+    try { await api.runtime.sendMessage({ target: "offscreen", type: "bdl-revoke", id: j.id }); } catch (e) {}
+  } else {
+    try { URL.revokeObjectURL(j.blobUrl); } catch (e) {}
+  }
+  j.blobUrl = "";
+}
+async function startBrowserDownload(msg) {
+  const url = String(msg.url || "");
+  const pairUrl = msg.pairUrl ? String(msg.pairUrl) : "";
+  if (!/^https?:\/\//i.test(url) || url.length > 4000 || (pairUrl && !/^https?:\/\//i.test(pairUrl))) {
+    return { ok: false, error: "only http(s) links can be downloaded" };
+  }
+  const kind = typeof DCBrowserDL !== "undefined" ? DCBrowserDL.kindFor(url, msg.mime, pairUrl) : (pairUrl ? "pair" : "file");
+  const id = `b${Date.now().toString(36)}${++bdlSeq}`;
+  const j = {
+    id, kind, title: String(msg.title || "").slice(0, 200), filename: bdlSafeName(msg.filename, url),
+    state: "running", bytes: 0, done: 0, total: 0, phase: "Starting", error: "", note: "",
+    startedAt: Date.now(), page: msg.pageUrl || "", size: 0,
+  };
+  bdlJobs.set(id, j);
+  if (kind === "file") {
+    // The browser's own downloader: resumable, in its download list. Marked
+    // seen so automatic capture does not hand it to the app instead.
+    markSeen(url, null);
+    try {
+      j.downloadId = await api.downloads.download({ url, filename: j.filename, conflictAction: "uniquify" });
+      j.phase = "Downloading";
+      return { ok: true, id };
+    } catch (e) {
+      await bdlFinish(j, "failed", { error: String((e && e.message) || e) });
+      return { ok: false, error: j.error };
+    }
+  }
+  const job = { id, kind, url, pairUrl, quality: msg.quality || "" };
+  try {
+    if (await ensureOffscreen()) {
+      await api.runtime.sendMessage({ target: "offscreen", type: "bdl-start", job });
+    } else if (typeof DCBrowserDL !== "undefined" && typeof URL.createObjectURL === "function") {
+      const ctl = new AbortController();
+      bdlCtl.set(id, ctl);
+      DCBrowserDL.run(job, (p) => Object.assign(j, p), ctl.signal)
+        .then((r) => bdlSaveBlob(j, URL.createObjectURL(r.blob), r.ext, r.note, r.bytes))
+        .catch((e) => bdlFinish(j, ctl.signal.aborted ? "cancelled" : "failed", { error: String((e && e.message) || e) }))
+        .finally(() => bdlCtl.delete(id));
+    } else {
+      throw new Error("this browser cannot assemble videos here");
+    }
+    return { ok: true, id };
+  } catch (e) {
+    await bdlFinish(j, "failed", { error: String((e && e.message) || e) });
+    return { ok: false, error: j.error };
+  }
+}
+// Live bytes for plain-file jobs come from the browser's download list.
+async function bdlRefresh() {
+  for (const j of bdlJobs.values()) {
+    if (j.downloadId === undefined || j.kind !== "file") continue;
+    try {
+      const [d] = await api.downloads.search({ id: j.downloadId });
+      if (d) { j.bytes = d.bytesReceived || 0; j.size = d.totalBytes > 0 ? d.totalBytes : j.size; }
+    } catch (e) { /* ignore */ }
+  }
+}
+try {
+  chrome.downloads.onChanged.addListener(async (delta) => {
+    const j = [...bdlJobs.values()].find((x) => x.downloadId === delta.id);
+    if (!j || !delta.state) return;
+    if (delta.state.current === "complete") {
+      let size = j.size;
+      try { const [d] = await api.downloads.search({ id: delta.id }); if (d) size = d.fileSize || d.totalBytes || size; } catch (e) {}
+      await bdlRelease(j);
+      await bdlFinish(j, "done", { size, phase: "Done" });
+    } else if (delta.state.current === "interrupted") {
+      await bdlRelease(j);
+      const why = (delta.error && delta.error.current) || "interrupted";
+      await bdlFinish(j, why === "USER_CANCELED" ? "cancelled" : "failed", { error: why });
+    }
+  });
+} catch (e) { /* downloads API unavailable */ }
+
 // ---- popup / content-script messages ----
 chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
+  // The offscreen runner reports here (fire-and-forget, no reply needed).
+  if (msg && msg.from === "offscreen" && sender && sender.id === chrome.runtime.id) {
+    const j = bdlJobs.get(msg.id);
+    if (j) {
+      if (msg.type === "bdl-progress") Object.assign(j, msg.progress || {});
+      else if (msg.type === "bdl-ready") bdlSaveBlob(j, msg.blobUrl, msg.ext, msg.note, msg.bytes);
+      else if (msg.type === "bdl-failed") bdlFinish(j, msg.error === "cancelled" ? "cancelled" : "failed", { error: msg.error });
+    }
+    return false;
+  }
+  if (msg && msg.target === "offscreen") return false;
   (async () => {
     if (!msg || typeof msg !== "object") return { ok: false };
     if (msg.type === "getVideoBarPosition") {
@@ -1151,6 +1326,57 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       }));
       return { sizes: out };
     }
+    if (msg.type === "browserDownload") return startBrowserDownload(msg);
+    if (msg.type === "bdlList") {
+      await bdlRefresh();
+      return { jobs: [...bdlJobs.values()].map(bdlPublic), history: await bdlHistory() };
+    }
+    if (msg.type === "bdlCancel" && typeof msg.id === "string") {
+      const j = bdlJobs.get(msg.id);
+      if (!j) return { ok: false };
+      if (j.downloadId !== undefined) {
+        try { await api.downloads.cancel(j.downloadId); } catch (e) {}
+      } else if (bdlCtl.has(j.id)) {
+        bdlCtl.get(j.id).abort();
+      } else {
+        try { await api.runtime.sendMessage({ target: "offscreen", type: "bdl-cancel", id: j.id }); } catch (e) {}
+      }
+      return { ok: true };
+    }
+    if (msg.type === "bdlShow" && Number.isInteger(msg.downloadId)) {
+      try { api.downloads.show(msg.downloadId); return { ok: true }; } catch (e) { return { ok: false }; }
+    }
+    if (msg.type === "bdlOpen" && Number.isInteger(msg.downloadId)) {
+      try { await api.downloads.open(msg.downloadId); return { ok: true }; } catch (e) { return { ok: false, error: String(e && e.message) }; }
+    }
+    if (msg.type === "bdlForget" && typeof msg.id === "string") {
+      const hist = (await bdlHistory()).filter((h) => h.id !== msg.id);
+      await api.storage.local.set({ bdlHistory: hist });
+      return { ok: true };
+    }
+    if (msg.type === "appList") {
+      try {
+        const res = await api.runtime.sendNativeMessage(HOST, { type: "list" });
+        hostOk = !!res;
+        return { ok: true, items: (res && res.items) || [] };
+      } catch (e) {
+        hostOk = false;
+        return { ok: false, items: [], error: String((e && e.message) || e) };
+      }
+    }
+    if (msg.type === "appControl" && typeof msg.action === "string") {
+      try {
+        const res = await api.runtime.sendNativeMessage(HOST, { type: "control", action: msg.action, id: Number.isInteger(msg.id) ? msg.id : undefined });
+        return { ok: !!res && res.type === "ok", error: res && res.error };
+      } catch (e) {
+        return { ok: false, error: String((e && e.message) || e) };
+      }
+    }
+    if (msg.type === "clearMedia") {
+      const tabId = msg.tabId;
+      if (Number.isInteger(tabId)) { tabMedia.delete(tabId); tabPlaylist.delete(tabId); setBadge(); }
+      return { ok: true };
+    }
     if (msg.type === "captureLink") {
       const cfg = await settings();
       if (!cfg.autoCapture || !/^https?:\/\//i.test(msg.url || "") || hostBlocked(msg.url,cfg.blockHosts)) return {ok:false};
@@ -1165,11 +1391,17 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       await sendToHostPing();
       const cfg = await settings();
       const downloadUI = await syncBrowserDownloadUI();
-      return { hideBrowserUI:!!cfg.hideBrowserUI, downloadUI, autoCapture: !!cfg.autoCapture, deepDetect: cfg.deepDetect !== false, minSizeKB: cfg.minSizeKB, blockHosts: cfg.blockHosts, hostOk, hostError: lastHostError || null, fallbackError: lastFallbackError || null };
+      return { hideBrowserUI:!!cfg.hideBrowserUI, downloadUI, autoCapture: !!cfg.autoCapture, detection: detectionOn, deepDetect: cfg.deepDetect !== false, minSizeKB: cfg.minSizeKB, blockHosts: cfg.blockHosts, hostOk, hostError: lastHostError || null, fallbackError: lastFallbackError || null };
     }
     if (msg.type === "setAuto" && typeof msg.value === "boolean") {
       await api.storage.local.set({ autoCapture: msg.value });
       await syncBrowserDownloadUI();
+      return { ok: true };
+    }
+    if (msg.type === "setDetection" && typeof msg.value === "boolean") {
+      detectionOn = msg.value;
+      await api.storage.local.set({ detection: msg.value });
+      if (!msg.value) { tabMedia.clear(); tabPlaylist.clear(); setBadge(); }
       return { ok: true };
     }
     if (msg.type === "setDeepDetect" && typeof msg.value === "boolean") {

@@ -1,0 +1,12 @@
+<!doctype html>
+<html>
+<head><meta charset="utf-8"><title>Download Craft — browser downloads</title></head>
+<body>
+<!-- Chrome only: the service worker cannot hold a long download or make a
+     Blob URL, so "Download in browser" jobs run here (see background.js). -->
+<script src="streams.js"></script>
+<script src="mp4merge.js"></script>
+<script src="browserdl.js"></script>
+<script src="offscreen.js"></script>
+</body>
+</html>

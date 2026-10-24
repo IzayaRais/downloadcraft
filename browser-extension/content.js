@@ -2181,6 +2181,11 @@
   function syncDismissControls() {
     // Remove the separate X buttons left by an older injected extension.
     document.querySelectorAll("button[data-dc-dismiss]").forEach(el=>el.remove());
+    // Facebook keeps the previous and next reels mounted: one bar, on the
+    // reel being watched (a scrolled-away neighbour's bar used to sit at the
+    // top edge as a second button).
+    let fbActive=null;
+    try { if (isFacebookPage()) fbActive=fbActiveVideo(); } catch (e) { fbActive=null; }
     document.querySelectorAll("[data-dc-pill]").forEach(host=>{
       const video=host.__dcVideo;
       if (!video || !video.isConnected) { host.remove(); return; }
@@ -2190,7 +2195,12 @@
       const r=video.getBoundingClientRect();
       const vw=window.innerWidth, vh=window.innerHeight;
       const width=Math.min(barWidth(host),r.width-16,vw-16);
-      host.style.display=r.width>=120 && r.height>=70 && r.bottom>0 && r.top<vh && r.right>0 && r.left<vw ? "block" : "none";
+      // Mostly scrolled away = not the video being watched: its bar would be
+      // pinned to the window edge, over the page.
+      const visH=Math.min(r.bottom,vh)-Math.max(r.top,0), visW=Math.min(r.right,vw)-Math.max(r.left,0);
+      const shown=r.width>=120 && r.height>=70 && visW>0 && visH>=Math.min(r.height*0.35,200)
+        && (!fbActive || video===fbActive);
+      host.style.display=shown ? "block" : "none";
       if(activeBarDrag===host || applySavedBarPosition(host))return;
       host.style.position="fixed";host.style.right="auto";host.style.bottom="auto";
       host.style.width=Math.max(0,width)+"px";
@@ -2469,8 +2479,22 @@
     addDismissControl(btn,key,api.panel);
   }
 
+  // The popup's ⏻ switch: with detection off no bar is shown anywhere.
+  let detectionOn = true;
+  try {
+    chrome.storage.local.get({ detection: true }, (r) => {
+      detectionOn = !(r && r.detection === false);
+      if (!detectionOn) { try { refreshYouTube(); ensureUniversalButtons(); } catch (e) { /* ignore */ } }
+    });
+    chrome.storage.onChanged.addListener((ch, area) => {
+      if (area !== "local" || !ch.detection) return;
+      detectionOn = ch.detection.newValue !== false;
+      try { refreshYouTube(); ensureUniversalButtons(); } catch (e) { /* ignore */ }
+    });
+  } catch (e) { /* storage unavailable: stay on */ }
+
   function refreshYouTube() {
-    const id = ytVideoId();
+    const id = detectionOn ? ytVideoId() : null;
     const oldBtn = document.getElementById("dc-yt-btn");
     const oldPanel = document.getElementById("dc-yt-panel");
     if (!id) {
@@ -2523,6 +2547,10 @@
 
   function ensureUniversalButtons() {
     if (!alive()) return;
+    if (!detectionOn) {
+      document.querySelectorAll("[data-dc-pill]").forEach((el) => { if (el.__dcClose) el.__dcClose.remove(); el.remove(); });
+      return;
+    }
     syncDismissControls();
     // YouTube watch/Shorts pages already have the quality menu button —
     // a second generic pill on the same player is the "double button" bug.

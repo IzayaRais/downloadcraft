@@ -8,6 +8,8 @@
     "nativeMessaging",
     "contextMenus",
     "downloads",
+    "downloads.open",
+    "offscreen",
     "downloads.ui",
     "storage",
     "scripting",

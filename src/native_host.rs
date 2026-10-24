@@ -63,6 +63,11 @@ struct Incoming {
     /// Page title for the links window.
     #[serde(default)]
     pub title: Option<String>,
+    /// `{"type":"control"}`: which queue row, and what to do with it.
+    #[serde(default)]
+    pub id: Option<u64>,
+    #[serde(default)]
+    pub action: Option<String>,
 }
 
 /// One link from a page ("Download all links").
@@ -175,15 +180,90 @@ struct Reply {
     /// extension's in-page controls match it.
     #[serde(skip_serializing_if = "Option::is_none")]
     theme: Option<String>,
+    /// `{"type":"list"}`: the app's active and recent downloads.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    items: Option<Vec<serde_json::Value>>,
 }
 
 impl Reply {
     fn ok() -> Self {
-        Reply { kind: "ok".into(), version: None, queued: Some(true), error: None, urls: None, theme: None }
+        Reply { kind: "ok".into(), version: None, queued: Some(true), error: None, urls: None, theme: None, items: None }
     }
     fn err(e: impl Into<String>) -> Self {
-        Reply { kind: "error".into(), version: None, queued: None, error: Some(e.into()), urls: None, theme: None }
+        Reply { kind: "error".into(), version: None, queued: None, error: Some(e.into()), urls: None, theme: None, items: None }
     }
+}
+
+/// The popup's Downloads tab: every active row, then the newest finished or
+/// failed ones, with live bytes and speed from the app's progress snapshot.
+fn app_downloads() -> Vec<serde_json::Value> {
+    use crate::model::{DownloadItem, Status};
+    let dir = match crate::model::config_dir() {
+        Some(d) => d,
+        None => return Vec::new(),
+    };
+    let items: Vec<DownloadItem> = std::fs::read_to_string(dir.join("queue.json"))
+        .ok()
+        .and_then(|s| serde_json::from_str(s.trim_start_matches('\u{feff}')).ok())
+        .unwrap_or_default();
+    let live: serde_json::Value = std::fs::read_to_string(dir.join("progress.json"))
+        .ok()
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or(serde_json::Value::Null);
+    let mut rows: Vec<&DownloadItem> = items.iter().collect();
+    rows.sort_by(|a, b| b.id.cmp(&a.id));
+    let active = |d: &&DownloadItem| matches!(d.status, Status::Downloading | Status::Queued | Status::Paused);
+    let mut out: Vec<&DownloadItem> = rows.iter().copied().filter(active).collect();
+    out.extend(rows.iter().copied().filter(|d| !active(d)).take(15));
+    out.into_iter()
+        .map(|d| {
+            let snap = live.get("items").and_then(|m| m.get(d.id.to_string()));
+            let num = |k: &str| snap.and_then(|s| s.get(k)).and_then(|x| x.as_f64());
+            let (state, error) = match &d.status {
+                Status::Downloading => ("downloading", String::new()),
+                Status::Queued => ("queued", String::new()),
+                Status::Paused => ("paused", String::new()),
+                Status::Completed => ("done", String::new()),
+                Status::Failed(e) => ("failed", e.clone()),
+            };
+            serde_json::json!({
+                "id": d.id,
+                "name": d.filename,
+                "state": state,
+                "error": error,
+                "total": num("total").map(|t| t as u64).or(d.total_bytes),
+                "done": num("downloaded").map(|t| t as u64).unwrap_or(d.downloaded_bytes),
+                "speed": num("speed").unwrap_or(0.0),
+                "url": d.url,
+            })
+        })
+        .collect()
+}
+
+/// Queue a pause/resume/cancel order for the app (the same cmd.json the
+/// progress windows use).
+fn app_control(id: Option<u64>, action: &str) -> Result<(), String> {
+    let allowed = ["pause", "resume", "cancel", "pause_all", "resume_all"];
+    if !allowed.contains(&action) {
+        return Err("unknown action".into());
+    }
+    let p = crate::model::config_dir().ok_or("no config dir")?.join("cmd.json");
+    let _guard = crate::model::fs_lock("cmd");
+    if !_guard.owned() {
+        return Err("the app is busy; retry".into());
+    }
+    let mut v: serde_json::Value = std::fs::read_to_string(&p)
+        .ok()
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_else(|| serde_json::json!([]));
+    let arr = v.as_array_mut().ok_or("cmd file unreadable")?;
+    let mut o = serde_json::json!({ "action": action });
+    if let Some(id) = id {
+        o["id"] = serde_json::json!(id);
+    }
+    arr.push(o);
+    let json = serde_json::to_string_pretty(&v).map_err(|e| e.to_string())?;
+    crate::model::atomic_write(&p, json.as_bytes()).map_err(|e| e.to_string())
 }
 
 /// The app theme as the extension understands it.
@@ -460,6 +540,7 @@ pub fn run() -> eframe::Result<()> {
                 error: None,
                 urls: None,
                 theme: Some(app_theme()),
+                items: None,
             }),
             "query" => {
                 // Presence check only: no queueing, no dialogs, no locks held
@@ -473,6 +554,7 @@ pub fn run() -> eframe::Result<()> {
                     error: None,
                     urls: Some(hits),
                     theme: None,
+                    items: None,
                 });
             }
             "download" => {
@@ -504,6 +586,19 @@ pub fn run() -> eframe::Result<()> {
                     Err(e) => write_message(&Reply::err(e)),
                 }
             }
+            "list" => write_message(&Reply {
+                kind: "list".into(),
+                version: None,
+                queued: None,
+                error: None,
+                urls: None,
+                theme: None,
+                items: Some(app_downloads()),
+            }),
+            "control" => match app_control(msg.id, msg.action.as_deref().unwrap_or("")) {
+                Ok(()) => write_message(&Reply::ok()),
+                Err(e) => write_message(&Reply::err(e)),
+            },
             "links" => match spawn_links(&msg) {
                 Ok(()) => write_message(&Reply::ok()),
                 Err(e) => write_message(&Reply::err(e)),

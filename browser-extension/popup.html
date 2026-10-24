@@ -5,10 +5,10 @@
 :root {
   --bg:#0f172a; --card:#1e293b; --hover:#334155; --line:#334155; --text:#f1f5f9;
   --dim:#94a3b8; --muted:#64748b; --accent:#3b82f6; --accent-soft:rgba(59,130,246,.16);
-  --ok:#22c55e; --bad:#ef4444; --thumb:linear-gradient(135deg,#667eea,#764ba2);
+  --ok:#22c55e; --bad:#ef4444; --warn:#f59e0b; --thumb:linear-gradient(135deg,#667eea,#764ba2);
 }
 * { box-sizing:border-box; }
-body { width:410px; margin:0; background:var(--bg); color:var(--text);
+body { width:430px; margin:0; background:var(--bg); color:var(--text);
   font:13px/1.35 system-ui,-apple-system,"Segoe UI",sans-serif; }
 button, input, select { font:inherit; color:inherit; }
 .top { display:flex; align-items:center; gap:8px; padding:12px 12px 8px; }
@@ -17,15 +17,37 @@ button, input, select { font:inherit; color:inherit; }
 .brand { font-weight:700; font-size:14px; flex:1; }
 .conn { font-size:11px; padding:2px 8px; border-radius:99px; background:var(--card); color:var(--dim); white-space:nowrap; }
 .conn.ok { color:var(--ok); } .conn.bad { color:var(--bad); }
-.tabs { display:flex; gap:4px; margin:0 12px 10px; padding:3px; background:var(--card); border-radius:10px; }
+.tabs { display:flex; gap:4px; margin:0 12px 8px; padding:3px; background:var(--card); border-radius:10px; }
 .tab { all:unset; flex:1; text-align:center; padding:6px 0; border-radius:8px; cursor:pointer; color:var(--dim); font-weight:600; }
 .tab.on { background:var(--accent); color:#fff; }
 .tab .n { display:inline-block; min-width:18px; padding:0 5px; margin-left:4px; border-radius:99px; font-size:11px; background:rgba(255,255,255,.22); }
 .tab:not(.on) .n { background:var(--accent-soft); color:var(--accent); }
+.tab .n:empty { display:none; }
+/* toolbar: filter menu, title search, quick actions */
+.tools { display:flex; gap:5px; align-items:center; margin:0 12px 8px; }
+.ib { all:unset; box-sizing:border-box; width:30px; height:30px; flex:none; border-radius:99px; display:grid; place-items:center;
+  background:var(--card); border:1px solid var(--line); cursor:pointer; color:var(--dim); position:relative; }
+.ib:hover { background:var(--hover); color:var(--text); }
+.ib.on { background:#facc15; border-color:#facc15; color:#1e1e1e; }
+.ib.off { color:var(--bad); }
+.ib svg { width:15px; height:15px; }
+.search { flex:1; min-width:0; display:flex; align-items:center; gap:6px; height:30px; padding:0 10px; border-radius:99px; background:var(--card); border:1px solid var(--line); }
+.search svg { width:14px; height:14px; color:var(--muted); flex:none; }
+.search input { all:unset; flex:1; min-width:0; font-size:12px; }
 .view { padding:0 12px 12px; max-height:470px; overflow-y:auto; }
 .view[hidden] { display:none; }
-.sec { display:flex; align-items:center; justify-content:space-between; margin:10px 0 6px; color:var(--dim); font-weight:700; font-size:12px; }
-.sec .n { color:var(--muted); font-weight:600; }
+.group { margin-bottom:6px; }
+.ghead { display:flex; align-items:center; gap:6px; padding:8px 2px 6px; cursor:pointer; user-select:none; }
+.ghead b { font-size:12px; }
+.ghead .n { color:var(--muted); font-weight:600; font-size:11px; }
+.ghead .sub { color:var(--muted); font-size:11px; flex:1; }
+.ghead .chev { color:var(--dim); transition:transform .15s; }
+.group.closed .chev { transform:rotate(-90deg); }
+.group.closed .gbody { display:none; }
+.pillsrc { font-size:10px; font-weight:700; padding:1px 6px; border-radius:99px; background:var(--accent-soft); color:var(--accent); }
+.pillsrc.br { background:rgba(34,197,94,.14); color:var(--ok); }
+.notice { padding:8px 10px; margin-bottom:8px; border-radius:9px; background:rgba(245,158,11,.12); color:var(--warn); font-size:12px; }
+.sec { display:flex; align-items:center; justify-content:space-between; margin:6px 0; color:var(--dim); font-weight:700; font-size:11px; text-transform:uppercase; letter-spacing:.03em; }
 .card { display:flex; gap:10px; padding:8px; background:var(--card); border:1px solid var(--line); border-radius:10px; margin-bottom:8px; }
 .thumb { position:relative; flex:none; width:92px; height:54px; border-radius:7px; overflow:hidden; background:var(--thumb); }
 .thumb img { width:100%; height:100%; object-fit:cover; display:block; }
@@ -38,21 +60,45 @@ button, input, select { font:inherit; color:inherit; }
 .queued { color:var(--ok); font-weight:600; }
 .row { display:flex; gap:6px; align-items:center; }
 select { flex:1; min-width:0; height:30px; padding:0 8px; background:var(--bg); border:1px solid var(--line); border-radius:7px; cursor:pointer; }
-.dl { all:unset; box-sizing:border-box; height:30px; padding:0 10px; border-radius:7px; background:var(--accent); color:#fff; font-weight:700; cursor:pointer; display:flex; align-items:center; gap:5px; }
+.dl { all:unset; box-sizing:border-box; height:30px; padding:0 10px; border-radius:7px; background:var(--accent); color:#fff; font-weight:700; cursor:pointer; display:flex; align-items:center; gap:5px; white-space:nowrap; }
+.dl.br { background:var(--ok); color:#06210f; }
 .dl:hover { filter:brightness(1.08); }
+.dl[disabled] { opacity:.5; cursor:default; }
 .dl svg { width:13px; height:13px; }
 .more { all:unset; box-sizing:border-box; width:26px; height:30px; border-radius:7px; display:grid; place-items:center; cursor:pointer; color:var(--dim); position:relative; }
 .more:hover { background:var(--hover); }
-.menu { position:absolute; right:0; top:32px; z-index:5; min-width:150px; padding:4px; background:var(--card); border:1px solid var(--line); border-radius:8px; box-shadow:0 8px 24px rgba(0,0,0,.35); }
-.menu button { all:unset; display:block; width:100%; box-sizing:border-box; padding:6px 8px; border-radius:6px; cursor:pointer; color:var(--text); font-size:12px; }
+.menu { position:absolute; right:0; top:32px; z-index:5; min-width:170px; padding:4px; background:var(--card); border:1px solid var(--line); border-radius:8px; box-shadow:0 8px 24px rgba(0,0,0,.35); }
+.menu button { all:unset; display:block; width:100%; box-sizing:border-box; padding:6px 8px; border-radius:6px; cursor:pointer; color:var(--text); font-size:12px; text-align:left; }
 .menu button:hover { background:var(--hover); }
-.empty { text-align:center; color:var(--dim); padding:28px 12px; }
+.menu button.sel { color:var(--accent); font-weight:700; }
+.empty { text-align:center; color:var(--dim); padding:22px 12px; }
 .empty b { display:block; color:var(--text); margin-bottom:4px; }
 .manual { display:flex; gap:6px; margin-top:8px; }
 input[type=text] { flex:1; min-width:0; height:32px; padding:0 9px; background:var(--card); border:1px solid var(--line); border-radius:7px; }
 .btn { all:unset; box-sizing:border-box; height:32px; padding:0 12px; border-radius:7px; background:var(--card); border:1px solid var(--line); cursor:pointer; font-weight:600; display:flex; align-items:center; }
 .btn:hover { background:var(--hover); }
 .btn.primary { background:var(--accent); border-color:var(--accent); color:#fff; }
+/* downloads tab */
+.job { padding:9px 10px; background:var(--card); border:1px solid var(--line); border-left:3px solid var(--accent); border-radius:9px; margin-bottom:7px; }
+.job.done { border-left-color:var(--ok); } .job.failed, .job.cancelled { border-left-color:var(--bad); }
+.job.paused, .job.queued { border-left-color:var(--warn); }
+.job .jt { display:flex; align-items:center; gap:6px; font-size:11px; color:var(--dim); }
+.job .jt .src { flex:1; min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+.job .jn { font-weight:600; margin:4px 0; word-break:break-all; display:-webkit-box; -webkit-line-clamp:2; -webkit-box-orient:vertical; overflow:hidden; }
+.job .jb { display:flex; align-items:center; gap:6px; font-size:11px; color:var(--dim); }
+.job .jb .grow { flex:1; }
+.bar { height:5px; border-radius:99px; background:var(--hover); overflow:hidden; margin:6px 0 4px; }
+.bar i { display:block; height:100%; background:var(--accent); border-radius:99px; transition:width .3s; }
+.bar.ind i { width:35% !important; animation:slide 1.2s linear infinite; }
+@keyframes slide { from { margin-left:-35%; } to { margin-left:100%; } }
+.chip { padding:0 6px; border-radius:5px; font-weight:700; font-size:10px; background:var(--accent-soft); color:var(--accent); }
+.chip.ok { background:rgba(34,197,94,.14); color:var(--ok); } .chip.bad { background:rgba(239,68,68,.14); color:var(--bad); }
+.chip.warn { background:rgba(245,158,11,.14); color:var(--warn); }
+.ja { all:unset; cursor:pointer; color:var(--dim); width:22px; height:22px; display:grid; place-items:center; border-radius:6px; }
+.ja:hover { background:var(--hover); color:var(--text); }
+.ja svg { width:14px; height:14px; }
+.err { color:var(--bad); font-size:11px; margin-top:3px; }
+/* settings */
 .opt { display:flex; align-items:center; gap:10px; padding:10px; background:var(--card); border:1px solid var(--line); border-radius:10px; margin-bottom:8px; }
 .opt .txt { flex:1; }
 .opt .txt b { display:block; font-weight:600; }
@@ -76,21 +122,39 @@ label.fl { display:block; color:var(--dim); font-size:11px; margin:2px 0 4px; }
   <div class="conn" id="conn">Checking…</div>
 </div>
 <div class="tabs">
-  <button class="tab on" id="tabVideos">Videos<span class="n" id="count">0</span></button>
+  <button class="tab on" id="tabVideos">Videos<span class="n" id="count"></span></button>
+  <button class="tab" id="tabDownloads">Downloads<span class="n" id="dlCount"></span></button>
   <button class="tab" id="tabSettings">Settings</button>
 </div>
 
-<div class="view" id="viewVideos">
-  <div id="videos"></div>
-  <div class="manual">
-    <input type="text" id="url" placeholder="Paste a link to download…">
-    <button class="btn primary" id="send">Send</button>
+<div id="viewVideos">
+  <div class="tools">
+    <button class="ib" id="filterBtn" title="Show: all, videos, streams or other files"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round"><path d="M4 7h16M7 12h10M10 17h4"/></svg></button>
+    <label class="search"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round"><circle cx="11" cy="11" r="7"/><path d="M20 20l-3.5-3.5"/></svg><input id="q" name="q" placeholder="Filter by title"></label>
+    <button class="ib" id="autoBtn" title="Send the browser's downloads to the app automatically"><svg viewBox="0 0 24 24" fill="currentColor"><path d="M13 2L4 14h7l-1 8 9-12h-7z"/></svg></button>
+    <button class="ib" id="detectBtn" title="Video detection on/off"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round"><path d="M12 3v8M6.3 6.3a8 8 0 1 0 11.4 0"/></svg></button>
+    <button class="ib" id="pauseBtn" title="Pause all downloads in the app"><svg viewBox="0 0 24 24" fill="currentColor"><rect x="6" y="5" width="4" height="14" rx="1"/><rect x="14" y="5" width="4" height="14" rx="1"/></svg></button>
+    <button class="ib" id="refreshBtn" title="Look for videos on this page again"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><path d="M20 11a8 8 0 1 0-2.3 5.7M20 4v7h-7"/></svg></button>
+    <button class="ib" id="clearBtn" title="Clear what was found on this page"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M4 7h16M10 11v6M14 11v6M6 7l1 13h10l1-13M9 7V4h6v3"/></svg></button>
   </div>
+  <div class="view" id="videosView">
+    <div id="videos"></div>
+    <div class="manual">
+      <input type="text" id="url" placeholder="Paste a link to download…">
+      <button class="btn primary" id="send">Send</button>
+    </div>
+  </div>
+</div>
+
+<div class="view" id="viewDownloads" hidden>
+  <div id="downloads"></div>
 </div>
 
 <div class="view" id="viewSettings" hidden>
   <div class="opt"><div class="txt"><b>Capture browser downloads</b><span>Hand every download to Download Craft.</span></div>
     <label class="sw"><input type="checkbox" id="auto"><i></i></label></div>
+  <div class="opt"><div class="txt"><b>Video detection</b><span>Find videos on pages and show the download bar on players.</span></div>
+    <label class="sw"><input type="checkbox" id="detect"><i></i></label></div>
   <div class="opt"><div class="txt"><b>Deep video detection</b><span>Reads the first 4 KB of unlabeled responses to find hidden streams.</span></div>
     <label class="sw"><input type="checkbox" id="deep"><i></i></label></div>
   <div class="opt"><div class="txt"><b>Hide browser download bubble</b><span>While capture is on and the app is connected.</span></div>

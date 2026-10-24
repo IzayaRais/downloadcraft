@@ -4712,6 +4712,10 @@ fn ytdlp_custom_path() -> Option<std::path::PathBuf> {
 /// "The page needs to be reloaded" (verified live here: same URL and cookies,
 /// same release, works with `--js-runtimes node` and fails without it).
 fn js_runtime_path() -> Option<(&'static str, std::path::PathBuf)> {
+    // The app's own Deno (Settings → Plugins → Install) comes first.
+    if let Some(p) = deno_local_path().filter(|p| crate::platform::executable_file(p)) {
+        return Some(("deno", p));
+    }
     for name in ["deno", "node"] {
         let file = if cfg!(windows) { format!("{name}.exe") } else { name.to_string() };
         for dir in tool_dirs() {
@@ -4732,6 +4736,136 @@ fn runtime_version_supported(name:&str,version:&str)->bool {
     match name {"node"=>major>=22,"deno"=>major>2||(major==2&&minor>=3),_=>false}
 }
 fn js_runtime() -> Option<&'static str> { js_runtime_path().map(|(name,_)| name) }
+
+/// Where the app keeps its own Deno (next to its yt-dlp).
+pub fn deno_local_path() -> Option<std::path::PathBuf> {
+    Some(crate::platform::helper_dir()?.join(if cfg!(windows) { "deno.exe" } else { "deno" }))
+}
+
+/// Deno's portable build for this machine (one executable in a zip).
+fn deno_zip_url() -> Option<String> {
+    const BASE: &str = "https://github.com/denoland/deno/releases/latest/download/";
+    let file = if cfg!(all(windows, target_arch = "x86_64")) {
+        "deno-x86_64-pc-windows-msvc.zip"
+    } else if cfg!(all(windows, target_arch = "aarch64")) {
+        "deno-aarch64-pc-windows-msvc.zip"
+    } else if cfg!(all(target_os = "macos", target_arch = "aarch64")) {
+        "deno-aarch64-apple-darwin.zip"
+    } else if cfg!(all(target_os = "macos", target_arch = "x86_64")) {
+        "deno-x86_64-apple-darwin.zip"
+    } else if cfg!(all(target_os = "linux", target_arch = "x86_64")) {
+        "deno-x86_64-unknown-linux-gnu.zip"
+    } else if cfg!(all(target_os = "linux", target_arch = "aarch64")) {
+        "deno-aarch64-unknown-linux-gnu.zip"
+    } else {
+        return None;
+    };
+    Some(format!("{BASE}{file}"))
+}
+
+/// One file out of a zip held in memory (stored or deflated, no zip64): what
+/// a single-executable release archive needs, with no system tools.
+fn zip_entry(zip: &[u8], name: &str) -> Result<Vec<u8>> {
+    use std::io::Read;
+    let u16_at = |i: usize| -> Result<usize> {
+        zip.get(i..i + 2).map(|b| u16::from_le_bytes([b[0], b[1]]) as usize).ok_or_else(|| anyhow!("zip: truncated"))
+    };
+    let u32_at = |i: usize| -> Result<usize> {
+        zip.get(i..i + 4).map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]) as usize).ok_or_else(|| anyhow!("zip: truncated"))
+    };
+    // End of central directory: the last "PK\x05\x06" (comment can follow).
+    let eocd = (0..zip.len().saturating_sub(21))
+        .rev()
+        .take(70_000)
+        .find(|&i| zip[i..].starts_with(b"PK\x05\x06"))
+        .ok_or_else(|| anyhow!("zip: no directory"))?;
+    let count = u16_at(eocd + 10)?;
+    let mut at = u32_at(eocd + 16)?;
+    for _ in 0..count {
+        if !zip.get(at..).map(|b| b.starts_with(b"PK\x01\x02")).unwrap_or(false) {
+            return Err(anyhow!("zip: bad directory"));
+        }
+        let method = u16_at(at + 10)?;
+        let csize = u32_at(at + 20)?;
+        let usize_ = u32_at(at + 24)?;
+        let nlen = u16_at(at + 28)?;
+        let xlen = u16_at(at + 30)?;
+        let clen = u16_at(at + 32)?;
+        let local = u32_at(at + 42)?;
+        let entry = zip.get(at + 46..at + 46 + nlen).ok_or_else(|| anyhow!("zip: truncated"))?;
+        let entry = String::from_utf8_lossy(entry);
+        if entry.rsplit('/').next() == Some(name) {
+            if !zip.get(local..).map(|b| b.starts_with(b"PK\x03\x04")).unwrap_or(false) {
+                return Err(anyhow!("zip: bad entry"));
+            }
+            let data_at = local + 30 + u16_at(local + 26)? + u16_at(local + 28)?;
+            let data = zip.get(data_at..data_at + csize).ok_or_else(|| anyhow!("zip: truncated entry"))?;
+            let out = match method {
+                0 => data.to_vec(),
+                8 => {
+                    let mut out = Vec::with_capacity(usize_);
+                    flate2::read::DeflateDecoder::new(data).read_to_end(&mut out)?;
+                    out
+                }
+                m => return Err(anyhow!("zip: unsupported method {m}")),
+            };
+            if out.len() != usize_ {
+                return Err(anyhow!("zip: {name} unpacked to {} bytes, expected {usize_}", out.len()));
+            }
+            return Ok(out);
+        }
+        at += 46 + nlen + xlen + clen;
+    }
+    Err(anyhow!("zip: {name} not found"))
+}
+
+/// Install (or refresh) the app's own Deno, so yt-dlp can solve YouTube's
+/// player challenges without the user installing anything. Blocking: call it
+/// from a worker thread.
+pub fn deno_install_blocking() -> Result<std::path::PathBuf> {
+    let url = deno_zip_url().ok_or_else(|| anyhow!("no Deno build for this system"))?;
+    let dst = deno_local_path().ok_or_else(|| anyhow!("no folder to keep Deno in"))?;
+    let rt = tokio::runtime::Builder::new_current_thread().enable_all().build()?;
+    let zip = rt.block_on(async {
+        let client = EngineOpts::default().build_client()?;
+        let resp = client.get(&url).send().await.map_err(|e| anyhow!("Deno download: {e}"))?;
+        if !resp.status().is_success() {
+            return Err(anyhow!("Deno download: HTTP {}", resp.status()));
+        }
+        let bytes = resp.bytes().await.map_err(|e| anyhow!("Deno download: {e}"))?;
+        Ok::<_, anyhow::Error>(bytes)
+    })?;
+    if zip.len() < 5_000_000 {
+        return Err(anyhow!("Deno download: suspicious payload ({} bytes)", zip.len()));
+    }
+    let exe = zip_entry(&zip, if cfg!(windows) { "deno.exe" } else { "deno" })?;
+    let magic_ok = if cfg!(windows) { exe.starts_with(b"MZ") } else { exe.starts_with(b"\x7fELF") || exe.starts_with(&[0xcf, 0xfa]) };
+    if !magic_ok {
+        return Err(anyhow!("Deno download: not an executable"));
+    }
+    if let Some(dir) = dst.parent() {
+        std::fs::create_dir_all(dir)?;
+    }
+    let tmp = dst.with_extension("part");
+    std::fs::write(&tmp, &exe)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o755))?;
+    }
+    std::fs::rename(&tmp, &dst)?;
+    // Must answer like a supported Deno, or it is not kept.
+    let mut cmd = std::process::Command::new(&dst);
+    cmd.arg("--version");
+    let ok = crate::platform::version_output(cmd)
+        .map(|o| runtime_version_supported("deno", &String::from_utf8_lossy(&o.stdout)))
+        .unwrap_or(false);
+    if !ok {
+        let _ = std::fs::remove_file(&dst);
+        return Err(anyhow!("the downloaded Deno did not run"));
+    }
+    Ok(dst)
+}
 
 /// Whether a helper we fetched is old enough that YouTube has probably moved
 /// on (extractors break within weeks).
@@ -8376,6 +8510,63 @@ mod tests {
         // An estimate is a size too.
         let mut g = MergedProgress::default();
         assert_eq!(g.step(&line("dcp@5|NA|900|NA")), (5, Some(900)));
+    }
+
+    #[test]
+    fn zip_entry_reads_a_release_archive() {
+        use std::io::Write;
+        // One stored and one deflated file, laid out like a release zip.
+        fn zip(files: &[(&str, &[u8], bool)]) -> Vec<u8> {
+            let (mut out, mut dir) = (Vec::new(), Vec::new());
+            for (name, data, deflate) in files {
+                let body = if *deflate {
+                    let mut e = flate2::write::DeflateEncoder::new(Vec::new(), flate2::Compression::default());
+                    e.write_all(data).unwrap();
+                    e.finish().unwrap()
+                } else {
+                    data.to_vec()
+                };
+                let method: u16 = if *deflate { 8 } else { 0 };
+                let local = out.len() as u32;
+                out.extend_from_slice(b"PK\x03\x04");
+                out.extend_from_slice(&[20, 0, 0, 0]);
+                out.extend_from_slice(&method.to_le_bytes());
+                out.extend_from_slice(&[0; 8]); // time, date, crc
+                out.extend_from_slice(&(body.len() as u32).to_le_bytes());
+                out.extend_from_slice(&(data.len() as u32).to_le_bytes());
+                out.extend_from_slice(&(name.len() as u16).to_le_bytes());
+                out.extend_from_slice(&0u16.to_le_bytes());
+                out.extend_from_slice(name.as_bytes());
+                out.extend_from_slice(&body);
+                dir.extend_from_slice(b"PK\x01\x02");
+                dir.extend_from_slice(&[20, 0, 20, 0, 0, 0]);
+                dir.extend_from_slice(&method.to_le_bytes());
+                dir.extend_from_slice(&[0; 8]);
+                dir.extend_from_slice(&(body.len() as u32).to_le_bytes());
+                dir.extend_from_slice(&(data.len() as u32).to_le_bytes());
+                dir.extend_from_slice(&(name.len() as u16).to_le_bytes());
+                dir.extend_from_slice(&[0; 12]); // extra, comment, disk, attrs
+                dir.extend_from_slice(&local.to_le_bytes());
+                dir.extend_from_slice(name.as_bytes());
+            }
+            let at = out.len() as u32;
+            let n = files.len() as u16;
+            out.extend_from_slice(&dir);
+            out.extend_from_slice(b"PK\x05\x06");
+            out.extend_from_slice(&[0; 4]);
+            out.extend_from_slice(&n.to_le_bytes());
+            out.extend_from_slice(&n.to_le_bytes());
+            out.extend_from_slice(&(dir.len() as u32).to_le_bytes());
+            out.extend_from_slice(&at.to_le_bytes());
+            out.extend_from_slice(&[0, 0]);
+            out
+        }
+        let exe = b"MZ portable runtime ".repeat(500);
+        let z = zip(&[("README.md", b"hi", false), ("deno/deno.exe", &exe, true)]);
+        assert_eq!(zip_entry(&z, "deno.exe").unwrap(), exe);
+        assert_eq!(zip_entry(&z, "README.md").unwrap(), b"hi");
+        assert!(zip_entry(&z, "missing").is_err());
+        assert!(zip_entry(&z[..z.len() / 2], "deno.exe").is_err());
     }
 
     #[test]

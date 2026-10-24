@@ -293,6 +293,9 @@ struct SettingsApp {
     ytdlp: Option<crate::engine::YtdlpInfo>,
     ytdlp_msg: String,
     ytdlp_busy: bool,
+    /// The app's own JavaScript runtime (Deno) being installed: the answer
+    /// is the installed path or the reason it failed.
+    deno_rx: Option<std::sync::mpsc::Receiver<Result<std::path::PathBuf, String>>>,
     ytdlp_rx: Option<
         std::sync::mpsc::Receiver<(
             String,
@@ -438,6 +441,7 @@ pub fn run() -> eframe::Result<()> {
         ytdlp: None,
         ytdlp_msg: String::new(),
         ytdlp_busy: false,
+        deno_rx: None,
         ytdlp_rx: None,
         ffmpeg: None,
         ffmpeg_msg: String::new(),
@@ -517,6 +521,20 @@ impl eframe::App for SettingsApp {
             if self.ffmpeg_rx.is_none() {
                 self.ffmpeg_rx = Some(ffmpeg_update_probe());
                 self.ffmpeg_busy = true;
+            }
+        }
+        if let Some(rx) = &self.deno_rx {
+            if let Ok(res) = rx.try_recv() {
+                self.deno_rx = None;
+                self.ytdlp_msg = match res {
+                    Ok(_) => "JavaScript runtime installed (Deno) — YouTube's player challenges are solved now.".into(),
+                    Err(e) => format!("Could not install the JavaScript runtime: {e}"),
+                };
+                // Re-read the status so the Runtime chip shows it.
+                if self.ytdlp_rx.is_none() {
+                    self.ytdlp_rx = Some(ytdlp_probe(false));
+                    self.ytdlp_busy = true;
+                }
             }
         }
         if let Some(rx) = &self.ytdlp_rx {
@@ -2696,7 +2714,36 @@ impl SettingsApp {
                             runtime_note(ui, rt);
                         }
 
-                        ui.hyperlink_to("Install a JavaScript runtime", "https://github.com/yt-dlp/yt-dlp/wiki/EJS#step-1-install-a-supported-javascript-runtime");
+                        // One click installs a portable Deno into the app's own
+                        // tools folder (like yt-dlp itself): no web page, no
+                        // installer, no PATH changes.
+                        let installing = self.deno_rx.is_some();
+                        let own = crate::engine::deno_local_path().map(|p| p.is_file()).unwrap_or(false);
+                        ui.add_space(8.0);
+                        ui.horizontal(|ui| {
+                            ui.spacing_mut().item_spacing.x = 8.0;
+                            let label = if own {
+                                "Update JavaScript runtime"
+                            } else if rt.is_some() {
+                                "Install app's own runtime"
+                            } else {
+                                "Install JavaScript runtime"
+                            };
+                            let b = ui.add_enabled_ui(!installing, |ui| btn_icon(ui, "\u{e2c4}", label, rt.is_none() && !own)).inner;
+                            if b.on_hover_text("Downloads a portable Deno (about 45 MB) next to yt-dlp — nothing else to set up").clicked() {
+                                let (tx, rx) = std::sync::mpsc::channel();
+                                std::thread::spawn(move || {
+                                    let _ = tx.send(crate::engine::deno_install_blocking().map_err(|e| format!("{e:#}")));
+                                });
+                                self.deno_rx = Some(rx);
+                                self.ytdlp_msg = "Installing the JavaScript runtime (Deno)…".into();
+                            }
+                            if installing {
+                                ui.add(egui::Spinner::new().size(14.0));
+                            } else if own {
+                                txt(ui, "✓ Installed (app's own copy)", reg(10.0), pl().success);
+                            }
+                        });
                         if !msg.is_empty() {
                             ui.add_space(7.0);
                             wrapped(ui, msg.as_str(), reg(10.0), t.accent);

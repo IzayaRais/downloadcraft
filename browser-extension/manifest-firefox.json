@@ -7,6 +7,7 @@
     "nativeMessaging",
     "contextMenus",
     "downloads",
+    "downloads.open",
     "storage",
     "scripting",
     "tabs",
@@ -21,6 +22,9 @@
   "background": {
     "scripts": [
       "rank.js",
+      "streams.js",
+      "mp4merge.js",
+      "browserdl.js",
       "background.js"
     ]
   },

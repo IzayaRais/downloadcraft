@@ -46,6 +46,8 @@ pub enum Commands {
     Helpers {
         #[arg(long)] install_ytdlp: bool,
         #[arg(long)] install_ffmpeg: bool,
+        /// Install the app's own JavaScript runtime (portable Deno) for yt-dlp
+        #[arg(long)] install_runtime: bool,
         /// Compare with the latest releases and update the app's own copies
         /// (what Settings → Plugins does when opened)
         #[arg(long)] update: bool,
@@ -175,9 +177,10 @@ pub fn run(cli: Cli) -> anyhow::Result<()> {
             Ok(())
         }
 
-        Commands::Helpers {install_ytdlp,install_ffmpeg,update} => {
+        Commands::Helpers {install_ytdlp,install_ffmpeg,install_runtime,update} => {
             if install_ytdlp {crate::engine::ytdlp_refresh_blocking()?;}
             if install_ffmpeg {crate::helpers::install_ffmpeg()?;}
+            if install_runtime {crate::engine::deno_install_blocking()?;}
             if update {
                 for line in [crate::engine::ytdlp_update_check_blocking(),crate::engine::ffmpeg_update_check_blocking()] {
                     if !line.is_empty() {eprintln!("{line}");}
