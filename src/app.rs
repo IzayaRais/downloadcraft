@@ -2125,7 +2125,10 @@ impl CraftApp {
             } else {
                 None
             };
-            if total.unwrap_or(0) == 0 {
+            // A fragmented stream has no size until it is done; the row may
+            // still hold an estimate from before, which must not come back.
+            let fragmented = task.shared.frag_count.load(Ordering::SeqCst) > 0;
+            if total.unwrap_or(0) == 0 && !fragmented {
                 total = row.and_then(|d| d.total_bytes);
             }
             let mut downloaded = task.shared.downloaded.load(Ordering::SeqCst);
@@ -2150,6 +2153,10 @@ impl CraftApp {
                     "phase": self.phases.get(id).cloned().unwrap_or_default(),
                     "resolution": resolution,
                     "parts": parts,
+                    "fragments": [
+                        task.shared.frag_index.load(Ordering::SeqCst),
+                        task.shared.frag_count.load(Ordering::SeqCst),
+                    ],
                 }),
             );
         }

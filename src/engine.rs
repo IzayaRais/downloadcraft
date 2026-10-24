@@ -54,6 +54,11 @@ pub struct SharedState {
     /// Set once a live HLS playlist is being recorded. The UI uses it to treat
     /// Stop as "finish the recording" instead of "pause for later".
     pub live: AtomicBool,
+    /// Fragment index/count while a helper fetches a fragmented stream
+    /// (count 0 = not fragmented). Such a stream has no size until it is
+    /// done, so this is what the progress bar and Part Info show.
+    pub frag_index: AtomicU64,
+    pub frag_count: AtomicU64,
 }
 
 impl SharedState {
@@ -79,6 +84,8 @@ impl SharedState {
             note: std::sync::Mutex::new(None),
             resolution: std::sync::Mutex::new(String::new()),
             live: AtomicBool::new(false),
+            frag_index: AtomicU64::new(0),
+            frag_count: AtomicU64::new(0),
         }
     }
 
@@ -5515,8 +5522,20 @@ const PROGRESS_MARK: &str = "dcp@";
 /// covers.
 fn ytdlp_progress_template() -> String {
     format!(
-        "download:{PROGRESS_MARK}%(progress.downloaded_bytes)s|%(progress.total_bytes)s|%(progress.total_bytes_estimate)s|%(progress.speed)s|%(info.height)s|%(info.width)s|%(info.format_id)s|%(info.vcodec)s"
+        "download:{PROGRESS_MARK}%(progress.downloaded_bytes)s|%(progress.total_bytes)s|%(progress.total_bytes_estimate)s|%(progress.speed)s|%(info.height)s|%(info.width)s|%(info.format_id)s|%(info.vcodec)s|%(progress.fragment_index)s|%(progress.fragment_count)s"
     )
+}
+
+/// Stable small id for a format id string (legs of a merged download differ).
+fn format_key(s: &str) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let s = s.trim();
+    if s.is_empty() || s == "NA" {
+        return 0;
+    }
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    s.hash(&mut h);
+    h.finish().max(1)
 }
 
 /// One progress line, parsed. A field is `None` when yt-dlp printed `NA`.
@@ -5534,6 +5553,12 @@ struct YtdlpProgress {
     /// photo format (which has a frame size but no video) and when yt-dlp
     /// cannot say. Only a video leg has a resolution to show.
     video: bool,
+    /// [`format_key`] of the format being fetched (0 = unknown): a change is
+    /// the only reliable sign that the next leg of a merged download began.
+    format: u64,
+    /// Fragment index/count of a fragmented (HLS/DASH) transfer.
+    frag_index: Option<f64>,
+    frag_count: Option<f64>,
 }
 
 /// Read a progress line, or `None` when this line is not one.
@@ -5543,18 +5568,27 @@ fn parse_progress_line(line: &str) -> Option<YtdlpProgress> {
     let at = line.find(PROGRESS_MARK)?;
     let mut field = line[at + PROGRESS_MARK.len()..].split('|');
     let num = |v: Option<&str>| v.map(str::trim).and_then(|v| v.parse::<f64>().ok());
-    let p = YtdlpProgress {
-        done: num(field.next()),
-        total: num(field.next()),
-        estimate: num(field.next()),
-        speed: num(field.next()),
-        height: num(field.next()),
-        width: num(field.next()),
-        // The format id is not used by the row; the codec after it decides
-        // whether the frame size means anything.
-        video: field.next().is_some() && field.next().map(is_video_codec).unwrap_or(false),
-    };
-    Some(p)
+    let done = num(field.next());
+    let total = num(field.next());
+    let estimate = num(field.next());
+    let speed = num(field.next());
+    let height = num(field.next());
+    let width = num(field.next());
+    let format = field.next().map(format_key).unwrap_or(0);
+    // The codec decides whether the frame size means anything.
+    let video = field.next().map(is_video_codec).unwrap_or(false);
+    Some(YtdlpProgress {
+        done,
+        total,
+        estimate,
+        speed,
+        height,
+        width,
+        video,
+        format,
+        frag_index: num(field.next()),
+        frag_count: num(field.next()).filter(|n| *n > 0.0),
+    })
 }
 
 /// "1280×720" when both sides are known, else "720p" from the height alone.
@@ -5594,21 +5628,41 @@ struct MergedProgress {
     last_total: u64,
     /// Whether the current leg has named its size.
     known: bool,
+    /// [`format_key`] of the current leg (0 = not named).
+    format: u64,
 }
 
 impl MergedProgress {
     /// Fold one line in and return `(downloaded, total)` to publish.
     fn step(&mut self, p: &YtdlpProgress) -> (u64, Option<u64>) {
         if let Some(done) = p.done.map(|d| d.max(0.0) as u64) {
-            if done + 1 < self.last {
+            // A new leg restarts its counter at 0. With several fragments in
+            // flight the counter also dips a little now and then, and reading
+            // every dip as a new leg added the whole count again each time:
+            // the "18 GB" an HLS download claimed after a resume. So a new leg
+            // is a new format id, or (ids unknown) a counter that fell back
+            // to under half of where it was.
+            let new_leg = if p.format != 0 && self.format != 0 {
+                p.format != self.format
+            } else {
+                done < self.last / 2
+            };
+            if new_leg {
                 self.base += self.last_total.max(self.last);
                 self.total_base += self.last_total;
                 self.last_total = 0;
                 self.known = false;
             }
-            self.last = done;
+            self.last = if new_leg { done } else { done.max(self.last) };
         }
-        if let Some(total) = p.total.or(p.estimate).filter(|t| *t > 0.0) {
+        if p.format != 0 {
+            self.format = p.format;
+        }
+        // A fragmented stream has no size, only an estimate that moves with
+        // every fragment (the "size keeps changing" report): leave it
+        // unknown, as IDM does, and let the fragment count drive the bar.
+        let size = if p.frag_count.is_some() { p.total } else { p.total.or(p.estimate) };
+        if let Some(total) = size.filter(|t| *t > 0.0) {
             self.last_total = total as u64;
             self.known = true;
         }
@@ -5652,6 +5706,50 @@ fn phase_for_line(line: &str) -> Option<&'static str> {
         return Some("Getting info");
     }
     None
+}
+
+/// Folder name for a helper's in-progress pieces, inside the save folder.
+const PARTS_DIR: &str = ".download_craft_parts";
+
+/// `(home, parts)` folders for a yt-dlp run saving to `dest`.
+fn ytdlp_dirs(dest: &std::path::Path) -> (PathBuf, PathBuf) {
+    let home = dest
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("."));
+    let parts = home.join(PARTS_DIR);
+    (home, parts)
+}
+
+/// The bare file name yt-dlp is told to write (relative to `home`).
+fn ytdlp_out_name(dest: &std::path::Path) -> String {
+    dest.file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_else(|| "download.mp4".to_string())
+}
+
+/// Create the parts folder and mark it hidden (Windows), best-effort.
+fn hide_dir(dir: &std::path::Path) {
+    if std::fs::create_dir_all(dir).is_err() {
+        return;
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::ffi::OsStrExt;
+        const FILE_ATTRIBUTE_HIDDEN: u32 = 0x2;
+        let wide: Vec<u16> = dir.as_os_str().encode_wide().chain(std::iter::once(0)).collect();
+        unsafe {
+            windows_sys::Win32::Storage::FileSystem::SetFileAttributesW(wide.as_ptr(), FILE_ATTRIBUTE_HIDDEN);
+        }
+    }
+}
+
+/// Drop the parts folder once nothing is left in it (other downloads in the
+/// same folder may still be using it).
+fn tidy_parts_dir(dest: &std::path::Path) {
+    let (_, parts) = ytdlp_dirs(dest);
+    let _ = std::fs::remove_dir(parts);
 }
 
 fn valid_ytdlp_output(path: &std::path::Path, dest: &std::path::Path) -> bool {
@@ -5749,7 +5847,16 @@ async fn download_with_ytdlp(
             ytdlp_format_with(&opts.quality_pref, merge_ffmpeg.is_some())
         })
         .arg("-o")
-        .arg(dest.to_string_lossy().replace('%',"%%"));
+        .arg(ytdlp_out_name(dest).replace('%',"%%"));
+    // Fragments and other in-progress pieces go to one hidden parts folder
+    // next to the file instead of dozens of ".part-FragN" files in the
+    // user's folder; only the finished file lands in it. Same drive, so the
+    // final move is a rename. (`-P temp:` is ignored for an absolute `-o`,
+    // hence home + a bare file name.)
+    let (home, parts) = ytdlp_dirs(dest);
+    cmd.arg("-P").arg(format!("home:{}", home.display()));
+    cmd.arg("-P").arg(format!("temp:{}", parts.display()));
+    hide_dir(&parts);
     if vimeo_needs_audio(url) || is_playlist_url(url) || opts.require_audio {
         // Missing fragments must fail rather than produce a shortened video.
         cmd.arg("--abort-on-unavailable-fragments");
@@ -5846,6 +5953,10 @@ async fn download_with_ytdlp(
                     progress.set_resolution(r);
                 }
             }
+            if let (Some(i), Some(n)) = (p.frag_index, p.frag_count) {
+                progress.frag_count.store(n as u64, Ordering::SeqCst);
+                progress.frag_index.store((i.max(0.0) as u64).min(n as u64), Ordering::SeqCst);
+            }
             let (downloaded, total) = folded.step(&p);
             progress.downloaded.store(downloaded, Ordering::SeqCst);
             match total {
@@ -5927,6 +6038,8 @@ async fn download_with_ytdlp(
     shared.downloaded.store(len, Ordering::SeqCst);
     shared.total.store(len, Ordering::SeqCst);
     shared.has_total.store(true, Ordering::SeqCst);
+    shared.frag_count.store(0, Ordering::SeqCst);
+    tidy_parts_dir(dest);
     // The file on disk is the ground truth: read its frame size back and, when
     // the video could not meet the menu cap, say so instead of letting a
     // 360p result pass for the 720p the user asked for.
@@ -8249,6 +8362,34 @@ mod tests {
         // An estimate is a size too.
         let mut g = MergedProgress::default();
         assert_eq!(g.step(&line("dcp@5|NA|900|NA")), (5, Some(900)));
+    }
+
+    #[test]
+    fn fragment_downloads_do_not_snowball_or_drift() {
+        let line = |s: &str| parse_progress_line(s).unwrap();
+        // Several fragments in flight: the counter dips now and then. Each
+        // dip used to count as a new leg and add the whole total again - an
+        // HLS movie claimed 18 GB downloaded after a resume.
+        let mut f = MergedProgress::default();
+        let mut last = 0;
+        for done in [500_000_000u64, 498_000_000, 520_000_000, 519_500_000, 530_000_000] {
+            let l = format!("dcp@{done}|NA|2300000000|6000000|960|1920|hls-3574|avc1|120|1340");
+            let (dl, total) = f.step(&line(&l));
+            assert!(dl >= last && dl <= 530_000_000, "{dl}");
+            last = dl;
+            // The estimate moves with every fragment: no size is published.
+            assert_eq!(total, None);
+        }
+        // The fragment fields are read.
+        let p = line("dcp@1|NA|5|1|NA|NA|hls-1|avc1|120|1340");
+        assert_eq!((p.frag_index, p.frag_count), (Some(120.0), Some(1340.0)));
+        assert_eq!(line("dcp@1|2|NA|1").frag_count, None);
+        // A different format id is the next leg, even when its counter has not
+        // dropped below half (the audio leg of a merge).
+        let mut g = MergedProgress::default();
+        g.step(&line("dcp@1000|1000|NA|1|720|1280|137|avc1"));
+        let (dl, total) = g.step(&line("dcp@900|900|NA|1|NA|NA|140|none"));
+        assert_eq!((dl, total), (1900, Some(1900)));
     }
 
     #[test]

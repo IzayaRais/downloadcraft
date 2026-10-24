@@ -282,7 +282,15 @@ function canonKey(url) {
 function noteMedia(tabId, entry) {
   if (tabId === undefined || tabId < 0) return;
   if (!entry || !entry.url || !/^https?:\/\//i.test(entry.url)) return;
-  entry.url = stripFbSlice(entry.url);
+  const whole = stripFbSlice(entry.url);
+  if (whole !== entry.url) {
+    // A Facebook byte range with its range removed is the whole quality
+    // file, not a fragment: flagged as one, the reel's own download was
+    // refused as "a playback fragment".
+    entry.segment = undefined;
+    entry.whole = true;
+  }
+  entry.url = whole;
   if (entry.url.length > 4000) return;
   // Sniffed verdicts (a .ts behind an opaque URL, a subtitle by content)
   // outrank URL-shape guesses.

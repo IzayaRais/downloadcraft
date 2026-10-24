@@ -9,11 +9,12 @@ const source = fs.readFileSync(__dirname + "/page-hook.js", "utf8");
 
 function page(globals = {}) {
   const posted = [];
+  const raw = [];
   const timers = [];
   const answers = new Map();
   const window = {
     location: { origin: "https://site.example" },
-    postMessage: (msg) => posted.push(...msg.items),
+    postMessage: (msg) => { raw.push(msg); if (msg.items) posted.push(...msg.items); },
     fetch: async (url) => {
       const a = answers.get(url);
       const res = {
@@ -37,7 +38,7 @@ function page(globals = {}) {
       run.forEach((fn) => fn());
     }
   };
-  return { window, posted, answers, flush };
+  return { window, posted, raw, answers, flush };
 }
 
 it("finds stream URLs in JSON API answers, including escaped slashes", async () => {
@@ -73,4 +74,17 @@ it("reads Bilibili player state as best video plus its audio pair", async () => 
   assert.equal(p.posted[0].url, "https://upos.example/v-1080.m4s");
   assert.equal(p.posted[0].pairUrl, "https://upos.example/a-192.m4s");
   assert.equal(p.posted[0].dur, 300);
+});
+
+it("on Facebook, hands video JSON to content.js instead of posting each file", async () => {
+  const p = page({ location: { origin: "https://www.facebook.com", hostname: "www.facebook.com" } });
+  const body = '{"extensions":{"all_video_dash_prefetch_representations":[{"video_id":"1","representations":[{"mime_type":"video/mp4","base_url":"https:\/\/x.fbcdn.net\/v\/a.mp4"}]}]}}';
+  p.answers.set("/api/graphql/", { type: "text/html; charset=utf-8", body });
+  p.answers.set("/api/other", { type: "application/json", body: '{"u":"https://x.fbcdn.net/v/b.mp4"}' });
+  await p.window.fetch("/api/graphql/");
+  await p.window.fetch("/api/other");
+  await p.flush();
+  assert.deepEqual(p.posted, [], "no loose fbcdn files");
+  assert.equal(p.raw.filter((m) => m.__dc === "fb-json").length, 1);
+  assert.equal(p.raw.find((m) => m.__dc === "fb-json").text, body);
 });

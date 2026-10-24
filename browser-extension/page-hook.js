@@ -34,8 +34,21 @@
   // Media URLs inside JSON/text, including JSON-escaped slashes.
   const MEDIA_RE = /https?:\/\/[^\s"'<>\\]+?\.(m3u8|mpd|mp4|webm)(\?[^\s"'<>\\]*)?(?=[\s"'<>\\,)\]}]|$)/gi;
   const MIME = { m3u8: "application/vnd.apple.mpegurl", mpd: "application/dash+xml", mp4: "video/mp4", webm: "video/webm" };
+  // Facebook: its GraphQL answers describe each video whole (every quality,
+  // audio, duration), which content.js turns into one entry per video. The
+  // generic scan below would instead post every quality of every preloaded
+  // reel as a separate nameless file, so it is skipped there.
+  const FB = /(^|\.)facebook\.com$/i.test(location.hostname);
+  const FB_MAX = 8 * 1024 * 1024;
+  function scanFacebook(text) {
+    if (text.length > FB_MAX) return;
+    if (text.indexOf("all_video_dash_prefetch_representations") < 0 && text.indexOf('"progressive_urls"') < 0) return;
+    try { window.postMessage({ __dc: "fb-json", text }, location.origin); } catch (e) {}
+  }
   function scanText(text) {
-    if (typeof text !== "string" || !text || text.length > MAX_BODY) return;
+    if (typeof text !== "string" || !text) return;
+    if (FB) return scanFacebook(text);
+    if (text.length > MAX_BODY) return;
     if (!/\.(?:m3u8|mpd|mp4|webm)/i.test(text)) return;
     const plain = text.replace(/\\u002[fF]/g, "/").replace(/\\\//g, "/");
     const out = [];
@@ -59,7 +72,7 @@
         try {
           const ct = res.headers.get("content-type") || "";
           const len = Number(res.headers.get("content-length") || 0);
-          if (!READABLE.test(ct) || SKIP.test(ct) || len > MAX_BODY) return;
+          if (!READABLE.test(ct) || SKIP.test(ct) || len > (FB ? FB_MAX : MAX_BODY)) return;
           res.clone().text().then(scanText, () => {});
         } catch (e) { /* never disturb the page */ }
       }, () => {});

@@ -63,6 +63,10 @@ describe("fmtDur", () => {
     assert.equal(DCRank.fmtDur(0), "");
     assert.equal(DCRank.fmtDur(-5), "");
   });
+  it("adds hours for long videos", () => {
+    assert.equal(DCRank.fmtDur(6542), "1:49:02");
+    assert.equal(DCRank.fmtDur(3600), "1:00:00");
+  });
 });
 
 describe("panelTokens", () => {
@@ -208,5 +212,48 @@ describe("Vimeo range captures", () => {
     for (const page of ["https://vimeo.com/", "https://vimeo.com/user123", "https://player.vimeo.com.evil.test/video/123", "ftp://vimeo.com/123"]) {
       assert.equal(DCRank.vimeoVideoPage(page), null);
     }
+  });
+});
+
+describe("Facebook videos from the page JSON", () => {
+  // Shape of a reel page / GraphQL answer: the DASH list sits in
+  // "extensions", the video node (duration, SD/HD, thumbnail) right after
+  // its id. Two reels, as Facebook preloads the next one.
+  const cdn = (p) => `https:\/\/scontent.example.fna.fbcdn.net\/o1\/v\/${p}.mp4?_nc_cat=1&oh=x&oe=1`;
+  const rep = (id, mime, w, h, bw) => `{"representation_id":"${id}","mime_type":"${mime}","base_url":"${cdn(id)}","bandwidth":${bw},"width":${w},"height":${h},"segments":[{"start":0,"end":826}]}`;
+  const page = [
+    `{"video":{"id":"111111111","preferred_thumbnail":{"image":{"uri":"https:\/\/scontent.example.fbcdn.net\/t15\/a.jpg"}},`,
+    `"length_in_second":19.122,"progressive_urls":[{"progressive_url":"${cdn("sd1")}&bitrate=138807&tag=sve_sd","metadata":{"quality":"SD"}},`,
+    `{"progressive_url":"${cdn("hd1")}&bitrate=359978","metadata":{"quality":"HD"}}],"id":"111111111"},`,
+    `{"id":"222222222","playable_duration_in_ms":77651},`,
+    `"extensions":{"all_video_dash_prefetch_representations":[`,
+    `{"video_id":"111111111","representations":[${rep("v720", "video/mp4", 720, 720, 146181)},${rep("v1080", "video/mp4", 1080, 1080, 388664)},${rep("a1", "audio/mp4", 0, 0, 58671)}]},`,
+    `{"video_id":"222222222","representations":[${rep("w1080", "video/mp4", 1080, 1920, 642641)},${rep("evil", "video/mp4", 1, 1, 1).replace("scontent.example.fna.fbcdn.net", "evil.example")}]}]}}`,
+  ].join("");
+
+  it("groups every quality, audio, duration and thumbnail per video", () => {
+    const v = DCRank.fbVideos(page);
+    assert.equal(v.length, 2);
+    const [a, b] = v;
+    assert.equal(a.id, "111111111");
+    assert.equal(a.dur, 19);
+    assert.match(a.thumb, /a\.jpg$/);
+    assert.deepEqual(a.video.map((x) => x.h), [1080, 720], "best first");
+    assert.equal(a.audio.length, 1);
+    assert.deepEqual(a.progressive.map((x) => [x.quality, x.bw]), [["SD", 138807], ["HD", 359978]]);
+    assert.equal(b.id, "222222222");
+    assert.equal(b.dur, 78);
+    // Only Facebook CDN files are kept, whatever the JSON names.
+    assert.deepEqual(b.video.map((x) => x.h), [1920]);
+  });
+
+  it("is empty for pages without video data and survives broken JSON", () => {
+    assert.deepEqual(DCRank.fbVideos('{"x":1}'), []);
+    assert.deepEqual(DCRank.fbVideos('"all_video_dash_prefetch_representations":[{"video_id":"1"'), []);
+  });
+
+  it("names a file by its path, so byte-range pieces map to their video", () => {
+    assert.equal(DCRank.fbPathOf("https://h.fbcdn.net/o1/v/x.mp4?bytestart=0&byteend=9"), "/o1/v/x.mp4");
+    assert.equal(DCRank.fbPathOf("not a url"), "");
   });
 });

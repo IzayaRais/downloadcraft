@@ -53,6 +53,9 @@ struct Snap {
     /// from the helper's chosen format. Empty while unknown.
     resolution: String,
     parts: Vec<(u64, u64, u64)>, // (start, end, done)
+    /// (index, count) while a helper fetches a fragmented stream, which has
+    /// no size until it is done: the bar and Part Info count fragments.
+    fragments: Option<(u64, u64)>,
 }
 
 fn read_snap(id: u64) -> Snap {
@@ -87,6 +90,12 @@ fn read_snap(id: u64) -> Snap {
         for p in arr.iter().take(32) {
             let n = |i: usize| p.get(i).and_then(|x| x.as_u64()).unwrap_or(0);
             out.parts.push((n(0), n(1), n(2)));
+        }
+    }
+    if let Some(f) = e.get("fragments").and_then(|x| x.as_array()) {
+        let n = |i: usize| f.get(i).and_then(|x| x.as_u64()).unwrap_or(0);
+        if n(1) > 0 {
+            out.fragments = Some((n(0).min(n(1)), n(1)));
         }
     }
     out
@@ -185,6 +194,17 @@ fn fmt_eta(left: u64, speed: f64) -> String {
         format!("{} m {} s left", secs / 60, secs % 60)
     } else {
         format!("{} s left", secs)
+    }
+}
+
+/// Media length as IDM words it: "1 h 49 min", "6 min 23 s", "19 s".
+fn fmt_duration(secs: u64) -> String {
+    if secs >= 3600 {
+        format!("{} h {} min", secs / 3600, (secs % 3600) / 60)
+    } else if secs >= 60 {
+        format!("{} min {} s", secs / 60, secs % 60)
+    } else {
+        format!("{secs} s")
     }
 }
 
@@ -416,12 +436,25 @@ impl ProgressApp {
         });
     }
 
-    /// Progress as a 0..1 fraction (unknown size = 0).
-    fn frac(item: &DownloadItem) -> f32 {
-        match item.total_bytes {
-            Some(t) if t > 0 => (item.downloaded_bytes as f32 / t as f32).clamp(0.0, 1.0),
+    /// Progress as a 0..1 fraction: bytes of the size, or fragments of a
+    /// stream that has no size yet (unknown and neither = 0).
+    fn frac(&self, item: &DownloadItem) -> f32 {
+        match (item.total_bytes, self.snap.fragments) {
+            (Some(t), _) if t > 0 => (item.downloaded_bytes as f32 / t as f32).clamp(0.0, 1.0),
+            (_, Some((i, n))) if self.snap.live => (i as f32 / n as f32).clamp(0.0, 1.0),
             _ => 0.0,
         }
+    }
+
+    /// Time left from the fragment pace when the stream has no size: the
+    /// bytes so far over the share of fragments done gives the whole.
+    fn fragment_eta(&self, item: &DownloadItem) -> Option<String> {
+        let (i, n) = self.snap.fragments?;
+        if i == 0 || item.downloaded_bytes == 0 {
+            return None;
+        }
+        let whole = item.downloaded_bytes as f64 * n as f64 / i as f64;
+        Some(fmt_eta((whole as u64).saturating_sub(item.downloaded_bytes), item.speed_bps))
     }
 }
 
@@ -533,7 +566,8 @@ impl eframe::App for ProgressApp {
         //
         // Every tab carries the part section (its header row holds the state
         // actions), so the height no longer depends on the tab.
-        let parts = self.snap.parts.len();
+        // A fragmented stream shows one row (see `fragment_parts`).
+        let parts = self.snap.parts.len().max(self.snap.fragments.map_or(0, |_| 1));
         let want_h = match &self.item {
             None => PG_DEAD_H,
             // The header row is always there: it carries the state actions
@@ -703,10 +737,10 @@ impl ProgressApp {
     /// state actions.
     fn paint(&mut self, ui: &mut egui::Ui, item: &DownloadItem, o: egui::Pos2) {
         let p = ui.painter().clone();
-        let frac = Self::frac(item);
+        let frac = self.frac(item);
         let pct = (frac * 100.0).floor() as u64;
         // IDM's title: "<pct>%-<name>" (the design shows 39%-Stories-…).
-        let raw_title = if item.total_bytes.unwrap_or(0) > 0 {
+        let raw_title = if item.total_bytes.unwrap_or(0) > 0 || frac > 0.0 {
             format!("{pct}%-{}", item.filename)
         } else {
             item.filename.clone()
@@ -812,14 +846,15 @@ impl ProgressApp {
         if !resolution.is_empty() {
             row("Resolution:", resolution, pl().dm_txt, reg(13.0));
         }
-        row(
-            "Size:",
-            item.total_bytes
-                .map(format_bytes)
-                .unwrap_or_else(|| "-".into()),
-            pl().dm_txt,
-            reg(13.0),
-        );
+        // A stream has no size until it is done: IDM says so and shows the
+        // duration instead of a number that changes with every fragment.
+        let size = match item.total_bytes {
+            Some(t) => format_bytes(t),
+            None if item.duration_secs > 0 => format!("Unknown ({})", fmt_duration(item.duration_secs)),
+            None if self.snap.fragments.is_some() => "Unknown (stream)".into(),
+            None => "-".into(),
+        };
+        row("Size:", size, pl().dm_txt, reg(13.0));
         row(
             "Downloaded:",
             format_bytes(item.downloaded_bytes),
@@ -841,6 +876,7 @@ impl ProgressApp {
             match item.total_bytes {
                 _ if matches!(item.status, Status::Paused) => "Paused".into(),
                 Some(t) if downloading => fmt_eta(t.saturating_sub(item.downloaded_bytes), item.speed_bps),
+                None if downloading => self.fragment_eta(item).unwrap_or_else(|| "-".into()),
                 _ => "-".into(),
             },
             pl().dm_txt,
@@ -1144,7 +1180,10 @@ impl ProgressApp {
         // A live transfer always has parts; a finished/failed one has none
         // (the engine drops the snapshot), which must not cost the header row
         // its actions.
-        let has_parts = !self.snap.parts.is_empty();
+        // A helper fetching a fragmented stream has no byte ranges, only a
+        // fragment count: that is its part list (IDM shows one too).
+        let frags = self.snap.fragments.filter(|_| self.snap.parts.is_empty());
+        let has_parts = !self.snap.parts.is_empty() || frags.is_some();
         p.line_segment(
             [
                 egui::pos2(o.x + 1.0, o.y + PART_Y + 0.5),
@@ -1273,6 +1312,10 @@ impl ProgressApp {
         // No snapshot (finished, failed or not yet started): the header row
         // above *is* the whole section — it still holds the state actions.
         if !has_parts || !self.parts_open {
+            return;
+        }
+        if let Some((i, n)) = frags {
+            self.fragment_parts(&p, o, i, n, downloading);
             return;
         }
 
@@ -1449,5 +1492,62 @@ impl ProgressApp {
                 pl().dm_box_bd,
             );
         }
+    }
+
+    /// Part Info for a fragmented stream: the strip fills with the fragments
+    /// done, and one row says how many of how many.
+    fn fragment_parts(&self, p: &egui::Painter, o: egui::Pos2, i: u64, n: u64, downloading: bool) {
+        let strip = at(o, PAD_X, STRIP_Y, PROG_W, STRIP_H);
+        p.rect_filled(strip, 2.0, if downloading && i == 0 { DM_YEL } else { pl().dm_box_bd });
+        let f = (i as f32 / n.max(1) as f32).clamp(0.0, 1.0);
+        if f > 0.0 {
+            p.rect_filled(
+                egui::Rect::from_min_size(strip.min, egui::vec2(strip.width() * f, STRIP_H)),
+                2.0,
+                DM_OK,
+            );
+        }
+        let hdr_y = o.y + TBL_HDR_Y + 4.0;
+        for (x, align, text) in [
+            (o.x + PAD_X, egui::Align2::LEFT_TOP, "#"),
+            (o.x + PAD_X + COL_NUM_W, egui::Align2::LEFT_TOP, "Status"),
+            (o.x + COL_DL_X + 90.0, egui::Align2::RIGHT_TOP, "Fragments"),
+            (o.x + COL_TOT_X + 80.0, egui::Align2::RIGHT_TOP, "Total"),
+        ] {
+            p.text(egui::pos2(x, hdr_y), align, text, reg(10.0), pl().dm_head);
+        }
+        p.line_segment(
+            [
+                egui::pos2(o.x + PAD_X, o.y + TBL_HDR_Y + TBL_HDR_H - 0.5),
+                egui::pos2(o.x + IN_R, o.y + TBL_HDR_Y + TBL_HDR_H - 0.5),
+            ],
+            egui::Stroke::new(1.0, pl().dm_line),
+        );
+        let y = o.y + TBL_Y;
+        let (status, col) = if i >= n {
+            ("Finished", DM_OK)
+        } else if downloading && i > 0 {
+            ("Receiving fragments", DM_OK)
+        } else if downloading {
+            ("Connecting...", DM_YEL)
+        } else {
+            ("Incomplete", pl().dm_dim)
+        };
+        p.text(egui::pos2(o.x + PAD_X, y + TBL_PAD), egui::Align2::LEFT_TOP, "1", reg(10.0), pl().dm_lbl);
+        p.text(egui::pos2(o.x + PAD_X + COL_NUM_W, y + TBL_PAD), egui::Align2::LEFT_TOP, status, reg(10.0), col);
+        p.text(
+            egui::pos2(o.x + COL_DL_X + 90.0, y + TBL_PAD),
+            egui::Align2::RIGHT_TOP,
+            i.to_string(),
+            reg(10.0),
+            pl().dm_dim,
+        );
+        p.text(
+            egui::pos2(o.x + COL_TOT_X + 80.0, y + TBL_PAD),
+            egui::Align2::RIGHT_TOP,
+            n.to_string(),
+            reg(10.0),
+            pl().dm_dim,
+        );
     }
 }

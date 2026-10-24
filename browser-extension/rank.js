@@ -373,9 +373,11 @@
   function fmtDur(sec) {
     const n = Math.round(Number(sec) || 0);
     if (!(n > 0) || n >= 86400) return "";
-    const m = Math.floor(n / 60);
+    const h = Math.floor(n / 3600);
+    const m = Math.floor((n % 3600) / 60);
     const s = String(n % 60).padStart(2, "0");
-    return `${m}:${s}`;
+    // A movie reads "1:49:02", not "109:02".
+    return h ? `${h}:${String(m).padStart(2, "0")}:${s}` : `${m}:${s}`;
   }
 
   // Floating panel tokens: the "extension_popup.html" design — a circle
@@ -491,7 +493,119 @@
     } catch (e) {}
   }
 
-  const DCRank = { attachmentDownload, videoDismissKey, directDownloadLink, hideDownloadUI, playerEvidence, playlistReferences, samePlayer, completePlaylist, isVimeoAdaptive, isVimeoFragment, vimeoVideoPage, isPlaylistUrl, isSegmentUrl, canonicalUrl, kindOf, scoreMedia, classifyResponse, sniffBytes, forwardHeaders, extOf, dispositionFilename, collapseDupes, fmtDur, panelTokens, dcThemeMode, dcSetTheme, paintDcPanel };
+  // ---- Facebook: one entry per video from the page's own JSON ----
+  // Facebook preloads several reels and plays each as DASH byte ranges, so
+  // the sniffer sees dozens of .mp4 pieces per video. The page JSON (initial
+  // HTML and /api/graphql answers) describes each video whole instead:
+  //   all_video_dash_prefetch_representations: [{video_id, representations:
+  //     [{mime_type, base_url, bandwidth, width, height}]}]   (whole files)
+  //   progressive_urls: [{progressive_url, metadata:{quality:"SD"|"HD"}}]
+  //   length_in_second / playable_duration_in_ms, preferred_thumbnail
+  // The last three sit just after their video's "id", so each is tied to
+  // the nearest preceding known video id.
+  function jsonAt(text, start) {
+    // Balanced {...} / [...] from `start`, strings respected.
+    let depth = 0, inStr = false, esc = false;
+    for (let i = start; i < text.length; i++) {
+      const c = text[i];
+      if (inStr) {
+        if (esc) esc = false;
+        else if (c === "\\") esc = true;
+        else if (c === '"') inStr = false;
+      } else if (c === '"') inStr = true;
+      else if (c === "[" || c === "{") depth++;
+      else if (c === "]" || c === "}") {
+        if (--depth === 0) {
+          try { return JSON.parse(text.slice(start, i + 1)); } catch (e) { return null; }
+        }
+      }
+    }
+    return null;
+  }
+  // `known`: ids of videos found earlier. A later answer often carries only
+  // a video's metadata (duration, SD/HD, thumbnail) without its DASH list,
+  // and those fields still belong to it.
+  function fbVideos(text, known) {
+    const t = String(text || "");
+    const byId = new Map();
+    const entry = (id) => {
+      if (!byId.has(id)) byId.set(id, { id, dur: 0, thumb: "", video: [], audio: [], progressive: [] });
+      return byId.get(id);
+    };
+    const knownIds = new Set((known || []).map(String));
+    for (const id of knownIds) entry(id);
+    const httpUrl = (u) => typeof u === "string" && /^https:\/\/[^/]+\.(fbcdn\.net|cdninstagram\.com)\//i.test(u);
+    const KEY = '"all_video_dash_prefetch_representations":';
+    for (let p = t.indexOf(KEY); p >= 0; p = t.indexOf(KEY, p + KEY.length)) {
+      const arr = jsonAt(t, p + KEY.length);
+      if (!Array.isArray(arr)) continue;
+      for (const v of arr) {
+        const id = v && /^\d{6,}$/.test(String(v.video_id)) ? String(v.video_id) : "";
+        if (!id || !Array.isArray(v.representations)) continue;
+        const e = entry(id);
+        for (const r of v.representations) {
+          if (!r || !httpUrl(r.base_url)) continue;
+          const mime = String(r.mime_type || "");
+          const list = mime.startsWith("audio/") ? e.audio : mime.startsWith("video/") ? e.video : null;
+          if (!list || list.some((x) => x.url === r.base_url)) continue;
+          list.push({ url: r.base_url, mime, bw: Number(r.bandwidth) || 0,
+            w: Number(r.width) || 0, h: Number(r.height) || 0 });
+        }
+      }
+    }
+    if (!byId.size) return [];
+    // Nearest known id before `p` (within a window), for the fields that
+    // follow a video's "id".
+    const idRe = /"(?:id|video_id)":"(\d{6,})"/g;
+    const ownerAt = (p) => {
+      const from = Math.max(0, p - 6000);
+      idRe.lastIndex = from;
+      let owner = "";
+      for (let m; (m = idRe.exec(t)) && m.index < p;) if (byId.has(m[1])) owner = m[1];
+      return owner;
+    };
+    const each = (key, fn) => {
+      for (let p = t.indexOf(key); p >= 0; p = t.indexOf(key, p + key.length)) {
+        const id = ownerAt(p);
+        if (id) fn(byId.get(id), p + key.length);
+      }
+    };
+    each('"length_in_second":', (e, at) => {
+      const n = parseFloat(t.slice(at, at + 20));
+      if (!e.dur && n > 0 && n < 86400) e.dur = Math.round(n);
+    });
+    each('"playable_duration_in_ms":', (e, at) => {
+      const n = parseInt(t.slice(at, at + 20), 10);
+      if (!e.dur && n > 0 && n < 86400000) e.dur = Math.round(n / 1000);
+    });
+    each('"progressive_urls":', (e, at) => {
+      const arr = jsonAt(t, at);
+      for (const x of Array.isArray(arr) ? arr : []) {
+        const u = x && x.progressive_url;
+        if (!httpUrl(u) || e.progressive.some((y) => y.url === u)) continue;
+        const br = parseInt((u.match(/[?&]bitrate=(\d+)/) || [])[1], 10) || 0;
+        e.progressive.push({ url: u, quality: String((x.metadata && x.metadata.quality) || ""), bw: br });
+      }
+    });
+    each('"preferred_thumbnail":', (e, at) => {
+      const o = jsonAt(t, at);
+      const u = o && o.image && o.image.uri;
+      if (!e.thumb && typeof u === "string" && /^https:\/\//i.test(u)) e.thumb = u;
+    });
+    for (const e of byId.values()) {
+      e.video.sort((a, b) => (b.h * b.w - a.h * a.w) || (b.bw - a.bw));
+      e.audio.sort((a, b) => b.bw - a.bw);
+    }
+    return [...byId.values()].filter((e) => e.video.length || e.progressive.length
+      || (knownIds.has(e.id) && (e.dur || e.thumb)));
+  }
+  // The file path identifies a representation across its byte-range pieces
+  // and signature refreshes (the query string changes, the path does not).
+  function fbPathOf(u) {
+    try { return new URL(String(u)).pathname; } catch (e) { return ""; }
+  }
+
+  const DCRank = { fbVideos, fbPathOf, attachmentDownload, videoDismissKey, directDownloadLink, hideDownloadUI, playerEvidence, playlistReferences, samePlayer, completePlaylist, isVimeoAdaptive, isVimeoFragment, vimeoVideoPage, isPlaylistUrl, isSegmentUrl, canonicalUrl, kindOf, scoreMedia, classifyResponse, sniffBytes, forwardHeaders, extOf, dispositionFilename, collapseDupes, fmtDur, panelTokens, dcThemeMode, dcSetTheme, paintDcPanel };
   g.DCRank = DCRank;
   if (typeof module !== "undefined" && module.exports) module.exports = DCRank;
 })(typeof globalThis !== "undefined" ? globalThis : this);

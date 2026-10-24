@@ -1096,6 +1096,101 @@
     return { rows, audio, pair };
   }
 
+  // Whole videos from Facebook's own JSON (DCRank.fbVideos): every quality
+  // as one file, its audio track, duration and thumbnail - instead of the
+  // dozens of byte-range pieces the sniffer sees per reel. Filled from the
+  // page's script tags on first use and from the GraphQL answers page-hook.js
+  // relays as reels load. Newest data last (Map order), capped.
+  const fbStore = new Map();
+  let fbDocScanned = false;
+  function fbAddVideos(text) {
+    if (typeof DCRank === "undefined" || !DCRank.fbVideos) return;
+    for (const v of DCRank.fbVideos(text, [...fbStore.keys()])) {
+      const old = fbStore.get(v.id);
+      fbStore.delete(v.id);
+      fbStore.set(v.id, old ? {
+        ...old,
+        dur: v.dur || old.dur,
+        thumb: v.thumb || old.thumb,
+        video: v.video.length ? v.video : old.video,
+        audio: v.audio.length ? v.audio : old.audio,
+        progressive: v.progressive.length ? v.progressive : old.progressive,
+      } : v);
+    }
+    while (fbStore.size > 40) fbStore.delete(fbStore.keys().next().value);
+  }
+  function fbScanDocument() {
+    if (fbDocScanned) return;
+    fbDocScanned = true;
+    // The quality lists and each video's duration/SD-HD/thumbnail sit in
+    // different script tags, so the relevant ones are read as one text.
+    try {
+      const keys = ["all_video_dash_prefetch_representations", '"length_in_second"',
+        '"playable_duration_in_ms"', '"progressive_urls"', '"preferred_thumbnail"'];
+      const parts = [];
+      for (const s of document.scripts) {
+        const t = s.textContent || "";
+        if (keys.some((k) => t.indexOf(k) >= 0)) parts.push(t);
+      }
+      if (parts.length) fbAddVideos(parts.join("\n"));
+    } catch (e) { /* best effort */ }
+  }
+  // Every file path a stored video owns (its qualities, audio, SD/HD).
+  function fbPathsOf(e) {
+    const R = DCRank;
+    return [...e.video, ...e.audio, ...e.progressive].map((x) => R.fbPathOf(x.url));
+  }
+  // The stored videos, the one on screen first: the reel id in the URL, else
+  // the video whose file the player fetched last.
+  function fbStoredVideos(items) {
+    fbScanDocument();
+    const list = [...fbStore.values()].reverse();
+    if (!list.length) return [];
+    const seen = new Map(); // path -> newest seenAt
+    for (const m of (items || [])) {
+      const p = DCRank.fbPathOf(m && m.url);
+      if (p) seen.set(p, Math.max(seen.get(p) || 0, Number(m.seenAt) || 1));
+    }
+    const lastSeen = (e) => Math.max(0, ...fbPathsOf(e).map((p) => seen.get(p) || 0));
+    const urlId = fbReelKeyOf(location.href);
+    const score = (e) => (e.id === urlId ? 1e15 : 0) + lastSeen(e);
+    return list.map((e, i) => ({ e, s: score(e), i }))
+      .sort((a, b) => (b.s - a.s) || (a.i - b.i))
+      .map((x) => x.e);
+  }
+  // Panel rows for one stored video: each quality with its audio paired in
+  // and a bitrate x duration size (shown with "~"), then the SD/HD files.
+  function fbStoredRows(e, info) {
+    const rows = [];
+    const fname = fbFilename(info.title);
+    const stem = fname.replace(/\.mp4$/i, "");
+    const dur = e.dur || info.durSec || 0;
+    const a = e.audio[0] || null;
+    const est = (bw) => (bw > 0 && dur > 0 ? Math.round((bw * dur) / 8) : 0);
+    const seenQ = new Set();
+    for (const v of e.video) {
+      const quality = fbQuality(v.w, v.h, true);
+      if (seenQ.has(quality)) continue;
+      seenQ.add(quality);
+      const q = fbQualityCap(quality);
+      rows.push({
+        url: v.url, fname: q ? `${stem} [${q}].mp4` : fname, q,
+        label: `⬇ ${info.title.slice(0, 40)}, MP4 file, quality ${quality}`,
+        _size: 0, _est: est(v.bw + (a ? a.bw : 0)), dur: dur || null,
+        thumb: e.thumb || info.thumb || "",
+        pair: a ? { url: a.url, mime: a.mime || "audio/mp4" } : null,
+      });
+    }
+    for (const p of e.progressive) {
+      const quality = p.quality === "HD" ? "HD (single file)" : "SD (single file)";
+      rows.push({
+        url: p.url, fname, q: "", label: `⬇ ${info.title.slice(0, 40)}, MP4 file, quality ${quality}`,
+        _size: 0, _est: est(p.bw), dur: dur || null, thumb: e.thumb || info.thumb || "", fromJson: true,
+      });
+    }
+    return rows;
+  }
+
   // ---------- end Facebook reels support ----------
   // Pick the best directly-downloadable candidate the background sniffer
   // caught for this page: prefer real video/mp4 over playlists, biggest
@@ -1928,16 +2023,23 @@
     try {
       const need = (pairs || []).filter((p) => p && p.sizeEl && p.st
         && !(p.st._size > 0) && !p.st.ciphered && /^https?:\/\//i.test(p.st.url || ""));
-      const urls = [...new Set(need.map((p) => p.st.url))].slice(0, 12);
+      // A row with its own audio track (`st.pair`) is that much bigger once
+      // merged, so both files are measured and added.
+      const pairOf = (p) => (p.st.pair && /^https?:\/\//i.test(p.st.pair.url || "") ? p.st.pair.url : "");
+      const urls = [...new Set(need.flatMap((p) => [p.st.url, pairOf(p)].filter(Boolean)))].slice(0, 16);
       if (!urls.length) return;
       chrome.runtime.sendMessage({ type: "getSizes", urls, referer: location.href }, (res) => {
         if (chrome.runtime.lastError) return;
         if (!alive()) return;
         const sizes = (res && res.sizes) || {};
         for (const p of need) {
-          const n = sizes[p.st.url] || 0;
+          const audio = pairOf(p);
+          const n = (sizes[p.st.url] || 0) > 0 && (!audio || sizes[audio] > 0)
+            ? sizes[p.st.url] + (audio ? sizes[audio] : 0)
+            : 0;
           if (n > 0 && p.sizeEl.isConnected) {
-            p.st._size = n;
+            // The app gets the file's own size; the row shows the merge.
+            p.st._size = sizes[p.st.url];
             p.sizeEl.textContent = fmtSize(n);
           }
         }
@@ -2548,10 +2650,10 @@
       const qm = String(st.label || "").match(/quality\s+(.+?)(?:,|$)/i);
       const q = {
         res: (qm && qm[1]) || "video",
-        size: st._size > 0 ? fmtSize(st._size) : "",
+        size: st._size > 0 ? fmtSize(st._size) : st._est > 0 ? "~" + fmtSize(st._est) : "",
         format: "MP4",
         tip: `${(qm && qm[1]) || "video"} · MP4 · ${title}`,
-        send: () => sendDownload(st.url, st.fname, "video/mp4", st._size || null, (pair && !st.fromJson) ? pair : null, st.q || null, st.dur || null),
+        send: () => sendDownload(st.url, st.fname, "video/mp4", st._size || null, st.pair || ((pair && !st.fromJson) ? pair : null), st.q || null, st.dur || null),
       };
       const it = api.addQuality({ ...q, onPick: () => api.setInfo(q) });
       sizePairs.push({ item: it, sizeEl: it.sizeEl, st });
@@ -2585,13 +2687,17 @@
         }
         const items = (res && res.items) || [];
         const data = fbMenuRows(info, items);
-        const rows = data.rows;
+        // The reel's own qualities from Facebook's JSON beat the pieces the
+        // sniffer caught (each piece used to become its own row).
+        const stored = fbStoredVideos(items)[0];
+        const rows = stored ? fbStoredRows(stored, info) : data.rows;
+        if (stored && !rows.length) rows.push(...data.rows);
         const audio = data.audio;
         if (!rows.length) {
           sendDownload(location.href, fbFilename(info.title), null, null, null, null, info.durSec || null);
         } else if (rows.length === 1 && !audio.length) {
           const r0 = rows[0];
-          sendDownload(r0.url, r0.fname, "video/mp4", r0._size || null, (data.pair && !r0.fromJson) ? data.pair : null, r0.q || null, r0.dur || info.durSec || null);
+          sendDownload(r0.url, r0.fname, "video/mp4", r0._size || null, r0.pair || ((data.pair && !r0.fromJson) ? data.pair : null), r0.q || null, r0.dur || info.durSec || null);
         } else {
           openFbMenu(pill, rows, info.title, info.thumb, audio, data.pair);
         }
@@ -2694,9 +2800,31 @@
           thumb = (og && og.content) || (v && v.poster) || "";
           if (!/^https?:\/\//i.test(thumb)) thumb = "";
         } catch (e) { /* ignore */ }
+        // Facebook: whole videos from its own JSON, the reel on screen first.
+        // Their byte-range pieces (and every other fbcdn file the sniffer or
+        // the page JSON turned up) are what filled the list with a dozen
+        // nameless, sizeless copies of one reel, so those are dropped.
+        let fb = [];
+        try {
+          if (isFacebookPage()) {
+            const stored = fbStoredVideos(net);
+            if (stored.length) {
+              const info = fbInfo();
+              fb = stored.slice(0, 15).map((e, i) => ({
+                id: e.id, dur: e.dur, thumb: e.thumb || (i === 0 ? info.thumb : ""),
+                title: i === 0 ? info.title : "",
+                video: e.video, audio: e.audio, progressive: e.progressive,
+              }));
+              net = net.filter((n) => !/(^|\.)fbcdn\.net$/i.test((() => {
+                try { return new URL(n.url).hostname; } catch (e) { return ""; }
+              })()));
+            }
+          }
+        } catch (e) { fb = []; }
         sendResponse({
           videos,
           links,
+          fb,
           net: net.map((n) => (n.thumb ? n : { ...n, thumb })),
           page: location.href,
           title: document.title || "",
@@ -2761,7 +2889,13 @@
     // them there and announces each navigation. A page faking one only
     // triggers a refresh.
     window.addEventListener("message", (ev) => {
-      if (ev.source === window && ev.data && ev.data.__dc === "nav") fireSpa();
+      if (ev.source !== window || !ev.data) return;
+      if (ev.data.__dc === "nav") fireSpa();
+      // Facebook's GraphQL answers that describe videos (page-hook.js). The
+      // parser keeps only Facebook CDN files, whatever a page posts here.
+      else if (ev.data.__dc === "fb-json" && typeof ev.data.text === "string" && isFacebookPage()) {
+        fbAddVideos(ev.data.text.slice(0, 4 * 1024 * 1024));
+      }
     });
     window.addEventListener("popstate", fireSpa);
     window.addEventListener("hashchange", fireSpa);

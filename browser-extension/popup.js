@@ -188,7 +188,11 @@ function card(item) {
   if (item.options.length < 2) sel.disabled = item.options.length === 0;
   const showSize = () => {
     const o = item.options[Number(sel.value)] || {};
-    size.textContent = o.size > 0 ? (o.approx ? "~" : "") + fmtSize(o.size) : "";
+    // A stream (HLS/DASH) has no size until it is downloaded: say how long
+    // it is instead, as IDM does.
+    const d = fmtDur(item.dur);
+    size.textContent = o.size > 0 ? (o.approx ? "~" : "") + fmtSize(o.size) : (d ? `⏱ ${d}` : "");
+    size.title = o.size > 0 ? "" : (d ? "Length — streams have no size until downloaded" : "");
     queued.textContent = o.queued ? "✓ Queued" : "";
   };
   sel.onchange = showSize;
@@ -271,11 +275,52 @@ function youtubeItem(v, pageUrl) {
   return { title: v.title || v.videoId, thumb: v.thumb, dur: firstDur, tag: "YOUTUBE", link: page, page, options: opts };
 }
 
+// A Facebook video from its own JSON (content.js fbStoredVideos): every
+// quality as one file with the audio track paired in, then the single-file
+// SD/HD encodes. Sizes start as bitrate x duration ("~") and are measured.
+function facebookItem(e, pageUrl) {
+  const stem = safeName(e.title || `facebook_${e.id}`).replace(/\.mp4$/i, "");
+  const dur = e.dur || 0;
+  const a = (e.audio || [])[0] || null;
+  const est = (bw) => (bw > 0 && dur > 0 ? Math.round((bw * dur) / 8) : 0);
+  const opts = [];
+  const seen = new Set();
+  for (const v of (e.video || [])) {
+    const q = Math.min(v.w || 0, v.h || 0) || v.h || 0;
+    if (!q || seen.has(q)) continue;
+    seen.add(q);
+    opts.push({
+      label: `${q}p${a ? " (+audio)" : ""} · MP4`,
+      size: est(v.bw + (a ? a.bw : 0)), approx: true, url: v.url, pairUrl: a && a.url,
+      msg: { type: "download", url: v.url, filename: `${stem} [${q}p].mp4`, pageUrl, quality: `${q}p`,
+        dur: dur || null, pairUrl: a ? a.url : undefined, pairMime: a ? (a.mime || "audio/mp4") : undefined },
+    });
+  }
+  for (const p of (e.progressive || [])) {
+    opts.push({
+      label: `${p.quality === "HD" ? "HD" : "SD"} · MP4 (single file)`,
+      size: est(p.bw), approx: true, url: p.url,
+      msg: { type: "download", url: p.url, filename: `${stem}.mp4`, pageUrl, dur: dur || null },
+    });
+  }
+  if (a) {
+    opts.push({
+      label: "Audio · M4A", size: est(a.bw), approx: true, url: a.url,
+      msg: { type: "download", url: a.url, filename: `${stem} [audio].m4a`, pageUrl, dur: dur || null },
+    });
+  }
+  return { title: e.title || "Facebook video", thumb: e.thumb, dur, tag: "FACEBOOK", link: pageUrl, page: pageUrl, options: opts };
+}
+
 function render(peek, pageUrl) {
   const box = $("videos");
   box.textContent = "";
   const sections = { streams: [], videos: [], other: [] };
   for (const v of (peek.videos || [])) sections.videos.push(youtubeItem(v, pageUrl));
+  for (const e of (peek.fb || [])) {
+    const it = facebookItem(e, pageUrl);
+    if (it.options.length) sections.videos.push(it);
+  }
 
   const net = peek.net || [];
   const have = new Set((peek.links || []).map((l) => l.url));
@@ -346,13 +391,18 @@ function enrich(items, pageUrl) {
       for (const { it, o } of opts) if (o.url && hit.has(o.url)) { o.queued = true; it.refresh && it.refresh(); }
     });
   }
-  const need = [...new Set(opts.filter(({ o }) => o.url && !(o.size > 0)).map(({ o }) => o.url))].slice(0, 12);
+  // Rows without a size, or with only an estimate, get measured; a row that
+  // carries its audio track (`pairUrl`) is both files together.
+  const want = opts.filter(({ o }) => o.url && (!(o.size > 0) || o.approx)).slice(0, 10);
+  const need = [...new Set(want.flatMap(({ o }) => [o.url, o.pairUrl].filter(Boolean)))].slice(0, 16);
   if (need.length) {
     chrome.runtime.sendMessage({ type: "getSizes", urls: need, referer: pageUrl }, (res) => {
       if (chrome.runtime.lastError) return;
       const sizes = (res && res.sizes) || {};
-      for (const { it, o } of opts) {
-        if (o.url && sizes[o.url] > 0 && !(o.size > 0)) { o.size = sizes[o.url]; o.approx = false; it.refresh && it.refresh(); }
+      for (const { it, o } of want) {
+        const v = sizes[o.url] || 0;
+        const a = o.pairUrl ? sizes[o.pairUrl] || 0 : 0;
+        if (v > 0 && (!o.pairUrl || a > 0)) { o.size = v + a; o.approx = false; it.refresh && it.refresh(); }
       }
     });
   }
@@ -377,7 +427,7 @@ async function activeTab() {
       // The top frame only: every iframe also answers (ad/account frames
       // replied first with an empty or foreign video list).
       const peek = await api.tabs.sendMessage(tab.id, { type: "peekState" }, { frameId: 0 });
-      if (peek && (peek.videos || peek.links || peek.net)) {
+      if (peek && (peek.videos || peek.links || peek.net || peek.fb)) {
         render(peek, peek.page || tabUrl);
         return;
       }
