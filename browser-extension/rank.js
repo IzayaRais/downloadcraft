@@ -129,14 +129,20 @@
     const headers = new Map((details.responseHeaders || []).map(h => [String(h.name).toLowerCase(), String(h.value || "")]));
     const disposition = headers.get("content-disposition") || "";
     if (!/^\s*attachment(?:\s*;|$)/i.test(disposition)) return null;
+    const filename = dispositionFilename(disposition);
+    return {filename, size:Math.max(0, Number(headers.get("content-length")) || 0), mime:headers.get("content-type") || null};
+  }
+
+  function dispositionFilename(disposition) {
     let filename = null;
-    const encoded = disposition.match(/(?:^|;)\s*filename\*\s*=\s*UTF-8'[^']*'([^;]+)/i);
-    const plain = disposition.match(/(?:^|;)\s*filename\s*=\s*(?:"((?:[^"\\]|\\.)*)"|([^;]+))/i);
+    const value = String(disposition || "");
+    const encoded = value.match(/(?:^|;)\s*filename\*\s*=\s*UTF-8'[^']*'([^;]+)/i);
+    const plain = value.match(/(?:^|;)\s*filename\s*=\s*(?:"((?:[^"\\]|\\.)*)"|([^;]+))/i);
     try { if (encoded) filename = decodeURIComponent(encoded[1].trim()); } catch (e) {}
     if (!filename && plain) filename = (plain[1] || plain[2] || "").replace(/\\(.)/g, "$1").trim();
     // A server filename is a basename, never a directory supplied by the server.
     if (filename) filename = filename.split(/[\\/]/).pop().replace(/[\x00-\x1f\x7f]/g, "").slice(0,240) || null;
-    return {filename, size:Math.max(0, Number(headers.get("content-length")) || 0), mime:headers.get("content-type") || null};
+    return filename;
   }
 
   function videoDismissKey(page, src, videoId) {
@@ -165,11 +171,157 @@
     }
   }
 
-  // 'playlist' | 'segment' | 'file'
+  // ---- Response classification (deep detection) ----
+  // Decides from one response's headers whether it is a stream, a media file,
+  // a subtitle, a playlist part, or worth sniffing its first bytes. Opaque
+  // CDNs hide manifests behind extensionless URLs and text/plain or
+  // octet-stream types, so URL + MIME matching alone misses them.
+  const VIDEO_EXT = ["mp4", "webm", "mkv", "mov", "avi", "m4v", "flv", "3gp", "wmv", "ogv"];
+  const AUDIO_EXT = ["mp3", "m4a", "aac", "flac", "ogg", "oga", "opus", "wav", "mka"];
+  const SUB_EXT = ["vtt", "webvtt", "srt", "ass", "ssa", "ttml", "dfxp"];
+  const SUB_MIME = /^(?:text\/vtt|application\/x-webvtt|application\/x-subrip|application\/x-srt|application\/(?:x-)?ttml\+xml|application\/dfxp\+xml|text\/x-ssa|application\/x-ssa)$/;
+  const OPAQUE_MIME = new Set(["text/plain", "application/octet-stream", "binary/octet-stream",
+    "application/binary", "application/x-binary", "application/force-download",
+    "application/x-download", "application/xml", "text/xml"]);
+  const HLS_MIME = "application/vnd.apple.mpegurl";
+  const DASH_MIME = "application/dash+xml";
+  const BIG_OPAQUE_BYTES = 5 * 1024 * 1024;
+  const SNIFF_TYPES = new Set(["xmlhttprequest", "media", "other", "object"]);
+
+  function extOf(name) {
+    const leaf = String(name || "").split(/[?#]/, 1)[0].split("/").pop() || "";
+    const dot = leaf.lastIndexOf(".");
+    return dot > 0 && dot < leaf.length - 1 ? leaf.slice(dot + 1).toLowerCase() : "";
+  }
+
+  function mediaMimeForExt(ext) {
+    if (VIDEO_EXT.includes(ext)) return ext === "mkv" ? "video/x-matroska" : ext === "mov" ? "video/quicktime" : `video/${ext === "m4v" ? "mp4" : ext}`;
+    if (AUDIO_EXT.includes(ext)) return ext === "mp3" ? "audio/mpeg" : ext === "m4a" ? "audio/mp4" : `audio/${ext}`;
+    return null;
+  }
+
+  // r: {url, mime, type, method, status, size, filename, acceptRanges}
+  // opts: {minBytes, deep}. Returns {kind, stream?, mime, reason},
+  // {sniff:true, reason}, or null (not media).
+  function classifyResponse(r, opts) {
+    const o = opts || {};
+    const minBytes = Math.max(0, Number(o.minBytes) || 0);
+    const url = String((r && r.url) || "");
+    const mime = String((r && r.mime) || "").toLowerCase().split(";")[0].trim();
+    const type = (r && r.type) || "";
+    const method = String((r && r.method) || "GET").toUpperCase();
+    const status = Number(r && r.status) || 200;
+    const size = Math.max(0, Number(r && r.size) || 0);
+    if (!/^https?:\/\//i.test(url)) return null;
+    if (!["GET", "HEAD", "POST"].includes(method)) return null;
+    if (status < 200 || status >= 300 || status === 204) return null;
+    let path = url, host = "";
+    try { const x = new URL(url); path = x.pathname; host = x.hostname; } catch (e) {}
+    const ext = extOf(path);
+    const frame = type === "main_frame" || type === "sub_frame";
+    if (frame && /^(?:text\/html|application\/xhtml\+xml)$/.test(mime)) return null; // pages
+    const tooSmall = size > 0 && size < minBytes;
+    const byExt = (x, why) => {
+      if (x === "m3u8") return { kind: "playlist", stream: "hls", mime: HLS_MIME, reason: why + "-hls" };
+      if (x === "mpd") return { kind: "playlist", stream: "dash", mime: DASH_MIME, reason: why + "-dash" };
+      if (SUB_EXT.includes(x)) return { kind: "subtitle", mime: SUB_MIME.test(mime) ? mime : "text/vtt", reason: why + "-subtitle" };
+      if (VIDEO_EXT.includes(x) || AUDIO_EXT.includes(x)) {
+        if (tooSmall) return null;
+        const usable = mime && !OPAQUE_MIME.has(mime) ? mime : mediaMimeForExt(x);
+        return { kind: "file", mime: usable, reason: why + "-media" };
+      }
+      return undefined;
+    };
+    if (/mpegurl/.test(mime)) return { kind: "playlist", stream: "hls", mime: HLS_MIME, reason: "hls-mime" };
+    if (mime === DASH_MIME) return { kind: "playlist", stream: "dash", mime: DASH_MIME, reason: "dash-mime" };
+    // Parts stay captured (unchanged behavior): they let a fragment resolve
+    // to its playlist or single-player page, and are demoted in menus.
+    if (isSegmentUrl(url) || mime === "video/mp2t") return { kind: "segment", mime: mime || "video/mp2t", reason: "segment" };
+    const fromPath = byExt(ext, "ext");
+    if (fromPath !== undefined) return fromPath;
+    // Content-Disposition names the real file behind download.php?id=… URLs.
+    const fromName = r && r.filename ? byExt(extOf(r.filename), "disposition") : undefined;
+    if (fromName !== undefined) return fromName;
+    if (SUB_MIME.test(mime)) return { kind: "subtitle", mime, reason: "subtitle-mime" };
+    if (/^(?:video|audio)\//.test(mime) || mime === "application/mp4" || mime === "application/ogg") {
+      return tooSmall ? null : { kind: "file", mime, reason: "media-mime" };
+    }
+    if (method !== "GET" || !SNIFF_TYPES.has(type)) return null;
+    const json = mime === "application/json" || /\+json$/.test(mime);
+    const hinted = /(?:^|\/)(?:hls|m3u8|dash|mpd)(?:[-_][^/?#]+)?(?:\/|$)/i.test(path)
+      || /(?:^|[.-])(?:hls|m3u8|dash|mpd)(?:[.-]|$)/i.test(host);
+    if (hinted && !json) return { sniff: true, reason: "stream-path-hint" };
+    if (/(?:^|\/)(?:master|manifest|playlist|index|video|audio|variant)(?:[-_.][^/?#]+)?\.txt$/i.test(path)) {
+      return { sniff: true, reason: "manifest-name-hint" };
+    }
+    // An extensionless, range-capable multi-megabyte body is almost always a
+    // progressive video behind an obfuscated URL.
+    if (!ext && r && r.acceptRanges && size >= Math.max(minBytes, BIG_OPAQUE_BYTES)) {
+      return { sniff: true, reason: "large-ranged-body" };
+    }
+    if (o.deep !== false && OPAQUE_MIME.has(mime)) return { sniff: true, reason: "opaque-mime" };
+    return null;
+  }
+
+  // Identify the first bytes (≤4 KiB) of a response. Returns
+  // {kind, stream?, mime, master?, reason} or null.
+  function sniffBytes(bytes) {
+    const b = bytes instanceof Uint8Array ? bytes : new Uint8Array(bytes || []);
+    if (!b.length) return null;
+    const at = (i, s) => [...s].every((c, k) => b[i + k] === c.charCodeAt(0));
+    if (at(4, "ftyp")) return { kind: "file", mime: "video/mp4", reason: "sniff-mp4" };
+    if (b[0] === 0x1a && b[1] === 0x45 && b[2] === 0xdf && b[3] === 0xa3) return { kind: "file", mime: "video/webm", reason: "sniff-webm" };
+    if (at(0, "FLV")) return { kind: "file", mime: "video/x-flv", reason: "sniff-flv" };
+    if (b[0] === 0x47 && (b.length <= 188 || b[188] === 0x47)) return { kind: "segment", mime: "video/mp2t", reason: "sniff-ts" };
+    if (at(0, "OggS")) return { kind: "file", mime: "application/ogg", reason: "sniff-ogg" };
+    if (at(0, "fLaC")) return { kind: "file", mime: "audio/flac", reason: "sniff-flac" };
+    if (at(0, "RIFF") && at(8, "WAVE")) return { kind: "file", mime: "audio/wav", reason: "sniff-wav" };
+    if (at(0, "ID3")) return { kind: "file", mime: "audio/mpeg", reason: "sniff-mp3" };
+    let enc = "utf-8", skip = 0;
+    if (b[0] === 0xff && b[1] === 0xfe) { enc = "utf-16le"; skip = 2; }
+    else if (b[0] === 0xfe && b[1] === 0xff) { enc = "utf-16be"; skip = 2; }
+    else if (b[0] === 0xef && b[1] === 0xbb && b[2] === 0xbf) skip = 3;
+    let text = "";
+    try { text = new TextDecoder(enc).decode(b.subarray(skip)); } catch (e) { return null; }
+    const low = text.trimStart().toLowerCase();
+    if (low.includes("#extm3u")) {
+      return { kind: "playlist", stream: "hls", mime: HLS_MIME, master: low.includes("#ext-x-stream-inf"), reason: "sniff-hls" };
+    }
+    if (/<mpd[\s>]/.test(low)) return { kind: "playlist", stream: "dash", mime: DASH_MIME, master: true, reason: "sniff-dash" };
+    if (low.startsWith("webvtt")) return { kind: "subtitle", mime: "text/vtt", reason: "sniff-vtt" };
+    if (/^\d+\s*\r?\n(?:\d{2}:)?\d{2}:\d{2}[:.,]\d{2,3}\s+-->\s+/.test(low)) return { kind: "subtitle", mime: "application/x-subrip", reason: "sniff-srt" };
+    if (low.includes('xmlns="http://www.w3.org/ns/ttml"')) return { kind: "subtitle", mime: "application/ttml+xml", reason: "sniff-ttml" };
+    return null;
+  }
+
+  // Request headers worth replaying from the download manager: the session
+  // (cookie), the page relationship (referer/origin), bearer tokens, and the
+  // CDN's own x-* tokens. Never hop-by-hop or browser-variation headers.
+  function forwardHeaders(requestHeaders) {
+    const out = { referer: null, cookie: null, headers: {} };
+    let budget = 8192;
+    for (const h of requestHeaders || []) {
+      const name = String((h && h.name) || "").toLowerCase();
+      const value = String((h && h.value) || "");
+      if (!name || !value || /[\r\n]/.test(value) || value.length > 4096) continue;
+      if (name === "referer") { out.referer = value; continue; }
+      if (name === "cookie") { out.cookie = value.length <= 6000 ? value : null; continue; }
+      const keep = name === "origin" || name === "authorization"
+        || (name.startsWith("x-") && name !== "x-client-data");
+      if (!keep || budget - value.length < 0) continue;
+      budget -= value.length;
+      out.headers[name] = value;
+    }
+    return out;
+  }
+
+  // 'playlist' | 'segment' | 'subtitle' | 'file'
   function kindOf(entry) {
     const u = (entry && entry.url) || "";
-    if (isPlaylistUrl(u) || /^(?:application\/(?:x-mpegurl|vnd\.apple\.mpegurl|dash\+xml)|audio\/mpegurl)(?:;|$)/i.test(String(entry && entry.mime || ""))) return "playlist";
+    const mime = String(entry && entry.mime || "").toLowerCase();
+    if (isPlaylistUrl(u) || /^(?:application\/(?:x-mpegurl|vnd\.apple\.mpegurl|dash\+xml)|audio\/mpegurl)(?:;|$)/i.test(mime)) return "playlist";
     if ((entry && entry.segment) || isSegmentUrl(u)) return "segment";
+    if ((entry && entry.kind === "subtitle") || SUB_MIME.test(mime.split(";")[0]) || SUB_EXT.includes(extOf(u))) return "subtitle";
     return "file";
   }
 
@@ -183,6 +335,8 @@
     const hasPlaylist = !!(ctx && ctx.hasPlaylist);
     const kind = kindOf(e);
     if (kind === "segment" && hasPlaylist) return -1;
+    // Subtitles are offered as files, but never outrank a video or stream.
+    if (kind === "subtitle") return 10;
     let s = kind === "file" ? 300 : kind === "playlist" ? 200 : 50;
     if (mime.startsWith("video/")) s += 100;
     else if (mime.startsWith("audio/")) s += 60;
@@ -336,7 +490,7 @@
     } catch (e) {}
   }
 
-  const DCRank = { attachmentDownload, videoDismissKey, directDownloadLink, hideDownloadUI, playerEvidence, playlistReferences, samePlayer, completePlaylist, isVimeoAdaptive, isVimeoFragment, vimeoVideoPage, isPlaylistUrl, isSegmentUrl, canonicalUrl, kindOf, scoreMedia, collapseDupes, fmtDur, panelTokens, dcThemeMode, dcSetTheme, paintDcPanel };
+  const DCRank = { attachmentDownload, videoDismissKey, directDownloadLink, hideDownloadUI, playerEvidence, playlistReferences, samePlayer, completePlaylist, isVimeoAdaptive, isVimeoFragment, vimeoVideoPage, isPlaylistUrl, isSegmentUrl, canonicalUrl, kindOf, scoreMedia, classifyResponse, sniffBytes, forwardHeaders, extOf, dispositionFilename, collapseDupes, fmtDur, panelTokens, dcThemeMode, dcSetTheme, paintDcPanel };
   g.DCRank = DCRank;
   if (typeof module !== "undefined" && module.exports) module.exports = DCRank;
 })(typeof globalThis !== "undefined" ? globalThis : this);

@@ -32,12 +32,25 @@ it('never borrows a playlist from a different frame or chooses between unrelated
 });
 const source=fs.readFileSync(path.join(__dirname,'background.js'),'utf8');
 const block=source.slice(source.indexOf('async function sendToHost('),source.indexOf('// ---- IDM-style network sniffer'));
-function harness(items,frame={pageUrl:context.pageUrl,videoCount:1,durationSecs:2700,audioExpected:true},cookiesFor=async()=>null){
+function harness(items,frame={pageUrl:context.pageUrl,videoCount:1,durationSecs:2700,audioExpected:true},cookiesFor=async()=>null,auth=new Map()){
  const calls=[];
  const api={tabs:{sendMessage:async()=>frame},runtime:{sendNativeMessage:async(h,m)=>{calls.push(m);return {type:'ok'}}}};
- const make=new Function('DCRank','tabMedia','api','cookiesFor','stripFbSlice','HOST','console',`let lastHostError='';${block};return {sendToHost,error:()=>lastHostError}`);
- return {...make(R,new Map([[7,items]]),api,cookiesFor,u=>u,'test',{error(){}}),calls};
+ const make=new Function('DCRank','tabMedia','mediaAuth','api','cookiesFor','stripFbSlice','HOST','console',`let lastHostError='';${block};return {sendToHost,error:()=>lastHostError}`);
+ return {...make(R,new Map([[7,items]]),auth,api,cookiesFor,u=>u,'test',{error(){}}),calls};
 }
+it('replays the headers the player sent for a captured file',async()=>{
+ const url='https://cdn.example.net/stream?id=9';
+ const auth=new Map([[url,{referer:'https://embed.example.com/p/9',cookie:'cdn=1',headers:{origin:'https://embed.example.com','x-token':'t'}}]]);
+ const h=harness([{...context,url,mime:'video/mp4'}],undefined,async()=>'page=cookie',auth);
+ assert.equal(await h.sendToHost(url,'clip.mp4',{pageUrl:context.pageUrl,referer:context.pageUrl}),true);
+ assert.equal(h.calls[0].referer,'https://embed.example.com/p/9');
+ assert.equal(h.calls[0].cookie,'cdn=1');
+ assert.deepEqual(h.calls[0].headers,{origin:'https://embed.example.com','x-token':'t'});
+ const plain=harness([{...context,url:'https://cdn.example.net/a.mp4'}]);
+ assert.equal(await plain.sendToHost('https://cdn.example.net/a.mp4','a.mp4',{pageUrl:context.pageUrl}),true);
+ assert.equal(plain.calls[0].headers,null);
+ assert.equal(plain.calls[0].referer,context.pageUrl);
+});
 it('hands a generic fragment to its complete playlist, preserving player expectations',async()=>{
  const h=harness([{...context,url:fragment},{...context,url:root,master:true}]);
  assert.equal(await h.sendToHost(fragment,'movie.mp4',{size:512}),true);

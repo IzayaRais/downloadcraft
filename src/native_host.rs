@@ -3,7 +3,8 @@
 //! Protocol (Chrome/Edge/Firefox native messaging = 4-byte LE length + UTF-8 JSON):
 //!   -> {"type":"ping"}                                  <- {"type":"pong","version":1}
 //!   -> {"type":"download","url":"https://...","filename":"optional",
-//!       "pageUrl":"https://page...","referer":"...","cookie":"...","mime":"..."}
+//!       "pageUrl":"https://page...","referer":"...","cookie":"...","mime":"...",
+//!       "headers":{"origin":"...","authorization":"...","x-...":"..."}}
 //!                                                      <- {"type":"ok","queued":true}
 //!
 //! Download requests are appended to an inbox file that the GUI polls and
@@ -24,6 +25,9 @@ struct Incoming {
     referer: Option<String>,
     #[serde(default)]
     cookie: Option<String>,
+    /// Origin / Authorization / x-* headers the player sent with this media.
+    #[serde(default)]
+    headers: Option<std::collections::BTreeMap<String, String>>,
     #[serde(default)]
     mime: Option<String>,
     /// Browser-measured size bytes (HEAD/Range from the page session).
@@ -107,6 +111,10 @@ pub struct InboxItem {
     pub referer: Option<String>,
     #[serde(default)]
     pub cookie: Option<String>,
+    /// Captured request headers (credentials: kept in the private inbox,
+    /// never on a command line).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub headers: Option<std::collections::BTreeMap<String, String>>,
     #[serde(default)]
     pub mime: Option<String>,
     #[serde(default)]
@@ -182,6 +190,26 @@ fn write_message(reply: &Reply) {
     }
 }
 
+/// Keep only headers the engine may replay, with sane sizes. The extension
+/// already filters; this is the trust boundary, so filter again.
+fn replayable_headers(
+    headers: Option<&std::collections::BTreeMap<String, String>>,
+) -> Option<std::collections::BTreeMap<String, String>> {
+    let kept: std::collections::BTreeMap<String, String> = headers?
+        .iter()
+        .map(|(k, v)| (k.trim().to_ascii_lowercase(), v.trim().to_string()))
+        .filter(|(k, v)| {
+            crate::engine::replayable_header(k)
+                && k.len() <= 64
+                && !v.is_empty()
+                && v.len() <= 4096
+                && !v.contains(['\r', '\n'])
+        })
+        .take(20)
+        .collect();
+    (!kept.is_empty()).then_some(kept)
+}
+
 fn queue_download(msg: &Incoming) -> Result<bool, String> {
     const MAX_INBOX: usize = 200;
     let url = msg.url.clone().unwrap_or_default();
@@ -210,6 +238,7 @@ fn queue_download(msg: &Incoming) -> Result<bool, String> {
         page_url: msg.page_url.clone(),
         referer,
         cookie: msg.cookie.clone().filter(|s| !s.trim().is_empty()),
+        headers: replayable_headers(msg.headers.as_ref()),
         mime: msg.mime.clone().filter(|s| !s.trim().is_empty()),
         size: msg.size.filter(|s| *s > 0),
         pair_url: msg.pair_url.clone().filter(|s| s.starts_with("http")),
@@ -382,5 +411,18 @@ mod media_tests {
         assert!(stored.audio_expected);
         let old: Incoming = serde_json::from_str(r#"{"type":"download","url":"https://cdn.example.org/video.mp4"}"#).unwrap();
         assert!(!old.audio_expected);
+        assert!(old.headers.is_none());
+    }
+
+    #[test]
+    fn captured_headers_keep_only_replayable_tokens() {
+        let msg: Incoming = serde_json::from_str(r#"{"type":"download","url":"https://cdn.example.org/v",
+            "headers":{"Origin":"https://site.example","authorization":"Bearer t","x-token":"1",
+                       "x-client-data":"variations","Range":"bytes=0-","host":"evil","x-bad":"a\r\nb: c"}}"#).unwrap();
+        let kept = replayable_headers(msg.headers.as_ref()).unwrap();
+        assert_eq!(kept.keys().cloned().collect::<Vec<_>>(), ["authorization", "origin", "x-token"]);
+        assert!(replayable_headers(None).is_none());
+        let none = std::collections::BTreeMap::from([("cookie".to_string(), "a=b".to_string())]);
+        assert!(replayable_headers(Some(&none)).is_none());
     }
 }

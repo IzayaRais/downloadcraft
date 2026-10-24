@@ -1038,9 +1038,11 @@
   // known size first. Facebook reels render as blob: players, so this is
   // what makes the pill work without a page reload.
   function bestSniffed(items) {
-    const list = (items || []).filter((m) => m && /^https?:\/\//i.test(m.url));
-    if (!list.length) return null;
     const R = (typeof DCRank !== "undefined") ? DCRank : null;
+    // Subtitle side files are listed in the popup, never picked as the video.
+    const list = (items || []).filter((m) => m && /^https?:\/\//i.test(m.url)
+      && !(R && R.kindOf(m) === "subtitle"));
+    if (!list.length) return null;
     // P4: when the tab already holds a playlist, loose segments are its
     // children (the engine assembles them) — never pick a part. Without
     // rank.js, fall back to the legacy inline score below.
@@ -1833,7 +1835,7 @@
       chrome.runtime.sendMessage({ type: "getMedia", pageUrl: location.href }, (res) => {
         if (chrome.runtime.lastError) return;
         if (!alive() || !api || !api.panel.isConnected) return;
-        const all = (res && res.items) || [];
+        const all = ((res && res.items) || []).filter((m) => !(m && m.kind === "subtitle"));
         const items = all.filter((m) => m && /^https?:\/\//i.test(m.url) && !known.has(m.url));
         // Video-only traffic gets an audio track paired, so the app can merge
         // it: the page's best audio when it has a direct URL, else the audio

@@ -1886,6 +1886,9 @@ pub struct CraftApp {
     // process_hits can commit without dialog locals).
     add_referer: String,
     add_cookie: String,
+    /// Captured request headers of the browser capture being added (not
+    /// editable; consumed by the next commit).
+    add_headers: std::collections::BTreeMap<String, String>,
     add_user: String,
     add_pass: String,
     /// Preferred quality from the extension menu (used by the size probe so
@@ -2029,6 +2032,7 @@ impl CraftApp {
             slider_cap: None,
             add_referer: String::new(),
             add_cookie: String::new(),
+            add_headers: std::collections::BTreeMap::new(),
             add_user: String::new(),
             add_pass: String::new(),
             add_quality: String::new(),
@@ -3205,6 +3209,7 @@ impl CraftApp {
             it.speed_bps = 0.0;
             if matches!(it.status, Status::Completed) {
                 it.cookie.clear();
+                it.extra_headers.clear();
             }
         }
         // Union with foreign additions made since our last sync (confirm /
@@ -3355,6 +3360,7 @@ impl CraftApp {
             },
             referer: item.referer.clone(),
             cookie: item.cookie.clone(),
+            captured_headers: crate::engine::CapturedHeaders::for_url(&item.url, &item.extra_headers),
             username: item.username.clone(),
             password: item.password.clone(),
             proxy_url: self.proxy_url.clone(),
@@ -3796,6 +3802,7 @@ impl CraftApp {
                     } else if task_can_complete(&task.shared, complete || file_done) {
                         d.status = Status::Completed;
                         d.cookie.clear();
+                        d.extra_headers.clear();
                         // The file on disk is the truth. A retried or merged
                         // transfer can end with a byte counter that claims more
                         // than the file holds, and a probe's size can be an
@@ -4098,6 +4105,7 @@ impl CraftApp {
             .or_else(|| item.page_url)
             .unwrap_or_default();
         let cookie = item.cookie.unwrap_or_default();
+        self.add_headers = item.headers.unwrap_or_default();
         if self.captured_media.len() >= 200 { self.captured_media.clear(); }
         self.captured_media.insert(url.clone(), (item.dur.unwrap_or(0), item.audio_expected));
         let size = item.size;
@@ -7549,6 +7557,9 @@ impl CraftApp {
         );
         item.referer = self.add_referer.clone();
         item.cookie = self.add_cookie.clone();
+        // Captured headers belong to that one capture: never reuse them for
+        // a later manual add.
+        item.extra_headers = std::mem::take(&mut self.add_headers);
         item.username = self.add_user.clone();
         item.password = self.add_pass.clone();
         item.checksum_sha256 = csum;

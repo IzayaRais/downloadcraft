@@ -125,6 +125,11 @@ pub struct DownloadItem {
     pub referer: String,
     #[serde(default)]
     pub cookie: String,
+    /// Origin / Authorization / x-* headers the browser player sent with the
+    /// captured media (see engine::CapturedHeaders). Cleared on completion
+    /// like the cookie.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub extra_headers: std::collections::BTreeMap<String, String>,
     #[serde(default)]
     pub username: String,
     #[serde(default)]
@@ -204,6 +209,7 @@ impl DownloadItem {
             selected: false,
             referer: String::new(),
             cookie: String::new(),
+            extra_headers: std::collections::BTreeMap::new(),
             username: String::new(),
             password: String::new(),
             resumable: false,
@@ -977,6 +983,7 @@ fn append_to_queue_at(path: &std::path::Path, item: &mut DownloadItem) -> Append
         items[pos].save_dir = item.save_dir.clone();
         items[pos].referer = std::mem::take(&mut item.referer);
         items[pos].cookie = std::mem::take(&mut item.cookie);
+        items[pos].extra_headers = std::mem::take(&mut item.extra_headers);
         items[pos].username = std::mem::take(&mut item.username);
         items[pos].password = std::mem::take(&mut item.password);
         let checksum_changed = items[pos].checksum_sha256 != item.checksum_sha256;

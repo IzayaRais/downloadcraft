@@ -189,6 +189,56 @@ pub struct EngineOpts {
     /// (Queue v2). 0 = no extra cap. Enforced process-wide, so three
     /// simultaneous jobs cannot open 3×8 sockets to the same server.
     pub per_host_conns: usize,
+    /// Origin / Authorization / CDN x-* headers the browser player sent with
+    /// the captured media, replayed so token-checked CDNs don't answer 403.
+    pub captured_headers: CapturedHeaders,
+}
+
+/// Request headers captured by the extension for one download. They are
+/// sent only to the site they were captured from, never to unrelated hosts a
+/// playlist or redirect points at (bearer tokens must not leak).
+#[derive(Debug, Clone, Default)]
+pub struct CapturedHeaders {
+    site: String,
+    headers: Vec<(String, String)>,
+}
+
+impl CapturedHeaders {
+    pub fn for_url(url: &str, headers: &std::collections::BTreeMap<String, String>) -> Self {
+        let Some(site) = site_of_url(url) else { return Self::default() };
+        let headers: Vec<(String, String)> = headers
+            .iter()
+            .map(|(k, v)| (k.trim().to_ascii_lowercase(), v.trim().to_string()))
+            .filter(|(k, v)| replayable_header(k) && !v.is_empty() && !v.contains(['\r', '\n']))
+            .collect();
+        if headers.is_empty() { Self::default() } else { Self { site, headers } }
+    }
+
+    fn applies_to(&self, url: &str) -> bool {
+        !self.headers.is_empty() && site_of_url(url).as_deref() == Some(self.site.as_str())
+    }
+}
+
+/// Which captured request headers may be replayed by the engine. Cookie and
+/// Referer travel in their own fields; hop-by-hop, range and fetch-metadata
+/// headers are the engine's own business.
+pub fn replayable_header(name: &str) -> bool {
+    name == "origin" || name == "authorization" || (name.starts_with("x-") && name != "x-client-data")
+}
+
+/// Registrable site of a URL's host ("a.b.example.co.uk" -> "example.co.uk",
+/// "rr1.googlevideo.com" -> "googlevideo.com"). Approximate public-suffix
+/// handling: a two-letter country TLD under a short second level (co.uk,
+/// com.au) keeps three labels.
+fn site_of_url(url: &str) -> Option<String> {
+    let host = reqwest::Url::parse(url).ok()?.host_str()?.trim_end_matches('.').to_ascii_lowercase();
+    if host.parse::<std::net::IpAddr>().is_ok() || !host.contains('.') {
+        return Some(host);
+    }
+    let labels: Vec<&str> = host.split('.').collect();
+    let n = labels.len();
+    let keep = if n >= 3 && labels[n - 1].len() == 2 && labels[n - 2].len() <= 3 { 3 } else { 2 };
+    Some(labels[n.saturating_sub(keep)..].join("."))
 }
 
 impl Default for EngineOpts {
@@ -211,6 +261,7 @@ impl Default for EngineOpts {
             quality_pref: String::new(),
             global_limit: None,
             per_host_conns: 0,
+            captured_headers: CapturedHeaders::default(),
         }
     }
 }
@@ -308,6 +359,16 @@ impl EngineOpts {
         }
         if !self.cookie.trim().is_empty() {
             r = r.header(reqwest::header::COOKIE, self.cookie.trim().to_string());
+        }
+        if url.is_some_and(|u| self.captured_headers.applies_to(u)) {
+            for (name, value) in &self.captured_headers.headers {
+                if let (Ok(n), Ok(v)) = (
+                    reqwest::header::HeaderName::from_bytes(name.as_bytes()),
+                    reqwest::header::HeaderValue::from_str(value),
+                ) {
+                    r = r.header(n, v);
+                }
+            }
         }
         if !self.username.trim().is_empty() {
             r = r.basic_auth(
@@ -2127,6 +2188,68 @@ async fn resolve_youtube_full(
     })
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ManifestKind {
+    Hls,
+    Dash,
+}
+
+/// Response types that may hide a manifest: generic text/binary/XML, or none.
+fn opaque_manifest_type(ctype: Option<&str>) -> bool {
+    let Some(t) = ctype else { return true };
+    let t = t.to_ascii_lowercase();
+    let base = t.split(';').next().unwrap_or("").trim();
+    base.is_empty()
+        || matches!(
+            base,
+            "text/plain"
+                | "application/octet-stream"
+                | "binary/octet-stream"
+                | "application/binary"
+                | "application/x-binary"
+                | "application/xml"
+                | "text/xml"
+        )
+}
+
+/// What the first bytes of a body are, if a manifest (BOM-tolerant).
+fn manifest_kind_of(head: &[u8]) -> Option<ManifestKind> {
+    let text = String::from_utf8_lossy(head);
+    let low = text.trim_start_matches('\u{feff}').trim_start().to_ascii_lowercase();
+    if low.contains("#extm3u") {
+        Some(ManifestKind::Hls)
+    } else if low.contains("<mpd ") || low.contains("<mpd>") || low.contains("<mpd\n") || low.contains("<mpd\r") {
+        Some(ManifestKind::Dash)
+    } else {
+        None
+    }
+}
+
+/// Fetch at most 4 KiB of `url` and classify it as a manifest or not.
+async fn sniff_manifest(client: &reqwest::Client, opts: &EngineOpts, url: &str) -> Option<ManifestKind> {
+    const HEAD: usize = 4096;
+    let resp = opts
+        .get(client, url)
+        .header(reqwest::header::RANGE, format!("bytes=0-{}", HEAD - 1))
+        .timeout(std::time::Duration::from_secs(15))
+        .send()
+        .await
+        .ok()?;
+    if !resp.status().is_success() {
+        return None;
+    }
+    // A server that ignores Range streams the whole body: stop at HEAD bytes.
+    let mut body = resp.bytes_stream();
+    let mut head = Vec::with_capacity(HEAD);
+    while head.len() < HEAD {
+        match body.next().await {
+            Some(Ok(chunk)) => head.extend_from_slice(&chunk[..chunk.len().min(HEAD - head.len())]),
+            _ => break,
+        }
+    }
+    manifest_kind_of(&head)
+}
+
 /// True for HLS/DASH playlists: the progressive engine cannot consume these
 /// as a single file (they need segment-assembly + transmux).
 fn is_playlist_url(u: &str) -> bool {
@@ -3655,6 +3778,29 @@ async fn download_inner(
             } else {
                 download_hls(&url, &dest, connections, &opts, &shared).await
             };
+        }
+    }
+    // …and by content when the type is generic (text/plain, octet-stream,
+    // xml) and the URL names no media file: the first bytes say #EXTM3U or
+    // <MPD for manifests the browser extension caught by sniffing. Manifests
+    // are small, so a multi-megabyte body is never sniffed (each extra
+    // request spends freshness on expiring signed links).
+    const MANIFEST_MAX: u64 = 2 * 1024 * 1024;
+    if range_verified.is_none()
+        && !has_direct_ext(&url)
+        && opaque_manifest_type(ctype.as_deref())
+        && total_opt.map_or(true, |t| t <= MANIFEST_MAX)
+    {
+        match sniff_manifest(&client, &opts, &url).await {
+            Some(ManifestKind::Dash) => {
+                drop(_job);
+                return download_dash(&url, dest, connections, opts, shared).await;
+            }
+            Some(ManifestKind::Hls) => {
+                drop(_job);
+                return download_hls(&url, &dest, connections, &opts, &shared).await;
+            }
+            None => {}
         }
     }
     // Pre-seeded totals imply resume support until proven otherwise; the
@@ -5384,6 +5530,11 @@ async fn download_with_ytdlp(
     }
     if !opts.referer.trim().is_empty() {
         cmd.arg("--referer").arg(opts.referer.trim());
+    }
+    if opts.captured_headers.applies_to(url) {
+        for (name, value) in &opts.captured_headers.headers {
+            cmd.arg("--add-header").arg(format!("{name}:{value}"));
+        }
     }
     if !opts.proxy_url.trim().is_empty() {
         cmd.arg("--proxy").arg(opts.proxy_url.trim());
@@ -8391,6 +8542,43 @@ mod tests {
     }
 
     #[test]
+    fn opaque_manifests_are_recognized_by_content() {
+        assert_eq!(manifest_kind_of(b"\xef\xbb\xbf#EXTM3U\n#EXTINF:4,\ns.ts"), Some(ManifestKind::Hls));
+        assert_eq!(manifest_kind_of(b"<?xml version=\"1.0\"?>\n<MPD xmlns=\"urn:mpeg:dash:schema:mpd:2011\">"), Some(ManifestKind::Dash));
+        assert_eq!(manifest_kind_of(b"<!doctype html><title>x</title>"), None);
+        assert_eq!(manifest_kind_of(b"\x00\x00\x00\x20ftypisom"), None);
+        assert!(opaque_manifest_type(None));
+        assert!(opaque_manifest_type(Some("text/plain; charset=utf-8")));
+        assert!(opaque_manifest_type(Some("application/octet-stream")));
+        assert!(!opaque_manifest_type(Some("video/mp4")));
+        assert!(!opaque_manifest_type(Some("text/html")));
+    }
+
+    #[test]
+    fn captured_headers_stay_on_their_site() {
+        assert_eq!(site_of_url("https://a.b.example.com/x").as_deref(), Some("example.com"));
+        assert_eq!(site_of_url("https://cdn.example.co.uk/x").as_deref(), Some("example.co.uk"));
+        assert_eq!(site_of_url("http://127.0.0.1:8080/x").as_deref(), Some("127.0.0.1"));
+        let map = std::collections::BTreeMap::from([
+            ("Authorization".to_string(), "Bearer t".to_string()),
+            ("x-token".to_string(), "1".to_string()),
+            ("range".to_string(), "bytes=0-".to_string()),
+        ]);
+        let opts = EngineOpts {
+            captured_headers: CapturedHeaders::for_url("https://media.example.com/m/master", &map),
+            ..EngineOpts::default()
+        };
+        let client = opts.build_client().unwrap();
+        let same = opts.get(&client, "https://seg.example.com/s0.ts").build().unwrap();
+        assert_eq!(same.headers().get("authorization").unwrap(), "Bearer t");
+        assert_eq!(same.headers().get("x-token").unwrap(), "1");
+        assert!(same.headers().get("range").is_none());
+        let other = opts.get(&client, "https://ads.other.net/s0.ts").build().unwrap();
+        assert!(other.headers().get("authorization").is_none());
+        assert!(!CapturedHeaders::for_url("https://h.example/x", &std::collections::BTreeMap::new()).applies_to("https://h.example/x"));
+    }
+
+    #[test]
     fn hls_helpers() {
         // playlists recognised, mpd rejected from generic resolve
         assert!(is_playlist_url("https://cdn.example/v/playlist.m3u8?x=1"));
@@ -8527,6 +8715,11 @@ mod tests {
         let text_resp: Option<(&str, String)> = match path.as_str() {
             "/hls/pl.m3u8" => Some((
                 "application/vnd.apple.mpegurl",
+                "#EXTM3U\n#EXT-X-STREAM-INF:BANDWIDTH=800000\nlo.m3u8\n#EXT-X-STREAM-INF:BANDWIDTH=5000000\nhi.m3u8\n".to_string(),
+            )),
+            // Opaque manifest: extensionless URL, generic type (deep detection).
+            "/hls/opaque" => Some((
+                "text/plain",
                 "#EXTM3U\n#EXT-X-STREAM-INF:BANDWIDTH=800000\nlo.m3u8\n#EXT-X-STREAM-INF:BANDWIDTH=5000000\nhi.m3u8\n".to_string(),
             )),
             "/hls/lo.m3u8" | "/hls/hi.m3u8" => Some((
@@ -9330,6 +9523,20 @@ mod tests {
         )
         .await
         .expect("hls vod");
+        assert_eq!(std::fs::read(&dest).unwrap(), want);
+
+        // 7b. Opaque HLS: text/plain at an extensionless URL is sniffed and
+        // assembled as a stream, never saved as playlist text.
+        let dest = dir.join("hlsopaque.bin");
+        download_inner(
+            format!("{base}/hls/opaque"),
+            dest.clone(),
+            6,
+            matrix_opts(),
+            Arc::new(SharedState::new()),
+        )
+        .await
+        .expect("opaque hls");
         assert_eq!(std::fs::read(&dest).unwrap(), want);
 
         // 8. HLS AES-128: key fetch + per-segment decrypt → exact.

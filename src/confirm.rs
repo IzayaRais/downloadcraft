@@ -178,6 +178,8 @@ struct ConfirmApp {
     description: String,
     referer: String,
     cookie: String,
+    /// Captured request headers of this browser capture (from the inbox).
+    headers: std::collections::BTreeMap<String, String>,
     pair_url: String,
     pair_mime: String,
     /// Page/media MIME from the extension (first hint for naming when the
@@ -501,6 +503,7 @@ impl ConfirmApp {
             proxy_url: self.proxy_url.clone(),
             referer,
             quality_pref,
+            captured_headers: engine::CapturedHeaders::for_url(&url, &self.headers),
             ..Default::default()
         };
         rt.spawn(async move {
@@ -576,6 +579,7 @@ impl ConfirmApp {
         );
         item.referer = self.referer.clone();
         item.cookie = self.cookie.clone();
+        item.extra_headers = self.headers.clone();
         item.description = self.description.trim().to_string();
         // Browser-measured size (extension HEAD/Range in the real session):
         // keep it so the engine and progress UI know the total even when a
@@ -713,10 +717,12 @@ pub fn run() -> eframe::Result<()> {
         .unwrap_or(0);
 
     // Claim the inbox entry first so the main window won't prompt too.
+    let mut headers = std::collections::BTreeMap::new();
     if let Some(item)=claim_inbox(url.trim()) {
         // The native host leaves credentials in the private inbox, not the
         // process command line where other local users can inspect them.
         if cookie.is_empty() {cookie=item.cookie.unwrap_or_default();}
+        headers = item.headers.unwrap_or_default();
     }
 
     let prefs = load_prefs();
@@ -745,6 +751,7 @@ pub fn run() -> eframe::Result<()> {
         description: String::new(),
         referer,
         cookie,
+        headers,
         pair_url,
         pair_mime,
         page_mime,

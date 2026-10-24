@@ -45,6 +45,9 @@ async function settings() {
     hideBrowserUI: false,
     minSizeKB: 100,
     blockHosts: "",
+    // Sniff the first bytes of opaque responses (text/plain, octet-stream…)
+    // to find manifests and videos hidden behind generic types.
+    deepDetect: true,
   });
   return s;
 }
@@ -182,7 +185,11 @@ async function sendToHost(url, filename, extra) {
         break;
       }
     }
-    let cookie = (extra && extra.cookie) || null;
+    // What the player itself sent for this exact URL when it was captured:
+    // the referer/origin the CDN checks, its session cookie and any bearer
+    // or x-* token. Truer than the page URL, so it wins when present.
+    const seenAuth = mediaAuth.get(url) || null;
+    let cookie = (extra && extra.cookie) || (seenAuth && seenAuth.cookie) || null;
     if (!cookie && /^https?:\/\//i.test(url)) {
       cookie = await cookiesFor(url); // best-effort, same-host only
       // CDN hosts (fbcdn/lookaside) carry no cookies of their own — fall
@@ -211,8 +218,9 @@ async function sendToHost(url, filename, extra) {
       url,
       filename: filename || null,
       pageUrl: (extra && extra.pageUrl) || null,
-      referer: (extra && extra.referer) || (extra && extra.pageUrl) || null,
+      referer: (seenAuth && seenAuth.referer) || (extra && extra.referer) || (extra && extra.pageUrl) || null,
       cookie,
+      headers: (seenAuth && Object.keys(seenAuth.headers).length) ? seenAuth.headers : null,
       mime: (extra && extra.mime) || null,
       size: (extra && extra.size) || null,
       pairUrl: (extra && extra.pairUrl) || null,
@@ -240,11 +248,9 @@ const tabMedia = new Map(); // tabId -> [{url, mime, size, pageUrl, seenAt}]
 const tabPlaylist = new Map(); // tabId -> playlist url (P4: demotes loose segments)
 const seenTabs = new Map(); // canonical url -> Set(tabId), for the "×N tabs" hint
 const sizeCache = new Map(); // url -> bytes (quality-menu sizes)
-const MEDIA_MIME = /^(video\/|audio\/|application\/(x-mpegurl|vnd\.apple\.mpegurl|dash\+xml|mp4|octet-stream))/i;
-const MEDIA_URL = /\.(mp4|webm|mkv|mov|avi|m4v|mp3|m4a|aac|flac|ogg|wav|m3u8|mpd|m4s|ts|cmfv|cmfa)(\?|#|$)/i;
 
-function rankKind(url, mime) {
-  if (typeof DCRank !== "undefined") return DCRank.kindOf({url, mime});
+function rankKind(url, mime, entry) {
+  if (typeof DCRank !== "undefined") return DCRank.kindOf({...(entry || {}), url, mime});
   if (typeof DCRank !== "undefined" && DCRank.isPlaylistUrl(url)) return "playlist";
   if (typeof DCRank !== "undefined" && DCRank.isSegmentUrl(url)) return "segment";
   // Legacy fallback when rank.js failed to load (same shapes, inline).
@@ -263,7 +269,11 @@ function noteMedia(tabId, entry) {
   if (!entry || !entry.url || !/^https?:\/\//i.test(entry.url)) return;
   entry.url = stripFbSlice(entry.url);
   if (entry.url.length > 4000) return;
-  const kind = rankKind(entry.url, entry.mime);
+  // Sniffed verdicts (a .ts behind an opaque URL, a subtitle by content)
+  // outrank URL-shape guesses.
+  const kind = entry.segment ? "segment"
+    : entry.subtitle ? "subtitle" : rankKind(entry.url, entry.mime, entry);
+  if (kind === "subtitle") entry.kind = "subtitle";
   // P4: a playlist on the tab demotes loose segments — they are children
   // the engine fetches itself (ad slivers hide among them), so menus must
   // offer the whole, and the badge must not count parts as downloads.
@@ -303,8 +313,9 @@ function noteMedia(tabId, entry) {
   try {
     chrome.storage.local.set({ downloadCraftNet: list.slice(-25) });
   } catch (e) { /* ignore */ }
-  // Badge counts downloadable candidates, never playlist children.
-  const badgeN = list.filter((e) => !e.child).length;
+  // Badge counts downloadable videos/streams, never playlist children or
+  // subtitle side files.
+  const badgeN = list.filter((e) => !e.child && e.kind !== "subtitle").length;
   try {
     api.action.setBadgeText({ text: String(badgeN), tabId }).catch(() => {});
     api.action.setBadgeBackgroundColor({ color: "#1F6FEB", tabId }).catch(() => {});
@@ -321,9 +332,14 @@ function pruneSeen(url, tabId) {
   } catch (e) { /* ignore */ }
 }
 
-function forgetTab(tabId) {
+function forgetTab(tabId, newUrl) {
   tabMedia.delete(tabId);
   tabPlaylist.delete(tabId);
+  tabNavSeq.set(tabId, navSeqOf(tabId) + 1);
+  // The new page's origin was recorded by its main_frame response, which
+  // arrives before this tab update: keep it, drop the previous page's frames.
+  tabOrigins.delete(tabId);
+  if (newUrl) noteTabOrigin(tabId, newUrl);
   try {
     for (const [ck, tabs] of seenTabs) {
       tabs.delete(tabId);
@@ -333,75 +349,237 @@ function forgetTab(tabId) {
   try { api.action.setBadgeText({ text: "", tabId }).catch(() => {}); } catch (e) {}
 }
 
+// Request types that can carry media. Frames are included so a video opened
+// directly in a tab or iframe is caught; classifyResponse skips HTML pages.
+const SNIFF_REQUEST_TYPES = new Set(["media", "xmlhttprequest", "other", "main_frame", "sub_frame", "object"]);
+
+// Exact request headers per in-flight request (session cookie, referer,
+// origin, bearer and CDN x-* tokens), so the app replays what the player
+// sent instead of guessing. Background-only: never stored, never sent to
+// page scripts.
+const requestAuth = new Map(); // requestId -> {referer, cookie, headers}
+// Same data, kept per captured media URL for the hand-off to the app.
+const mediaAuth = new Map(); // url -> {referer, cookie, headers}
+function rememberAuth(map, key, value, cap) {
+  map.delete(key);
+  map.set(key, value);
+  while (map.size > cap) map.delete(map.keys().next().value);
+}
+
+// Origins each tab has loaded (top page + frames). Workers and service
+// workers fetch with tabId -1; their initiator origin maps them back to the
+// tab that owns them.
+const tabOrigins = new Map(); // tabId -> Map(origin -> lastSeen)
+function originOf(u) {
+  try { const x = new URL(u); return /^https?:$/.test(x.protocol) ? x.origin : null; } catch (e) { return null; }
+}
+function noteTabOrigin(tabId, url) {
+  const origin = originOf(url);
+  if (tabId === undefined || tabId < 0 || !origin) return;
+  let seen = tabOrigins.get(tabId);
+  if (!seen) { seen = new Map(); tabOrigins.set(tabId, seen); }
+  seen.set(origin, Date.now());
+  if (seen.size > 50) seen.delete(seen.keys().next().value);
+}
+async function resolveTabId(details) {
+  if (details.tabId !== undefined && details.tabId >= 0) return details.tabId;
+  const origin = originOf(details.initiator || details.documentUrl || details.originUrl || "");
+  if (!origin) return null;
+  let best = null, bestAt = -1;
+  for (const [tabId, seen] of tabOrigins) {
+    const at = seen.get(origin);
+    if (at !== undefined && at > bestAt) { best = tabId; bestAt = at; }
+  }
+  if (best !== null) return best;
+  try {
+    const tabs = await api.tabs.query({});
+    const owners = tabs.filter(t => t.id !== undefined && originOf(t.url || "") === origin);
+    owners.sort((a, b) => (b.active - a.active) || ((b.lastAccessed || 0) - (a.lastAccessed || 0)));
+    return owners.length ? owners[0].id : null;
+  } catch (e) { return null; }
+}
+
+// Bumped on every navigation: results of a slow sniff that finish after the
+// tab moved on belong to the previous page and are dropped.
+const tabNavSeq = new Map(); // tabId -> number
+const navSeqOf = (tabId) => tabNavSeq.get(tabId) || 0;
+
+// First-bytes sniffing for responses whose URL and type hide what they are.
+// Bounded so busy pages never double their traffic.
+const SNIFF_BYTES = 4096;
+const SNIFF_MAX_INFLIGHT = 4;
+const sniffedUrls = new Map(); // url -> result (null = not media)
+let sniffInflight = 0;
+// Token headers the player sent (Authorization, x-*) that fetch may set;
+// cookies ride along via credentials, Origin/Referer are the browser's.
+function replayHeaders(auth) {
+  const out = {};
+  for (const [k, v] of Object.entries((auth && auth.headers) || {})) {
+    if (k !== "origin") out[k] = v;
+  }
+  return out;
+}
+// Throws when the server refuses (so the caller does not cache a miss).
+async function readHead(url, maxBytes, timeoutMs, headers) {
+  const res = await fetch(url, {
+    credentials: "include",
+    headers: { ...(headers || {}), Range: `bytes=0-${maxBytes - 1}` },
+    signal: AbortSignal.timeout(timeoutMs),
+  });
+  if (!res.ok || !res.body) throw new Error(`HTTP ${res.status}`);
+  // Servers may ignore Range and stream the whole file: stop at maxBytes.
+  const reader = res.body.getReader();
+  const parts = [];
+  let got = 0;
+  try {
+    while (got < maxBytes) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      parts.push(value);
+      got += value.length;
+    }
+  } finally { try { await reader.cancel(); } catch (e) {} }
+  const out = new Uint8Array(Math.min(got, maxBytes));
+  let at = 0;
+  for (const p of parts) {
+    const take = Math.min(p.length, out.length - at);
+    out.set(p.subarray(0, take), at);
+    at += take;
+    if (at >= out.length) break;
+  }
+  return out;
+}
+async function sniffUrl(url, headers) {
+  if (sniffedUrls.has(url)) return sniffedUrls.get(url);
+  if (sniffInflight >= SNIFF_MAX_INFLIGHT) return null; // busy: skip, not cached
+  sniffInflight++;
+  try {
+    const head = await readHead(url, SNIFF_BYTES, 6000, headers);
+    const hit = typeof DCRank !== "undefined" ? DCRank.sniffBytes(head) : null;
+    rememberAuth(sniffedUrls, url, hit, 500); // a definitive answer only
+    return hit;
+  } catch (e) {
+    return null; // refused or timed out: the player's next request may retry
+  } finally { sniffInflight--; }
+}
+
+// Master flag + child references of a playlist, for parent/part linking.
+async function playlistShape(url, headers) {
+  let master = false, children = [];
+  try {
+    const res = await fetch(url, {credentials:"include", headers:headers || {}, signal:AbortSignal.timeout(8000)});
+    if (res.ok && (!res.headers.get("content-length") || Number(res.headers.get("content-length")) <= 1024 * 1024)) {
+      const reader = res.body.getReader();
+      let body = "", size = 0;
+      const decoder = new TextDecoder();
+      try {
+        while (size <= 1024 * 1024) {
+          const {value, done} = await reader.read();
+          if (done) break;
+          size += value.length; body += decoder.decode(value, {stream:true});
+          if (/#EXT-X-STREAM-INF|<MPD[\s>]/i.test(body)) master = true;
+        }
+        if (typeof DCRank !== "undefined") children = DCRank.playlistReferences(body, url);
+      } finally { await reader.cancel(); }
+    }
+  } catch (e) { /* metadata optional; keep the original signed URL */ }
+  return { master, children };
+}
+
+function responseMeta(details) {
+  const meta = { url: details.url, type: details.type, method: details.method,
+    status: details.statusCode, mime: "", size: 0, filename: null, acceptRanges: false };
+  let clen = 0, total = 0;
+  for (const h of details.responseHeaders || []) {
+    const n = String(h.name || "").toLowerCase();
+    const v = String(h.value || "");
+    if (n === "content-type") meta.mime = v.split(";")[0].trim().toLowerCase();
+    else if (n === "content-length") clen = parseInt(v, 10) || 0;
+    // Range chunks (206) report the CHUNK size in content-length, not the
+    // file size — judge the size filter by the Content-Range total
+    // (`bytes 0-0/12345`), or a throttled CDN's drips get skipped and
+    // Facebook reels never produce a pill without a reload.
+    else if (n === "content-range") { const m = v.match(/\/(\d+)\s*$/); if (m) total = parseInt(m[1], 10) || 0; }
+    else if (n === "accept-ranges") meta.acceptRanges = /bytes/i.test(v);
+    else if (n === "content-disposition" && typeof DCRank !== "undefined") meta.filename = DCRank.dispositionFilename(v);
+  }
+  meta.size = total || clen;
+  if (total) meta.acceptRanges = true;
+  return meta;
+}
+
+async function onMediaResponse(details) {
+  if (!SNIFF_REQUEST_TYPES.has(details.type) || typeof DCRank === "undefined") return;
+  if (details.initiator && /^(?:chrome|moz)-extension:/i.test(details.initiator)) return; // our own sniffs
+  const auth = requestAuth.get(details.requestId) || null;
+  const tabId = await resolveTabId(details);
+  if (tabId === null || tabId < 0) return;
+  const seq = navSeqOf(tabId);
+  const cfg = await settings().catch(() => ({ blockHosts: "", minSizeKB: 100, deepDetect: true }));
+  if (hostBlocked(details.url, cfg.blockHosts)) return;
+  const meta = responseMeta(details);
+  const minBytes = Math.max(0, (parseInt(cfg.minSizeKB, 10) || 100)) * 1024;
+  let hit = DCRank.classifyResponse(meta, { minBytes, deep: cfg.deepDetect !== false });
+  if (hit && hit.sniff) {
+    const found = await sniffUrl(details.url, replayHeaders(auth));
+    if (!found) return;
+    if (found.kind === "file" && meta.size > 0 && meta.size < minBytes) return;
+    hit = found;
+  }
+  if (!hit) return;
+  const shape = hit.kind === "playlist" ? await playlistShape(details.url, replayHeaders(auth)) : { master: false, children: [] };
+  if (navSeqOf(tabId) !== seq) return; // the tab navigated while we looked
+  if (auth) rememberAuth(mediaAuth, stripFbSlice(details.url), auth, 300);
+  noteMedia(tabId, {
+    master: shape.master, children: shape.children,
+    url: details.url,
+    mime: hit.mime || meta.mime,
+    size: meta.size || 0,
+    pageUrl: details.documentUrl || null,
+    frameId: details.tabId >= 0 ? details.frameId : undefined,
+    segment: hit.kind === "segment" || undefined,
+    subtitle: hit.kind === "subtitle" || undefined,
+    via: hit.reason,
+  });
+}
+
 try {
+  if (chrome.webRequest && chrome.webRequest.onSendHeaders) {
+    // Chrome hides Cookie/Referer/Origin from this event unless asked with
+    // extraHeaders; Firefox exposes them already and rejects the option.
+    const spec = ["requestHeaders"];
+    if (chrome.webRequest.OnSendHeadersOptions
+        && Object.prototype.hasOwnProperty.call(chrome.webRequest.OnSendHeadersOptions, "EXTRA_HEADERS")) {
+      spec.push("extraHeaders");
+    }
+    chrome.webRequest.onSendHeaders.addListener((details) => {
+      try {
+        if (!SNIFF_REQUEST_TYPES.has(details.type) || typeof DCRank === "undefined") return;
+        if (details.initiator && /^(?:chrome|moz)-extension:/i.test(details.initiator)) return;
+        const picked = DCRank.forwardHeaders(details.requestHeaders);
+        if (picked.referer || picked.cookie || Object.keys(picked.headers).length) {
+          rememberAuth(requestAuth, details.requestId, picked, 1000);
+        }
+      } catch (e) { /* header capture is best-effort */ }
+    }, { urls: ["http://*/*", "https://*/*"] }, spec);
+  }
   if (chrome.webRequest && chrome.webRequest.onHeadersReceived) {
     chrome.webRequest.onHeadersReceived.addListener(
       (details) => {
-        (async () => {
-        try {
-          if (details.tabId === undefined || details.tabId < 0) return;
-          if (details.type !== "media" && details.type !== "xmlhttprequest" && details.type !== "other") return;
-          const cfg = await settings().catch(() => ({ blockHosts: "", minSizeKB: 100 }));
-          if (hostBlocked(details.url, cfg.blockHosts)) return;
-          const headers = details.responseHeaders || [];
-          let ctype = "";
-          let clen = 0;
-          let crange = "";
-          for (const h of headers) {
-            const n = String(h.name || "").toLowerCase();
-            if (n === "content-type") ctype = String(h.value || "");
-            if (n === "content-length") clen = parseInt(h.value || "0", 10) || 0;
-            if (n === "content-range") crange = String(h.value || "");
-          }
-          // Range chunks (206) report the CHUNK size in content-length, not
-          // the file size — judge the size filter by the Content-Range total
-          // (`bytes 0-0/12345`), or a throttled CDN's drips get skipped and
-          // Facebook reels never produce a pill without a reload.
-          let totalForFilter = clen;
-          const crm = crange.match(/\/(\d+)\s*$/);
-          if (crm) totalForFilter = parseInt(crm[1], 10) || clen;
-          const mime = ctype.split(";")[0].trim();
-          const looksMedia = MEDIA_MIME.test(ctype) || MEDIA_URL.test(details.url.split("?")[0]);
-          if (!looksMedia) return;
-          // Skip tiny chunks unless HLS/DASH playlist (threshold configurable).
-          const minB = Math.max(0, (parseInt(cfg.minSizeKB, 10) || 100)) * 1024;
-          const isPlaylist = /m3u8|mpd|mpegurl|dash/i.test(details.url) || /m3u8|mpd|mpegurl|dash/i.test(ctype);
-          const fragment = typeof DCRank !== "undefined" && DCRank.isSegmentUrl(details.url);
-          if (!isPlaylist && !fragment && totalForFilter > 0 && totalForFilter < minB) return;
-          let master = false, children = [];
-          if (isPlaylist) {
-            try {
-              const res = await fetch(details.url, {credentials:"include", signal:AbortSignal.timeout(8000)});
-              if (res.ok && (!res.headers.get("content-length") || Number(res.headers.get("content-length")) <= 1024 * 1024)) {
-                const reader = res.body.getReader();
-                let body = "", size = 0;
-                const decoder = new TextDecoder();
-                try {
-                  while (size <= 1024 * 1024) {
-                    const {value, done} = await reader.read();
-                    if (done) break;
-                    size += value.length; body += decoder.decode(value, {stream:true});
-                    if (/#EXT-X-STREAM-INF|<MPD[\s>]/i.test(body)) master = true;
-                  }
-                  if (typeof DCRank !== "undefined") children = DCRank.playlistReferences(body, details.url);
-                } finally { await reader.cancel(); }
-              }
-            } catch (e) { /* metadata optional; keep the original signed URL */ }
-          }
-          noteMedia(details.tabId, {
-            master, children,
-            url: details.url,
-            mime,
-            size: totalForFilter || 0,
-            pageUrl: details.documentUrl || null,
-            frameId: details.frameId,
-          });
-        } catch (e) { /* never break navigation */ }
-        })();
+        if (details.tabId >= 0) {
+          if (details.type === "main_frame" || details.type === "sub_frame") noteTabOrigin(details.tabId, details.url);
+          if (details.initiator) noteTabOrigin(details.tabId, details.initiator);
+        }
+        onMediaResponse(details).catch(() => { /* never break navigation */ });
       },
       { urls: ["http://*/*", "https://*/*"] },
       ["responseHeaders"]
     );
+  }
+  if (chrome.webRequest && chrome.webRequest.onCompleted) {
+    const done = (details) => { requestAuth.delete(details.requestId); };
+    chrome.webRequest.onCompleted.addListener(done, { urls: ["http://*/*", "https://*/*"] });
+    chrome.webRequest.onErrorOccurred.addListener(done, { urls: ["http://*/*", "https://*/*"] });
   }
 } catch (e) { /* webRequest unavailable (Firefox MV3 w/o permission) */ }
 
@@ -409,6 +587,7 @@ try {
   if (chrome.tabs && chrome.tabs.onRemoved) {
     chrome.tabs.onRemoved.addListener((tabId) => {
       forgetTab(tabId);
+      tabNavSeq.delete(tabId);
     });
   }
   // New navigation (same tab, new video): drop the previous video's URLs so
@@ -419,7 +598,7 @@ try {
   if (chrome.tabs && chrome.tabs.onUpdated) {
     chrome.tabs.onUpdated.addListener((tabId, info) => {
       if ((info.status === "loading" && info.url !== undefined) || info.url !== undefined) {
-        forgetTab(tabId);
+        forgetTab(tabId, info.url);
       }
     });
   }
@@ -802,11 +981,15 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       await sendToHostPing();
       const cfg = await settings();
       const downloadUI = await syncBrowserDownloadUI();
-      return { hideBrowserUI:!!cfg.hideBrowserUI, downloadUI, autoCapture: !!cfg.autoCapture, minSizeKB: cfg.minSizeKB, blockHosts: cfg.blockHosts, hostOk, hostError: lastHostError || null, fallbackError: lastFallbackError || null };
+      return { hideBrowserUI:!!cfg.hideBrowserUI, downloadUI, autoCapture: !!cfg.autoCapture, deepDetect: cfg.deepDetect !== false, minSizeKB: cfg.minSizeKB, blockHosts: cfg.blockHosts, hostOk, hostError: lastHostError || null, fallbackError: lastFallbackError || null };
     }
     if (msg.type === "setAuto" && typeof msg.value === "boolean") {
       await api.storage.local.set({ autoCapture: msg.value });
       await syncBrowserDownloadUI();
+      return { ok: true };
+    }
+    if (msg.type === "setDeepDetect" && typeof msg.value === "boolean") {
+      await api.storage.local.set({ deepDetect: msg.value });
       return { ok: true };
     }
     if (msg.type === "setBrowserUI" && typeof msg.value === "boolean") {

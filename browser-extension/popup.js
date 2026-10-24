@@ -11,6 +11,7 @@ chrome.runtime.sendMessage({ type: "getState" }, (res) => {
     return;
   }
   $("auto").checked = !!res.autoCapture;
+  $("deep").checked = res.deepDetect !== false;
   $("hideUI").checked = !!res.hideBrowserUI;
   $("hideUI").disabled = !(res.downloadUI && res.downloadUI.supported);
   if (res.minSizeKB !== undefined) $("minSize").value = String(res.minSizeKB);
@@ -25,6 +26,10 @@ chrome.runtime.sendMessage({ type: "getState" }, (res) => {
 
 $("auto").onchange = () => {
   chrome.runtime.sendMessage({ type: "setAuto", value: $("auto").checked });
+};
+
+$("deep").onchange = () => {
+  chrome.runtime.sendMessage({ type: "setDeepDetect", value: $("deep").checked });
 };
 
 $("hideUI").onchange = () => {
@@ -277,12 +282,15 @@ function renderLinks(list, links, net, pageUrl, pageTitle) {
     const a = document.createElement("a");
     a.href = n.url; a.textContent = `Stream (${n.mime || "media"})${n.tabs > 1 ? ` ×${n.tabs} tabs` : ""}`; a.target = "_blank";
     const btn = document.createElement("button");
-    const isStream = /m3u8|mpd|mpegurl|dash/i.test(n.url);
-    const isPart = R ? R.kindOf(n) === "segment" : /(\.ts|\.m4s|\.cmfv|\.cmfa)(\?|#|$)/i.test(String(n.url).split("?")[0]);
-    const base = isStream ? "Send stream (needs app resolve)" : isPart ? "Download part (segment)" : "Download stream";
+    // Kind, not URL shape: sniffed manifests often live at opaque URLs.
+    const kind = R ? R.kindOf(n) : null;
+    const isStream = kind ? kind === "playlist" : /m3u8|mpd|mpegurl|dash/i.test(n.url);
+    const isPart = kind ? kind === "segment" : /(\.ts|\.m4s|\.cmfv|\.cmfa)(\?|#|$)/i.test(String(n.url).split("?")[0]);
+    const isSub = kind === "subtitle";
+    const base = isStream ? "Send stream (needs app resolve)" : isPart ? "Download part (segment)" : isSub ? "Download subtitles" : "Download stream";
     btn.textContent = n.size > 0 ? `${base} (${fmtSize(n.size)})` : base;
     btn.onclick = () => {
-      chrome.runtime.sendMessage({ type: "download", url: n.url, filename: isStream ? undefined : fnameFor(), pageUrl: pageUrl || undefined }, (res) => {
+      chrome.runtime.sendMessage({ type: "download", url: n.url, filename: (isStream || isSub) ? undefined : fnameFor(), pageUrl: pageUrl || undefined }, (res) => {
         $("status").textContent = res && res.ok ? "Sent ✓" : "App not reachable.";
       });
     };

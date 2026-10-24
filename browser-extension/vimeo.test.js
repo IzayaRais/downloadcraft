@@ -17,9 +17,9 @@ function harness(capture, framePage, capturedUrl = fragment) {
     } },
     runtime: { sendNativeMessage: async (host, msg) => { calls.push(msg); return {type:'ok'}; } },
   };
-  const make = new Function('DCRank', 'tabMedia', 'api', 'cookiesFor', 'stripFbSlice', 'HOST', 'console',
+  const make = new Function('DCRank', 'tabMedia', 'mediaAuth', 'api', 'cookiesFor', 'stripFbSlice', 'HOST', 'console',
     `let lastHostError=''; ${block}; return { sendToHost, error: () => lastHostError };`);
-  const result = make(R, new Map([[7, capture ? [{url:capturedUrl, ...capture}] : []]]), api,
+  const result = make(R, new Map([[7, capture ? [{url:capturedUrl, ...capture}] : []]]), new Map(), api,
     async url => { cookies.push(url); return 'session=example'; }, u => u, 'test-host', {error(){}});
   return {...result, calls, cookies};
 }
