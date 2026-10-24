@@ -114,8 +114,15 @@ function renderVideos(box, videos, pageUrl) {
     };
     wrap.appendChild(linkBtn);
     const sizeJobs = [];
+    // By bitrate (`br`), like the in-page menu: YouTube's labels are
+    // "MEDIUM"/"LOW", so parsing "128k" out of them ranked every track 0 and
+    // took whichever came first (often the 48k one).
     const bestAudio = (arr) => (arr || []).slice().sort((a, b) => {
-      const bn = (x) => { const m = String(x.label || "").match(/(\d+)k/); return m ? parseInt(m[1], 10) : 0; };
+      const bn = (x) => {
+        if (Number(x.br) > 0) return Number(x.br);
+        const m = String(x.label || "").match(/(\d+)k/);
+        return m ? parseInt(m[1], 10) * 1000 : 0;
+      };
       return bn(b) - bn(a);
     })[0] || null;
     const bestA = bestAudio(v.audio);
@@ -344,7 +351,9 @@ async function activeTab() {
   const tabUrl = (tab && tab.url && /^https?:\/\//i.test(tab.url)) ? tab.url : null;
   if (tab && tab.id !== undefined) {
     try {
-      const peek = await api.tabs.sendMessage(tab.id, { type: "peekState" });
+      // The top frame only: every iframe also answers (ad/account frames
+      // replied first with an empty or foreign video list).
+      const peek = await api.tabs.sendMessage(tab.id, { type: "peekState" }, { frameId: 0 });
       if (peek && (peek.videos || peek.links || peek.net)) {
         renderVideos(box, peek.videos, peek.page || tabUrl);
         renderLinks(list, peek.links, peek.net, peek.page || tabUrl, peek.title || "");

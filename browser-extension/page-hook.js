@@ -128,6 +128,8 @@
       const r = orig.apply(this, args);
       polls = 0;
       setTimeout(pollGlobals, 800);
+      // Tell content.js (isolated world, which cannot see these calls).
+      try { window.postMessage({ __dc: "nav" }, location.origin); } catch (e) {}
       return r;
     };
   }

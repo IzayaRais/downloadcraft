@@ -17,6 +17,15 @@
   // update), older live instances must go quiet instead of fighting over
   // the button. The newest instance always wins.
   const GEN = (window.__dcGen = (window.__dcGen || 0) + 1);
+  // Only the top frame owns the popup's shared storage keys: ad/account
+  // iframes wrote empty or foreign video lists over the page's own.
+  // Incognito pages never write it either: storage.local is on disk and
+  // outlives the private window.
+  const IS_TOP = (() => {
+    try {
+      return window.top === window && !(chrome.extension && chrome.extension.inIncognitoContext);
+    } catch (e) { return false; }
+  })();
   const alive = () => window.__dcGen === GEN;
   // "Extension context invalidated" happens when Chrome reloads/updates the
   // extension while this page is open: every chrome.* call in the OLD script
@@ -65,7 +74,7 @@
           media.push({ url: el.src, text: "Page media (source)", thumb: posterOf(el) });
         }
       });
-      chrome.storage.local.set({
+      if (IS_TOP) chrome.storage.local.set({
         downloadCraftLinks: [...media, ...links].slice(0, 50),
         downloadCraftPage: location.href,
       });
@@ -1034,7 +1043,10 @@
     const isPlaylist = (u) => R ? R.kindOf({ url: u }) === "playlist" : /m3u8|mpd|mpegurl|dash/i.test(String(u));
     const isSeg = (u) => R ? R.kindOf({ url: u }) === "segment" : /(\.ts|\.m4s|\.cmfv|\.cmfa)(\?|#|$)/i.test(String(u).split("?")[0]);
     const hasPlaylist = (Array.isArray(items) ? items : []).some((m) => m && isPlaylist(m.url));
-    const live = fbReelMedia(items, info.since).filter((m) => !isPlaylist(m.url));
+    // Subtitle files (.srt/.vtt, captured at any size) are never "MP4 file"
+    // rows: a caption could become the only row and be sent as the video.
+    const live = fbReelMedia(items, info.since).filter((m) => !isPlaylist(m.url)
+      && !(R && R.kindOf(m) === "subtitle"));
     const liveVideo = live.filter((m) => !fbAudioItem(m) && !(hasPlaylist && isSeg(m.url)));
     const liveAudio = live.filter((m) => fbAudioItem(m) && !isSeg(m.url));
     const liveQ = fbQuality(info.w, info.h, true);
@@ -1074,12 +1086,22 @@
   // caught for this page: prefer real video/mp4 over playlists, biggest
   // known size first. Facebook reels render as blob: players, so this is
   // what makes the pill work without a page reload.
-  function bestSniffed(items) {
+  // `opts.streamPlayer`: the clicked <video> plays a blob:/MediaSource source,
+  // so what it plays is a stream; its playlist beats any loose file on the
+  // page (an ad or preview .mp4 used to win: files outrank playlists).
+  function bestSniffed(items, opts) {
     const R = (typeof DCRank !== "undefined") ? DCRank : null;
     // Subtitle side files are listed in the popup, never picked as the video.
-    const list = (items || []).filter((m) => m && /^https?:\/\//i.test(m.url)
+    let list = (items || []).filter((m) => m && /^https?:\/\//i.test(m.url)
       && !(R && R.kindOf(m) === "subtitle"));
     if (!list.length) return null;
+    // What the page's players really requested beats URLs a page only
+    // mentioned in its JSON (a feed lists every post's .mp4).
+    if (list.some((m) => m.via !== "page")) list = list.filter((m) => m.via !== "page");
+    if (opts && opts.streamPlayer && R) {
+      const streams = list.filter((m) => R.kindOf(m) === "playlist");
+      if (streams.length) list = streams;
+    }
     // P4: when the tab already holds a playlist, loose segments are its
     // children (the engine assembles them) — never pick a part. Without
     // rank.js, fall back to the legacy inline score below.
@@ -1909,6 +1931,10 @@
           if (fresh && fresh.url !== p.st.url && p.item && p.item.el.isConnected) {
             p.st.url = fresh.url;
             p.st.ciphered = false;
+            // The row now says "+ audio": pair the audio this playback really
+            // used (on ciphered pages the page lists none, so the merge used
+            // to be skipped and the file came out silent).
+            if (p.st.kind === "v" && pickAudio && pickAudio.url !== fresh.url) p.st._pair = pickAudio;
             const cont = (contOf(fresh.mime) || p.st.disp || "mp4").toUpperCase();
             const fmt = cont + (p.st.kind === "v" ? " + audio" : "");
             if (p.item.fmtEl) p.item.fmtEl.textContent = fmt;
@@ -2082,9 +2108,12 @@
     // Video-only cells bundle the best audio track so the app merges them to
     // a single file (IDM's "MKV file" behavior).
     const bestAudio = (info.audio || []).slice().sort((a, b) => (b.br || 0) - (a.br || 0))[0] || null;
-    const pairFor = (st) => (st.kind === "v" && bestAudio && bestAudio.url !== st.url)
-      ? { url: bestAudio.url, mime: bestAudio.mime }
-      : null;
+    const pairFor = (st) => {
+      if (st._pair && st._pair.url && st._pair.url !== st.url) return { url: st._pair.url, mime: st._pair.mime };
+      return (st.kind === "v" && bestAudio && bestAudio.url !== st.url)
+        ? { url: bestAudio.url, mime: bestAudio.mime }
+        : null;
+    };
     const sendStream = (st, name) => {
       // Ciphered rows have no URL at build time: hand the page + quality hint
       // over and the app deciphers that exact quality itself.
@@ -2258,7 +2287,7 @@
       if (oldBtn) oldBtn.remove();
       if (oldPanel) oldPanel.remove();
       try {
-        chrome.storage.local.set({ downloadCraftVideos: [] });
+        if (IS_TOP) chrome.storage.local.set({ downloadCraftVideos: [] });
       } catch (e) {
         /* ignore */
       }
@@ -2271,7 +2300,7 @@
     // never show the previous video's title/streams.
     const info = ytStreams() || { videoId: id, title: document.title.replace(/ - YouTube$/, ""), thumb: `https://i.ytimg.com/vi/${id}/hqdefault.jpg`, streams: [], videoOnly: [], audio: [], subs: [] };
     try {
-      chrome.storage.local.set({
+      if (IS_TOP) chrome.storage.local.set({
         downloadCraftVideos: [{
           videoId: info.videoId, title: info.title, thumb: info.thumb || "",
           streams: info.streams, videoOnly: info.videoOnly || [], audio: info.audio || [],
@@ -2366,7 +2395,8 @@
                   return;
                 }
                 const items = (res && res.items) || [];
-                const best = bestSniffed(items);
+                const src = String((v && (v.currentSrc || v.src)) || "");
+                const best = bestSniffed(items, { streamPlayer: /^blob:/i.test(src) || !!(v && v.srcObject) });
                 if (best) {
                   const base = mediaBase(best.url);
                   // Page readers hand over a video track with its audio pair
@@ -2516,7 +2546,7 @@
             const add = use
               .filter((m) => !have.has(m.url))
               .map((m) => ({ url: m.url, text: `Stream (${m.mime || "media"})`, thumb: m.thumb || pageThumb }));
-            if (add.length) {
+            if (add.length && IS_TOP) {
               chrome.storage.local.get(["downloadCraftLinks", "downloadCraftPage"], (c2) => {
                 const merged = [...(((c2 && c2.downloadCraftLinks) || [])), ...add].slice(0, 50);
                 chrome.storage.local.set({ downloadCraftLinks: merged, downloadCraftPage: location.href });
@@ -2587,6 +2617,10 @@
   // fall back to the original link if the app declines capture.
   const bypassDownloadLinks = new WeakSet();
   document.addEventListener("click", ev => {
+    // Only a real user click: a page script calling a.click() on download
+    // links could otherwise make the app fetch any URL with that site's
+    // cookies, silently and in a loop.
+    if (!ev.isTrusted) return;
     if (!alive() || ev.button !== 0 || ev.ctrlKey || ev.metaKey || ev.shiftKey || ev.altKey) return;
     const a = ev.target && ev.target.closest && ev.target.closest("a[href]");
     if (!a) return;
@@ -2627,17 +2661,17 @@
     try { refreshYouTube(); } catch (e) { if (ctxInvalidated(e)) return markDead(); }
   }
   try {
-    const fireSpa = () => setTimeout(spaRefresh, 300);
-    if (!window.__dcHistPatched) {
-      window.__dcHistPatched = true;
-      const ps = history.pushState;
-      const rs = history.replaceState;
-      history.pushState = function () { try { ps.apply(this, arguments); } finally { fireSpa(); } };
-      history.replaceState = function () { try { rs.apply(this, arguments); } finally { fireSpa(); } };
-      window.addEventListener("popstate", fireSpa);
-      window.addEventListener("hashchange", fireSpa);
-    }
-  } catch (e) { /* history patch is best-effort */ }
+    const fireSpa = () => { if (alive()) setTimeout(spaRefresh, 300); };
+    // The page's own history.pushState/replaceState run in the page world,
+    // which a patch here (isolated world) never sees: page-hook.js wraps
+    // them there and announces each navigation. A page faking one only
+    // triggers a refresh.
+    window.addEventListener("message", (ev) => {
+      if (ev.source === window && ev.data && ev.data.__dc === "nav") fireSpa();
+    });
+    window.addEventListener("popstate", fireSpa);
+    window.addEventListener("hashchange", fireSpa);
+  } catch (e) { /* navigation hooks are best-effort */ }
   try {
     // Debounced + generation-gated: a superseded instance disconnects
     // instead of fighting the new one, and mutation storms (infinite

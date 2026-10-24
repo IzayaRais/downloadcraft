@@ -191,7 +191,21 @@ async function sendToHost(url, filename, extra) {
     // or x-* token. Truer than the page URL, so it wins when present.
     const seenAuth = mediaAuth.get(url) || null;
     let cookie = (extra && extra.cookie) || (seenAuth && seenAuth.cookie) || null;
-    if (!cookie && /^https?:\/\//i.test(url)) {
+    // A URL known only from a page script's report (page-hook) gets no
+    // cookies attached: any page can post such reports, and the app must
+    // not be steered into fetching other sites with the user's session.
+    let pageOnly = false;
+    {
+      let fromPage = false, fromNet = false;
+      for (const items of tabMedia.values()) {
+        for (const m of items) {
+          if (m.url !== url) continue;
+          if (m.via === "page") fromPage = true; else fromNet = true;
+        }
+      }
+      pageOnly = fromPage && !fromNet;
+    }
+    if (!cookie && /^https?:\/\//i.test(url) && !pageOnly) {
       cookie = await cookiesFor(url); // best-effort, same-host only
       // CDN hosts (fbcdn/lookaside) carry no cookies of their own — fall
       // back to the page's session cookies so expiring signed URLs keep
@@ -311,15 +325,21 @@ function noteMedia(tabId, entry) {
     seenTabs.clear(); // bounded best-effort; rebuilt by live traffic
   }
   // Legacy global snapshot: fallback only (popup prefers per-tab peek).
+  // Never from an incognito tab: storage.local is on disk and outlives the
+  // private window (its page and signed media URLs would persist).
   try {
-    chrome.storage.local.set({ downloadCraftNet: list.slice(-25) });
+    api.tabs.get(tabId).then((t) => {
+      if (t && !t.incognito) chrome.storage.local.set({ downloadCraftNet: list.slice(-25) });
+    }).catch(() => {});
   } catch (e) { /* ignore */ }
   // Badge counts downloadable videos/streams, never playlist children or
   // subtitle side files.
   const badgeN = list.filter((e) => !e.child && e.kind !== "subtitle").length;
+  // A per-tab badge overrides the global one, so while the app is down the
+  // tab keeps the red "!" instead of a count that hides the failure.
   try {
-    api.action.setBadgeText({ text: String(badgeN), tabId }).catch(() => {});
-    api.action.setBadgeBackgroundColor({ color: "#1F6FEB", tabId }).catch(() => {});
+    api.action.setBadgeText({ text: hostOk ? String(badgeN) : "!", tabId }).catch(() => {});
+    api.action.setBadgeBackgroundColor({ color: hostOk ? "#1F6FEB" : "#C42B1C", tabId }).catch(() => {});
   } catch (e) { /* ignore */ }
 }
 
@@ -347,7 +367,7 @@ function forgetTab(tabId, newUrl) {
       if (!tabs.size) seenTabs.delete(ck);
     }
   } catch (e) { /* ignore */ }
-  try { api.action.setBadgeText({ text: "", tabId }).catch(() => {}); } catch (e) {}
+  try { api.action.setBadgeText({ text: hostOk ? "" : "!", tabId }).catch(() => {}); } catch (e) {}
 }
 
 // Request types that can carry media. Frames are included so a video opened
@@ -365,6 +385,29 @@ function rememberAuth(map, key, value, cap) {
   map.delete(key);
   map.set(key, value);
   while (map.size > cap) map.delete(map.keys().next().value);
+}
+
+// Loopback, private-network and link-local hosts (what a hostile page must
+// not steer credentialed extension/app requests at).
+function privateHost(u) {
+  let h = "";
+  try { h = new URL(u).hostname.toLowerCase().replace(/^\[|\]$/g, ""); } catch (e) { return false; }
+  return h === "localhost" || h.endsWith(".localhost") || h.endsWith(".local") || h === "::1"
+    || /^127\./.test(h) || /^10\./.test(h) || /^192\.168\./.test(h) || /^169\.254\./.test(h)
+    || /^172\.(1[6-9]|2\d|3[01])\./.test(h) || /^0\./.test(h) || /^f[cd][0-9a-f]{2}:/.test(h) || /^fe80:/.test(h);
+}
+
+// True when `url` is known only from a page's own report (page-hook), never
+// from observed network traffic.
+function pageReportedOnly(url) {
+  let page = false, net = false;
+  for (const items of tabMedia.values()) {
+    for (const m of items) {
+      if (m.url !== url) continue;
+      if (m.via === "page") page = true; else net = true;
+    }
+  }
+  return page && !net;
 }
 
 // Origins each tab has loaded (top page + frames). Workers and service
@@ -900,7 +943,14 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       if (tabId === undefined || tabId < 0 || typeof DCRank === "undefined") return { ok: false };
       const cfg = await settings();
       if (cfg.deepDetect === false) return { ok: false };
-      const http = (u) => typeof u === "string" && u.length <= 4000 && /^https?:\/\//i.test(u);
+      // Any page script can post these, so they are held to what the page
+      // reader legitimately finds: media-shaped URLs on public hosts (a
+      // page on a local host may name local media). Other URLs were a way
+      // to make the extension and app send credentialed requests anywhere.
+      const pageHost = (() => { try { return new URL(sender.url).hostname; } catch (e) { return ""; } })();
+      const http = (u) => typeof u === "string" && u.length <= 4000 && /^https?:\/\//i.test(u)
+        && /\.(?:m3u8|mpd|mp4|webm|m4s)(?:[?#]|$)/i.test(u.split(/[?#]/)[0] + "?")
+        && (!privateHost(u) || privateHost(sender.url || "") || (() => { try { return new URL(u).hostname === pageHost; } catch (e) { return false; } })());
       for (const it of msg.items.slice(0, 30)) {
         if (!it || !http(it.url) || hostBlocked(it.url, cfg.blockHosts)) continue;
         const mime = typeof it.mime === "string" && it.mime.length < 100 ? it.mime : "";
@@ -955,8 +1005,12 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       // forbidden header — so off-session hosts may stay unknown; sizes
       // stay best-effort.)
       const seenUrls = new Set();
+      // Never a credentialed request to a URL only a page script reported,
+      // or to a private-network host from a public page.
+      const fromPrivate = !!(sender && sender.url && privateHost(sender.url));
       const urls = msg.urls
         .filter((u) => typeof u === "string" && /^https?:\/\//i.test(u) && !seenUrls.has(u) && (seenUrls.add(u), true))
+        .filter((u) => !pageReportedOnly(u) && (!privateHost(u) || fromPrivate))
         .slice(0, 12);
       const referrer = (typeof msg.referer === "string" && /^https?:\/\//i.test(msg.referer))
         ? msg.referer
