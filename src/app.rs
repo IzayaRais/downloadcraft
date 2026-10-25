@@ -1827,6 +1827,16 @@ pub struct CraftApp {
     col_w: std::collections::HashMap<SortCol, f32>,
     // ---- power features ----
     max_concurrent: usize,
+    /// "Today / this month" line for the sidebar footer, refreshed now and then.
+    stats_line: String,
+    stats_at: Instant,
+    /// Download quota (IDM "download limits"): at most `quota_mb` per
+    /// `quota_hours`; rows paused by it, to resume when the window frees.
+    quota_mb: u64,
+    quota_hours: u64,
+    quota_log: std::collections::VecDeque<(Instant, u64)>,
+    quota_last: u64,
+    quota_paused: Vec<u64>,
     /// Cap on simultaneous connections per host across every download
     /// (0 = no extra cap). Loaded from ui.json so Settings can change it.
     per_host_conns: usize,
@@ -2005,6 +2015,13 @@ impl CraftApp {
         per_host_conns: 0,
             show_complete: true,
             sounds: false,
+            stats_line: String::new(),
+            stats_at: Instant::now().checked_sub(std::time::Duration::from_secs(60)).unwrap_or_else(Instant::now),
+            quota_mb: 0,
+            quota_hours: 1,
+            quota_log: Default::default(),
+            quota_last: 0,
+            quota_paused: Vec::new(),
             queue_running: false,
             had_active: false,
             timeout_secs: 60,
@@ -2428,6 +2445,12 @@ impl CraftApp {
                     }
                     if let Some(b) = g("sounds").and_then(|x| x.as_bool()) {
                         self.sounds = b;
+                    }
+                    if let Some(n) = g("quota_mb").and_then(|x| x.as_u64()) {
+                        self.quota_mb = n;
+                    }
+                    if let Some(n) = g("quota_hours").and_then(|x| x.as_u64()) {
+                        self.quota_hours = n.clamp(1, 24 * 30);
                     }
                     if let Some(b) = g("show_complete").and_then(|x| x.as_bool()) {
                         self.show_complete = b;
@@ -3248,7 +3271,7 @@ impl CraftApp {
 
     fn import_list(&mut self) {
         let file = rfd::FileDialog::new()
-            .add_filter("Text", &["txt", "list", "urls"])
+            .add_filter("URL lists and IDM exports", &["txt", "list", "urls", "ef2"])
             .set_title("Import URL list")
             .pick_file();
         let Some(path) = file else { return };
@@ -3257,10 +3280,16 @@ impl CraftApp {
             return;
         };
         let mut n = 0;
-        for line in data.lines() {
-            let t = line.trim().trim_matches(|c| c == '"' || c == '\'');
-            if is_download_url(t) && !self.downloads.iter().any(|d| d.url == t) {
-                self.queue_url(t.to_string(), None, false, None);
+        for l in crate::model::parse_url_list(&data) {
+            if self.downloads.iter().any(|d| d.url == l.url) {
+                continue;
+            }
+            let name = (!l.filename.is_empty()).then(|| l.filename.clone());
+            if self.queue_url(l.url.clone(), name, false, None) {
+                if let Some(d) = self.downloads.iter_mut().find(|d| d.url == l.url) {
+                    d.referer = l.referer.clone();
+                    d.cookie = l.cookie.clone();
+                }
                 n += 1;
             }
         }
@@ -3706,6 +3735,88 @@ impl CraftApp {
         self.save_queue();
     }
 
+    /// Files dropped on the window: `.url` shortcuts and text lists. One link
+    /// opens the Add dialog with it; several open the pick-and-queue window.
+    fn take_dropped_files(&mut self, ctx: &egui::Context) {
+        let dropped = ctx.input(|i| i.raw.dropped_files.clone());
+        if dropped.is_empty() {
+            return;
+        }
+        let mut urls: Vec<String> = Vec::new();
+        for f in dropped {
+            if let Some(p) = f.path {
+                for u in crate::basket::urls_from_dropped(&p) {
+                    if !urls.contains(&u) {
+                        urls.push(u);
+                    }
+                }
+            }
+        }
+        match urls.len() {
+            0 => self.push_log("Nothing to download in the dropped file (drop .url shortcuts or text lists of links)."),
+            1 => {
+                self.add_file = filename_from_url(&urls[0]);
+                self.add_url = urls.remove(0);
+                self.add_focus_req = true;
+                self.show_add = true;
+            }
+            n => {
+                let links: Vec<crate::native_host::PageLink> =
+                    urls.into_iter().map(|url| crate::native_host::PageLink { url, text: String::new() }).collect();
+                if let Err(e) = crate::native_host::open_links_window("", "Dropped links", "", &links) {
+                    self.push_log(format!("Dropped links: {e}"));
+                } else {
+                    self.push_log(format!("{n} dropped links - pick them in the window that opened."));
+                }
+            }
+        }
+    }
+
+    /// Download quota: once `quota_mb` arrived within `quota_hours`, running
+    /// downloads pause; they resume by themselves when the window frees up.
+    fn enforce_quota(&mut self) {
+        let now_total: u64 = self.downloads.iter().map(|d| d.downloaded_bytes).sum();
+        // First look: what is already on disk is not "this window's" traffic.
+        if self.quota_last == 0 {
+            self.quota_last = now_total.max(1);
+            return;
+        }
+        let delta = now_total.saturating_sub(self.quota_last);
+        self.quota_last = now_total;
+        if self.quota_mb == 0 {
+            if !self.quota_paused.is_empty() {
+                for id in std::mem::take(&mut self.quota_paused) {
+                    self.resume(id);
+                }
+            }
+            return;
+        }
+        let window = std::time::Duration::from_secs(self.quota_hours.max(1) * 3600);
+        if delta > 0 {
+            self.quota_log.push_back((Instant::now(), delta));
+        }
+        while self.quota_log.front().is_some_and(|(t, _)| t.elapsed() > window) {
+            self.quota_log.pop_front();
+        }
+        let used: u64 = self.quota_log.iter().map(|(_, b)| *b).sum();
+        let cap = self.quota_mb.saturating_mul(1024 * 1024);
+        if used >= cap && self.quota_paused.is_empty() {
+            let running: Vec<u64> = self.downloads.iter().filter(|d| matches!(d.status, Status::Downloading)).map(|d| d.id).collect();
+            for id in &running {
+                self.pause(*id);
+            }
+            if !running.is_empty() {
+                self.push_log(format!("Download quota reached ({} MB per {} h): paused until it frees up.", self.quota_mb, self.quota_hours));
+            }
+            self.quota_paused = running;
+        } else if used < cap * 9 / 10 && !self.quota_paused.is_empty() {
+            for id in std::mem::take(&mut self.quota_paused) {
+                self.resume(id);
+            }
+            self.push_log("Download quota freed up: resuming.");
+        }
+    }
+
     /// IDM-style list keys (only while no text field has the keyboard and no
     /// dialog is open): Ctrl+A checks every visible row, Delete removes the
     /// checked rows (files stay), Space pauses or resumes them, Enter opens a
@@ -4124,6 +4235,8 @@ impl CraftApp {
     /// Called with an immutable borrow-safe snapshot after a download completes.
     fn on_download_finished(&mut self, name: &str, path: &std::path::Path) {
         notify("Download Craft — download finished", name);
+        crate::model::record_finished_bytes(std::fs::metadata(path).map(|m| m.len()).unwrap_or(0));
+        self.stats_at = Instant::now().checked_sub(std::time::Duration::from_secs(60)).unwrap_or_else(Instant::now);
         if self.sounds {
             crate::platform::play_sound(true);
         }
@@ -5536,7 +5649,11 @@ impl eframe::App for CraftApp {
                         ui.painter().text(
                             egui::pos2(fr.min.x, fr.center().y + 3.0),
                             egui::Align2::LEFT_CENTER,
-                            format!("{n_active} active · {n_all} total"),
+                            if self.stats_line.is_empty() {
+                                format!("{n_active} active · {n_all} total")
+                            } else {
+                                format!("{n_active} active · {n_all} total · {}", self.stats_line)
+                            },
                             egui::FontId::proportional(10.0),
                             pl().dim,
                         );
@@ -6016,6 +6133,13 @@ impl eframe::App for CraftApp {
         }
 
         self.list_shortcuts(ctx);
+        self.take_dropped_files(ctx);
+        if self.stats_at.elapsed() >= std::time::Duration::from_secs(30) {
+            self.stats_at = Instant::now();
+            let s = crate::model::stats();
+            self.stats_line = if s.day_bytes > 0 { format!("today {}", format_bytes(s.day_bytes)) } else { String::new() };
+        }
+        self.enforce_quota();
         // ================= dialogs =================
         if self.show_add {
             if self.add_focus_req {
@@ -7804,6 +7928,21 @@ impl CraftApp {
     /// Manual dialog/toast button dispatcher (driven by process_hits).
     /// Validate + queue the Add dialog contents (shared by Add/Download).
     fn commit_add(&mut self, download: bool) {
+        // A batch pattern (img[001-120].jpg): every URL it names goes to the
+        // pick-and-queue window instead of becoming one row.
+        if let Some(urls) = crate::model::expand_batch(self.add_url.trim()) {
+            let links: Vec<crate::native_host::PageLink> = urls
+                .into_iter()
+                .map(|url| crate::native_host::PageLink { url, text: String::new() })
+                .collect();
+            let n = links.len();
+            match crate::native_host::open_links_window(self.add_url.trim(), "Batch download", &self.add_cookie, &links) {
+                Ok(()) => self.push_log(format!("Batch pattern: {n} links - pick them in the window that opened.")),
+                Err(e) => self.push_log(format!("Batch pattern: {e}")),
+            }
+            self.show_add = false;
+            return;
+        }
         if !is_download_url(self.add_url.trim()) {
             self.show_add = true;
             self.push_log("Add download: invalid URL (need http/https).");

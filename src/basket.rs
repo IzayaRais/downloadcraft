@@ -79,7 +79,7 @@ fn queue_one(url: &str) -> &'static str {
 }
 
 /// URLs inside a dropped file: `.url` (URL= line) or plain text (any token).
-fn urls_from_dropped(path: &std::path::Path) -> Vec<String> {
+pub(crate) fn urls_from_dropped(path: &std::path::Path) -> Vec<String> {
     let ext = path
         .extension()
         .map(|e| e.to_string_lossy().to_ascii_lowercase())

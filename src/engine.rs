@@ -6315,6 +6315,15 @@ async fn download_with_ytdlp(
     if opts.overwrite_existing {
         cmd.arg("--force-overwrites");
     }
+    // Settings -> Plugins -> YouTube: subtitles saved next to the video.
+    if crate::model::ui_pref_bool("subtitles", false) {
+        let langs = crate::model::ui_pref_str("subtitle_langs", "en.*");
+        let langs: String = langs.chars().filter(|c| c.is_ascii_alphanumeric() || ",.*-_".contains(*c)).collect();
+        cmd.arg("--write-subs").arg("--sub-langs").arg(if langs.is_empty() { "en.*".to_string() } else { langs });
+        if merge_ffmpeg.is_some() {
+            cmd.arg("--convert-subs").arg("srt");
+        }
+    }
     cmd.arg(url);
     cmd.stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())

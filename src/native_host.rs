@@ -143,13 +143,18 @@ pub fn links_batch(page_url: &str, title: &str, cookie: &str, links: &[PageLink]
 }
 
 fn spawn_links(msg: &Incoming) -> Result<(), String> {
-    let page = msg.page_url.clone().unwrap_or_default();
-    let batch = links_batch(
-        &page,
+    open_links_window(
+        &msg.page_url.clone().unwrap_or_default(),
         msg.title.as_deref().unwrap_or(""),
         msg.cookie.as_deref().unwrap_or(""),
         msg.links.as_deref().unwrap_or(&[]),
-    );
+    )
+}
+
+/// The "pick links" window for any list of links (download all links, batch
+/// patterns, dropped lists).
+pub fn open_links_window(page: &str, title: &str, cookie: &str, links: &[PageLink]) -> Result<(), String> {
+    let batch = links_batch(page, title, cookie, links);
     if batch.links.is_empty() {
         return Err("no downloadable links on this page".into());
     }

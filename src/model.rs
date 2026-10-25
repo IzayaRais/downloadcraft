@@ -1878,3 +1878,203 @@ mod audit_private_state_tests {
         std::fs::remove_dir_all(dir).unwrap();
     }
 }
+
+// ---- batch download patterns (IDM "Add batch download") --------------------
+
+/// Expand `https://site/img[001-120].jpg` (or `(001-120)`, `[a-z]`) into
+/// every URL it names. Several groups multiply. Numbers keep the width of the
+/// first bound (001, 002, …). None when the text holds no range or would
+/// produce more than 10,000 URLs.
+pub fn expand_batch(pattern: &str) -> Option<Vec<String>> {
+    // One range group: (start index, end index, values).
+    fn group(s: &str, open: usize) -> Option<(usize, Vec<String>)> {
+        let close_ch = if s[open..].starts_with('[') { ']' } else { ')' };
+        let rel = s[open + 1..].find(close_ch)?;
+        let inner = &s[open + 1..open + 1 + rel];
+        let (a, b) = inner.split_once('-')?;
+        let (a, b) = (a.trim(), b.trim());
+        let vals: Vec<String> = if !a.is_empty() && a.chars().all(|c| c.is_ascii_digit()) && b.chars().all(|c| c.is_ascii_digit()) && !b.is_empty() {
+            let (x, y): (u64, u64) = (a.parse().ok()?, b.parse().ok()?);
+            if y < x || y - x > 10_000 {
+                return None;
+            }
+            let width = if a.len() > 1 && a.starts_with('0') { a.len() } else { 0 };
+            (x..=y).map(|n| format!("{n:0width$}")).collect()
+        } else if a.len() == 1 && b.len() == 1 {
+            let (x, y) = (a.chars().next()?, b.chars().next()?);
+            if !(x.is_ascii_alphabetic() && y.is_ascii_alphabetic()) || y < x {
+                return None;
+            }
+            (x..=y).map(|c| c.to_string()).collect()
+        } else {
+            return None;
+        };
+        Some((open + 1 + rel + 1, vals))
+    }
+    let mut parts: Vec<Vec<String>> = Vec::new();
+    let mut lit = String::new();
+    let mut i = 0;
+    let mut groups = 0;
+    while i < pattern.len() {
+        let c = pattern[i..].chars().next()?;
+        if c == '[' || c == '(' {
+            if let Some((next, vals)) = group(pattern, i) {
+                parts.push(vec![std::mem::take(&mut lit)]);
+                parts.push(vals);
+                groups += 1;
+                i = next;
+                continue;
+            }
+        }
+        lit.push(c);
+        i += c.len_utf8();
+    }
+    parts.push(vec![lit]);
+    if groups == 0 {
+        return None;
+    }
+    let total: usize = parts.iter().map(|p| p.len()).try_fold(1usize, |acc, n| acc.checked_mul(n))?;
+    if total > 10_000 {
+        return None;
+    }
+    let mut out = vec![String::new()];
+    for p in parts {
+        out = out.iter().flat_map(|pre| p.iter().map(move |v| format!("{pre}{v}"))).collect();
+    }
+    Some(out.into_iter().filter(|u| is_download_url(u)).collect())
+}
+
+// ---- URL lists, including IDM's export (.ef2) ------------------------------
+
+/// One link from an imported list.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct ImportedLink {
+    pub url: String,
+    pub referer: String,
+    pub filename: String,
+    pub cookie: String,
+}
+
+/// Read a URL list: one URL per line, or IDM's export format (`.ef2`):
+/// `<` / URL / `referer: …` / `User-Agent: …` / `filename: …` / `>` blocks.
+pub fn parse_url_list(text: &str) -> Vec<ImportedLink> {
+    let mut out: Vec<ImportedLink> = Vec::new();
+    let mut cur: Option<ImportedLink> = None;
+    for line in text.lines() {
+        let t = line.trim().trim_start_matches('\u{feff}');
+        if t == "<" {
+            cur = Some(ImportedLink::default());
+            continue;
+        }
+        if t == ">" {
+            if let Some(l) = cur.take().filter(|l| is_download_url(&l.url)) {
+                out.push(l);
+            }
+            continue;
+        }
+        if let Some(l) = cur.as_mut() {
+            let low = t.to_ascii_lowercase();
+            if l.url.is_empty() && is_download_url(t) {
+                l.url = t.to_string();
+            } else if let Some(v) = low.strip_prefix("referer:").map(|_| t[8..].trim()) {
+                l.referer = v.to_string();
+            } else if let Some(v) = low.strip_prefix("filename:").map(|_| t[9..].trim()) {
+                l.filename = v.to_string();
+            } else if let Some(v) = low.strip_prefix("cookie:").map(|_| t[7..].trim()) {
+                l.cookie = v.to_string();
+            }
+            continue;
+        }
+        let u = t.trim_matches(|c| c == '"' || c == '\'');
+        if is_download_url(u) {
+            out.push(ImportedLink { url: u.to_string(), ..Default::default() });
+        }
+    }
+    let mut seen = std::collections::HashSet::new();
+    out.retain(|l| seen.insert(l.url.clone()));
+    out
+}
+
+// ---- statistics -------------------------------------------------------------
+
+/// Bytes and files finished today, this month and ever.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Stats {
+    pub day: String,
+    pub day_bytes: u64,
+    pub month: String,
+    pub month_bytes: u64,
+    pub total_bytes: u64,
+    pub files: u64,
+}
+
+fn stats_path() -> Option<std::path::PathBuf> {
+    config_dir().map(|d| d.join("stats.json"))
+}
+
+/// The statistics, rolled over to today's day and month.
+pub fn stats() -> Stats {
+    let mut s: Stats = stats_path()
+        .and_then(|p| std::fs::read_to_string(p).ok())
+        .and_then(|t| serde_json::from_str(&t).ok())
+        .unwrap_or_default();
+    let now = Local::now();
+    let (day, month) = (now.format("%Y-%m-%d").to_string(), now.format("%Y-%m").to_string());
+    if s.day != day {
+        s.day = day;
+        s.day_bytes = 0;
+    }
+    if s.month != month {
+        s.month = month;
+        s.month_bytes = 0;
+    }
+    s
+}
+
+/// Count one finished download.
+pub fn record_finished_bytes(bytes: u64) {
+    let _guard = fs_lock("stats");
+    if !_guard.owned() {
+        return;
+    }
+    let mut s = stats();
+    s.day_bytes += bytes;
+    s.month_bytes += bytes;
+    s.total_bytes += bytes;
+    s.files += 1;
+    if let (Some(p), Ok(j)) = (stats_path(), serde_json::to_string(&s)) {
+        let _ = atomic_write(&p, j.as_bytes());
+    }
+}
+
+#[cfg(test)]
+mod batch_import_tests {
+    use super::*;
+
+    #[test]
+    fn batch_patterns_expand() {
+        let v = expand_batch("https://s.example/img[008-011].jpg").unwrap();
+        assert_eq!(v, ["https://s.example/img008.jpg", "https://s.example/img009.jpg", "https://s.example/img010.jpg", "https://s.example/img011.jpg"]);
+        let v = expand_batch("https://s.example/(a-c)/p(1-2).zip").unwrap();
+        assert_eq!(v.len(), 6);
+        assert_eq!(v[0], "https://s.example/a/p1.zip");
+        assert_eq!(v[5], "https://s.example/c/p2.zip");
+        assert!(expand_batch("https://s.example/plain.zip").is_none());
+        assert!(expand_batch("https://s.example/x[1-99999].zip").is_none());
+        // Parentheses that are not a range stay as they are.
+        assert!(expand_batch("https://s.example/Movie (2024).mp4").is_none());
+    }
+
+    #[test]
+    fn idm_export_and_plain_lists_import() {
+        let ef2 = "<\r\nhttps://cdn.example/a.zip\r\nreferer: https://site.example/page\r\nUser-Agent: Mozilla/5.0\r\nfilename: a (1).zip\r\n>\r\n<\r\nhttps://cdn.example/b.iso\r\n>\r\n";
+        let v = parse_url_list(ef2);
+        assert_eq!(v.len(), 2);
+        assert_eq!(v[0].url, "https://cdn.example/a.zip");
+        assert_eq!(v[0].referer, "https://site.example/page");
+        assert_eq!(v[0].filename, "a (1).zip");
+        assert_eq!(v[1].referer, "");
+        let plain = parse_url_list("\"https://x.example/1.zip\"\nnot a url\nhttps://x.example/1.zip\nhttps://x.example/2.zip");
+        assert_eq!(plain.iter().map(|l| l.url.as_str()).collect::<Vec<_>>(), ["https://x.example/1.zip", "https://x.example/2.zip"]);
+    }
+}

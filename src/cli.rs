@@ -382,20 +382,18 @@ pub fn run(cli: Cli) -> anyhow::Result<()> {
             let data = std::fs::read_to_string(&file)?;
             let mut items = load_queue()?;
             let mut n = 0;
-            for line in data.lines() {
-                let t = line.trim().trim_matches(|c| c == '"' || c == '\'');
-                if is_download_url(t) && !items.iter().any(|d| d.url == t) {
+            for l in crate::model::parse_url_list(&data) {
+                let t = l.url.as_str();
+                if !items.iter().any(|d| d.url == t) {
                     let id = crate::model::next_queue_id(&queue_path(), &items);
                     let dir = dirs::download_dir()
                         .map(|p| p.to_string_lossy().to_string())
                         .unwrap_or_else(|| crate::model::default_download_dir().to_string_lossy().into_owned());
-                    items.push(DownloadItem::new(
-                        id,
-                        t.to_string(),
-                        filename_from_url(t),
-                        dir,
-                        8,
-                    ));
+                    let name = if l.filename.is_empty() { filename_from_url(t) } else { crate::engine::sanitize_filename(&l.filename) };
+                    let mut item = DownloadItem::new(id, t.to_string(), name, dir, 8);
+                    item.referer = l.referer.clone();
+                    item.cookie = l.cookie.clone();
+                    items.push(item);
                     n += 1;
                 }
             }

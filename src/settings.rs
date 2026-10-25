@@ -72,6 +72,12 @@ struct Settings {
     temp_dir: String,
     /// Play a sound when a download finishes or fails.
     sounds: bool,
+    /// Download quota: at most this many MB (0 = off) per `quota_hours`.
+    quota_mb: String,
+    quota_hours: String,
+    /// yt-dlp: save subtitles next to the video, in these languages.
+    subtitles: bool,
+    subtitle_langs: String,
     // Browser capture (pushed to the extension over its live connection)
     capture_auto: bool,
     /// File extensions to take over from the browser ("zip exe mp4 ..");
@@ -129,6 +135,10 @@ impl Default for Settings {
             per_host_conns: 0,
             temp_dir: String::new(),
             sounds: false,
+            quota_mb: "0".into(),
+            quota_hours: "1".into(),
+            subtitles: false,
+            subtitle_langs: "en.*".into(),
             capture_auto: true,
             capture_types: String::new(),
             capture_skip_sites: String::new(),
@@ -216,6 +226,18 @@ fn load() -> Settings {
     }
     if let Some(b) = g("sounds").and_then(|x| x.as_bool()) {
         s.sounds = b;
+    }
+    if let Some(n) = g("quota_mb").and_then(|x| x.as_u64()) {
+        s.quota_mb = n.to_string();
+    }
+    if let Some(n) = g("quota_hours").and_then(|x| x.as_u64()) {
+        s.quota_hours = n.to_string();
+    }
+    if let Some(b) = g("subtitles").and_then(|x| x.as_bool()) {
+        s.subtitles = b;
+    }
+    if let Some(x) = g("subtitle_langs").and_then(|x| x.as_str()) {
+        s.subtitle_langs = x.to_string();
     }
     if let Some(b) = g("capture_auto").and_then(|x| x.as_bool()) {
         s.capture_auto = b;
@@ -344,6 +366,10 @@ fn save(s: &Settings) -> bool {
     set(obj, "per_host_conns", (s.per_host_conns as u64).into());
     set(obj, "temp_dir", s.temp_dir.trim().to_string().into());
     set(obj, "sounds", s.sounds.into());
+    set(obj, "quota_mb", s.quota_mb.trim().parse::<u64>().unwrap_or(0).into());
+    set(obj, "quota_hours", s.quota_hours.trim().parse::<u64>().unwrap_or(1).clamp(1, 720).into());
+    set(obj, "subtitles", s.subtitles.into());
+    set(obj, "subtitle_langs", s.subtitle_langs.trim().to_string().into());
     set(obj, "capture_auto", s.capture_auto.into());
     set(obj, "capture_types", normalize_types(&s.capture_types).into());
     set(obj, "capture_skip_sites", s.capture_skip_sites.trim().to_string().into());
@@ -2426,6 +2452,15 @@ impl SettingsApp {
             }
             ui.add_space(6.0);
             checkbox(ui, &mut s.sounds, "Play a sound when a download finishes or fails", 14.0, 11.5, true);
+            ui.add_space(6.0);
+            let mut c = field_row(ui, "quota", "Download quota", None, Some("For capped connections: downloads pause once this much arrived within the hours on the right, and resume by themselves. 0 = off."));
+            input_box(&mut c, "quota_mb_in", &mut s.quota_mb, 80.0, true, false, "0");
+            c.add_space(6.0);
+            c.label(egui::RichText::new("MB per").font(reg(11.0)).color(tok().text2));
+            c.add_space(6.0);
+            input_box(&mut c, "quota_h_in", &mut s.quota_hours, 50.0, true, false, "1");
+            c.add_space(6.0);
+            c.label(egui::RichText::new("hours").font(reg(11.0)).color(tok().text2));
             ui.add_space(1.0);
             checkbox(
                 ui,
@@ -2599,6 +2634,14 @@ impl SettingsApp {
                 _ => "Auto",
             }
             .to_string();
+            ui.add_space(8.0);
+            checkbox(ui, &mut s.subtitles, "Save subtitles next to the video", 14.0, 11.5, true);
+            if s.subtitles {
+                let mut c = field_row(ui, "sub_langs", "Languages", None, Some("yt-dlp language codes, comma separated: en.*, bn, all"));
+                let w = c.available_width();
+                input_box(&mut c, "sub_langs_in", &mut s.subtitle_langs, w, true, false, "en.*");
+            }
+            ui.add_space(8.0);
             if segmented(ui, "yt_engine", &["Auto", "App first", "yt-dlp first"], &mut pick) {
                 s.youtube_engine = match pick.as_str() {
                     "App first" => "native",
