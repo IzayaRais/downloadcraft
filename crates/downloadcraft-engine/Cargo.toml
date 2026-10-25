@@ -1,0 +1,29 @@
+[package]
+name = "downloadcraft-engine"
+version = "0.1.0"
+edition = "2021"
+description = "Multi-connection HTTP download engine with dynamic segmentation (work stealing), crash-safe resume and link refresh — the engine behind Download Craft"
+license = "MIT"
+repository = "https://github.com/hungry-detective/downloadcraft"
+keywords = ["download", "http", "accelerator", "segmented", "resume"]
+categories = ["network-programming", "asynchronous"]
+readme = "README.md"
+
+[features]
+default = ["rustls"]
+# TLS backend for reqwest. Turn defaults off to pick your own (for example
+# reqwest's `native-tls`) in your Cargo.toml.
+rustls = ["reqwest/rustls-tls-native-roots"]
+
+[dependencies]
+tokio = { version = "1", features = ["rt", "fs", "time", "sync", "macros"] }
+reqwest = { version = "0.12", default-features = false, features = ["stream"] }
+futures-util = "0.3"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_System_IO", "Win32_System_Ioctl"] }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["full"] }

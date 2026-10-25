@@ -870,6 +870,7 @@ pub fn drop_resume_state(dest: &std::path::Path) {
         let _ = std::fs::remove_file(dest.with_extension(format!("dcpart{i}")));
     }
     let _ = std::fs::remove_file(dest.with_extension("hlsmap"));
+    downloadcraft_engine::remove_partial(dest);
 }
 
 /// Outcome of `append_to_queue`.

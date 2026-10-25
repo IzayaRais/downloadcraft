@@ -497,7 +497,8 @@ fn resume_meta_path(dest: &std::path::Path) -> std::path::PathBuf {
 /// successful completion/verification; retain it for paused/failed jobs.
 fn cleanup_completed_resume(dest: &std::path::Path) {
     if !dest.is_file() || dest.with_extension("dcpart").exists()
-        || (0..16).any(|i| dest.with_extension(format!("dcpart{i}")).exists()) {
+        || (0..16).any(|i| dest.with_extension(format!("dcpart{i}")).exists())
+        || downloadcraft_engine::has_partial(dest) {
         return;
     }
     let _ = std::fs::remove_file(resume_meta_path(dest));
@@ -578,76 +579,8 @@ pub(crate) fn resume_offset(
         }
     }
 }
-/// Shared token-bucket rate limiter (clean-room implementation).
-/// Unlike a naive per-chunk `sleep(bytes/limit)`, the bucket smooths bursts
-/// across all connections: tokens accrue at `limit_bps` and each chunk
-/// waits only for the deficit. A single shared instance is cloned into
-/// every segment task so the *global* budget is honored.
-/// An optional scheduler-provided atomic overrides the cap live (speed
-/// windows), taking effect in running downloads without restarts.
-#[derive(Debug, Clone)]
-pub struct RateLimiter {
-    limit_bps: u64,
-    global_bps: Option<std::sync::Arc<std::sync::atomic::AtomicU64>>,
-    state: Arc<std::sync::Mutex<(f64, std::time::Instant)>>,
-}
-
-impl RateLimiter {
-    pub fn new(limit_bps: u64) -> Self {
-        Self {
-            limit_bps,
-            global_bps: None,
-            state: Arc::new(std::sync::Mutex::new((
-                limit_bps as f64,
-                std::time::Instant::now(),
-            ))),
-        }
-    }
-
-    pub fn with_global(mut self, global_bps: Option<std::sync::Arc<std::sync::atomic::AtomicU64>>) -> Self {
-        self.global_bps = global_bps;
-        self
-    }
-
-    fn effective_limit(&self) -> u64 {
-        match &self.global_bps {
-            Some(g) => {
-                let v = g.load(Ordering::SeqCst);
-                // Scheduler convention: u64::MAX = "no window active".
-                if v == u64::MAX {
-                    self.limit_bps
-                } else {
-                    v.min(if self.limit_bps == 0 { v } else { self.limit_bps })
-                }
-            }
-            None => self.limit_bps,
-        }
-    }
-
-    pub async fn consume(&self, bytes: u64) {
-        let limit = self.effective_limit();
-        if limit == 0 || bytes == 0 {
-            return;
-        }
-        let wait_secs: f64 = {
-            let mut g = mutex_guard(&self.state);
-            let (ref mut tokens, ref mut last) = *g;
-            let now = std::time::Instant::now();
-            let elapsed = now.duration_since(*last).as_secs_f64();
-            *last = now;
-            *tokens = (*tokens + elapsed * limit as f64).min(limit as f64 * 2.0);
-            *tokens -= bytes as f64;
-            if *tokens < 0.0 {
-                -(*tokens) / limit as f64
-            } else {
-                0.0
-            }
-        };
-        if wait_secs > 0.0 {
-            tokio::time::sleep(std::time::Duration::from_secs_f64(wait_secs)).await;
-        }
-    }
-}
+/// Shared token-bucket rate limiter: lives in the reusable engine crate.
+pub use downloadcraft_engine::RateLimiter;
 
 /// Lock a mutex even when poisoned (a panicking holder must not cascade
 /// into every UI poll and engine task — take the guard anyway).
@@ -673,6 +606,11 @@ fn host_of(url: &str) -> String {
 
 /// Hold a connection slot for `url`'s host until the permit is dropped.
 async fn host_slot(url: &str, cap: usize) -> Option<tokio::sync::OwnedSemaphorePermit> {
+    host_gate(url, cap)?.acquire_owned().await.ok()
+}
+
+/// The process-wide semaphore for `url`'s host (None = no cap).
+fn host_gate(url: &str, cap: usize) -> Option<Arc<tokio::sync::Semaphore>> {
     if cap == 0 {
         return None;
     }
@@ -693,7 +631,7 @@ async fn host_slot(url: &str, cap: usize) -> Option<tokio::sync::OwnedSemaphoreP
             }
         }
     };
-    sem.acquire_owned().await.ok()
+    Some(sem)
 }
 
 /// Marker for HTTP refusals that must NOT be retried (401/403): the same
@@ -720,7 +658,15 @@ fn final_err(msg: String) -> anyhow::Error {
 /// (they expire and are IP/session-bound) — retrying the same URL is
 /// pointless, so callers fail fast on these instead of burning retries.
 fn http_status_err(url: &str, e: reqwest::Error) -> anyhow::Error {
-    let status = e.status();
+    match e.status() {
+        Some(s) => http_code_err(url, s.as_u16()),
+        None => anyhow!("network: {e}"),
+    }
+}
+
+/// [`http_status_err`] for a bare status code.
+fn http_code_err(url: &str, code: u16) -> anyhow::Error {
+    let status = reqwest::StatusCode::from_u16(code).ok();
     if status == Some(reqwest::StatusCode::FORBIDDEN) {
         if url.contains("googlevideo.com")
             || url.contains("youtube.com")
@@ -741,7 +687,7 @@ fn http_status_err(url: &str, e: reqwest::Error) -> anyhow::Error {
     }
     match status {
         Some(s) => anyhow!("HTTP {s}"),
-        None => anyhow!("network: {e}"),
+        None => anyhow!("HTTP {code}"),
     }
 }
 
@@ -4201,7 +4147,8 @@ async fn download_inner(
     // state first) replace the file instead.
     if opts.allow_rename && dest.exists() && !opts.overwrite_existing {
         let resumable_here = dest.with_extension("dcpart").exists()
-            || (0..16).any(|i| dest.with_extension(format!("dcpart{i}")).exists());
+            || (0..16).any(|i| dest.with_extension(format!("dcpart{i}")).exists())
+            || downloadcraft_engine::has_partial(&dest);
         if !resumable_here {
             dest = crate::model::conflict_free_dest(&dest);
             if let Some(name) = dest
@@ -4234,16 +4181,15 @@ async fn download_inner(
     let mut fell_back_single = fragile_cdn;
     let mut last_segmented = false;
     loop {
-        // P-speed: size googlevideo splits to the strict ~2 MiB window so
-        // parallel ranges 206 instead of 403ing into the fallback.
-        let mut seg_parts = effective_conns;
-        if is_googlevideo_url(&url) {
-            if let Some(t) = total_opt {
-                seg_parts = google_parts(t, effective_conns);
-            }
-        }
-        let use_segmented =
-            supports_range && matches!(total_opt, Some(t) if t >= 1024 * 1024) && seg_parts > 1 && !fell_back_single;
+        // googlevideo's strict ~2 MiB window is a per-request limit inside
+        // the segmented engine (`max_request`), not a smaller split.
+        let seg_parts = effective_conns;
+        // One connection still goes through the engine when it has a
+        // partial download to continue (the last halving step).
+        let use_segmented = supports_range
+            && matches!(total_opt, Some(t) if t >= 1024 * 1024)
+            && (seg_parts > 1 || downloadcraft_engine::has_partial(&dest))
+            && !fell_back_single;
         last_segmented = use_segmented;
         let r = if use_segmented {
             segmented(
@@ -4277,7 +4223,14 @@ async fn download_inner(
             single_stream(&client, &opts, &url, &dest, shared.clone(), limiter.clone()).await
         };
         match r {
-            Ok(()) => break,
+            Ok(()) => {
+                // A plain-stream fallback finished: the engine's partial
+                // data (kept in case that failed too) is no longer needed.
+                if !last_segmented {
+                    downloadcraft_engine::remove_partial(&dest);
+                }
+                break;
+            }
             Err(e)
                 if !retried_fresh
                     && is_final_http_error(&e)
@@ -4293,6 +4246,7 @@ async fn download_inner(
                         // rebinds it on first write.)
                         let _ = tokio::fs::remove_file(dest.with_extension("dcpart")).await;
                         let _ = tokio::fs::remove_file(dest.with_extension("dcmeta")).await;
+                        downloadcraft_engine::remove_partial(&dest);
                         for i in 0..16 {
                             let _ = tokio::fs::remove_file(
                                 dest.with_extension(format!("dcpart{i}")),
@@ -6222,12 +6176,7 @@ async fn adaptive_leg(
 ) -> Result<()> {
     let strict = is_fragile_cdn(url) || is_googlevideo_url(url);
     let can_chunk = strict && matches!(total, Some(t) if t > 0);
-    let mut parts = conns.clamp(1, 16);
-    if is_googlevideo_url(url) {
-        if let Some(t) = total {
-            parts = google_parts(t, parts);
-        }
-    }
+    let parts = conns.clamp(1, 16);
     let can_segment = range && matches!(total, Some(t) if t >= 1024 * 1024) && parts > 1;
     if can_segment {
         // Legs start at zero (fresh work dir), so the counter holds only
@@ -6248,6 +6197,7 @@ async fn adaptive_leg(
                         // Stale parts belong to the failed split; the
                         // chunked round rebinds its own offset, and the
                         // counter restarts with it (never double-counts).
+                        downloadcraft_engine::remove_partial(leg_dest);
                         for i in 0..16 {
                             let _ = tokio::fs::remove_file(
                                 leg_dest.with_extension(format!("dcpart{i}")),
@@ -7282,20 +7232,6 @@ pub async fn download_dash(
 /// fixture and googlevideo SABR edges).
 const STRICT_PART_MAX: u64 = 2 * 1024 * 1024;
 
-/// Segmented split size for googlevideo URLs (P-speed): no more parts than
-/// needed to keep ranges near the strict ~2 MiB window — fewer, fuller
-/// ranges beat a storm of micro-ranges. Never exceeds what was asked
-/// (a single connection stays single); larger files still split fully
-/// and rely on the chunked fallback below when an edge balks.
-fn google_parts(total: u64, conns: usize) -> usize {
-    let c = conns.clamp(1, 16);
-    if c <= 1 || total < 1024 * 1024 {
-        return c;
-    }
-    let fit = ((total + STRICT_PART_MAX - 1) / STRICT_PART_MAX).clamp(2, 16) as usize;
-    fit.min(c)
-}
-
 /// Classify a retryable attempt error for the end-of-download summary
 /// (cuts vs stalls vs restarts), so the log tells the user what the
 /// server actually kept doing instead of just the last error.
@@ -7309,15 +7245,16 @@ fn classify_attempt(msg: &str) -> &'static str {
     }
 }
 
-/// Next split when parallel ranges get throttled (P2): halve 16→8→4→2,
-/// then give up splitting (None) and collapse to one sequential stream.
-/// Halving (not abandoning) survives hosts that tolerate a few ranges but
-/// cut under a many-way storm.
+/// Next split when parallel ranges get throttled (P2): halve 16→8→4→2→1,
+/// then give up (None) and fall back to a plain stream. Halving (not
+/// abandoning) survives hosts that tolerate a few ranges but cut under a
+/// many-way storm; the last step is still the engine, so its resume journal
+/// keeps everything downloaded so far.
 fn halve_conns(conns: usize) -> Option<usize> {
-    if conns > 2 {
-        Some((conns / 2).max(2))
-    } else {
-        None
+    match conns {
+        0 | 1 => None,
+        2 => Some(1),
+        n => Some((n / 2).max(2)),
     }
 }
 
@@ -8017,6 +7954,12 @@ async fn chunked_once(
     Ok(wrote)
 }
 
+/// Multi-connection download through the reusable engine crate
+/// (`crates/downloadcraft-engine`): dynamic segmentation with work stealing,
+/// one pre-allocated file, a crash-safe resume journal, throttling and
+/// connection-limit detection, expired-link refresh. This wrapper maps the
+/// app's options, pause/stop flags, progress view and errors onto it.
+#[allow(clippy::too_many_arguments)]
 async fn segmented(
     client: &reqwest::Client,
     opts: &EngineOpts,
@@ -8027,315 +7970,128 @@ async fn segmented(
     shared: Arc<SharedState>,
     limiter: std::sync::Arc<RateLimiter>,
 ) -> Result<()> {
-    // Fresh segmented download: reset counter (no cross-session resume for v1).
-    shared.downloaded.store(0, Ordering::SeqCst);
-
-    // Bind the part set: stale dcpart{i} files from another URL/total/split
-    // are discarded here (ranges below derive from this exact split).
-    // NOTE: this drops cross-session resume for mismatched splits by design
-    // (P0); same-URL+total+conns still resumes via download_range seeding.
-    resume_offset(dest, "dcpart", url, Some(total), connections);
-
-    let chunk = total / connections as u64;
-
-    let mut handles = Vec::new();
-    {
-        let mut totals = mutex_guard(&shared.part_total);
-        let mut dones = mutex_guard(&shared.part_done);
-        totals.clear();
-        dones.clear();
-        for i in 0..connections {
-            let start = i as u64 * chunk;
-            let mut end = if i == connections - 1 {
-                total - 1
-            } else {
-                (i as u64 + 1) * chunk - 1
-            };
-            if end >= total {
-                end = total - 1;
-            }
-            totals.push((start, end));
-            dones.push(0);
-        }
+    use downloadcraft_engine as dce;
+    let dbg = std::env::var("DOWNLOAD_CRAFT_DEBUG").is_ok();
+    // Strict googlevideo edges 403 ranges above ~2 MiB: ask in windows.
+    let strict = is_googlevideo_url(url);
+    let config = dce::Config {
+        connections: connections.clamp(1, 16),
+        max_request: strict.then_some(STRICT_PART_MAX),
+        min_split: if strict { STRICT_PART_MAX } else { 1024 * 1024 },
+        stall_timeout: std::time::Duration::from_secs(opts.timeout_secs.clamp(15, 120)),
+        max_retries: opts.max_retries.max(1),
+        ..dce::Config::default()
+    };
+    let (req_client, req_opts) = (client.clone(), opts.clone());
+    let request: dce::RequestFn = Arc::new(move |u: &str| req_opts.get(&req_client, u));
+    let mut dl = dce::Downloader::with_request(request).config(config).limiter(limiter);
+    if let Some(gate) = host_gate(url, opts.per_host_conns) {
+        dl = dl.connection_gate(gate);
     }
-    for i in 0..connections {
-        let (start, end) = mutex_guard(&shared.part_total)[i];
-        let part = dest.with_extension(format!("dcpart{}", i));
-        let client = client.clone();
-        let url = url.to_string();
-        let shared = shared.clone();
-        let opts = opts.clone();
-        let limiter = limiter.clone();
-        handles.push(tokio::spawn(async move {
-            download_range(
-                &client,
-                &opts,
-                &url,
-                &part,
-                start,
-                end,
-                limiter,
-                i,
-                shared,
-            )
-            .await
+    // A stream link that dies mid-file is re-resolved from its page; the
+    // engine keeps every byte already on disk when the size still matches.
+    if strict && is_youtube_page(&opts.referer) {
+        let (c, o, s) = (client.clone(), opts.clone(), shared.clone());
+        dl = dl.on_link_expired(Arc::new(move |old: String| {
+            let (c, o, s) = (c.clone(), o.clone(), s.clone());
+            Box::pin(async move {
+                resolve_media(&c, &o, &o.referer, &s)
+                    .await
+                    .map(|hit| hit.url)
+                    .filter(|u| *u != old && is_googlevideo_url(u))
+            })
         }));
     }
+    if dbg {
+        dl = dl.on_event(Arc::new(|e: &dce::Event| eprintln!("[dbg] engine: {e}")));
+    }
+    // Part files of the old fixed-split engine (0.9.8 and earlier) cannot be
+    // continued by this one.
+    for i in 0..16 {
+        let _ = tokio::fs::remove_file(dest.with_extension(format!("dcpart{i}"))).await;
+    }
+    let job = dce::Job::new(url, dest.clone()).size_hint(Some(total), true);
+    let progress = Arc::new(dce::Progress::default());
+    let control = Arc::new(dce::Control::default());
 
-    let mut failed: Option<anyhow::Error> = None;
-    for h in handles {
-        match h.await {
-            Ok(Ok(())) => {}
-            Ok(Err(e)) => {
-                if failed.is_none() {
-                    failed = Some(e);
+    // Bridge: the UI's pause/stop flags in, live progress out.
+    let done = Arc::new(AtomicBool::new(false));
+    let bridge = {
+        let (progress, control, shared, done) = (progress.clone(), control.clone(), shared.clone(), done.clone());
+        tokio::spawn(async move {
+            loop {
+                sync_engine_progress(&progress, &control, &shared, total);
+                if done.load(Ordering::SeqCst) {
+                    break;
                 }
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
             }
-            Err(e) => {
-                if failed.is_none() {
-                    failed = Some(anyhow!("task join: {e}"));
-                }
-            }
-        }
-    }
-    if let Some(e) = failed {
-        // Cancel siblings already done; leave parts for debugging.
-        return Err(e);
-    }
-
-    // Merge parts in order. A 1 MiB buffer on both sides keeps `copy` from
-    // paying an 8 KiB blocking-pool round trip per chunk (a 2 GB file is
-    // ~250k of them at the default size).
-    let tmp = dest.with_extension("dcpart");
-    let mut out = tokio::io::BufWriter::with_capacity(
-        WRITE_BUF,
-        tokio::fs::OpenOptions::new()
-            .create(true)
-            .write(true)
-            .truncate(true)
-            .open(&tmp)
-            .await?,
-    );
-    let mut buf = vec![0u8; WRITE_BUF];
-    for i in 0..connections {
-        let part = dest.with_extension(format!("dcpart{}", i));
-        let mut f = tokio::fs::File::open(&part).await?;
-        loop {
-            let n = tokio::io::AsyncReadExt::read(&mut f, &mut buf).await?;
-            if n == 0 {
-                break;
-            }
-            tokio::io::AsyncWriteExt::write_all(&mut out, &buf[..n]).await?;
-        }
-    }
-    tokio::io::AsyncWriteExt::flush(&mut out).await?;
-    drop(out);
-    for i in 0..connections {
-        let part = dest.with_extension(format!("dcpart{}", i));
-        let _ = tokio::fs::remove_file(&part).await;
-    }
-    tokio::fs::rename(&tmp, dest).await?;
-    Ok(())
-}
-
-/// One segment of a multi-connection download. Args are bundled loosely;
-/// splitting them further would obscure the call sites.
-#[allow(clippy::too_many_arguments)]
-async fn download_range(
-    client: &reqwest::Client,    opts: &EngineOpts,
-    url: &str,
-    part: &PathBuf,
-    start: u64,
-    end: u64,
-    limiter: std::sync::Arc<RateLimiter>,
-    part_idx: usize,
-    shared: Arc<SharedState>,
-) -> Result<()> {
-    // One host-wide slot per open connection (Queue v2): with the cap set,
-    // three jobs to the same CDN can never open 3×8 sockets.
-    let _host_slot = host_slot(url, opts.per_host_conns).await;
-    let max_retries = opts.max_retries.max(1);
-    // Attempts that made ANY progress don't count toward the retry budget
-    // (throttled CDNs drip-feed: each 1 MB trickle resets the stall count).
-    // Only consecutive zero-progress attempts fail the part, with an
-    // absolute cap so a 1-byte trickle can't loop forever.
-    let mut stalled = 0u32;
-    let mut attempt = 0u32;
-    // Seed the slot from any previous partial file (FB-style throttled
-    // servers get resumed, never restarted).
-    let range_len = end.saturating_sub(start).saturating_add(1);
-    let mut have = tokio::fs::metadata(part).await.map(|m| m.len()).unwrap_or(0);
-    if have > range_len {
-        // Stale garbage from another URL/shape: drop it, start clean.
-        let _ = tokio::fs::remove_file(part).await;
-        have = 0;
-    }
-    if let Ok(mut g) = shared.part_done.lock() {
-        if let Some(slot) = g.get_mut(part_idx) {
-            if *slot < have {
-                shared.downloaded.fetch_add(have - *slot, Ordering::SeqCst);
-                *slot = have;
-            }
-        }
-    }
-    loop {
-        attempt += 1;
-        let len_before = tokio::fs::metadata(part).await.map(|m| m.len()).unwrap_or(0);
-        let res = download_range_once(
-            client,
-            opts,
-            url,
-            part,
-            start,
-            end,
-            limiter.clone(),
-            part_idx,
-            &shared,
-        )
-        .await;
-        match res {
-            Ok(()) => return Ok(()),
-            Err(e) => {
-                if shared.cancelled.load(Ordering::SeqCst) {
-                    return Err(e);
-                }
-                if e.to_string() == "cancelled" || is_final_http_error(&e) {
-                    return Err(e);
-                }
-                // Attempts append, so file growth == progress.
-                let len_after = tokio::fs::metadata(part).await.map(|m| m.len()).unwrap_or(0);
-                if len_after > len_before {
-                    stalled = 0;
-                } else {
-                    stalled = stalled.saturating_add(1);
-                }
-                if stalled >= max_retries || attempt >= max_retries * 20 {
-                    return Err(e);
-                }
-                tokio::time::sleep(std::time::Duration::from_secs(1 << stalled.min(4))).await;
-            }
-        }
-    }
-}
-
-#[allow(clippy::too_many_arguments)]
-async fn download_range_once(
-    client: &reqwest::Client,
-    opts: &EngineOpts,
-    url: &str,
-    part: &PathBuf,
-    start: u64,
-    end: u64,
-    limiter: std::sync::Arc<RateLimiter>,
-    part_idx: usize,
-    shared: &Arc<SharedState>,
-) -> Result<()> {
-    let range_len = end.saturating_sub(start).saturating_add(1);
-    // Resume offset: previous attempts (or an earlier throttled run) may
-    // have left a prefix. Stale over-long files are dropped, not appended to.
-    let orig = tokio::fs::metadata(part).await.map(|m| m.len()).unwrap_or(0);
-    let have = if orig > range_len {
-        let _ = tokio::fs::remove_file(part).await;
-        0
-    } else {
-        orig
+        })
     };
-    let from = start.saturating_add(have);
-    let resp = opts
-        .get(client, url)
-        .header(
-            reqwest::header::RANGE,
-            format!("bytes={from}-{end}"),
-        )
-        .send()
-        .await?
-        .error_for_status()
-        .map_err(|e| http_status_err(url, e))?;
+    let result = dl.download(job, progress.clone(), control.clone()).await;
+    done.store(true, Ordering::SeqCst);
+    let _ = bridge.await;
+    sync_engine_progress(&progress, &control, &shared, total);
+    match result {
+        Ok(out) => {
+            if out.url_refreshed {
+                shared.set_note("the stream link expired mid-download and was refreshed automatically");
+            }
+            Ok(())
+        }
+        Err(e) => Err(engine_error(url, e)),
+    }
+}
 
-    // 206 continues our prefix (append). A 200 means the server ignored Range
-    // and sent the whole file: slice our window out of the stream instead of
-    // writing garbage (or failing outright).
-    let is_partial = resp.status() == reqwest::StatusCode::PARTIAL_CONTENT;
-    if !is_partial && have > 0 {
-        let _ = tokio::fs::remove_file(part).await;
+/// Copy the engine's progress into the app's shared state and the app's
+/// pause/stop flags into the engine.
+fn sync_engine_progress(
+    progress: &downloadcraft_engine::Progress,
+    control: &downloadcraft_engine::Control,
+    shared: &SharedState,
+    total: u64,
+) {
+    if shared.cancelled.load(Ordering::SeqCst) {
+        control.cancel();
     }
-    let mut file = tokio::io::BufWriter::with_capacity(
-        WRITE_BUF,
-        tokio::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(part)
-            .await?,
-    );
-    let mut stream = resp.bytes_stream();
-    // Bytes to skip/take when slicing a 200 response down to our window.
-    let mut to_skip = if is_partial { 0 } else { start };
-    let mut to_take = range_len;
-    // Any early exit still flushes what landed: the retry loop measures
-    // progress by the part file's length, so buffered bytes must not be lost.
-    let mut failure: Option<anyhow::Error> = None;
-    loop {
-        let next = match stream.next().await {
-            Some(n) => n,
-            None => break,
-        };
-        if let Err(e) = wait_if_paused(shared).await {
-            failure = Some(e);
-            break;
-        }
-        let bytes = match next {
-            Ok(b) => b,
-            Err(e) => {
-                failure = Some(anyhow!("network: {e}"));
-                break;
-            }
-        };
-        let mut data = &bytes[..];
-        if to_skip > 0 {
-            let cut = (to_skip as usize).min(data.len());
-            data = &data[cut..];
-            to_skip -= cut as u64;
-            if data.is_empty() {
-                continue;
-            }
-        }
-        if !is_partial {
-            let take = (to_take as usize).min(data.len());
-            data = &data[..take];
-            to_take -= take as u64;
-        }
-        if data.is_empty() {
-            break;
-        }
-        file.write_all(data)
-            .await
-            .map_err(|e| anyhow!(io_message(&e)))?;
-        shared.downloaded.fetch_add(data.len() as u64, Ordering::SeqCst);
-        if let Ok(mut g) = shared.part_done.lock() {
-            if let Some(slot) = g.get_mut(part_idx) {
-                *slot = slot.saturating_add(data.len() as u64);
-            }
-        }
-        limiter.consume(data.len() as u64).await;
-        if !is_partial && to_take == 0 {
-            break;
-        }
+    if shared.paused.load(Ordering::SeqCst) {
+        control.pause();
+    } else {
+        control.resume();
     }
-    file.flush().await.map_err(|e| anyhow!(io_message(&e)))?;
-    drop(file);
-    if let Some(e) = failure {
-        return Err(e);
+    let segs = progress.segments();
+    if !segs.is_empty() {
+        let size = progress.total().unwrap_or(total);
+        *mutex_guard(&shared.part_total) = segs
+            .iter()
+            .map(|s| (s.start, if s.end == u64::MAX { size.saturating_sub(1) } else { s.end.saturating_sub(1) }))
+            .collect();
+        *mutex_guard(&shared.part_done) = segs.iter().map(|s| s.done).collect();
     }
-    // A clean-but-early socket close yields a short stream with no error —
-    // never accept a short part (the retry loop re-fetches the range).
-    let wrote = tokio::fs::metadata(part).await.map(|m| m.len()).unwrap_or(0);
-    let want = end.saturating_sub(start).saturating_add(1);
-    if wrote != want {
-        return Err(anyhow!(
-            "segment short: got {wrote} of {want} bytes — retrying the range"
-        ));
+    shared.downloaded.store(progress.downloaded(), Ordering::SeqCst);
+    shared.resumable.store(progress.resumable(), Ordering::SeqCst);
+}
+
+/// Engine errors in the app's vocabulary: refusals stay final (no retry
+/// storms), throttling keeps the words the fallback ladder looks for.
+fn engine_error(url: &str, e: downloadcraft_engine::Error) -> anyhow::Error {
+    use downloadcraft_engine::Error as E;
+    match e {
+        E::Cancelled => anyhow!("cancelled"),
+        E::Http { status, .. } => http_code_err(url, status),
+        E::LinkExpired { status, downloaded } => final_err(format!(
+            "link expired after {} (HTTP {status}) — capture the download again for a fresh link; it resumes where it stopped",
+            crate::model::format_bytes(downloaded)
+        )),
+        E::Throttled { status } => anyhow!("the server keeps throttling the Range requests (HTTP {status})"),
+        E::FileChanged(why) => anyhow!("the file on the server changed during the download ({why})"),
+        E::HtmlPage => anyhow!(
+            "the server sent a web page instead of the file — it likely needs a login: capture the download with the browser extension"
+        ),
+        E::Network(msg) => anyhow!("{msg} (segment short after retries)"),
+        E::Io(e) => anyhow!(io_message(&e)),
+        other => anyhow!("{other}"),
     }
-    Ok(())
 }
 
 #[cfg(test)]
@@ -8816,7 +8572,7 @@ mod tests {
         assert_eq!(halve_conns(8), Some(4));
         assert_eq!(halve_conns(4), Some(2));
         assert_eq!(halve_conns(3), Some(2));
-        assert_eq!(halve_conns(2), None);
+        assert_eq!(halve_conns(2), Some(1));
         assert_eq!(halve_conns(1), None);
         // Throttling signatures halve; hard refusals go straight single.
         assert!(segmented_throttled("segment short: got 1 of 100 bytes — retrying the range"));
@@ -8836,23 +8592,15 @@ mod tests {
         };
         assert_eq!(is(seg_fallback(false, 16, true)), "halve:8");
         assert_eq!(is(seg_fallback(false, 3, true)), "halve:2");
-        assert_eq!(is(seg_fallback(false, 2, true)), "chunked");
-        assert_eq!(is(seg_fallback(false, 2, false)), "single");
+        // Two connections step down to one engine connection first.
+        assert_eq!(is(seg_fallback(false, 2, true)), "halve:1");
+        assert_eq!(is(seg_fallback(false, 1, true)), "chunked");
+        assert_eq!(is(seg_fallback(false, 1, false)), "single");
         assert_eq!(is(seg_fallback(true, 8, true)), "chunked");
         assert_eq!(is(seg_fallback(true, 8, false)), "single");
         assert_eq!(is(seg_fallback(true, 1, false)), "single");
     }
 
-    #[test]
-    fn google_split_sizing() {
-        // P-speed: fit ranges to the strict window, never exceed asked.
-        assert_eq!(google_parts(5 * 1024 * 1024, 8), 3);
-        assert_eq!(google_parts(28 * 1024 * 1024, 8), 8);
-        assert_eq!(google_parts(5 * 1024 * 1024, 2), 2);
-        assert_eq!(google_parts(5 * 1024 * 1024, 1), 1);
-        assert_eq!(google_parts(500 * 1024, 8), 8);
-        assert_eq!(google_parts(100 * 1024 * 1024, 16), 16);
-    }
 
     #[test]
     fn fb_slice_normalize() {

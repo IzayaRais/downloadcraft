@@ -5,7 +5,11 @@ edition = "2021"
 description = "Download Craft — a lightweight, offline-first download manager (egui GUI + CLI)"
 license = "MIT"
 
+[workspace]
+members = [".", "crates/downloadcraft-engine"]
+
 [dependencies]
+downloadcraft-engine = { path = "crates/downloadcraft-engine", version = "0.1.0" }
 eframe = "0.32"
 egui = "0.32"
 tokio = { version = "1", features = ["full"] }

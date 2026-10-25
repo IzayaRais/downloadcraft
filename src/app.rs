@@ -2507,6 +2507,8 @@ impl CraftApp {
         for i in 0..16 {
             out.push(dest.with_extension(format!("dcpart{i}")));
         }
+        out.push(downloadcraft_engine::data_path(dest));
+        out.push(downloadcraft_engine::journal_path(dest));
         out
     }
 

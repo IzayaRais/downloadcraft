@@ -1122,6 +1122,7 @@ dependencies = [
  "chrono",
  "clap",
  "dirs 5.0.1",
+ "downloadcraft-engine",
  "eframe",
  "egui",
  "flate2",
@@ -1140,6 +1141,18 @@ dependencies = [
  "tray-icon",
  "unicode-segmentation",
  "url",
+ "windows-sys 0.61.2",
+]
+
+[[package]]
+name = "downloadcraft-engine"
+version = "0.1.0"
+dependencies = [
+ "futures-util",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "tokio",
  "windows-sys 0.61.2",
 ]
 

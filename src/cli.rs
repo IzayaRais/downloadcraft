@@ -79,6 +79,11 @@ pub enum Commands {
         #[arg(long)]
         quality: Option<String>,
     },
+    /// List the files inside a remote ZIP without downloading it
+    /// (reads only its table of contents with a Range request)
+    Peek {
+        url: String,
+    },
     /// Remove an item from the queue (keeps the file)
     Remove {
         id: u64,
@@ -302,6 +307,26 @@ pub fn run(cli: Cli) -> anyhow::Result<()> {
             o.expected_sha256 = csum;
             o.quality_pref = quality.filter(|s| !s.trim().is_empty()).unwrap_or_default();
             run_engine(url, dest, connections, o)?;
+            Ok(())
+        }
+        Commands::Peek { url } => {
+            if !is_download_url(&url) {
+                anyhow::bail!("not an http(s) URL: {url}");
+            }
+            let opts = global_opts();
+            let client = opts.build_client()?;
+            let request: downloadcraft_engine::RequestFn = Arc::new(move |u: &str| opts.get(&client, u));
+            let rt = tokio::runtime::Builder::new_current_thread().enable_all().build()?;
+            let entries = rt.block_on(downloadcraft_engine::zip::list_remote(&request, &url))?;
+            let total: u64 = entries.iter().map(|e| e.size).sum();
+            for e in &entries {
+                if e.is_dir {
+                    println!("{:>12}  {}", "", e.name);
+                } else {
+                    println!("{:>12}  {}", format_bytes(e.size), e.name);
+                }
+            }
+            println!("{} entries, {} unpacked", entries.len(), format_bytes(total));
             Ok(())
         }
         Commands::Remove { id } => {

@@ -112,7 +112,10 @@ Full notes: [Release 0.9.8](https://github.com/hungry-detective/downloadcraft/re
 ## 🚀 Features
 
 **Downloading**
-- Segmented downloads (1–16 connections) with resume, a global speed limit and per-download connections.
+- **Dynamic segmentation** (1–16 connections): a free connection takes over half of whatever would finish
+  last, so no connection idles while another crawls. Crash-safe resume, self-healing connections and
+  automatic link refresh. See [the engine](#-the-engine).
+- A global speed limit, per-download connections and a per-server connection cap.
 - Queue with concurrency limit, scheduler, retry-all-failed and finish actions (shutdown / sleep / hibernate).
 - Smart names from the server or the video title; safe auto-rename or overwrite; optional SHA-256 check.
 - HLS and DASH streams (live recording, AES-128), video + audio merged with FFmpeg.
@@ -131,6 +134,40 @@ Full notes: [Release 0.9.8](https://github.com/hungry-detective/downloadcraft/re
 - System / Dark / Light themes, status sidebar, search, sortable and resizable columns, bulk actions.
 - File names in any script (Bangla, Arabic, CJK …) with proper Indic shaping.
 - Clipboard detection, notifications, tray icon, antivirus hook, and a CLI that shares the same queue.
+
+---
+
+## ⚡ The engine
+
+The download engine is a separate, reusable Rust crate,
+[`crates/downloadcraft-engine`](crates/downloadcraft-engine). Use it to make your own downloader fast
+too (MIT).
+
+- **Work stealing.** When a connection finishes, it splits the part that will finish last, in
+  proportion to the measured speeds. A slow connection never holds the whole download back, and very
+  slow ones are reopened.
+- **The first request is the probe.** Downloading starts at once; more connections join as soon as the
+  server shows it supports ranges.
+- **One pre-allocated file.** There is no joining of parts at the end, so bytes are not copied a second
+  time.
+- **Crash-safe resume.** A journal of the missing ranges is flushed every few seconds. A changed server
+  file (size, ETag, Last-Modified) is detected instead of being stitched onto old bytes.
+- **Self-healing.** HTTP 429/503 lowers the connection count, a per-IP connection limit is detected,
+  and cut or stalled connections resume where they stopped.
+- **Expired links.** A refused signed link is retried through its original URL, or re-resolved from
+  its page, keeping every byte already downloaded.
+- **Checks every reply.** A wrong `Content-Range`, a different size, or an HTML error page instead of
+  the file is caught before it can corrupt the download.
+- **ZIP preview.** `download_craft peek <url>` lists what's inside a remote ZIP without downloading it.
+
+Measured on a home connection (100 MB, 8 connections) against 0.9.8: speedtest.belwue.net went from
+70.6 s to **21.4 s**, and mirror.nforce.com from 28.2 s to **19.7 s**.
+
+```rust
+let done = downloadcraft_engine::Downloader::new(reqwest::Client::new())
+    .download(Job::new(url, "file.iso"), progress, control)
+    .await?;
+```
 
 ---
 
@@ -162,7 +199,7 @@ Prerequisites: [Rust stable](https://www.rust-lang.org/tools/install) (MSVC buil
 
 ```powershell
 cargo build --release   # target\release\download_craft.exe (portable)
-cargo test              # unit + local HTTP engine tests (no network needed)
+cargo test --workspace  # app + engine crate: unit and local HTTP tests (no network needed)
 node --test browser-extension/*.test.js   # extension tests
 ```
 
@@ -170,7 +207,8 @@ Packaging: `python scripts/package.py --platform windows --arch x64` (see [PORTA
 for macOS and Linux).
 
 **Command line:** `download_craft.exe add "https://example.com/file.zip"`,
-`download_craft.exe get "https://example.com/file.zip" -o out.zip`, `download_craft.exe --help`.
+`download_craft.exe get "https://example.com/file.zip" -o out.zip`,
+`download_craft.exe peek "https://example.com/file.zip"`, `download_craft.exe --help`.
 
 ---
 
