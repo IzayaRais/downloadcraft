@@ -9,6 +9,14 @@
 //!
 //! Download requests are appended to an inbox file that the GUI polls and
 //! imports as queued (auto-started) downloads.
+//!
+//! Persistent port (`runtime.connectNative`): every message may carry a
+//! `rid`, echoed on its reply, so several requests can be in flight. After
+//! `{"type":"hello"}` the host also *pushes* to the extension:
+//!   <- {"type":"settings","settings":{...},"rules":{...}}   capture settings + site rules
+//!   <- {"type":"event","event":"done"|"failed",...}        downloads the extension sent
+//!   <- {"type":"pageFetch","id":"...","url":"...","page":"..."}  fetch inside the page
+//! and accepts `{"type":"pageFetchChunk","fetchId":..,"chunk":b64,"done":bool}`.
 
 use serde::{Deserialize, Serialize};
 
@@ -68,6 +76,28 @@ struct Incoming {
     pub id: Option<u64>,
     #[serde(default)]
     pub action: Option<String>,
+    /// Request id on a persistent port; echoed on the reply.
+    #[serde(default)]
+    pub rid: Option<u64>,
+    /// The browser's side of the capture (method/body, request headers,
+    /// server IP, proxy). Sanitized before it is stored.
+    #[serde(default)]
+    pub browser: Option<crate::model::BrowserContext>,
+    /// `pageFetchChunk`: which request, a base64 piece, the last one, and
+    /// the outcome.
+    #[serde(default, alias = "fetchId")]
+    pub fetch_id: Option<String>,
+    #[serde(default)]
+    pub chunk: Option<String>,
+    #[serde(default)]
+    pub done: bool,
+    #[serde(default)]
+    pub status: Option<u16>,
+    #[serde(default)]
+    pub error: Option<String>,
+    /// `setPrefs`: capture settings changed in the extension's popup.
+    #[serde(default)]
+    pub prefs: Option<serde_json::Value>,
 }
 
 /// One link from a page ("Download all links").
@@ -352,6 +382,8 @@ pub struct InboxItem {
     pub dur: Option<u64>,
     #[serde(default, alias = "audioExpected")]
     pub audio_expected: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub browser: Option<crate::model::BrowserContext>,
 }
 
 pub fn inbox_path() -> Option<std::path::PathBuf> {
@@ -400,15 +432,257 @@ fn read_message() -> HostFrame {
     }
 }
 
+/// Request id of the message being answered (one at a time: replies are
+/// written by the reading loop).
+static CURRENT_RID: std::sync::Mutex<Option<u64>> = std::sync::Mutex::new(None);
+/// Replies and pushes share stdout: one frame at a time.
+static OUT: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 fn write_message(reply: &Reply) {
-    if let Ok(data) = serde_json::to_vec(reply) {
+    let Ok(mut v) = serde_json::to_value(reply) else { return };
+    if let Some(rid) = *CURRENT_RID.lock().unwrap_or_else(|e| e.into_inner()) {
+        v["rid"] = serde_json::json!(rid);
+    }
+    write_value(&v);
+}
+
+fn write_value(v: &serde_json::Value) {
+    if let Ok(data) = serde_json::to_vec(v) {
         let len = (data.len() as u32).to_le_bytes();
+        let _g = OUT.lock().unwrap_or_else(|e| e.into_inner());
         let mut out = std::io::stdout();
         use std::io::Write;
         let _ = out.write_all(&len);
         let _ = out.write_all(&data);
         let _ = out.flush();
     }
+}
+
+// ---- push channel (persistent port) ----------------------------------------
+
+/// Capture settings the user set in the app (only keys present in ui.json,
+/// so the extension keeps its own choices for the rest).
+pub fn capture_settings() -> serde_json::Value {
+    let ui: serde_json::Value = crate::model::config_dir()
+        .and_then(|d| std::fs::read_to_string(d.join("ui.json")).ok())
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or(serde_json::Value::Null);
+    let mut out = serde_json::Map::new();
+    for (key, ext) in [
+        ("capture_auto", "autoCapture"),
+        ("capture_types", "captureTypes"),
+        ("capture_skip_sites", "blockHosts"),
+        ("capture_min_kb", "minSizeKB"),
+        ("notify_done", "notify"),
+        ("browser_fallback", "browserFallback"),
+        ("capture_skip_key", "skipKey"),
+    ] {
+        if let Some(v) = ui.get(key) {
+            out.insert(ext.to_string(), v.clone());
+        }
+    }
+    serde_json::Value::Object(out)
+}
+
+/// Capture settings changed in the extension popup land in the app's
+/// settings too, so the two never disagree.
+fn set_prefs(prefs: &serde_json::Value) -> Result<(), String> {
+    let mut changes: Vec<(&str, serde_json::Value)> = Vec::new();
+    if let Some(b) = prefs.get("autoCapture").and_then(|v| v.as_bool()) {
+        changes.push(("capture_auto", b.into()));
+    }
+    if let Some(n) = prefs.get("minSizeKB").and_then(|v| v.as_u64().or_else(|| v.as_str().and_then(|s| s.trim().parse().ok()))) {
+        changes.push(("capture_min_kb", n.min(10_000_000).into()));
+    }
+    if let Some(h) = prefs.get("blockHosts").and_then(|v| v.as_str()) {
+        let h: String = h.chars().filter(|c| !c.is_control()).take(2000).collect();
+        changes.push(("capture_skip_sites", h.into()));
+    }
+    if changes.is_empty() {
+        return Ok(());
+    }
+    let path = crate::model::config_dir().ok_or("no config dir")?.join("ui.json");
+    let _guard = crate::model::fs_lock("ui-settings");
+    if !_guard.owned() {
+        return Err("settings are busy; retry".into());
+    }
+    let mut v: serde_json::Value = std::fs::read_to_string(&path)
+        .ok()
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_else(|| serde_json::json!({}));
+    let obj = v.as_object_mut().ok_or("settings unreadable")?;
+    for (k, val) in changes {
+        obj.insert(k.to_string(), val);
+    }
+    let json = serde_json::to_string_pretty(&v).map_err(|e| e.to_string())?;
+    crate::model::atomic_write(&path, json.as_bytes()).map_err(|e| e.to_string())
+}
+
+/// Built-in site rules (also published at the repository root, where the
+/// app looks for newer ones).
+pub const DEFAULT_SITE_RULES: &str = include_str!("../site_rules.json");
+
+/// Where the app fetches newer site rules (at most once a day).
+const SITE_RULES_URL: &str = "https://raw.githubusercontent.com/hungry-detective/downloadcraft/master/site_rules.json";
+
+/// Refresh `site_rules.json` from the project when the copy is a day old.
+/// A rules file only replaces ours when it parses and is newer.
+pub fn refresh_site_rules() {
+    let Some(dir) = crate::model::config_dir() else { return };
+    let path = dir.join("site_rules.json");
+    let version = |v: &serde_json::Value| v.get("version").and_then(|x| x.as_u64()).unwrap_or(0);
+    let builtin: serde_json::Value = serde_json::from_str(DEFAULT_SITE_RULES).unwrap_or_default();
+    let current: Option<serde_json::Value> = std::fs::read_to_string(&path).ok().and_then(|s| serde_json::from_str(&s).ok());
+    if current.as_ref().map_or(true, |c| version(c) < version(&builtin)) {
+        let _ = std::fs::create_dir_all(&dir);
+        let _ = crate::model::atomic_write(&path, DEFAULT_SITE_RULES.as_bytes());
+    }
+    let fresh = std::fs::metadata(&path)
+        .and_then(|m| m.modified())
+        .ok()
+        .and_then(|t| t.elapsed().ok())
+        .is_some_and(|age| age < std::time::Duration::from_secs(24 * 3600));
+    if fresh && current.is_some() {
+        return;
+    }
+    let Ok(rt) = tokio::runtime::Builder::new_current_thread().enable_all().build() else { return };
+    let got = rt.block_on(async {
+        let client = reqwest::Client::builder().timeout(std::time::Duration::from_secs(10)).build().ok()?;
+        let r = client.get(SITE_RULES_URL).send().await.ok()?.error_for_status().ok()?;
+        r.text().await.ok()
+    });
+    let mine = std::fs::read_to_string(&path).ok().and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok()).unwrap_or_default();
+    match got.and_then(|t| serde_json::from_str::<serde_json::Value>(&t).ok().map(|v| (t, v))) {
+        Some((text, v)) if v.is_object() && version(&v) > version(&mine) => {
+            let _ = crate::model::atomic_write(&path, text.as_bytes());
+        }
+        // Nothing newer: touch the file so the next check waits a day.
+        _ => {
+            let _ = crate::model::atomic_write(&path, serde_json::to_string_pretty(&mine).unwrap_or_default().as_bytes());
+        }
+    }
+}
+
+/// Site rules the app keeps (`site_rules.json`, refreshed by the app).
+pub fn site_rules() -> serde_json::Value {
+    crate::model::config_dir()
+        .and_then(|d| std::fs::read_to_string(d.join("site_rules.json")).ok())
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .filter(|v: &serde_json::Value| v.is_object())
+        // Before the app has written its copy: the rules it was built with.
+        .or_else(|| serde_json::from_str(DEFAULT_SITE_RULES).ok())
+        .unwrap_or(serde_json::Value::Null)
+}
+
+/// Folder for page-fetch requests (app -> extension) and their results.
+pub fn page_fetch_dir() -> Option<std::path::PathBuf> {
+    crate::model::config_dir().map(|d| d.join("pagefetch"))
+}
+
+fn safe_fetch_id(id: &str) -> bool {
+    !id.is_empty() && id.len() <= 64 && id.chars().all(|c| c.is_ascii_alphanumeric() || c == '-')
+}
+
+/// One queue row as an event for the extension.
+fn row_event(d: &crate::model::DownloadItem, event: &str, error: &str) -> serde_json::Value {
+    serde_json::json!({
+        "type": "event", "event": event, "id": d.id, "url": d.url, "name": d.filename,
+        "error": error, "page": d.referer, "quality": d.quality_pref,
+        "path": d.dest_path().to_string_lossy(),
+    })
+}
+
+/// Pushes settings, finished/failed downloads and page-fetch requests to the
+/// extension until the browser closes the port (the process then exits).
+fn push_loop() {
+    use crate::model::{DownloadItem, Status};
+    let mut last_settings = serde_json::Value::Null;
+    let mut known: std::collections::HashMap<u64, u8> = std::collections::HashMap::new();
+    let mut first = true;
+    let mut asked: std::collections::HashSet<String> = std::collections::HashSet::new();
+    loop {
+        let settings = serde_json::json!({ "type": "settings", "settings": capture_settings(), "rules": site_rules() });
+        if settings != last_settings {
+            write_value(&settings);
+            last_settings = settings;
+        }
+        // Rows the extension sent: tell it when they finish or fail.
+        let items: Vec<DownloadItem> = crate::model::config_dir()
+            .and_then(|d| std::fs::read_to_string(d.join("queue.json")).ok())
+            .and_then(|s| serde_json::from_str(s.trim_start_matches('\u{feff}')).ok())
+            .unwrap_or_default();
+        for d in &items {
+            if !d.browser.as_ref().is_some_and(|b| b.from_extension) {
+                continue;
+            }
+            let state = match &d.status {
+                Status::Completed => 2,
+                Status::Failed(_) => 3,
+                _ => 1,
+            };
+            let before = known.insert(d.id, state);
+            if first || before == Some(state) || state == 1 {
+                continue;
+            }
+            match &d.status {
+                Status::Completed => write_value(&row_event(d, "done", "")),
+                Status::Failed(e) => write_value(&row_event(d, "failed", e)),
+                _ => {}
+            }
+        }
+        first = false;
+        // Page-fetch requests the app is waiting on.
+        if let Some(dir) = page_fetch_dir() {
+            if let Ok(rd) = std::fs::read_dir(&dir) {
+                for e in rd.flatten() {
+                    let name = e.file_name().to_string_lossy().to_string();
+                    let Some(id) = name.strip_suffix(".req.json") else { continue };
+                    if !safe_fetch_id(id) || asked.contains(id) {
+                        continue;
+                    }
+                    asked.insert(id.to_string());
+                    if let Some(req) = std::fs::read_to_string(e.path()).ok().and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok()) {
+                        write_value(&serde_json::json!({
+                            "type": "pageFetch", "id": id,
+                            "url": req.get("url"), "page": req.get("page"),
+                        }));
+                    }
+                }
+            }
+        }
+        std::thread::sleep(std::time::Duration::from_millis(700));
+    }
+}
+
+/// Store one piece of a page-fetch answer; the last piece publishes it.
+fn page_fetch_chunk(msg: &Incoming) -> Result<(), String> {
+    let id = msg.fetch_id.clone().unwrap_or_default();
+    if !safe_fetch_id(&id) {
+        return Err("bad fetch id".into());
+    }
+    let dir = page_fetch_dir().ok_or("no config dir")?;
+    if !dir.join(format!("{id}.req.json")).exists() {
+        return Err("no such fetch request".into());
+    }
+    let part = dir.join(format!("{id}.part"));
+    if let Some(err) = msg.error.clone().filter(|e| !e.is_empty()) {
+        let _ = std::fs::remove_file(&part);
+        let body = serde_json::json!({ "error": err, "status": msg.status });
+        return std::fs::write(dir.join(format!("{id}.err")), body.to_string()).map_err(|e| e.to_string());
+    }
+    if let Some(c) = msg.chunk.as_deref().filter(|c| !c.is_empty()) {
+        let bytes = crate::model::base64_decode(c).ok_or("bad chunk")?;
+        use std::io::Write;
+        let mut f = std::fs::OpenOptions::new().create(true).append(true).open(&part).map_err(|e| e.to_string())?;
+        f.write_all(&bytes).map_err(|e| e.to_string())?;
+    }
+    if msg.done {
+        if !part.exists() {
+            std::fs::write(&part, b"").map_err(|e| e.to_string())?;
+        }
+        std::fs::rename(&part, dir.join(format!("{id}.res"))).map_err(|e| e.to_string())?;
+    }
+    Ok(())
 }
 
 /// Keep only headers the engine may replay, with sane sizes. The extension
@@ -468,6 +742,7 @@ fn queue_download(msg: &Incoming) -> Result<bool, String> {
         quality: msg.quality.clone().filter(|s| !s.trim().is_empty()),
         dur: msg.dur.filter(|s| *s > 0),
         audio_expected: msg.audio_expected,
+        browser: msg.browser.clone().and_then(|b| b.sanitized()),
     };
     // Same URL re-captured: refresh metadata instead of ignoring it (the
     // filename/referer/cookie may be corrected this time).
@@ -554,7 +829,31 @@ pub fn run() -> eframe::Result<()> {
                 write_message(&Reply::err(e));
                 continue;
             }
-            HostFrame::Msg(msg) => match msg.kind.as_str() {
+            HostFrame::Msg(msg) => {
+            *CURRENT_RID.lock().unwrap_or_else(|e| e.into_inner()) = msg.rid;
+            match msg.kind.as_str() {
+            "hello" => {
+                if !PUSHING.swap(true, std::sync::atomic::Ordering::SeqCst) {
+                    std::thread::spawn(push_loop);
+                }
+                write_message(&Reply {
+                    kind: "pong".into(),
+                    version: Some(2),
+                    queued: None,
+                    error: None,
+                    urls: None,
+                    theme: Some(app_theme()),
+                    items: None,
+                });
+            }
+            "setPrefs" => match msg.prefs.as_ref().map(set_prefs).unwrap_or(Ok(())) {
+                Ok(()) => write_message(&Reply::ok()),
+                Err(e) => write_message(&Reply::err(e)),
+            },
+            "pageFetchChunk" => match page_fetch_chunk(&msg) {
+                Ok(()) => write_message(&Reply::ok()),
+                Err(e) => write_message(&Reply::err(e)),
+            },
             "ping" => write_message(&Reply {
                 kind: "pong".into(),
                 version: Some(1),
@@ -631,10 +930,13 @@ pub fn run() -> eframe::Result<()> {
             },
             _ => write_message(&Reply::err("unknown message")),
             }
+            }
         }
     }
     Ok(())
 }
+
+static PUSHING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 #[cfg(test)]
 mod media_tests {
@@ -662,6 +964,32 @@ mod media_tests {
         assert!(replayable_headers(None).is_none());
         let none = std::collections::BTreeMap::from([("cookie".to_string(), "a=b".to_string())]);
         assert!(replayable_headers(Some(&none)).is_none());
+    }
+
+    #[test]
+    fn browser_context_is_sanitized_at_the_inbox() {
+        let msg: Incoming = serde_json::from_str(r#"{"type":"download","url":"https://site.example/r","rid":7,
+            "browser":{"method":"post","body":"YT0xJmI9Mg==","fromExtension":true,"serverIp":"203.0.113.9",
+              "proxy":"socks5://127.0.0.1:9050","headers":{"User-Agent":"UA/1","Cookie":"a=b","Accept":"*/*","Range":"bytes=0-"}}}"#).unwrap();
+        assert_eq!(msg.rid, Some(7));
+        let b = msg.browser.clone().unwrap().sanitized().unwrap();
+        assert!(b.is_post());
+        assert_eq!(crate::model::base64_decode(&b.body).unwrap(), b"a=1&b=2");
+        assert!(b.from_extension);
+        assert_eq!(b.server_ip, "203.0.113.9");
+        assert_eq!(b.proxy, "socks5://127.0.0.1:9050");
+        assert_eq!(b.headers.keys().cloned().collect::<Vec<_>>(), ["accept", "user-agent"]);
+        let bad: crate::model::BrowserContext = serde_json::from_str(r#"{"method":"DELETE","serverIp":"x","proxy":"file:///etc"}"#).unwrap();
+        assert!(bad.sanitized().is_none());
+        assert_eq!(crate::model::base64_encode(b"a=1&b=2"), "YT0xJmI9Mg==");
+        assert!(safe_fetch_id("f1a2-3") && !safe_fetch_id("../x") && !safe_fetch_id(""));
+    }
+
+    #[test]
+    fn built_in_site_rules_parse() {
+        let v: serde_json::Value = serde_json::from_str(DEFAULT_SITE_RULES).unwrap();
+        assert!(v.get("version").and_then(|x| x.as_u64()).unwrap() >= 1);
+        assert!(v.get("youtube").and_then(|y| y.get("itagQuality")).is_some());
     }
 
     #[test]

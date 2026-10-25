@@ -35,7 +35,7 @@ const block=source.slice(source.indexOf('async function sendToHost('),source.ind
 function harness(items,frame={pageUrl:context.pageUrl,videoCount:1,durationSecs:2700,audioExpected:true},cookiesFor=async()=>null,auth=new Map()){
  const calls=[];
  const api={tabs:{sendMessage:async()=>frame},runtime:{sendNativeMessage:async(h,m)=>{calls.push(m);return {type:'ok'}}}};
- const make=new Function('DCRank','tabMedia','mediaAuth','api','cookiesFor','stripFbSlice','HOST','console',`let lastHostError='';${block};return {sendToHost,error:()=>lastHostError}`);
+ const make=new Function('DCRank','tabMedia','mediaAuth','api','cookiesFor','stripFbSlice','HOST','console',`let lastHostError=''; const hostSend = (m) => api.runtime.sendNativeMessage(HOST, m);${block};return {sendToHost,error:()=>lastHostError}`);
  return {...make(R,new Map([[7,items]]),auth,api,cookiesFor,u=>u,'test',{error(){}}),calls};
 }
 it('replays the headers the player sent for a captured file',async()=>{

@@ -24,7 +24,7 @@ $stage = Join-Path $env:TEMP "download-craft-firefox-stage"
 if (Test-Path $stage) { Remove-Item $stage -Recurse -Force }
 New-Item -ItemType Directory -Path (Join-Path $stage "icons") -Force | Out-Null
 
-foreach ($f in "rank.js", "streams.js", "mp4merge.js", "browserdl.js", "background.js", "content.js", "page-hook.js", "page-relay.js", "popup.html", "popup.js") {
+foreach ($f in "rank.js", "streams.js", "mp4merge.js", "browserdl.js", "bridge.js", "background.js", "content.js", "page-hook.js", "page-relay.js", "popup.html", "popup.js", "welcome.html", "welcome.js") {
   Copy-Item (Join-Path $here $f) $stage
 }
 Copy-Item (Join-Path $here "icons\*.png") (Join-Path $stage "icons")

@@ -59,6 +59,9 @@ pub struct SharedState {
     /// done, so this is what the progress bar and Part Info show.
     pub frag_index: AtomicU64,
     pub frag_count: AtomicU64,
+    /// yt-dlp has already run for this download (the fallback chain must not
+    /// start it twice).
+    pub ytdlp_tried: AtomicBool,
 }
 
 impl SharedState {
@@ -86,6 +89,7 @@ impl SharedState {
             live: AtomicBool::new(false),
             frag_index: AtomicU64::new(0),
             frag_count: AtomicU64::new(0),
+            ytdlp_tried: AtomicBool::new(false),
         }
     }
 
@@ -199,6 +203,12 @@ pub struct EngineOpts {
     /// Origin / Authorization / CDN x-* headers the browser player sent with
     /// the captured media, replayed so token-checked CDNs don't answer 403.
     pub captured_headers: CapturedHeaders,
+    /// The browser's side of a captured download: its request headers,
+    /// method/body, server IP and proxy (see model::BrowserContext).
+    pub browser: Option<crate::model::BrowserContext>,
+    /// YouTube visitor id for a yt-dlp retry after a bot check (empty =
+    /// yt-dlp's own). Set only by the fallback chain.
+    pub ytdlp_visitor_data: String,
 }
 
 /// Request headers captured by the extension for one download. They are
@@ -282,12 +292,41 @@ impl Default for EngineOpts {
             global_limit: None,
             per_host_conns: 0,
             captured_headers: CapturedHeaders::default(),
+            browser: None,
+            ytdlp_visitor_data: String::new(),
         }
     }
 }
 
 impl EngineOpts {
     pub fn build_client(&self) -> Result<reqwest::Client> {
+        Ok(self.client_builder()?.build()?)
+    }
+
+    /// A client that connects to the server address the browser used for
+    /// `url` (same CDN edge, IP-bound tokens) - only when that address
+    /// answers right now; None = use the normal client.
+    pub async fn pinned_client(&self, url: &str) -> Option<reqwest::Client> {
+        let ip: std::net::IpAddr = self.browser.as_ref()?.server_ip.parse().ok()?;
+        // The client binds IPv4 (see client_builder): IPv6 cannot be pinned.
+        if !ip.is_ipv4() {
+            return None;
+        }
+        let u = reqwest::Url::parse(url).ok()?;
+        let host = u.host_str()?.to_string();
+        if host.parse::<std::net::IpAddr>().is_ok() || !self.proxy_url.trim().is_empty() {
+            return None;
+        }
+        let port = u.port_or_known_default()?;
+        let addr = std::net::SocketAddr::new(ip, port);
+        let reach = tokio::time::timeout(std::time::Duration::from_secs(3), tokio::net::TcpStream::connect(addr)).await;
+        if !matches!(reach, Ok(Ok(_))) {
+            return None;
+        }
+        self.client_builder().ok()?.resolve(&host, addr).build().ok()
+    }
+
+    fn client_builder(&self) -> Result<reqwest::ClientBuilder> {
         // HTTP/1.1 only: several media servers RST or truncate H2 streams
         // from non-browser TLS stacks, while plain H1 range GETs work.
         // IPv4-only egress: a broken IPv6 path (tunnel/relay) completes TCP
@@ -336,7 +375,7 @@ impl EngineOpts {
         if !self.proxy_url.trim().is_empty() {
             b = b.proxy(reqwest::Proxy::all(self.proxy_url.trim())?);
         }
-        Ok(b.build()?)
+        Ok(b)
     }
 
     pub(crate) fn get(&self, client: &reqwest::Client, url: &str) -> reqwest::RequestBuilder {
@@ -351,7 +390,7 @@ impl EngineOpts {
         self.apply(client.head(url), Some(url))
     }
 
-    fn apply(
+    pub(crate) fn apply(
         &self,
         mut r: reqwest::RequestBuilder,
         url: Option<&str>,
@@ -378,6 +417,24 @@ impl EngineOpts {
                 )
                 .header("sec-ch-ua-mobile", "?0")
                 .header("sec-ch-ua-platform", format!("\"{}\"", client_hint_platform(&self.user_agent)));
+        }
+        // The browser's own request headers for this capture (User-Agent,
+        // Accept, Accept-Language, client hints) replace the defaults above:
+        // the server sees the same request the browser made.
+        if let Some(b) = self.browser.as_ref().filter(|b| !b.headers.is_empty()) {
+            let mut map = reqwest::header::HeaderMap::new();
+            for (k, v) in &b.headers {
+                if k == "content-type" && !b.is_post() {
+                    continue;
+                }
+                if let (Ok(n), Ok(v)) = (
+                    reqwest::header::HeaderName::from_bytes(k.as_bytes()),
+                    reqwest::header::HeaderValue::from_str(v),
+                ) {
+                    map.insert(n, v);
+                }
+            }
+            r = r.headers(map);
         }
         // Default page referer for social CDNs when the caller captured none:
         // bare CDN hosts (fbcdn/instagram) often 403 Range requests with no
@@ -949,6 +1006,11 @@ pub async fn probe(
     url: &str,
 ) -> (Option<u64>, bool, Option<String>, Option<String>) {
     let dbg = std::env::var("DOWNLOAD_CRAFT_DEBUG").is_ok();
+    // A form (POST) download only exists as that POST: a GET/HEAD probe
+    // would ask for something else (often the form page itself).
+    if opts.browser.as_ref().is_some_and(|b| b.is_post()) {
+        return (None, false, None, None);
+    }
     // Try HEAD first — but ONLY trust success responses. Error pages
     // (403/404 with `Content-Length: 0`) must fall through to the Range
     // fallback: treating 0 as a real total poisons everything downstream
@@ -3700,9 +3762,165 @@ pub async fn download(
 ) -> Result<()> {
     shared.expected_duration.store(opts.expected_duration_secs, Ordering::SeqCst);
     shared.expects_audio.store(opts.require_audio, Ordering::SeqCst);
-    download_inner(url, dest.clone(), connections, opts.clone(), shared.clone()).await?;
+    if let Err(e) = download_inner(url.clone(), dest.clone(), connections, opts.clone(), shared.clone()).await {
+        fallback_chain(e, &url, &dest, connections, &opts, &shared).await?;
+    }
     verify_completed_media(&dest, &shared).await?;
     cleanup_completed_job(&dest, &shared);
+    Ok(())
+}
+
+/// Safety net after the main path failed, in order:
+/// 1. YouTube: yt-dlp, when it has not run yet (the native engine went
+///    first) - and once more with the page's visitor id after a bot check;
+/// 2. a refused file the extension sent: fetched inside the browser page
+///    itself (its own session and origin).
+/// The extension's own "download in the browser" is the last step; it hears
+/// about the failure through the native host and takes over from there.
+async fn fallback_chain(
+    err: anyhow::Error,
+    url: &str,
+    dest: &PathBuf,
+    connections: usize,
+    opts: &EngineOpts,
+    shared: &Arc<SharedState>,
+) -> Result<()> {
+    if shared.cancelled.load(Ordering::SeqCst) || err.to_string() == "cancelled" {
+        return Err(err);
+    }
+    let dbg = std::env::var("DOWNLOAD_CRAFT_DEBUG").is_ok();
+    let actual = mutex_guard(&shared.resolved_name).clone().map(|n| dest.with_file_name(n)).unwrap_or_else(|| dest.clone());
+    let yt_page = if is_youtube_page(url) {
+        Some(url.to_string())
+    } else if is_googlevideo_url(url) && is_youtube_page(&opts.referer) {
+        Some(opts.referer.clone())
+    } else {
+        None
+    };
+    let mut err = err;
+    if let Some(page) = yt_page {
+        let client = opts.build_client()?;
+        if !shared.ytdlp_tried.load(Ordering::SeqCst) {
+            if let Ok(exe) = ensure_ytdlp(&client).await {
+                if dbg {
+                    eprintln!("[dbg] native YouTube engine failed ({err:#}); continuing with yt-dlp");
+                }
+                shared.set_note(format!("the app's own YouTube engine failed ({err:#}) - yt-dlp took over"));
+                reset_counters(shared);
+                match download_with_ytdlp(&exe, &page, &actual, connections, opts, shared).await {
+                    Ok(()) => return Ok(()),
+                    Err(e) => err = e,
+                }
+            }
+        }
+        // A bot check ("Sign in to confirm you're not a bot") can clear with
+        // the page's own visitor id when there are no cookies to send.
+        let visitor = opts.browser.as_ref().map(|b| b.visitor_data.clone()).unwrap_or_default();
+        let bot = format!("{err:#}").to_ascii_lowercase();
+        if !visitor.is_empty() && opts.cookie.trim().is_empty() && (bot.contains("not a bot") || bot.contains("sign in to confirm")) {
+            if let Ok(exe) = ensure_ytdlp(&client).await {
+                let mut o2 = opts.clone();
+                o2.ytdlp_visitor_data = visitor;
+                reset_counters(shared);
+                match download_with_ytdlp(&exe, &page, &actual, connections, &o2, shared).await {
+                    Ok(()) => return Ok(()),
+                    Err(e) => err = e,
+                }
+            }
+        }
+    }
+    let from_ext = opts.browser.as_ref().is_some_and(|b| b.from_extension);
+    let page = opts.referer.trim();
+    let refused = is_final_http_error(&err) || format!("{err:#}").contains("web page instead of the file");
+    if from_ext && refused && page.starts_with("http") && !is_youtube_page(page) {
+        if dbg {
+            eprintln!("[dbg] refused ({err:#}); asking the browser page to fetch it");
+        }
+        reset_counters(shared);
+        match page_fetch_file(url, page, &actual, shared).await {
+            Ok(()) => {
+                shared.set_note("the server refused the app, so the file was fetched inside the browser page");
+                return Ok(());
+            }
+            Err(e) if dbg => eprintln!("[dbg] page fetch failed: {e:#}"),
+            Err(_) => {}
+        }
+    }
+    Err(err)
+}
+
+fn reset_counters(shared: &SharedState) {
+    shared.downloaded.store(0, Ordering::SeqCst);
+    shared.total.store(0, Ordering::SeqCst);
+    shared.has_total.store(false, Ordering::SeqCst);
+}
+
+static PAGE_FETCH_SEQ: AtomicU64 = AtomicU64::new(0);
+
+/// Ask the browser extension (through the native host) to fetch `url` inside
+/// the page `page` - with that page's own cookies, origin and referrer - and
+/// save what it gets to `dest`. Needs the browser open with that page.
+async fn page_fetch_file(url: &str, page: &str, dest: &PathBuf, shared: &Arc<SharedState>) -> Result<()> {
+    let dir = crate::native_host::page_fetch_dir().ok_or_else(|| anyhow!("no config dir"))?;
+    tokio::fs::create_dir_all(&dir).await?;
+    let id = format!(
+        "{:x}-{:x}-{}",
+        std::process::id(),
+        chrono::Local::now().timestamp_millis(),
+        PAGE_FETCH_SEQ.fetch_add(1, Ordering::SeqCst)
+    );
+    let req = dir.join(format!("{id}.req.json"));
+    let part = dir.join(format!("{id}.part"));
+    let res = dir.join(format!("{id}.res"));
+    let errf = dir.join(format!("{id}.err"));
+    tokio::fs::write(&req, serde_json::json!({ "url": url, "page": page }).to_string()).await?;
+    let cleanup = || {
+        for f in [&req, &part, &res, &errf] {
+            let _ = std::fs::remove_file(f);
+        }
+    };
+    // 20 s for the browser to start answering, then as long as data flows.
+    let mut last_len = 0u64;
+    let mut last_move = std::time::Instant::now();
+    let mut started = false;
+    loop {
+        if shared.cancelled.load(Ordering::SeqCst) {
+            cleanup();
+            return Err(anyhow!("cancelled"));
+        }
+        if res.exists() {
+            break;
+        }
+        if errf.exists() {
+            let why = std::fs::read_to_string(&errf).unwrap_or_default();
+            cleanup();
+            return Err(anyhow!("the browser could not fetch it either: {why}"));
+        }
+        let len = std::fs::metadata(&part).map(|m| m.len()).unwrap_or(0);
+        if len != last_len {
+            last_len = len;
+            last_move = std::time::Instant::now();
+            started = true;
+            shared.downloaded.store(len, Ordering::SeqCst);
+        }
+        let wait = if started { 60 } else { 20 };
+        if last_move.elapsed() > std::time::Duration::from_secs(wait) {
+            cleanup();
+            return Err(anyhow!("the browser did not answer (is the page still open?)"));
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    }
+    if let Some(parent) = dest.parent() {
+        tokio::fs::create_dir_all(parent).await?;
+    }
+    let size = std::fs::metadata(&res).map(|m| m.len()).unwrap_or(0);
+    if tokio::fs::rename(&res, dest).await.is_err() {
+        tokio::fs::copy(&res, dest).await?;
+    }
+    cleanup();
+    shared.total.store(size, Ordering::SeqCst);
+    shared.has_total.store(true, Ordering::SeqCst);
+    shared.downloaded.store(size, Ordering::SeqCst);
     Ok(())
 }
 
@@ -3713,6 +3931,20 @@ async fn download_inner(
     mut opts: EngineOpts,
     shared: Arc<SharedState>,
 ) -> Result<()> {
+    // The browser's user agent and proxy for a capture it handed over: the
+    // server and the network path stay the ones that worked in the browser.
+    if let Some(b) = opts.browser.clone() {
+        if let Some(ua) = b.headers.get("user-agent").filter(|u| !u.trim().is_empty()) {
+            opts.user_agent = ua.clone();
+        }
+        if opts.proxy_url.trim().is_empty() && !b.proxy.is_empty() {
+            opts.proxy_url = b.proxy.clone();
+        }
+        if b.is_post() {
+            let _job = claim_dest_job(&dest).ok_or_else(|| anyhow!("this destination is already downloading elsewhere"))?;
+            return post_download(&url, &dest, connections, &opts, &shared).await;
+        }
+    }
     // Resolve Vimeo before probing the CDN: a successful fragment response
     // proves nothing about the full video's size or completeness.
     let resolve_page = match vimeo_download_target(&url, &opts.referer)? {
@@ -3802,7 +4034,10 @@ async fn download_inner(
     let _job = claim_dest_job(&dest).ok_or_else(|| {
         anyhow!("this destination is already downloading elsewhere — wait for it or remove the duplicate queue entry")
     })?;
-    let client = opts.build_client()?;
+    let client = match opts.pinned_client(&url).await {
+        Some(c) => c,
+        None => opts.build_client()?,
+    };
 
     if let Some(parent) = dest.parent() {
         tokio::fs::create_dir_all(parent).await?;
@@ -3938,7 +4173,7 @@ async fn download_inner(
     // is installed — or can be fetched once — it takes every quality above
     // the progressive file. Anything it cannot do falls through to the
     // built-in engine below, progressive fallback and all.
-    if is_yt && ytdlp_preferred(&opts) {
+    if is_yt && youtube_ytdlp_first(&opts) {
         match ensure_ytdlp(&client).await {
             Ok(exe) => {
                 match download_with_ytdlp(&exe, &url, &dest, connections, &opts, &shared).await {
@@ -4839,6 +5074,19 @@ async fn ytdlp_stale(path: &std::path::Path) -> bool {
 /// installed. Its failures fall straight back to the built-in path.
 fn ytdlp_preferred(opts: &EngineOpts) -> bool {
     quality_cap(&opts.quality_pref).map(|h| h > 360).unwrap_or(true)
+}
+
+/// Which YouTube engine runs first (Settings -> Plugins -> YouTube):
+/// "native" = the app's own engine, then yt-dlp; "ytdlp" = yt-dlp, then the
+/// app's engine; "auto" (default) = whichever can deliver the requested
+/// quality (YouTube serves the app's engine only its progressive streams in
+/// full), with the other one as the fallback.
+fn youtube_ytdlp_first(opts: &EngineOpts) -> bool {
+    match crate::model::ui_pref_str("youtube_engine", "auto").as_str() {
+        "native" => false,
+        "ytdlp" => true,
+        _ => ytdlp_preferred(opts),
+    }
 }
 
 /// Path to a usable yt-dlp: the user's if they have one, else the copy this
@@ -5872,6 +6120,7 @@ async fn download_with_ytdlp(
     shared: &Arc<SharedState>,
 ) -> Result<()> {
     shared.external_helper.store(true, Ordering::SeqCst);
+    shared.ytdlp_tried.store(true, Ordering::SeqCst);
     wait_if_paused(shared).await?;
     if let Some(parent) = dest.parent() {
         tokio::fs::create_dir_all(parent).await?;
@@ -5969,6 +6218,13 @@ async fn download_with_ytdlp(
     }
     if let Some(jar) = &jar {
         cmd.arg("--cookies").arg(&jar.0);
+    } else if !opts.ytdlp_visitor_data.is_empty() && is_youtube_page(url) {
+        // Retry after a bot check: the page's own visitor id (yt-dlp wants the
+        // web page skipped with it, and no cookies).
+        cmd.arg("--extractor-args").arg(format!(
+            "youtube:visitor_data={};player_skip=webpage,configs",
+            opts.ytdlp_visitor_data
+        ));
     }
     if !opts.referer.trim().is_empty() {
         cmd.arg("--referer").arg(opts.referer.trim());
@@ -7971,7 +8227,6 @@ async fn segmented(
     limiter: std::sync::Arc<RateLimiter>,
 ) -> Result<()> {
     use downloadcraft_engine as dce;
-    let dbg = std::env::var("DOWNLOAD_CRAFT_DEBUG").is_ok();
     // Strict googlevideo edges 403 ranges above ~2 MiB: ask in windows.
     let strict = is_googlevideo_url(url);
     let config = dce::Config {
@@ -8002,19 +8257,78 @@ async fn segmented(
             })
         }));
     }
-    if dbg {
-        dl = dl.on_event(Arc::new(|e: &dce::Event| eprintln!("[dbg] engine: {e}")));
-    }
     // Part files of the old fixed-split engine (0.9.8 and earlier) cannot be
     // continued by this one.
     for i in 0..16 {
         let _ = tokio::fs::remove_file(dest.with_extension(format!("dcpart{i}"))).await;
     }
     let job = dce::Job::new(url, dest.clone()).size_hint(Some(total), true);
+    run_dce(dl, job, url, total, &shared).await.map(|_| ())
+}
+
+/// A form (POST) download the browser handed over: repeat the POST with its
+/// body and headers. The first request doubles as the probe; when the server
+/// also answers ranged POSTs, more connections join, otherwise one stream
+/// fetches it (the engine decides from the reply).
+async fn post_download(
+    url: &str,
+    dest: &PathBuf,
+    connections: usize,
+    opts: &EngineOpts,
+    shared: &Arc<SharedState>,
+) -> Result<()> {
+    use downloadcraft_engine as dce;
+    let b = opts.browser.clone().unwrap_or_default();
+    let body = crate::model::base64_decode(&b.body).ok_or_else(|| anyhow!("the form data could not be read"))?;
+    let client = opts.build_client()?;
+    if let Some(parent) = dest.parent() {
+        tokio::fs::create_dir_all(parent).await?;
+    }
+    let limiter = Arc::new(RateLimiter::new(opts.speed_limit_bps).with_global(opts.global_limit.clone()));
+    let config = dce::Config {
+        connections: connections.clamp(1, 16),
+        stall_timeout: std::time::Duration::from_secs(opts.timeout_secs.clamp(15, 120)),
+        max_retries: opts.max_retries.max(1),
+        ..dce::Config::default()
+    };
+    let (c, o) = (client.clone(), opts.clone());
+    let request: dce::RequestFn = Arc::new(move |u: &str| o.apply(c.post(u), Some(u)).body(body.clone()));
+    let dl = dce::Downloader::with_request(request).config(config).limiter(limiter);
+    shared.resumable.store(false, Ordering::SeqCst);
+    let job = dce::Job::new(url, dest.clone());
+    let out = run_dce(dl, job, url, 0, shared).await?;
+    // Name from the server's Content-Disposition when ours is a placeholder.
+    if opts.allow_rename {
+        let cur = dest.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
+        if let Some(name) = out.filename.map(|n| sanitize_filename(&n)).filter(|n| *n != cur) {
+            if crate::model::is_fallback_filename(&cur) || !cur.contains('.') {
+                let target = crate::model::conflict_free_dest(&dest.with_file_name(&name));
+                if tokio::fs::rename(dest, &target).await.is_ok() {
+                    if let Some(n) = target.file_name() {
+                        mutex_guard(&shared.resolved_name).replace(n.to_string_lossy().to_string());
+                    }
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Run one engine-crate download with the app's pause/stop flags bridged in
+/// and its progress bridged out; errors in the app's vocabulary.
+async fn run_dce(
+    mut dl: downloadcraft_engine::Downloader,
+    job: downloadcraft_engine::Job,
+    url: &str,
+    total: u64,
+    shared: &Arc<SharedState>,
+) -> Result<downloadcraft_engine::Outcome> {
+    use downloadcraft_engine as dce;
+    if std::env::var("DOWNLOAD_CRAFT_DEBUG").is_ok() {
+        dl = dl.on_event(Arc::new(|e: &dce::Event| eprintln!("[dbg] engine: {e}")));
+    }
     let progress = Arc::new(dce::Progress::default());
     let control = Arc::new(dce::Control::default());
-
-    // Bridge: the UI's pause/stop flags in, live progress out.
     let done = Arc::new(AtomicBool::new(false));
     let bridge = {
         let (progress, control, shared, done) = (progress.clone(), control.clone(), shared.clone(), done.clone());
@@ -8031,13 +8345,13 @@ async fn segmented(
     let result = dl.download(job, progress.clone(), control.clone()).await;
     done.store(true, Ordering::SeqCst);
     let _ = bridge.await;
-    sync_engine_progress(&progress, &control, &shared, total);
+    sync_engine_progress(&progress, &control, shared, total);
     match result {
         Ok(out) => {
             if out.url_refreshed {
-                shared.set_note("the stream link expired mid-download and was refreshed automatically");
+                shared.set_note("the download link expired mid-download and was refreshed automatically");
             }
-            Ok(())
+            Ok(out)
         }
         Err(e) => Err(engine_error(url, e)),
     }
@@ -8070,6 +8384,10 @@ fn sync_engine_progress(
     }
     shared.downloaded.store(progress.downloaded(), Ordering::SeqCst);
     shared.resumable.store(progress.resumable(), Ordering::SeqCst);
+    if let Some(t) = progress.total().filter(|t| *t > 0) {
+        shared.total.store(t, Ordering::SeqCst);
+        shared.has_total.store(true, Ordering::SeqCst);
+    }
 }
 
 /// Engine errors in the app's vocabulary: refusals stay final (no retry
@@ -10371,5 +10689,145 @@ mod audit_helper_tests {
             let req=opts.get(&reqwest::Client::new(),"https://example.com").build().unwrap();
             assert_eq!(req.headers().get("sec-ch-ua-platform").unwrap(),&format!("\"{want}\""));
         }
+    }
+}
+
+#[cfg(test)]
+mod browser_capture_tests {
+    use super::*;
+
+    fn browser_ctx(method: &str, body: &[u8], headers: &[(&str, &str)]) -> crate::model::BrowserContext {
+        crate::model::BrowserContext {
+            method: method.to_string(),
+            body: crate::model::base64_encode(body),
+            headers: headers.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect(),
+            from_extension: true,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn browser_headers_replace_the_defaults() {
+        let opts = EngineOpts {
+            user_agent: "Mozilla/5.0 Chrome/130.0".into(),
+            browser: Some(browser_ctx("", b"", &[("user-agent", "UA/browser"), ("accept-language", "bn-BD"), ("accept", "text/html")])),
+            ..Default::default()
+        };
+        let client = opts.build_client().unwrap();
+        let req = opts.get(&client, "https://files.example/a.zip").build().unwrap();
+        let h = req.headers();
+        assert_eq!(h.get_all("user-agent").iter().count(), 1);
+        assert_eq!(h["user-agent"], "UA/browser");
+        assert_eq!(h.get_all("accept-language").iter().count(), 1);
+        assert_eq!(h["accept-language"], "bn-BD");
+        assert_eq!(h["accept"], "text/html");
+        // A GET never carries the form's Content-Type.
+        let get = EngineOpts { browser: Some(browser_ctx("", b"", &[("content-type", "x/y")])), ..Default::default() };
+        assert!(get.get(&client, "https://files.example/a").build().unwrap().headers().get("content-type").is_none());
+    }
+
+    /// Serves `body` only to a POST carrying `form` (like a report export).
+    async fn post_only_server(form: &'static [u8], body: Vec<u8>) -> String {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let body = std::sync::Arc::new(body);
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut s, _)) = listener.accept().await else { break };
+                let body = body.clone();
+                tokio::spawn(async move {
+                    let mut raw = Vec::new();
+                    let mut buf = [0u8; 4096];
+                    loop {
+                        let n = s.read(&mut buf).await.unwrap_or(0);
+                        if n == 0 { return; }
+                        raw.extend_from_slice(&buf[..n]);
+                        if let Some(end) = raw.windows(4).position(|w| w == b"\r\n\r\n") {
+                            let head = String::from_utf8_lossy(&raw[..end]).to_lowercase();
+                            let len: usize = head.lines().find_map(|l| l.strip_prefix("content-length:")).map(|v| v.trim().parse().unwrap_or(0)).unwrap_or(0);
+                            if raw.len() < end + 4 + len { continue; }
+                            let got = &raw[end + 4..end + 4 + len];
+                            let ok = head.starts_with("post ") && got == form && head.contains("content-type: application/x-www-form-urlencoded");
+                            let resp = if ok {
+                                let mut r = format!("HTTP/1.1 200 OK\r\nContent-Type: application/pdf\r\nContent-Disposition: attachment; filename=\"report.pdf\"\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", body.len()).into_bytes();
+                                r.extend_from_slice(&body);
+                                r
+                            } else {
+                                b"HTTP/1.1 405 Method Not Allowed\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_vec()
+                            };
+                            let _ = s.write_all(&resp).await;
+                            return;
+                        }
+                    }
+                });
+            }
+        });
+        format!("http://{addr}/export")
+    }
+
+    #[tokio::test]
+    async fn a_form_download_is_repeated_as_a_post_with_its_body() {
+        let want: Vec<u8> = (0..300_000u32).map(|i| (i % 251) as u8).collect();
+        let url = post_only_server(b"from=2026-01-01&to=2026-02-01", want.clone()).await;
+        let dir = std::env::temp_dir().join(format!("dc-post-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let dest = dir.join("export");
+        let opts = EngineOpts {
+            browser: Some(browser_ctx("POST", b"from=2026-01-01&to=2026-02-01", &[("content-type", "application/x-www-form-urlencoded")])),
+            ..Default::default()
+        };
+        let shared = Arc::new(SharedState::new());
+        download(url, dest.clone(), 4, opts, shared.clone()).await.unwrap();
+        // Saved under the server's name (the placeholder name gave way).
+        let saved = dir.join("report.pdf");
+        assert_eq!(std::fs::read(&saved).unwrap(), want);
+        assert_eq!(mutex_guard(&shared.resolved_name).as_deref(), Some("report.pdf"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn a_refused_file_is_fetched_through_the_browser_page() {
+        // Plays the native host + extension: answer the request file the way
+        // the extension's chunks would arrive.
+        let dir = crate::native_host::page_fetch_dir().unwrap();
+        std::fs::create_dir_all(&dir).unwrap();
+        let fake_host = tokio::spawn({
+            let dir = dir.clone();
+            async move {
+                for _ in 0..100 {
+                    for e in std::fs::read_dir(&dir).unwrap().flatten() {
+                        let name = e.file_name().to_string_lossy().to_string();
+                        let Some(id) = name.strip_suffix(".req.json") else { continue };
+                        let req: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(e.path()).unwrap()).unwrap();
+                        if req["url"] != "https://cdn.example/locked.bin" { continue; }
+                        assert_eq!(req["page"], "https://site.example/page");
+                        std::fs::write(dir.join(format!("{id}.part")), b"page-fetched bytes").unwrap();
+                        std::fs::rename(dir.join(format!("{id}.part")), dir.join(format!("{id}.res"))).unwrap();
+                        return true;
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                }
+                false
+            }
+        });
+        let out = std::env::temp_dir().join(format!("dc-pagefetch-{}.bin", std::process::id()));
+        let shared = Arc::new(SharedState::new());
+        page_fetch_file("https://cdn.example/locked.bin", "https://site.example/page", &out, &shared).await.unwrap();
+        assert!(fake_host.await.unwrap());
+        assert_eq!(std::fs::read(&out).unwrap(), b"page-fetched bytes");
+        assert_eq!(shared.total.load(Ordering::SeqCst), 18);
+        let _ = std::fs::remove_file(&out);
+    }
+
+    #[test]
+    fn youtube_order_setting_decides_who_goes_first() {
+        let hd = EngineOpts { quality_pref: "1080p".into(), ..Default::default() };
+        let sd = EngineOpts { quality_pref: "360p".into(), ..Default::default() };
+        // Auto (no setting): yt-dlp for what YouTube gates, the app's engine
+        // for the progressive stream.
+        assert!(ytdlp_preferred(&hd));
+        assert!(!ytdlp_preferred(&sd));
     }
 }

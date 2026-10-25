@@ -46,7 +46,8 @@
     try { __dcObservers.forEach((o) => { try { o.disconnect(); } catch (x) {} }); } catch (e) {}
     toast("Download Craft was updated — reload this tab (Ctrl+R), then click again");
   }
-  const DL = /\.(zip|rar|7z|exe|msi|pdf|mp4|mkv|webm|mov|mp3|flac|wav|ogg|m4a|iso|tar|gz|dmg)$/i;
+  // `let`: site rules from the app may add extensions (see applySiteRules).
+  let DL = /\.(zip|rar|7z|exe|msi|pdf|mp4|mkv|webm|mov|mp3|flac|wav|ogg|m4a|iso|tar|gz|dmg)$/i;
 
   function collectLinks() {
     try {
@@ -87,6 +88,20 @@
   }
 
   // ---------- YouTube support ----------
+  // YouTube's visitor id from the page's config script: yt-dlp can use it to
+  // get past a bot check when there are no cookies (the app retries with it).
+  function ytVisitorData() {
+    try {
+      if (!/(^|\.)youtube\.com$/i.test(location.hostname)) return null;
+      for (const s of document.scripts) {
+        if (s.src || !s.textContent || s.textContent.length > 3000000) continue;
+        const m = /"VISITOR_DATA":"([A-Za-z0-9%_=.-]{10,200})"/.exec(s.textContent);
+        if (m) return m[1];
+      }
+    } catch (e) {}
+    return null;
+  }
+
   function ytVideoId() {
     try {
       const u = new URL(location.href);
@@ -434,7 +449,7 @@
       filename = base.toLowerCase().endsWith(ext.toLowerCase()) ? base : base + ext;
     }
     try {
-      chrome.runtime.sendMessage({ type: "download", url: sendUrl, filename, ver: EXT_VER, pageUrl: location.href, referer: location.href, mime: mime || null, size: size || null, pairUrl: (pair && pair.url) || null, pairMime: (pair && pair.mime) || null, quality: quality || null, dur: dur || null, audioExpected }, (res) => {
+      chrome.runtime.sendMessage({ type: "download", url: sendUrl, filename, ver: EXT_VER, pageUrl: location.href, referer: location.href, mime: mime || null, size: size || null, pairUrl: (pair && pair.url) || null, pairMime: (pair && pair.mime) || null, quality: quality || null, dur: dur || null, audioExpected, visitorData: ytVisitorData() }, (res) => {
       if (chrome.runtime.lastError) {
         if (ctxInvalidated(chrome.runtime.lastError)) markDead();
         toast("Download Craft: " + chrome.runtime.lastError.message);
@@ -2099,6 +2114,26 @@
       return im ? im[1] : "";
     } catch (e) { return ""; }
   }
+  // Site rules pushed by the app (newer YouTube itags, more file types):
+  // they only add to the tables above, never take anything away.
+  function applySiteRules(rules) {
+    try {
+      if (!rules || typeof rules !== "object") return;
+      const yt = rules.youtube || {};
+      const okLabel = (v) => typeof v === "string" && /^\d{2,4}p(?:\d{2})?$|^\d{1,3}k$/.test(v);
+      for (const [k, v] of Object.entries(yt.itagQuality || {})) if (/^\d+$/.test(k) && okLabel(v)) ITAG_Q[k] = v;
+      for (const [k, v] of Object.entries(yt.itagAudio || {})) if (/^\d+$/.test(k) && okLabel(v)) ITAG_A[k] = v;
+      for (const n of yt.progressiveItags || []) if (Number.isInteger(n)) PROG_ITAG.add(n);
+      const ext = ((rules.links || {}).linkListExtensions || []).filter((e) => /^[a-z0-9]{1,8}$/i.test(e));
+      if (ext.length) DL = new RegExp(DL.source.replace(")$", "|" + ext.join("|") + ")$"), "i");
+      const click = ((rules.links || {}).clickCaptureExtensions || []);
+      if (DCRank.addDirectExtensions) DCRank.addDirectExtensions(click);
+    } catch (e) { /* bad rules: keep the built-in ones */ }
+  }
+  try {
+    chrome.storage.local.get({ siteRules: null }, (v) => { void chrome.runtime.lastError; applySiteRules(v && v.siteRules); });
+  } catch (e) {}
+
   // Frame size for the panel's resolution line ("1080p" → "1920×1080").
   const RES_WH = {"4320p":"7680×4320","2160p":"3840×2160","1440p":"2560×1440","1080p":"1920×1080","720p":"1280×720","480p":"854×480","360p":"640×360","240p":"426×240","144p":"256×144"};
   function resWH(label, w, h) {
@@ -2930,11 +2965,32 @@
   // bypass the browser downloader entirely. Preserve modified clicks and
   // fall back to the original link if the app declines capture.
   const bypassDownloadLinks = new WeakSet();
+  // "Keep in the browser" key (Settings -> Capture in the app; Alt by
+  // default): a link clicked with it held is left to the browser.
+  let skipKey = "alt";
+  const readSkipKey = () => {
+    try {
+      chrome.storage.local.get({ appPrefs: {} }, (v) => {
+        void chrome.runtime.lastError;
+        const k = v && v.appPrefs && v.appPrefs.skipKey;
+        skipKey = /^(alt|shift|off)$/.test(k || "") ? k : "alt";
+      });
+    } catch (e) {}
+  };
+  readSkipKey();
+  try { chrome.storage.onChanged.addListener((ch) => { if (ch.appPrefs) readSkipKey(); }); } catch (e) {}
   document.addEventListener("click", ev => {
     // Only a real user click: a page script calling a.click() on download
     // links could otherwise make the app fetch any URL with that site's
     // cookies, silently and in a loop.
     if (!ev.isTrusted) return;
+    if (alive() && ev.button === 0 && ((skipKey === "alt" && ev.altKey) || (skipKey === "shift" && ev.shiftKey))) {
+      const a = ev.target && ev.target.closest && ev.target.closest("a[href]");
+      if (a && /^https?:\/\//i.test(a.href)) {
+        try { chrome.runtime.sendMessage({ type: "skipLink", url: a.href }, () => void chrome.runtime.lastError); } catch (e) {}
+      }
+      return;
+    }
     if (!alive() || ev.button !== 0 || ev.ctrlKey || ev.metaKey || ev.shiftKey || ev.altKey) return;
     const a = ev.target && ev.target.closest && ev.target.closest("a[href]");
     if (!a) return;

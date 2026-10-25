@@ -191,6 +191,141 @@ pub struct DownloadItem {
     /// can take it. A time already past starts immediately.
     #[serde(default)]
     pub start_at: String,
+    /// What the browser knew about this download when the extension caught
+    /// it (method/body, its request headers, server IP, proxy). None for
+    /// downloads added any other way.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub browser: Option<BrowserContext>,
+}
+
+/// The browser's side of a captured download, so the app can repeat the
+/// request the way the browser made it (IDM sends the same).
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct BrowserContext {
+    /// "POST" for form downloads; empty = GET.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub method: String,
+    /// POST body, base64.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub body: String,
+    /// The browser's own request headers (User-Agent, Accept, Accept-Language,
+    /// client hints, Content-Type of a POST). Never cookies or credentials:
+    /// those travel in their own, site-bound fields.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub headers: std::collections::BTreeMap<String, String>,
+    /// The server address the browser was connected to.
+    #[serde(default, alias = "serverIp", skip_serializing_if = "String::is_empty")]
+    pub server_ip: String,
+    /// The browser's proxy ("http://host:port", "socks5://host:port").
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub proxy: String,
+    /// YouTube's visitor id from the page (helps yt-dlp past bot checks).
+    #[serde(default, alias = "visitorData", skip_serializing_if = "String::is_empty")]
+    pub visitor_data: String,
+    /// Sent by the browser extension (it can take the download back).
+    #[serde(default, alias = "fromExtension")]
+    pub from_extension: bool,
+}
+
+/// Request headers from the browser that the app may repeat. Hop-by-hop,
+/// range, cookie and credential headers are never among them.
+pub fn browser_header_allowed(name: &str) -> bool {
+    matches!(
+        name,
+        "user-agent" | "accept" | "accept-language" | "content-type" | "upgrade-insecure-requests" | "dnt"
+    ) || name.starts_with("sec-ch-ua")
+        || name.starts_with("sec-fetch-")
+}
+
+impl BrowserContext {
+    /// Clean what the extension sent (this is the trust boundary).
+    pub fn sanitized(mut self) -> Option<Self> {
+        self.method = self.method.trim().to_ascii_uppercase();
+        if self.method != "POST" {
+            self.method.clear();
+            self.body.clear();
+        }
+        if self.body.len() > 2 * 1024 * 1024 || base64_decode(&self.body).is_none() {
+            self.body.clear();
+            if self.method == "POST" {
+                // A POST whose body could not be kept cannot be repeated.
+                self.method.clear();
+            }
+        }
+        self.headers = std::mem::take(&mut self.headers)
+            .into_iter()
+            .map(|(k, v)| (k.trim().to_ascii_lowercase(), v.trim().to_string()))
+            .filter(|(k, v)| browser_header_allowed(k) && !v.is_empty() && v.len() <= 2048 && !v.contains(['\r', '\n']))
+            .take(24)
+            .collect();
+        if self.server_ip.parse::<std::net::IpAddr>().is_err() {
+            self.server_ip.clear();
+        }
+        let p = self.proxy.trim().to_ascii_lowercase();
+        if !(p.starts_with("http://") || p.starts_with("https://") || p.starts_with("socks5://") || p.starts_with("socks5h://") || p.starts_with("socks4://"))
+            || self.proxy.len() > 300
+            || self.proxy.contains(['\r', '\n', ' '])
+        {
+            self.proxy.clear();
+        }
+        if self.visitor_data.len() > 200 || !self.visitor_data.chars().all(|c| c.is_ascii_alphanumeric() || "-_%=.".contains(c)) {
+            self.visitor_data.clear();
+        }
+        let empty = self.method.is_empty() && self.headers.is_empty() && self.server_ip.is_empty()
+            && self.proxy.is_empty() && self.visitor_data.is_empty() && !self.from_extension;
+        (!empty).then_some(self)
+    }
+
+    pub fn is_post(&self) -> bool {
+        self.method == "POST"
+    }
+}
+
+/// Standard base64 (with or without padding). None on bad input.
+pub fn base64_decode(s: &str) -> Option<Vec<u8>> {
+    let val = |c: u8| -> Option<u32> {
+        Some(match c {
+            b'A'..=b'Z' => c - b'A',
+            b'a'..=b'z' => c - b'a' + 26,
+            b'0'..=b'9' => c - b'0' + 52,
+            b'+' | b'-' => 62,
+            b'/' | b'_' => 63,
+            _ => return None,
+        } as u32)
+    };
+    let bytes: Vec<u8> = s.bytes().filter(|b| !b.is_ascii_whitespace() && *b != b'=').collect();
+    if bytes.len() % 4 == 1 {
+        return None;
+    }
+    let mut out = Vec::with_capacity(bytes.len() * 3 / 4);
+    for chunk in bytes.chunks(4) {
+        let mut acc = 0u32;
+        for (i, &c) in chunk.iter().enumerate() {
+            acc |= val(c)? << (18 - 6 * i);
+        }
+        out.push((acc >> 16) as u8);
+        if chunk.len() > 2 {
+            out.push((acc >> 8) as u8);
+        }
+        if chunk.len() > 3 {
+            out.push(acc as u8);
+        }
+    }
+    Some(out)
+}
+
+/// Standard base64 with padding.
+pub fn base64_encode(data: &[u8]) -> String {
+    const T: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity(data.len().div_ceil(3) * 4);
+    for c in data.chunks(3) {
+        let n = (c[0] as u32) << 16 | (*c.get(1).unwrap_or(&0) as u32) << 8 | *c.get(2).unwrap_or(&0) as u32;
+        out.push(T[(n >> 18) as usize & 63] as char);
+        out.push(T[(n >> 12) as usize & 63] as char);
+        out.push(if c.len() > 1 { T[(n >> 6) as usize & 63] as char } else { '=' });
+        out.push(if c.len() > 2 { T[n as usize & 63] as char } else { '=' });
+    }
+    out
 }
 
 impl DownloadItem {
@@ -227,6 +362,7 @@ impl DownloadItem {
             checksum_repaired: false,
             priority: 0,
             start_at: String::new(),
+            browser: None,
         }
     }
 

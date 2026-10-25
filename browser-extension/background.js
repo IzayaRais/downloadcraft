@@ -1,6 +1,6 @@
-// Background worker: every browser download is captured
-// automatically, cancelled in-browser, and handed to the native host.
-// No clicks, no pasting — zero config.
+// Background worker: every browser download is captured automatically -
+// paused in the browser, handed to the app, and resumed in the browser when
+// the app cannot take it. No clicks, no pasting - zero config.
 
 const HOST = "com.download_craft";
 const GRACE_MS = 15_000; // ignore our own fallback re-downloads
@@ -31,6 +31,15 @@ try {
 try {
   if (typeof importScripts === "function") importScripts("streams.js", "mp4merge.js", "browserdl.js");
 } catch (e) { /* browser downloads of plain files still work */ }
+// Live connection to the app (persistent port, pushes, request context).
+try {
+  if (typeof importScripts === "function") importScripts("bridge.js");
+} catch (e) { console.error("[download-craft] bridge.js failed to load", e); }
+// Talk to the app: the live port when there is one, else a one-shot host.
+function hostSend(msg) {
+  if (typeof DCBridge !== "undefined") return DCBridge.send(msg);
+  return api.runtime.sendNativeMessage(HOST, msg);
+}
 
 function markSeen(url, filename) {
   seen.set(url + "|" + (filename || ""), Date.now());
@@ -53,8 +62,47 @@ async function settings() {
     // Sniff the first bytes of opaque responses (text/plain, octet-stream…)
     // to find manifests and videos hidden behind generic types.
     deepDetect: true,
+    appPrefs: {},
+    siteRules: null,
   });
+  // Sites the project's rules say never to capture (sign-in or streaming
+  // services whose downloads only work in the browser).
+  const never = ((s.siteRules || {}).capture || {}).neverSites;
+  delete s.siteRules;
+  const extraBlocked = Array.isArray(never) ? never.filter((h) => typeof h === "string" && /^[a-z0-9.*-]{1,100}$/i.test(h)) : [];
+  // Capture settings set in the app (Settings -> Browser Integration ->
+  // Capture) win: the app is where they are edited, the popup mirrors them.
+  const a = s.appPrefs || {};
+  if (typeof a.autoCapture === "boolean") s.autoCapture = a.autoCapture;
+  if (Number.isFinite(a.minSizeKB)) s.minSizeKB = a.minSizeKB;
+  if (typeof a.blockHosts === "string") s.blockHosts = a.blockHosts;
+  if (extraBlocked.length) s.blockHosts = [s.blockHosts, ...extraBlocked].filter(Boolean).join(", ");
+  s.captureTypes = typeof a.captureTypes === "string" ? a.captureTypes : "";
+  s.notify = a.notify !== false;
+  s.browserFallback = a.browserFallback !== false;
+  s.skipKey = /^(alt|shift|off)$/.test(a.skipKey || "") ? a.skipKey : "alt";
+  delete s.appPrefs;
   return s;
+}
+
+// The app's "File types" list: empty = every type. Matched on the file name,
+// else on the URL path.
+function typeAllowed(cfg, name, url) {
+  const list = String(cfg.captureTypes || "").toLowerCase().split(/[\s,;]+/).filter(Boolean);
+  if (!list.length) return true;
+  const ext = (s) => { const m = /\.([a-z0-9]{1,12})$/i.exec(String(s || "").split(/[?#]/)[0]); return m ? m[1].toLowerCase() : ""; };
+  let e = ext(String(name || "").split(/[\\/]/).pop());
+  if (!e) { try { e = ext(new URL(url).pathname); } catch (x) {} }
+  return !!e && list.includes(e);
+}
+
+// Links clicked with the "keep in browser" key held (Alt by default).
+const skipOnce = new Map(); // url -> until
+function skipped(url) {
+  const t = skipOnce.get(url);
+  if (t === undefined) return false;
+  if (Date.now() > t) { skipOnce.delete(url); return false; }
+  return true;
 }
 
 // Chromium's UI switch affects the whole profile, so it is opt-in and
@@ -233,12 +281,20 @@ async function sendToHost(url, filename, extra) {
         } catch (e) { /* host parse failed: no cookies */ }
       }
     }
-    const res = await api.runtime.sendNativeMessage(HOST, {
+    const ctx = typeof DCBridge !== "undefined" ? DCBridge.browserContext(url, extra) : { fromExtension: true };
+    // The exact Cookie the browser sent with this request beats a cookie-jar
+    // lookup (and never leaves its own host: the request was to that URL).
+    if (ctx._cookie && !pageOnly && (!cookie || (extra && extra.fromRequest))) cookie = ctx._cookie;
+    const sentReferer = ctx._referer;
+    delete ctx._cookie; delete ctx._referer; delete ctx._post;
+    rememberCapture(url, filename, extra);
+    const res = await hostSend({
       type: "download",
+      browser: ctx,
       url,
       filename: filename || null,
       pageUrl: (extra && extra.pageUrl) || null,
-      referer: (seenAuth && seenAuth.referer) || (extra && extra.referer) || (extra && extra.pageUrl) || null,
+      referer: (seenAuth && seenAuth.referer) || (extra && extra.fromRequest && sentReferer) || (extra && extra.referer) || (extra && extra.pageUrl) || null,
       cookie,
       headers: (seenAuth && Object.keys(seenAuth.headers).length) ? seenAuth.headers : null,
       mime: (extra && extra.mime) || null,
@@ -257,6 +313,17 @@ async function sendToHost(url, filename, extra) {
     console.error("[download-craft] native host '" + HOST + "' failed:", lastHostError);
     return false;
   }
+}
+
+// What each capture was, so a failure the app reports later can be handed to
+// the extension's own browser download (the last fallback).
+const sentCaptures = new Map(); // url -> {url, filename, pairUrl, mime, quality, pageUrl}
+function rememberCapture(url, filename, extra) {
+  const e = extra || {};
+  sentCaptures.delete(url);
+  sentCaptures.set(url, { url, filename: filename || null, pairUrl: e.pairUrl || null, mime: e.mime || null,
+    quality: e.quality || null, pageUrl: e.pageUrl || null, title: e.title || null, at: Date.now() });
+  if (sentCaptures.size > 100) sentCaptures.delete(sentCaptures.keys().next().value);
 }
 
 // ---- IDM-style network sniffer ----
@@ -687,7 +754,7 @@ function setBadge() {
 sendToHostPing();
 async function sendToHostPing() {
   try {
-    const res = await api.runtime.sendNativeMessage(HOST, { type: "ping" });
+    const res = await hostSend({ type: "ping" });
     hostOk = !!res && res.type === "pong";
     // The app's Light/Dark/System choice, for the in-page bar and panels.
     if (res && /^(light|dark|system)$/.test(res.theme || "")) {
@@ -705,12 +772,16 @@ async function sendToHostPing() {
     console.error(
       "[download-craft] native host '" + HOST + "' unreachable:", lastHostError
     );
+    // Say how to fix it (at most once a day). The extension keeps working
+    // on its own meanwhile: "Download in browser" needs no app.
+    if (/native|host|not found|not installed/i.test(lastHostError)) showWelcome("no-app");
   }
   setBadge();
   await syncBrowserDownloadUI();
 }
 
-chrome.runtime.onInstalled.addListener(() => {
+chrome.runtime.onInstalled.addListener((details) => {
+  if (details && details.reason === "install") showWelcome("install");
   // removeAll first: re-installs otherwise fail with duplicate-id.
   api.contextMenus.removeAll().then(() => {
     chrome.contextMenus.create({
@@ -725,6 +796,18 @@ chrome.runtime.onInstalled.addListener(() => {
       title: "Download all links with Download Craft",
       contexts: ["page", "selection"],
     });
+    // IDM's "Download with IDM" on the browser's own downloads page: hand an
+    // existing (or failed) browser download to the app. Chromium only.
+    if (!(typeof browser !== "undefined" && browser.runtime && browser.runtime.getBrowserInfo)) {
+      try {
+        chrome.contextMenus.create({
+          id: "download-item",
+          title: "Download with Download Craft",
+          contexts: ["link"],
+          documentUrlPatterns: ["chrome://downloads/*"],
+        }, () => void chrome.runtime.lastError);
+      } catch (e) { /* not supported here */ }
+    }
   });
   sendToHostPing();
   // Push the current page script into every open tab. Content scripts in
@@ -794,6 +877,24 @@ function pageLinks(selectionOnly) {
   for (const m of document.querySelectorAll("video[src], audio[src], source[src]")) {
     if (inSel(m)) add(m.getAttribute("src"), m.getAttribute("title") || "");
   }
+  for (const img of document.querySelectorAll("img[src]")) {
+    if (inSel(img)) add(img.currentSrc || img.getAttribute("src"), img.getAttribute("alt") || "");
+  }
+  // Plain-text URLs: in the selection, in text boxes, and (whole page only)
+  // in frames and scripts.
+  const URL_RE = /\bhttps?:\/\/[^\s"'<>()\[\]{}]+/gi;
+  const fromText = (text) => { for (const m of String(text || "").matchAll(URL_RE)) add(m[0].replace(/[.,;:!?]+$/, ""), ""); };
+  if (sel && !sel.isCollapsed) fromText(sel.toString());
+  for (const ta of document.querySelectorAll("textarea")) {
+    if (!sel || sel.isCollapsed) fromText(ta.value);
+    else if (sel.containsNode(ta, true)) fromText(ta.value);
+  }
+  if (!selectionOnly) {
+    for (const f of document.querySelectorAll("iframe[src]")) add(f.getAttribute("src"), "");
+    for (const sc of document.querySelectorAll("script:not([src])")) {
+      if (sc.textContent && sc.textContent.length < 2000000) fromText(sc.textContent);
+    }
+  }
   return out;
 }
 
@@ -815,7 +916,7 @@ async function sendAllLinks(tab, selectionOnly) {
   try {
     // The page's own cookies only: the app applies them to same-host links.
     const cookie = await cookiesFor(tab.url);
-    const res = await api.runtime.sendNativeMessage(HOST, {
+    const res = await hostSend({
       type: "links", pageUrl: tab.url, title: tab.title || "", cookie, links,
     });
     hostOk = !!res && res.type === "ok";
@@ -829,6 +930,20 @@ async function sendAllLinks(tab, selectionOnly) {
 chrome.contextMenus.onClicked.addListener((info, tab) => {
   if (info.menuItemId === "download-all-links") {
     sendAllLinks(tab, !!info.selectionText);
+    return;
+  }
+  if (info.menuItemId === "download-item" && /^https?:\/\//i.test(info.linkUrl || "")) {
+    (async () => {
+      let referrer = null;
+      try {
+        const hits = await api.downloads.search({ url: info.linkUrl });
+        const hit = hits && hits.find((d) => d.referrer);
+        referrer = hit ? hit.referrer : null;
+      } catch (e) {}
+      markSeen(info.linkUrl, null);
+      hostOk = await sendToHost(info.linkUrl, null, { pageUrl: referrer, referer: referrer });
+      setBadge();
+    })();
     return;
   }
   const url = info.linkUrl || info.srcUrl;
@@ -850,34 +965,52 @@ async function performBrowserCapture(item) {
   if (!cfg.autoCapture) return;
   // The user chose "Download in browser" for this one: never hand it back.
   if (item.byExtensionId && item.byExtensionId === chrome.runtime.id) return;
-  // DownloadItem omits the original HTTP method. Replaying a form's POST as
-  // a GET loses the request body, so leave observed non-GET downloads intact.
-  if (nonReplayableDownload(item.url) || nonReplayableDownload(url)) return;
+  // Clicked with the "keep in browser" key held.
+  if (skipped(item.url) || skipped(url)) return;
+  // A form (POST) download is handed over with its body when the browser
+  // showed it to us; without the body it stays in the browser.
+  const ctx = typeof DCBridge !== "undefined" ? DCBridge.browserContext(url) : {};
+  const post = ctx._post || nonReplayableDownload(item.url) || nonReplayableDownload(url);
+  if (post && ctx.method !== "POST") return;
   if (hostBlocked(url, cfg.blockHosts)) return; // P0.1 site filter
+  if (!typeAllowed(cfg, item.filename, url)) return; // the app's file types
   if (freshSeen(url, item.filename)) return; // our own fallback re-download
   // Honor the size filter here too (sniffer-only before): tiny files stay
   // in the browser. Unknown sizes (0/undefined) still capture.
   const minB = Math.max(0, (parseInt(cfg.minSizeKB, 10) || 0)) * 1024;
   const known = item.fileSize || item.totalBytes || 0;
   if (minB > 0 && known > 0 && known < minB) return;
+  // IDM's way: PAUSE the browser's download while the app is asked, so a
+  // "no" (or no app) simply resumes it - same request, same session, no
+  // bytes lost. Only a download that cannot pause is cancelled up front.
+  let paused = false;
   try {
-    await api.downloads.cancel(item.id);
+    await api.downloads.pause(item.id);
+    paused = true;
   } catch (e) {
-    // Already finished (fast download): cancelling is impossible, and
-    // re-sending would deliver a SECOND copy — leave the browser's file.
-    return;
-  }
-  const ok = await sendToHost(url, item.filename, {pageUrl:item.referrer || null,referer:item.referrer || null});
-  // Erase the browser entry only once the app confirmed receipt.
-  if (ok) {
     try {
-      await api.downloads.erase({ id: item.id });
-    } catch (e) {
-      /* already gone */
+      await api.downloads.cancel(item.id);
+    } catch (e2) {
+      // Already finished (fast download): cancelling is impossible, and
+      // re-sending would deliver a SECOND copy — leave the browser's file.
+      return;
     }
   }
+  const ok = await sendToHost(url, item.filename, {pageUrl:item.referrer || null,referer:item.referrer || null, fromRequest:true});
   hostOk = ok;
   setBadge();
+  if (ok) {
+    // The app has it: drop the browser's copy and its entry.
+    if (paused) { try { await api.downloads.cancel(item.id); } catch (e) { /* finished meanwhile */ } }
+    try { await api.downloads.erase({ id: item.id }); } catch (e) { /* already gone */ }
+    return;
+  }
+  if (paused) {
+    // The app declined or is not there: the browser carries on.
+    try { await api.downloads.resume(item.id); } catch (e) { /* the user acted on it */ }
+    await syncBrowserDownloadUI();
+    return;
+  }
   if (!ok) {
     await syncBrowserDownloadUI();
     // Native host missing: hand the file back to the browser so nothing is lost.
@@ -1143,7 +1276,7 @@ try {
       await bdlFinish(j, "done", { size, phase: "Done", path });
       // List it in the app too (finished, with Open file / folder).
       if (path) {
-        try { await api.runtime.sendNativeMessage(HOST, { type: "record", url: j.src, filename: path, pageUrl: j.page || null }); } catch (e) { /* app not installed */ }
+        try { await hostSend({ type: "record", url: j.src, filename: path, pageUrl: j.page || null }); } catch (e) { /* app not installed */ }
       }
     } else if (delta.state.current === "interrupted") {
       await bdlRelease(j);
@@ -1240,7 +1373,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
           .filter((u) => typeof u === "string" && /^https?:\/\//i.test(u))
           .slice(0, 25);
         if (!urls.length) return { queued: [] };
-        const res = await api.runtime.sendNativeMessage(HOST, { type: "query", urls });
+        const res = await hostSend({ type: "query", urls });
         if (res && res.type === "queued" && Array.isArray(res.urls)) {
           return { queued: res.urls };
         }
@@ -1399,7 +1532,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     }
     if (msg.type === "appList") {
       try {
-        const res = await api.runtime.sendNativeMessage(HOST, { type: "list" });
+        const res = await hostSend({ type: "list" });
         hostOk = !!res;
         return { ok: true, items: (res && res.items) || [] };
       } catch (e) {
@@ -1409,7 +1542,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     }
     if (msg.type === "appControl" && typeof msg.action === "string") {
       try {
-        const res = await api.runtime.sendNativeMessage(HOST, { type: "control", action: msg.action, id: Number.isInteger(msg.id) ? msg.id : undefined });
+        const res = await hostSend({ type: "control", action: msg.action, id: Number.isInteger(msg.id) ? msg.id : undefined });
         return { ok: !!res && res.type === "ok", error: res && res.error };
       } catch (e) {
         return { ok: false, error: String((e && e.message) || e) };
@@ -1420,9 +1553,18 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       if (Number.isInteger(tabId)) { tabMedia.delete(tabId); tabPlaylist.delete(tabId); setBadge(); }
       return { ok: true };
     }
+    if (msg.type === "skipLink" && typeof msg.url === "string" && /^https?:\/\//i.test(msg.url)) {
+      skipOnce.set(msg.url, Date.now() + 15000);
+      if (skipOnce.size > 50) skipOnce.delete(skipOnce.keys().next().value);
+      return { ok: true };
+    }
+    if (msg.type === "pageFetchChunk" && typeof msg.id === "string" && sender && sender.tab) {
+      return typeof DCBridge !== "undefined" ? DCBridge.relayChunk(msg) : { ok: false };
+    }
     if (msg.type === "captureLink") {
       const cfg = await settings();
-      if (!cfg.autoCapture || !/^https?:\/\//i.test(msg.url || "") || hostBlocked(msg.url,cfg.blockHosts)) return {ok:false};
+      if (!cfg.autoCapture || !/^https?:\/\//i.test(msg.url || "") || hostBlocked(msg.url,cfg.blockHosts)
+          || !typeAllowed(cfg, msg.filename, msg.url)) return {ok:false};
       const ok = await sendToHost(msg.url,msg.filename,{pageUrl:msg.pageUrl,referer:msg.pageUrl});
       // A failed direct handoff must replay in Brave without recapture.
       markSeen(msg.url,null);
@@ -1434,10 +1576,12 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       await sendToHostPing();
       const cfg = await settings();
       const downloadUI = await syncBrowserDownloadUI();
-      return { hideBrowserUI:!!cfg.hideBrowserUI, downloadUI, autoCapture: !!cfg.autoCapture, detection: detectionOn, deepDetect: cfg.deepDetect !== false, minSizeKB: cfg.minSizeKB, blockHosts: cfg.blockHosts, hostOk, hostError: lastHostError || null, fallbackError: lastFallbackError || null };
+      return { hideBrowserUI:!!cfg.hideBrowserUI, downloadUI, autoCapture: !!cfg.autoCapture, detection: detectionOn, deepDetect: cfg.deepDetect !== false, minSizeKB: cfg.minSizeKB, blockHosts: cfg.blockHosts, hostOk, hostError: lastHostError || null, fallbackError: lastFallbackError || null,
+        live: typeof DCBridge !== "undefined" && DCBridge.live(), captureTypes: cfg.captureTypes || "" };
     }
     if (msg.type === "setAuto" && typeof msg.value === "boolean") {
       await api.storage.local.set({ autoCapture: msg.value });
+      await mirrorToApp({ autoCapture: msg.value });
       await syncBrowserDownloadUI();
       return { ok: true };
     }
@@ -1474,9 +1618,74 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       }
       if (!ok) return { ok: false, error: "nothing valid to save" };
       await api.storage.local.set(patch);
+      await mirrorToApp(patch);
       return { ok: true };
     }
     return { ok: false };
   })().then(sendResponse,()=>sendResponse({ok:false}));
   return true; // async response
 });
+
+// ---- live connection: what the app pushes ----------------------------------
+async function mirrorToApp(prefs) {
+  try { await hostSend({ type: "setPrefs", prefs }); } catch (e) { /* app not installed: popup settings stay local */ }
+}
+
+function notifyUser(id, title, message) {
+  try {
+    if (!api.notifications || !api.notifications.create) return;
+    api.notifications.create(String(id), { type: "basic", iconUrl: "icons/icon.png", title, message: String(message || "").slice(0, 300) });
+  } catch (e) { /* notifications not allowed */ }
+}
+
+// A media URL the extension can download by itself (not a web page).
+function browserCanTake(c) {
+  if (!c || !/^https?:\/\//i.test(c.url)) return false;
+  if (c.pairUrl || c.mime) return true;
+  return typeof DCRank !== "undefined" && (DCRank.isPlaylistUrl(c.url) || /\.(mp4|webm|mkv|mov|m4v|mp3|m4a|aac|ogg|opus|flac|wav)(\?|#|$)/i.test(c.url.split("?")[0]) || /googlevideo\.com\//i.test(c.url));
+}
+
+if (typeof DCBridge !== "undefined") {
+  DCBridge.on("state", (m) => {
+    hostOk = hostOk || !!m.live;
+    if (m.live) { lastHostError = ""; setBadge(); }
+  });
+  DCBridge.on("settings", async (m) => {
+    const prefs = (m.settings && typeof m.settings === "object") ? m.settings : {};
+    const rules = (m.rules && typeof m.rules === "object") ? m.rules : null;
+    await api.storage.local.set({ appPrefs: prefs, siteRules: rules });
+    await syncBrowserDownloadUI();
+  });
+  DCBridge.on("event", async (m) => {
+    // Only downloads this browser sent (another browser may share the app).
+    if (!sentCaptures.has(m.url)) return;
+    const cfg = await settings();
+    const name = m.name || m.url || "download";
+    if (m.event === "done") {
+      if (cfg.notify) notifyUser(`dc-${m.id}`, "Download complete", name);
+      return;
+    }
+    if (m.event !== "failed") return;
+    const c = sentCaptures.get(m.url);
+    if (cfg.browserFallback && browserCanTake(c) && !String(m.error || "").includes("cancelled")) {
+      const r = await startBrowserDownload({ url: c.url, pairUrl: c.pairUrl, mime: c.mime, quality: c.quality,
+        filename: c.filename || name, title: c.title, pageUrl: c.pageUrl });
+      if (cfg.notify) notifyUser(`dc-${m.id}`, r && r.ok ? "Downloading in the browser instead" : "Download failed",
+        r && r.ok ? `The app could not download ${name}: the browser is downloading it now.` : `${name}: ${m.error || "failed"}`);
+      return;
+    }
+    if (cfg.notify) notifyUser(`dc-${m.id}`, "Download failed", `${name}: ${m.error || "failed"}`);
+  });
+  DCBridge.start(HOST);
+}
+
+// First run, and whenever the app cannot be reached: one page that says what
+// is wrong and how to fix it (IDM's welcome / error page).
+async function showWelcome(reason) {
+  try {
+    const { welcomeShownAt = 0 } = await api.storage.local.get({ welcomeShownAt: 0 });
+    if (reason !== "install" && Date.now() - welcomeShownAt < 24 * 3600 * 1000) return;
+    await api.storage.local.set({ welcomeShownAt: Date.now() });
+    await api.tabs.create({ url: api.runtime.getURL(`welcome.html?reason=${encodeURIComponent(reason)}`) });
+  } catch (e) { /* no tabs here */ }
+}

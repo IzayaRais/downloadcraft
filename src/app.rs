@@ -1914,6 +1914,8 @@ pub struct CraftApp {
     /// Captured request headers of the browser capture being added (not
     /// editable; consumed by the next commit).
     add_headers: std::collections::BTreeMap<String, String>,
+    /// The browser's side of the capture being confirmed (see BrowserContext).
+    add_browser: Option<crate::model::BrowserContext>,
     /// Details dialog "Start at" text while it is being typed, per row id:
     /// only a complete HH:MM is saved to the row, so reloading the field
     /// from the row every frame threw away each keystroke of "02:30".
@@ -2063,6 +2065,7 @@ impl CraftApp {
             add_referer: String::new(),
             add_cookie: String::new(),
             add_headers: std::collections::BTreeMap::new(),
+            add_browser: None,
             det_start_draft: (u64::MAX, String::new()),
             add_user: String::new(),
             add_pass: String::new(),
@@ -3467,6 +3470,8 @@ impl CraftApp {
             quality_pref: item.quality_pref.clone(),
             global_limit: Some(self.speed_limit_live.clone()),
             per_host_conns: self.per_host_conns,
+            browser: item.browser.clone(),
+            ytdlp_visitor_data: String::new(),
         };
         let shared2 = shared.clone();
         // Adaptive pairs (video-only + audio) merge via ffmpeg on completion.
@@ -4240,6 +4245,7 @@ impl CraftApp {
             .unwrap_or_default();
         let cookie = item.cookie.unwrap_or_default();
         self.add_headers = item.headers.unwrap_or_default();
+        self.add_browser = item.browser;
         if self.captured_media.len() >= 200 { self.captured_media.clear(); }
         self.captured_media.insert(url.clone(), (item.dur.unwrap_or(0), item.audio_expected));
         let size = item.size;
@@ -7712,6 +7718,7 @@ impl CraftApp {
         self.add_referer.clear();
         self.add_cookie.clear();
         self.add_headers.clear();
+        self.add_browser = None;
         self.add_user.clear();
         self.add_pass.clear();
     }
@@ -7786,6 +7793,7 @@ impl CraftApp {
         // Captured headers belong to that one capture: never reuse them for
         // a later manual add.
         item.extra_headers = std::mem::take(&mut self.add_headers);
+        item.browser = self.add_browser.take();
         item.username = self.add_user.clone();
         item.password = self.add_pass.clone();
         item.checksum_sha256 = csum;

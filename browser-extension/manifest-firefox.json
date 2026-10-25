@@ -2,7 +2,7 @@
   "manifest_version": 3,
   "name": "Send to Download Craft",
   "version": "0.9.8",
-  "description": "Automatically sends downloads to your Download Craft download manager.",
+  "description": "Sends downloads and videos to Download Craft — or downloads them right in the browser.",
   "permissions": [
     "nativeMessaging",
     "contextMenus",
@@ -13,7 +13,8 @@
     "tabs",
     "cookies",
     "webRequest",
-    "webRequestBlocking"
+    "webRequestBlocking",
+    "notifications"
   ],
   "host_permissions": [
     "http://*/*",
@@ -25,6 +26,7 @@
       "streams.js",
       "mp4merge.js",
       "browserdl.js",
+      "bridge.js",
       "background.js"
     ]
   },

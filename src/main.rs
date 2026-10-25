@@ -134,6 +134,9 @@ fn main() -> eframe::Result<()> {
         viewport,
         ..Default::default()
     };
+    // Site rules for the browser extension: newer ones from the project, at
+    // most once a day, off the UI thread.
+    std::thread::spawn(crate::native_host::refresh_site_rules);
     eframe::run_native(
         crate::model::APP_NAME,
         options,

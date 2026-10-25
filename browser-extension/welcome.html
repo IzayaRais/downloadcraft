@@ -1,0 +1,77 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Download Craft</title>
+<style>
+  :root { --bg:#f6f7f9; --card:#fff; --text:#1b1f24; --muted:#5d6670; --line:#e3e6ea; --accent:#3b82f6; --ok:#16a34a; --warn:#d97706; --bad:#dc2626; }
+  @media (prefers-color-scheme: dark) {
+    :root { --bg:#16181c; --card:#1f2228; --text:#e8eaed; --muted:#9aa3ad; --line:#2d3139; --accent:#60a5fa; --ok:#22c55e; --warn:#f59e0b; --bad:#f87171; }
+  }
+  * { box-sizing: border-box; }
+  body { margin:0; background:var(--bg); color:var(--text); font:15px/1.5 system-ui, -apple-system, "Segoe UI", sans-serif; }
+  main { max-width:720px; margin:0 auto; padding:40px 16px 60px; }
+  header { display:flex; align-items:center; gap:14px; margin-bottom:22px; }
+  header img { width:48px; height:48px; }
+  h1 { font-size:24px; margin:0; }
+  .sub { color:var(--muted); margin:2px 0 0; }
+  .card { background:var(--card); border:1px solid var(--line); border-radius:12px; padding:18px 20px; margin:14px 0; }
+  .card h2 { font-size:16px; margin:0 0 10px; }
+  .row { display:flex; gap:10px; align-items:flex-start; padding:7px 0; border-top:1px solid var(--line); }
+  .row:first-of-type { border-top:0; }
+  .dot { flex:none; width:10px; height:10px; border-radius:50%; margin-top:7px; background:var(--muted); }
+  .dot.ok { background:var(--ok); } .dot.warn { background:var(--warn); } .dot.bad { background:var(--bad); }
+  .row b { display:block; }
+  .row span { color:var(--muted); font-size:14px; }
+  ol { margin:6px 0 0; padding-left:20px; }
+  li { margin:4px 0; }
+  code { background:color-mix(in srgb, var(--accent) 12%, transparent); padding:1px 5px; border-radius:4px; font-size:13px; }
+  a { color:var(--accent); }
+  button { font:inherit; border:1px solid var(--line); background:var(--card); color:var(--text); border-radius:8px; padding:7px 14px; cursor:pointer; }
+  button.primary { background:var(--accent); border-color:var(--accent); color:#fff; }
+  .actions { display:flex; gap:8px; flex-wrap:wrap; margin-top:12px; }
+  .hidden { display:none; }
+</style>
+</head>
+<body>
+<main>
+  <header>
+    <img src="icons/icon.png" alt="">
+    <div>
+      <h1>Download Craft</h1>
+      <p class="sub" id="sub">Your browser extension is installed.</p>
+    </div>
+  </header>
+
+  <section class="card">
+    <h2>Status</h2>
+    <div class="row"><i class="dot" id="d-app"></i><div><b id="t-app">Checking the app…</b><span id="s-app"></span></div></div>
+    <div class="row"><i class="dot" id="d-live"></i><div><b id="t-live">Live connection</b><span id="s-live"></span></div></div>
+    <div class="row"><i class="dot" id="d-inc"></i><div><b id="t-inc">Private windows</b><span id="s-inc"></span></div></div>
+    <div class="actions"><button class="primary" id="recheck">Check again</button></div>
+  </section>
+
+  <section class="card hidden" id="fix-app">
+    <h2>Connect the app</h2>
+    <ol>
+      <li>Install or open <b>Download Craft</b> (<a href="https://github.com/hungry-detective/downloadcraft/releases/latest" target="_blank" rel="noopener">download it here</a>).</li>
+      <li>In the app open <b>Settings → Browser Integration</b> and press <b>Install</b> next to this browser.</li>
+      <li>Restart the browser, then press <b>Check again</b> above.</li>
+    </ol>
+    <p class="sub">Until then the extension still works on its own: pick <b>Download in browser</b> on any video it finds.</p>
+  </section>
+
+  <section class="card">
+    <h2>How it works</h2>
+    <ol>
+      <li><b>Downloads</b> you start in the browser go to the app (paused in the browser first, so nothing is lost if the app says no).</li>
+      <li>Hold <code>Alt</code> while clicking a link to keep that one download in the browser (changeable in the app's Capture settings).</li>
+      <li><b>Videos</b>: a small <i>Download this video</i> bar appears on players; the toolbar button lists every stream with its quality and size.</li>
+      <li>Right-click a page → <b>Download all links with Download Craft</b> to pick files from it.</li>
+    </ol>
+  </section>
+</main>
+<script src="welcome.js"></script>
+</body>
+</html>

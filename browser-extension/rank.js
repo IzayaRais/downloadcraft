@@ -149,11 +149,18 @@
     if (videoId) return `youtube:${videoId}`;
     return `${String(page || "").split("#")[0]}|${String(src || "")}`;
   }
+  // Extensions the app's site rules add to the click-capture list.
+  const extraDirect = new Set();
+  function addDirectExtensions(list) {
+    for (const e of list || []) if (/^[a-z0-9]{1,8}$/i.test(String(e))) extraDirect.add(String(e).toLowerCase());
+  }
   function directDownloadLink(href, downloadAttribute) {
     try {
       const u = new URL(String(href || ""));
       if (!/^https?:$/.test(u.protocol)) return false;
-      return !!downloadAttribute || /\.(?:zip|7z|rar|tar|tgz|gz|bz2|xz|exe|msi|dmg|pkg|deb|rpm|appimage|iso)(?:$)/i.test(u.pathname);
+      if (downloadAttribute || /\.(?:zip|7z|rar|tar|tgz|gz|bz2|xz|exe|msi|dmg|pkg|deb|rpm|appimage|iso)(?:$)/i.test(u.pathname)) return true;
+      const m = /\.([a-z0-9]{1,8})$/i.exec(u.pathname);
+      return !!m && extraDirect.has(m[1].toLowerCase());
     } catch (e) { return false; }
   }
 
@@ -609,7 +616,7 @@
     try { return new URL(String(u)).pathname; } catch (e) { return ""; }
   }
 
-  const DCRank = { fbVideos, fbPathOf, attachmentDownload, videoDismissKey, directDownloadLink, hideDownloadUI, playerEvidence, playlistReferences, samePlayer, completePlaylist, isVimeoAdaptive, isVimeoFragment, vimeoVideoPage, isPlaylistUrl, isSegmentUrl, canonicalUrl, kindOf, scoreMedia, classifyResponse, sniffBytes, forwardHeaders, extOf, dispositionFilename, collapseDupes, fmtDur, panelTokens, dcThemeMode, dcSetTheme, paintDcPanel };
+  const DCRank = { fbVideos, fbPathOf, attachmentDownload, videoDismissKey, directDownloadLink, addDirectExtensions, hideDownloadUI, playerEvidence, playlistReferences, samePlayer, completePlaylist, isVimeoAdaptive, isVimeoFragment, vimeoVideoPage, isPlaylistUrl, isSegmentUrl, canonicalUrl, kindOf, scoreMedia, classifyResponse, sniffBytes, forwardHeaders, extOf, dispositionFilename, collapseDupes, fmtDur, panelTokens, dcThemeMode, dcSetTheme, paintDcPanel };
   g.DCRank = DCRank;
   if (typeof module !== "undefined" && module.exports) module.exports = DCRank;
 })(typeof globalThis !== "undefined" ? globalThis : this);

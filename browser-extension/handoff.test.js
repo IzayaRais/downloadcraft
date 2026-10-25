@@ -4,20 +4,25 @@ const fs = require('node:fs');
 const vm = require('node:vm');
 const rank = require('./rank.js');
 const source = fs.readFileSync(__dirname + '/background.js', 'utf8');
-function harness(accept=true, cancelFails=false, cfg={autoCapture:true,minSizeKB:0}) {
+// pauseFails: the browser cannot pause it (finished, or never started).
+function harness(accept=true, cancelFails=false, cfg={autoCapture:true,minSizeKB:0}, pauseFails=cancelFails, ctx={}) {
   const calls=[], handlers={};
+  const skips=new Set();
   const context={ console, Map, Object, Promise,
     settings:async()=>cfg, hostBlocked:()=>false, freshSeen:()=>false,
+    skipped:(u)=>skips.has(u), typeAllowed:(c,n,u)=>!c.captureTypes || c.captureTypes.split(' ').some(t=>String(n||u).endsWith('.'+t)),
+    DCBridge:{browserContext:()=>ctx},
     sendToHost:async(...args)=>{calls.push(['host',...args]);return accept;},
     syncBrowserDownloadUI:async()=>{},setBadge:()=>{},markSeen:(...a)=>calls.push(['seen',...a]),
     hostOk:false,lastFallbackError:'',
-    api:{downloads:{cancel:async(id)=>{calls.push(['cancel',id]);if(cancelFails)throw Error('complete');},erase:async(x)=>calls.push(['erase',x])}},
+    api:{downloads:{cancel:async(id)=>{calls.push(['cancel',id]);if(cancelFails)throw Error('complete');},erase:async(x)=>calls.push(['erase',x]),
+      pause:async(id)=>{calls.push(['pause',id]);if(pauseFails)throw Error('cannot pause');},resume:async(id)=>calls.push(['resume',id])}},
     chrome:{downloads:{download:(x,cb)=>{calls.push(['fallback',x]);cb();},
       onCreated:{addListener:f=>handlers.created=f},onDeterminingFilename:{addListener:f=>handlers.filename=f}},runtime:{}}
   };
   vm.createContext(context);
   vm.runInContext(source.slice(source.indexOf('async function performBrowserCapture('),source.indexOf('// ---- popup / content-script messages ----')),context);
-  return {calls,handlers,context};
+  return {calls,handlers,context,skips};
 }
 const item={id:5,url:'https://example.com/file.zip',filename:'file.zip',referrer:'https://example.com/page'};
 test('Brave creation and filename events share one cancellation and native handoff',async()=>{
@@ -31,12 +36,38 @@ test('Brave creation and filename events share one cancellation and native hando
   assert.equal(h.calls.filter(x=>x[0]==='erase').length,1);
   assert.equal(released,1);
 });
-test('missing host releases filename callback and returns transfer to browser',async()=>{
+test('missing host releases filename callback and resumes the paused browser download',async()=>{
   const h=harness(false);let released=0;
   h.handlers.filename(item,()=>released++);
   await vm.runInContext('captureBrowserDownload({id:5})',h.context);
-  assert.equal(released,1);assert.equal(h.calls.filter(x=>x[0]==='fallback').length,1);
+  assert.equal(released,1);
+  // Paused, not cancelled: the browser simply carries on - no second request.
+  assert.equal(h.calls.filter(x=>x[0]==='pause').length,1);
+  assert.equal(h.calls.filter(x=>x[0]==='resume').length,1);
+  assert.equal(h.calls.filter(x=>x[0]==='cancel').length,0);
+  assert.equal(h.calls.filter(x=>x[0]==='fallback').length,0);
   assert.equal(h.calls.filter(x=>x[0]==='erase').length,0);
+});
+test('a download that cannot pause is cancelled, and re-downloaded when the app is missing',async()=>{
+  const h=harness(false,false,{autoCapture:true,minSizeKB:0},true);
+  await vm.runInContext('captureBrowserDownload('+JSON.stringify(item)+')',h.context);
+  assert.equal(h.calls.filter(x=>x[0]==='cancel').length,1);
+  assert.equal(h.calls.filter(x=>x[0]==='fallback').length,1);
+});
+test('the app accepting a paused download cancels and erases the browser copy',async()=>{
+  const h=harness(true);
+  await vm.runInContext('captureBrowserDownload('+JSON.stringify(item)+')',h.context);
+  const order=h.calls.map(x=>x[0]).filter(x=>['pause','host','cancel','erase'].includes(x));
+  assert.deepEqual(order,['pause','host','cancel','erase']);
+});
+test('the keep-in-browser key and the file-type list leave downloads alone',async()=>{
+  const h=harness();
+  h.skips.add(item.url);
+  await vm.runInContext('captureBrowserDownload('+JSON.stringify(item)+')',h.context);
+  assert.equal(h.calls.length,0);
+  const t=harness(true,false,{autoCapture:true,minSizeKB:0,captureTypes:'iso exe'});
+  await vm.runInContext('captureBrowserDownload('+JSON.stringify(item)+')',t.context);
+  assert.equal(t.calls.length,0);
 });
 test('completed browser download is not duplicated',async()=>{
   const h=harness(true,true);
@@ -100,11 +131,17 @@ test('redirect resolved during settings read is used for the handoff',async()=>{
 });
 
 
-test('POST-generated downloads retain their original browser request and body',async()=>{
+test('POST downloads without a known body stay in the browser',async()=>{
   const h=harness();
   vm.runInContext('rememberDownloadRequest({url:"https://example.com/file.zip",method:"POST"})',h.context);
   await vm.runInContext('captureBrowserDownload('+JSON.stringify(item)+')',h.context);
   assert.equal(h.calls.length,0);
+});
+test('POST downloads with their body go to the app',async()=>{
+  const h=harness(true,false,{autoCapture:true,minSizeKB:0},false,{_post:true,method:'POST',body:'YT0x'});
+  vm.runInContext('rememberDownloadRequest({url:"https://example.com/file.zip",method:"POST"})',h.context);
+  await vm.runInContext('captureBrowserDownload('+JSON.stringify(item)+')',h.context);
+  assert.equal(h.calls.filter(x=>x[0]==='host').length,1);
 });
 test('GET requests remain eligible for automatic takeover',async()=>{
   const h=harness();

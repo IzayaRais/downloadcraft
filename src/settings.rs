@@ -68,6 +68,25 @@ struct Settings {
     ffmpeg_custom_path: String,
     /// Max simultaneous connections per host across all downloads (0 = off).
     per_host_conns: usize,
+    // Browser capture (pushed to the extension over its live connection)
+    capture_auto: bool,
+    /// File extensions to take over from the browser ("zip exe mp4 ..");
+    /// empty = every download.
+    capture_types: String,
+    /// Sites whose downloads stay in the browser (comma separated).
+    capture_skip_sites: String,
+    /// Smaller files stay in the browser (KB, as text while editing).
+    capture_min_kb: String,
+    /// Key held while clicking a link to leave it to the browser:
+    /// "alt", "shift" or "off".
+    capture_skip_key: String,
+    /// Browser notification when a download sent from it finishes.
+    notify_done: bool,
+    /// When the app cannot download a video, the extension downloads it in
+    /// the browser instead.
+    browser_fallback: bool,
+    /// YouTube engine order: "auto", "native" or "ytdlp".
+    youtube_engine: String,
     // Updates
     update_check_on: bool,
 }
@@ -104,6 +123,14 @@ impl Default for Settings {
             ffmpeg_source: "managed".to_string(),
             ffmpeg_custom_path: String::new(),
             per_host_conns: 0,
+            capture_auto: true,
+            capture_types: String::new(),
+            capture_skip_sites: String::new(),
+            capture_min_kb: "100".to_string(),
+            capture_skip_key: "alt".to_string(),
+            notify_done: true,
+            browser_fallback: true,
+            youtube_engine: "auto".to_string(),
             update_check_on: true,
         }
     }
@@ -178,6 +205,32 @@ fn load() -> Settings {
     if let Some(x) = g("ffmpeg_custom_path").and_then(|x| x.as_str()) {
         s.ffmpeg_custom_path = x.to_string();
     }
+    if let Some(b) = g("capture_auto").and_then(|x| x.as_bool()) {
+        s.capture_auto = b;
+    }
+    if let Some(x) = g("capture_types").and_then(|x| x.as_str()) {
+        s.capture_types = x.to_string();
+    }
+    if let Some(x) = g("capture_skip_sites").and_then(|x| x.as_str()) {
+        s.capture_skip_sites = x.to_string();
+    }
+    if let Some(n) = g("capture_min_kb").and_then(|x| x.as_u64()) {
+        s.capture_min_kb = n.to_string();
+    }
+    match g("capture_skip_key").and_then(|x| x.as_str()) {
+        Some(v @ ("alt" | "shift" | "off")) => s.capture_skip_key = v.to_string(),
+        _ => {}
+    }
+    if let Some(b) = g("notify_done").and_then(|x| x.as_bool()) {
+        s.notify_done = b;
+    }
+    if let Some(b) = g("browser_fallback").and_then(|x| x.as_bool()) {
+        s.browser_fallback = b;
+    }
+    match g("youtube_engine").and_then(|x| x.as_str()) {
+        Some(v @ ("auto" | "native" | "ytdlp")) => s.youtube_engine = v.to_string(),
+        _ => {}
+    }
     if let Some(n) = g("per_host_conns").and_then(|x| x.as_u64()) {
         s.per_host_conns = (n as usize).clamp(0, 64);
     }
@@ -227,6 +280,18 @@ fn load() -> Settings {
     s
 }
 
+/// "zip, .EXE  mp4" -> "zip exe mp4": lowercase extensions, one space apart.
+fn normalize_types(raw: &str) -> String {
+    let mut seen = Vec::new();
+    for t in raw.split(|c: char| c == ',' || c == ';' || c.is_whitespace()) {
+        let t = t.trim().trim_start_matches('.').to_ascii_lowercase();
+        if !t.is_empty() && t.len() <= 12 && t.chars().all(|c| c.is_ascii_alphanumeric()) && !seen.contains(&t) {
+            seen.push(t);
+        }
+    }
+    seen.join(" ")
+}
+
 /// Read-modify-write: overlay our keys onto whatever is on disk now.
 fn save(s: &Settings) -> bool {
     let _guard=crate::model::fs_lock("ui-settings");
@@ -265,6 +330,14 @@ fn save(s: &Settings) -> bool {
     set(obj, "ffmpeg_source", s.ffmpeg_source.clone().into());
     set(obj, "ffmpeg_custom_path", s.ffmpeg_custom_path.clone().into());
     set(obj, "per_host_conns", (s.per_host_conns as u64).into());
+    set(obj, "capture_auto", s.capture_auto.into());
+    set(obj, "capture_types", normalize_types(&s.capture_types).into());
+    set(obj, "capture_skip_sites", s.capture_skip_sites.trim().to_string().into());
+    set(obj, "capture_min_kb", s.capture_min_kb.trim().parse::<u64>().unwrap_or(0).min(10_000_000).into());
+    set(obj, "capture_skip_key", s.capture_skip_key.clone().into());
+    set(obj, "notify_done", s.notify_done.into());
+    set(obj, "browser_fallback", s.browser_fallback.into());
+    set(obj, "youtube_engine", s.youtube_engine.clone().into());
     set(obj, "update_check_on", s.update_check_on.into());
     set(obj, "folder_rules", serde_json::to_value(&s.folder_rules).unwrap_or_default());
     set(
@@ -317,6 +390,10 @@ struct SettingsApp {
     // card starts collapsed: the five heads stay readable at a glance and each
     // section opens on demand.
     open_storage: bool,
+    /// Browser Integration -> Capture card expanded.
+    open_capture: bool,
+    /// Plugins -> YouTube card expanded.
+    open_youtube: bool,
     open_perf: bool,
     open_network: bool,
     open_complete: bool,
@@ -459,6 +536,8 @@ pub fn run() -> eframe::Result<()> {
         ffmpeg_rx: None,
         plugins_open: [true, false],
         open_storage: false,
+        open_capture: true,
+        open_youtube: true,
         open_perf: false,
         open_network: false,
         open_complete: false,
@@ -2485,6 +2564,32 @@ impl SettingsApp {
         self.plugin_card_ytdlp(ui);
         ui.add_space(10.0);
         self.plugin_card_ffmpeg(ui);
+        ui.add_space(10.0);
+        let s = &mut self.s;
+        card(ui, "YouTube", None, &mut self.open_youtube, |ui| {
+            sec_head(ui, "Which engine goes first");
+            let mut pick = match s.youtube_engine.as_str() {
+                "native" => "App first",
+                "ytdlp" => "yt-dlp first",
+                _ => "Auto",
+            }
+            .to_string();
+            if segmented(ui, "yt_engine", &["Auto", "App first", "yt-dlp first"], &mut pick) {
+                s.youtube_engine = match pick.as_str() {
+                    "App first" => "native",
+                    "yt-dlp first" => "ytdlp",
+                    _ => "auto",
+                }
+                .to_string();
+            }
+            ui.add_space(4.0);
+            wrapped(
+                ui,
+                "Whichever goes first, the other takes over when it fails, and a download sent from the browser falls back to the extension's own browser download last. Auto uses the app's engine where YouTube serves it the whole file (the progressive streams) and yt-dlp for the higher qualities, which YouTube only serves in full to yt-dlp.",
+                reg(9.5),
+                tok().muted,
+            );
+        });
         ui.add_space(14.0);
 
         // `.empty-note`: what the catalogue grows into.
@@ -3128,6 +3233,52 @@ impl SettingsApp {
         self.browser_card(ui, 0);
         ui.add_space(10.0);
         self.browser_card(ui, 1);
+        ui.add_space(10.0);
+        let s = &mut self.s;
+        card(ui, "Capture", None, &mut self.open_capture, |ui| {
+            switch_row(
+                ui,
+                "cap_auto",
+                &mut s.capture_auto,
+                "Take over browser downloads",
+                "The browser's download is paused, handed to the app, and resumed in the browser if the app cannot take it.",
+            );
+            ui.add_space(6.0);
+            let mut c = field_row(ui, "cap_types", "File types", None, Some("Empty = every download. Example: zip rar 7z exe msi iso mp4 mkv mp3 pdf"));
+            let w = c.available_width();
+            input_box(&mut c, "cap_types_in", &mut s.capture_types, w, true, false, "every type");
+            let mut c = field_row(ui, "cap_skip", "Never from", None, Some("Sites whose downloads stay in the browser, comma separated."));
+            let w = c.available_width();
+            input_box(&mut c, "cap_skip_in", &mut s.capture_skip_sites, w, true, false, "example.com, intranet.local");
+            let mut c = field_row(ui, "cap_min", "Smaller than (KB)", None, Some("Files below this stay in the browser."));
+            input_box(&mut c, "cap_min_in", &mut s.capture_min_kb, 90.0, true, false, "100");
+            ui.add_space(6.0);
+            sec_head(ui, "Hold while clicking a link to keep it in the browser");
+            let mut key = match s.capture_skip_key.as_str() {
+                "shift" => "Shift",
+                "off" => "Off",
+                _ => "Alt",
+            }
+            .to_string();
+            if segmented(ui, "cap_key", &["Alt", "Shift", "Off"], &mut key) {
+                s.capture_skip_key = key.to_ascii_lowercase();
+            }
+            ui.add_space(8.0);
+            switch_row(
+                ui,
+                "cap_notify",
+                &mut s.notify_done,
+                "Browser notification when done",
+                "For downloads sent from the browser.",
+            );
+            switch_row(
+                ui,
+                "cap_fallback",
+                &mut s.browser_fallback,
+                "Fall back to downloading in the browser",
+                "When the app cannot download a video the extension sent, the extension downloads it itself.",
+            );
+        });
         if !self.browser_msg.is_empty() {
             ui.add_space(10.0);
             wrapped(ui, self.browser_msg.as_str(), reg(10.0), t.muted);

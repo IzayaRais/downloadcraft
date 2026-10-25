@@ -129,6 +129,16 @@ Full notes: [Release 0.9.8](https://github.com/hungry-detective/downloadcraft/re
 - Catches videos from network traffic, manifests and page data — HLS, DASH, MP4/WebM, subtitles.
 - *Download this video* bar on players, quality menus with sizes, right-click *Download all links*.
 - Works **without the app**: downloads, joins and saves videos in the browser.
+- **IDM-style hand-off.** A browser download is *paused*, handed to the app, and resumed in the browser
+  if the app can't take it, so nothing is lost. Form (POST) downloads, the browser's own request headers,
+  its proxy and the server it used all go along. Hold **Alt** while clicking to keep a download in the
+  browser.
+- **A live connection to the app.** Capture settings (file types, excluded sites, minimum size) are
+  edited in the app and pushed to the browser, with notifications when downloads finish. Site rules
+  update from the project without a new extension release.
+- **Safety net.** YouTube runs the app's own engine or yt-dlp first (your choice in Settings), and the
+  other one takes over if it fails. A file the server refuses to the app is fetched inside the open
+  page instead. A video the app can't get is downloaded in the browser.
 
 **App**
 - System / Dark / Light themes, status sidebar, search, sortable and resizable columns, bulk actions.
