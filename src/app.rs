@@ -5132,6 +5132,9 @@ fn select_in_file_manager(path: &std::path::Path) {
 /// Zero-config: the unpacked extension carries a pinned key, so its ID is
 /// always this value — nothing to paste.
 pub(crate) const EXTENSION_ID: &str = "pgdhmfgefjnfijmlheboncdmfhcnoikk";
+/// IDs the Edge / Opera stores give the same extension once it is listed
+/// there (each store assigns its own); the host accepts them too.
+pub(crate) const STORE_EXTENSION_IDS: &[&str] = &[];
 
 #[cfg(windows)]
 pub(crate) fn install_native_host(browser: &str) -> Result<String, String> {
@@ -5167,7 +5170,10 @@ pub(crate) fn install_native_host(browser: &str) -> Result<String, String> {
             "description": "Download Craft native host",
             "path": bat.to_string_lossy(),
             "type": "stdio",
-            "allowed_origins": [format!("chrome-extension://{EXTENSION_ID}/")]
+            "allowed_origins": std::iter::once(EXTENSION_ID)
+                .chain(STORE_EXTENSION_IDS.iter().copied())
+                .map(|id| format!("chrome-extension://{id}/"))
+                .collect::<Vec<_>>()
         }),
     };
     std::fs::write(

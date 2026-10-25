@@ -43,7 +43,7 @@ flate2 = "1"
 
 [target.'cfg(windows)'.dependencies]
 tray-icon = "0.20"
-windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_System_JobObjects", "Win32_System_Threading", "Win32_Security", "Win32_Storage_FileSystem", "Win32_UI_WindowsAndMessaging", "Win32_System_Diagnostics_Debug", "Win32_Security_Cryptography"] }
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_System_JobObjects", "Win32_System_Threading", "Win32_Security", "Win32_Storage_FileSystem", "Win32_UI_WindowsAndMessaging", "Win32_System_Diagnostics_Debug", "Win32_Security_Cryptography", "Win32_Networking_WinHttp"] }
 
 [target.'cfg(unix)'.dependencies]
 shlex = "2"

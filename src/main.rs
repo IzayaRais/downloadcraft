@@ -21,6 +21,7 @@ mod native_host;
 mod progress;
 mod settings;
 mod shaped;
+mod sysproxy;
 #[cfg(windows)]
 mod tray;
 #[cfg(not(windows))]

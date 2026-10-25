@@ -550,8 +550,24 @@ impl EngineOpts {
         }
         if !self.proxy_url.trim().is_empty() {
             b = b.proxy(reqwest::Proxy::all(self.proxy_url.trim())?);
+        } else if crate::sysproxy::auto_configured() {
+            // Windows uses a PAC script / auto-detect: ask it per host.
+            b = b.proxy(reqwest::Proxy::custom(|u| {
+                crate::sysproxy::proxy_for(u.as_str()).and_then(|p| reqwest::Url::parse(&p).ok())
+            }));
         }
         Ok(b)
+    }
+
+    /// The proxy a download of `url` goes through: the one set in Settings,
+    /// else what the system's PAC script picks (for tools like yt-dlp that
+    /// do not read it themselves).
+    pub fn effective_proxy(&self, url: &str) -> Option<String> {
+        let set = self.proxy_url.trim();
+        if !set.is_empty() {
+            return Some(set.to_string());
+        }
+        crate::sysproxy::proxy_for(url)
     }
 
     pub(crate) fn get(&self, client: &reqwest::Client, url: &str) -> reqwest::RequestBuilder {
@@ -5332,8 +5348,8 @@ pub async fn playlist_entries(url: &str, opts: &EngineOpts) -> Result<(String, V
     if let Some((name, path)) = js_runtime_path() {
         cmd.arg("--js-runtimes").arg(format!("{name}:{}", path.display()));
     }
-    if !opts.proxy_url.trim().is_empty() {
-        cmd.arg("--proxy").arg(opts.proxy_url.trim());
+    if let Some(p) = opts.effective_proxy(url) {
+        cmd.arg("--proxy").arg(p);
     }
     cmd.arg(url).stdin(std::process::Stdio::null());
     let out = tokio::time::timeout(std::time::Duration::from_secs(120), cmd.output())
@@ -6529,8 +6545,8 @@ async fn download_with_ytdlp(
             cmd.arg("--add-header").arg(format!("{name}:{value}"));
         }
     }
-    if !opts.proxy_url.trim().is_empty() {
-        cmd.arg("--proxy").arg(opts.proxy_url.trim());
+    if let Some(p) = opts.effective_proxy(url) {
+        cmd.arg("--proxy").arg(p);
     }
     if opts.overwrite_existing {
         cmd.arg("--force-overwrites");
