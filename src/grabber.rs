@@ -230,47 +230,67 @@ async fn fetch_html(
     Some(String::from_utf8_lossy(&body).into_owned())
 }
 
-/// Crawl one page (depth 0) or the page + same-host linked pages (depth 1,
-/// capped). Returns deduped file links across all fetched pages.
+/// The folder part of a URL ("https://h/a/b/page.html" -> "https://h/a/b/").
+fn folder_of(url: &str) -> String {
+    let base = url.split(['?', '#']).next().unwrap_or(url);
+    match base.rfind('/') {
+        Some(i) if i > base.find("://").map_or(0, |p| p + 2) => base[..=i].to_string(),
+        _ => format!("{base}/"),
+    }
+}
+
+/// Crawl the start page and same-site pages up to `depth` links away (IDM's
+/// Site Grabber), breadth first, at most `max_pages` pages. `stay_under` keeps
+/// the crawl inside the start page's folder. Returns deduped file links.
 pub async fn grab_site(
     client: &reqwest::Client,
     opts: &EngineOpts,
     start_url: &str,
     exts: &[String],
-    depth_1: bool,
+    depth: usize,
+    stay_under: bool,
     max_pages: usize,
 ) -> Result<Vec<GrabLink>, String> {
     let first = fetch_html(client, opts, start_url)
         .await
         .ok_or_else(|| "could not fetch that page (network or not HTML)".to_string())?;
     let mut all = extract_file_links(&first, start_url, exts);
-    if !depth_1 {
-        return Ok(all);
-    }
-    let mut pages = extract_page_links(&first, start_url);
-    pages.truncate(max_pages.max(1).saturating_sub(1));
+    let folder = folder_of(start_url);
+    let allowed = |p: &str| !stay_under || p.starts_with(&folder);
+    let mut visited: std::collections::HashSet<String> = std::collections::HashSet::from([start_url.to_string()]);
+    let mut frontier: Vec<String> = extract_page_links(&first, start_url).into_iter().filter(|p| allowed(p)).collect();
+    let max_pages = max_pages.max(1);
     let sem = std::sync::Arc::new(tokio::sync::Semaphore::new(4));
-    let mut handles = Vec::new();
-    for p in pages {
-        let client = client.clone();
-        let opts = opts.clone();
-        let exts = exts.to_vec();
-        let sem = sem.clone();
-        handles.push(tokio::spawn(async move {
-            let _g = sem.acquire_owned().await;
-            let html = fetch_html(&client, &opts, &p).await?;
-            Some(extract_file_links(&html, &p, &exts))
-        }));
-    }
-    for h in handles {
-        if let Ok(Some(mut links)) = h.await {
-            all.append(&mut links);
+    for _level in 0..depth.min(5) {
+        frontier.retain(|p| visited.insert(p.clone()));
+        let room = max_pages.saturating_sub(visited.len() - frontier.len());
+        frontier.truncate(room);
+        if frontier.is_empty() || all.len() >= MAX_LINKS_DEFAULT * 5 {
+            break;
+        }
+        let mut handles = Vec::new();
+        for p in std::mem::take(&mut frontier) {
+            let client = client.clone();
+            let opts = opts.clone();
+            let exts = exts.to_vec();
+            let sem = sem.clone();
+            handles.push(tokio::spawn(async move {
+                let _g = sem.acquire_owned().await;
+                let html = fetch_html(&client, &opts, &p).await?;
+                Some((extract_file_links(&html, &p, &exts), extract_page_links(&html, &p)))
+            }));
+        }
+        for h in handles {
+            if let Ok(Some((mut links, pages))) = h.await {
+                all.append(&mut links);
+                frontier.extend(pages.into_iter().filter(|p| allowed(p) && !visited.contains(p)));
+            }
         }
     }
     // Dedupe across pages, keep first-seen order.
     let mut seen = std::collections::HashSet::new();
     all.retain(|l| seen.insert(l.url.clone()));
-    all.truncate(MAX_LINKS_DEFAULT);
+    all.truncate(MAX_LINKS_DEFAULT * 5);
     Ok(all)
 }
 

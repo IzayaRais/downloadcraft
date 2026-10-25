@@ -5300,6 +5300,77 @@ fn ytdlp_preferred(opts: &EngineOpts) -> bool {
     quality_cap(&opts.quality_pref).map(|h| h > 360).unwrap_or(true)
 }
 
+/// A YouTube playlist or channel page (not one video): its videos are listed
+/// for picking instead of being downloaded as one file.
+pub fn is_youtube_list(url: &str) -> bool {
+    let Ok(u) = reqwest::Url::parse(url) else { return false };
+    let host = u.host_str().unwrap_or("").trim_start_matches("www.").trim_start_matches("m.");
+    if host != "youtube.com" {
+        return false;
+    }
+    let path = u.path().trim_end_matches('/');
+    (path == "/playlist" && u.query_pairs().any(|(k, _)| k == "list"))
+        || path.starts_with("/@")
+        || path.starts_with("/channel/")
+        || path.starts_with("/c/")
+        || path.starts_with("/user/")
+}
+
+/// The videos of a playlist / channel: (watch URL, title), via yt-dlp's
+/// flat listing (no video is downloaded). The list's own title comes first.
+pub async fn playlist_entries(url: &str, opts: &EngineOpts) -> Result<(String, Vec<(String, String)>)> {
+    let client = opts.build_client()?;
+    let exe = ensure_ytdlp(&client).await?;
+    let mut cmd = tokio::process::Command::new(exe);
+    cmd.kill_on_drop(true);
+    #[cfg(windows)]
+    {
+        const CREATE_NO_WINDOW: u32 = 0x08000000;
+        cmd.creation_flags(CREATE_NO_WINDOW);
+    }
+    cmd.arg("--flat-playlist").arg("-J").arg("--no-warnings");
+    if let Some((name, path)) = js_runtime_path() {
+        cmd.arg("--js-runtimes").arg(format!("{name}:{}", path.display()));
+    }
+    if !opts.proxy_url.trim().is_empty() {
+        cmd.arg("--proxy").arg(opts.proxy_url.trim());
+    }
+    cmd.arg(url).stdin(std::process::Stdio::null());
+    let out = tokio::time::timeout(std::time::Duration::from_secs(120), cmd.output())
+        .await
+        .map_err(|_| anyhow!("listing the playlist took too long"))??;
+    if !out.status.success() {
+        let err = String::from_utf8_lossy(&out.stderr);
+        return Err(anyhow!("yt-dlp could not list it: {}", err.lines().last().unwrap_or("unknown error")));
+    }
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout)?;
+    let title = v.get("title").and_then(|t| t.as_str()).unwrap_or("Playlist").to_string();
+    let mut list = Vec::new();
+    // Channels nest their tabs (Videos, Shorts) one level down.
+    let mut stack: Vec<&serde_json::Value> = vec![&v];
+    while let Some(node) = stack.pop() {
+        for e in node.get("entries").and_then(|e| e.as_array()).into_iter().flatten().rev() {
+            if e.get("entries").is_some() {
+                stack.push(e);
+                continue;
+            }
+            let id = e.get("id").and_then(|x| x.as_str()).unwrap_or("");
+            let link = e
+                .get("url")
+                .and_then(|x| x.as_str())
+                .filter(|u| u.starts_with("http"))
+                .map(str::to_string)
+                .or_else(|| (!id.is_empty()).then(|| format!("https://www.youtube.com/watch?v={id}")));
+            if let Some(link) = link {
+                let t = e.get("title").and_then(|x| x.as_str()).unwrap_or(id).to_string();
+                list.push((link, t));
+            }
+        }
+    }
+    list.truncate(5000);
+    Ok((title, list))
+}
+
 /// Which YouTube engine runs first (Settings -> Plugins -> YouTube):
 /// "native" = the app's own engine, then yt-dlp; "ytdlp" = yt-dlp, then the
 /// app's engine; "auto" (default) = whichever can deliver the requested
@@ -11077,6 +11148,16 @@ mod browser_capture_tests {
         assert!(h.contains(r#"opaque="5ccc069c403ebaf9f0171e9517f40e41""#));
         assert!(DigestAuth::parse("Basic realm=x").is_none());
         assert!(DigestAuth::parse(r#"Digest realm="r", nonce="n", algorithm=SHA-256"#).is_none());
+    }
+
+    #[test]
+    fn youtube_lists_are_told_apart_from_videos() {
+        assert!(is_youtube_list("https://www.youtube.com/playlist?list=PL123"));
+        assert!(is_youtube_list("https://www.youtube.com/@SomeChannel/videos"));
+        assert!(is_youtube_list("https://youtube.com/channel/UC123"));
+        assert!(!is_youtube_list("https://www.youtube.com/watch?v=abc&list=PL123"));
+        assert!(!is_youtube_list("https://www.youtube.com/watch?v=abc"));
+        assert!(!is_youtube_list("https://example.com/@user"));
     }
 
     #[test]

@@ -1782,8 +1782,30 @@ enum RowAct {
     OpenFile,
     CopyUrl,
     RefreshAddress,
+    /// Move to a queue: 0 = Main, n = the n-th named queue.
+    MoveToQueue(u8),
+    /// List a ZIP's files and fetch only the picked ones.
+    ZipPick,
+    /// Convert a finished file with ffmpeg: 0 = MP3, 1 = MP4, 2 = smaller MP4.
+    Convert(u8),
     Details,
     VerifyChecksum,
+}
+
+struct ZipPick {
+    name: String,
+    url: String,
+    out_dir: std::path::PathBuf,
+    opts: EngineOpts,
+    entries: Vec<(downloadcraft_engine::zip::ZipEntry, bool)>,
+    status: String,
+    busy: bool,
+}
+
+enum ZipMsg {
+    Listed(Result<Vec<downloadcraft_engine::zip::ZipEntry>, String>),
+    Status(String),
+    Done(String),
 }
 
 pub struct CraftApp {
@@ -1828,6 +1850,21 @@ pub struct CraftApp {
     col_w: std::collections::HashMap<SortCol, f32>,
     // ---- power features ----
     max_concurrent: usize,
+    /// Named queues besides Main, and the one shown in the Queues window.
+    queues: Vec<crate::model::QueueDef>,
+    queue_sel: usize,
+    queue_new_name: String,
+    /// Answers of queue-sync size checks: (row id, size on the server).
+    sync_rx: Option<std::sync::mpsc::Receiver<(u64, Option<u64>)>>,
+    sync_tx: Option<std::sync::mpsc::Sender<(u64, Option<u64>)>>,
+    /// A playlist being listed by yt-dlp: (playlist URL, answer).
+    playlist_rx: Option<(String, std::sync::mpsc::Receiver<Result<(String, Vec<(String, String)>), String>>)>,
+    /// The "ZIP: pick files" window and its worker's messages.
+    zip_pick: Option<ZipPick>,
+    zip_rx: Option<std::sync::mpsc::Receiver<ZipMsg>>,
+    /// ffmpeg conversions report here (one line each when they end).
+    conv_tx: std::sync::mpsc::Sender<String>,
+    conv_rx: std::sync::mpsc::Receiver<String>,
     /// "Today / this month" line for the sidebar footer, refreshed now and then.
     stats_line: String,
     stats_at: Instant,
@@ -1881,6 +1918,10 @@ pub struct CraftApp {
     grab_preset: usize,
     grab_exts: String,
     grab_depth: bool,
+    /// How many links deep the grabber follows (1-5) and whether it stays
+    /// in the start page's folder.
+    grab_levels: usize,
+    grab_stay: bool,
     grab_busy: bool,
     grab_results: Vec<crate::grabber::GrabLink>,
     grab_notice: String,
@@ -1972,6 +2013,7 @@ impl CraftApp {
             .unwrap_or_else(|| crate::model::default_download_dir().to_string_lossy().into_owned());
         let (tx, rx) = std::sync::mpsc::channel();
         std::thread::spawn(move || clipboard_watch(tx));
+        let (conv_tx_init, conv_rx_init) = std::sync::mpsc::channel();
         let mut app = Self {
             rt,
             downloads: Vec::new(),
@@ -2019,6 +2061,16 @@ impl CraftApp {
             show_complete: true,
             sounds: false,
             stats_line: String::new(),
+            queues: Vec::new(),
+            queue_sel: 0,
+            queue_new_name: String::new(),
+            sync_rx: None,
+            sync_tx: None,
+            playlist_rx: None,
+            zip_pick: None,
+            zip_rx: None,
+            conv_tx: conv_tx_init,
+            conv_rx: conv_rx_init,
             stats_at: Instant::now().checked_sub(std::time::Duration::from_secs(60)).unwrap_or_else(Instant::now),
             quota_mb: 0,
             quota_hours: 1,
@@ -2057,6 +2109,8 @@ impl CraftApp {
             grab_preset: 0,
             grab_exts: crate::grabber::preset_exts("Mixed"),
             grab_depth: false,
+            grab_levels: 1,
+            grab_stay: true,
             grab_busy: false,
             grab_results: Vec::new(),
             grab_notice: String::new(),
@@ -2365,6 +2419,7 @@ impl CraftApp {
                 "proxy_url": self.proxy_url,
                 "antivirus_cmd": self.antivirus_cmd,
                 "finish_action": self.finish_action,
+                "queues": self.queues,
                 "category_folders": self.category_folders,
                 "close_to_tray": self.close_to_tray,
                 "theme": self.theme,
@@ -2478,6 +2533,22 @@ impl CraftApp {
                     }
                     if let Some(s) = g("finish_action").and_then(|x| x.as_str()) {
                         self.finish_action = s.to_string();
+                    }
+                    if let Some(q) = g("queues").and_then(|x| serde_json::from_value::<Vec<crate::model::QueueDef>>(x.clone()).ok()) {
+                        // Keep what only lives in memory (running, fired times).
+                        let old = std::mem::take(&mut self.queues);
+                        self.queues = q
+                            .into_iter()
+                            .map(|mut n| {
+                                if let Some(o) = old.iter().find(|o| o.name == n.name) {
+                                    n.running = o.running;
+                                    n.fired_start = o.fired_start.clone();
+                                    n.fired_stop = o.fired_stop.clone();
+                                    n.last_sync = o.last_sync;
+                                }
+                                n
+                            })
+                            .collect();
                     }
                     if let Some(b) = g("category_folders").and_then(|x| x.as_bool()) {
                         self.category_folders = b;
@@ -2761,6 +2832,17 @@ impl CraftApp {
                 }
             }
             RowAct::VerifyChecksum => self.verify_checksum(id),
+            RowAct::MoveToQueue(i) => {
+                let name = if i == 0 { String::new() } else { self.queues.get(i as usize - 1).map(|q| q.name.clone()).unwrap_or_default() };
+                let ids = if bulk { sel } else { vec![id] };
+                for d in self.downloads.iter_mut().filter(|d| ids.contains(&d.id)) {
+                    d.queue = name.clone();
+                }
+                self.save_queue();
+                self.push_log(format!("Moved {} row(s) to queue {}.", ids.len(), if name.is_empty() { "Main" } else { &name }));
+            }
+            RowAct::ZipPick => self.open_zip_pick(id),
+            RowAct::Convert(kind) => self.convert(id, kind),
             RowAct::RefreshAddress => {
                 let Some(d) = self.downloads.iter().find(|d| d.id == id) else { return };
                 let page = d.referer.clone();
@@ -2811,8 +2893,197 @@ impl CraftApp {
         self.resume(id);
     }
 
+    /// Options for a side request (ZIP listing) made for an existing row.
+    fn side_opts(&self, d: &DownloadItem) -> EngineOpts {
+        EngineOpts {
+            user_agent: if self.user_agent.trim().is_empty() {
+                format!("download_craft/{}", crate::model::APP_VERSION)
+            } else {
+                self.user_agent.clone()
+            },
+            referer: d.referer.clone(),
+            cookie: d.cookie.clone(),
+            captured_headers: crate::engine::CapturedHeaders::for_url(&d.url, &d.extra_headers),
+            username: d.username.clone(),
+            password: d.password.clone(),
+            proxy_url: self.proxy_url.clone(),
+            timeout_secs: d.eff_timeout(self.timeout_secs),
+            browser: d.browser.clone(),
+            ..Default::default()
+        }
+    }
+
+    /// IDM's "download part of a ZIP": read the archive's table of contents
+    /// with a few Range requests and open a window to pick files from it.
+    fn open_zip_pick(&mut self, id: u64) {
+        let Some(d) = self.downloads.iter().find(|d| d.id == id) else { return };
+        let opts = self.side_opts(d);
+        let url = d.url.clone();
+        let stem = std::path::Path::new(&d.filename).file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_else(|| "zip".into());
+        let out_dir = std::path::PathBuf::from(&d.save_dir).join(stem);
+        self.zip_pick = Some(ZipPick {
+            name: d.filename.clone(),
+            url: url.clone(),
+            out_dir,
+            opts: opts.clone(),
+            entries: Vec::new(),
+            status: "Reading the ZIP's table of contents…".into(),
+            busy: true,
+        });
+        let (tx, rx) = std::sync::mpsc::channel();
+        self.zip_rx = Some(rx);
+        self.rt.spawn(async move {
+            let r = async {
+                let client = opts.build_client().map_err(|e| format!("{e:#}"))?;
+                let request: downloadcraft_engine::RequestFn = Arc::new(move |u: &str| opts.get(&client, u));
+                downloadcraft_engine::zip::list_remote(&request, &url).await.map_err(|e| e.to_string())
+            }
+            .await;
+            let _ = tx.send(ZipMsg::Listed(r));
+        });
+    }
+
+    /// Fetch the ticked entries one after another into the ZIP's folder.
+    fn zip_fetch_selected(&mut self) {
+        let Some(p) = self.zip_pick.as_mut() else { return };
+        let picked: Vec<downloadcraft_engine::zip::ZipEntry> =
+            p.entries.iter().filter(|(e, on)| *on && e.can_extract()).map(|(e, _)| e.clone()).collect();
+        if picked.is_empty() {
+            p.status = "Tick at least one file.".into();
+            return;
+        }
+        p.busy = true;
+        let (url, out_dir, opts) = (p.url.clone(), p.out_dir.clone(), p.opts.clone());
+        let (tx, rx) = std::sync::mpsc::channel();
+        self.zip_rx = Some(rx);
+        self.rt.spawn(async move {
+            let client = match opts.build_client() {
+                Ok(c) => c,
+                Err(e) => {
+                    let _ = tx.send(ZipMsg::Done(format!("ZIP: {e:#}")));
+                    return;
+                }
+            };
+            let request: downloadcraft_engine::RequestFn = Arc::new(move |u: &str| opts.get(&client, u));
+            let (mut ok, n) = (0, picked.len());
+            for (i, e) in picked.iter().enumerate() {
+                let _ = tx.send(ZipMsg::Status(format!("{}/{n}: {}", i + 1, e.name)));
+                // Keep the archive's folders, never let a name climb out.
+                let rel: std::path::PathBuf = e
+                    .name
+                    .split(['/', '\\'])
+                    .filter(|s| !s.is_empty() && *s != "." && *s != "..")
+                    .map(crate::engine::sanitize_filename)
+                    .collect();
+                match downloadcraft_engine::zip::extract_remote(&request, &url, e, &out_dir.join(rel)).await {
+                    Ok(_) => ok += 1,
+                    Err(err) => {
+                        let _ = tx.send(ZipMsg::Status(format!("{}: {err}", e.name)));
+                    }
+                }
+            }
+            let _ = tx.send(ZipMsg::Done(format!("ZIP: {ok} of {n} file(s) saved to {}", out_dir.display())));
+        });
+    }
+
+    fn poll_zip(&mut self) {
+        let Some(rx) = self.zip_rx.as_ref() else { return };
+        let msgs: Vec<ZipMsg> = rx.try_iter().collect();
+        for m in msgs {
+            match m {
+                ZipMsg::Listed(r) => {
+                    let Some(p) = self.zip_pick.as_mut() else { continue };
+                    p.busy = false;
+                    match r {
+                        Ok(entries) => {
+                            let files = entries.iter().filter(|e| !e.is_dir).count();
+                            p.status = format!("{files} file(s). Tick the ones you want.");
+                            p.entries = entries.into_iter().filter(|e| !e.is_dir).map(|e| (e, false)).collect();
+                        }
+                        Err(e) => p.status = format!("Could not read the ZIP: {e}"),
+                    }
+                    self.zip_rx = None;
+                }
+                ZipMsg::Status(s) => {
+                    if let Some(p) = self.zip_pick.as_mut() {
+                        p.status = s;
+                    }
+                }
+                ZipMsg::Done(s) => {
+                    if let Some(p) = self.zip_pick.as_mut() {
+                        p.busy = false;
+                        p.status = s.clone();
+                    }
+                    self.push_log(s);
+                    self.zip_rx = None;
+                }
+            }
+        }
+    }
+
+    /// Convert a finished file with ffmpeg in the background; the result
+    /// lands next to the original.
+    fn convert(&mut self, id: u64, kind: u8) {
+        let Some(d) = self.downloads.iter().find(|d| d.id == id) else { return };
+        let src = d.dest_path();
+        if !src.is_file() {
+            self.push_log("Convert: the file is not on disk (finish the download first).");
+            return;
+        }
+        let Some(ffmpeg) = crate::engine::ffmpeg_path() else {
+            self.push_log("Convert needs ffmpeg - get it in Settings -> Plugins.");
+            return;
+        };
+        let stem = src.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
+        let (suffix, args): (&str, &[&str]) = match kind {
+            0 => (".mp3", &["-vn", "-c:a", "libmp3lame", "-q:a", "2"]),
+            1 => (".mp4", &["-c:v", "libx264", "-preset", "veryfast", "-crf", "23", "-c:a", "aac", "-b:a", "160k", "-movflags", "+faststart"]),
+            _ => (" (small).mp4", &["-vf", "scale=-2:'min(720,ih)'", "-c:v", "libx264", "-preset", "veryfast", "-crf", "28", "-c:a", "aac", "-b:a", "128k", "-movflags", "+faststart"]),
+        };
+        let mut out = src.with_file_name(format!("{stem}{suffix}"));
+        if out == src {
+            out = src.with_file_name(format!("{stem} (converted){suffix}"));
+        }
+        let args: Vec<String> = args.iter().map(|s| s.to_string()).collect();
+        let tx = self.conv_tx.clone();
+        let name = d.filename.clone();
+        self.push_log(format!("Converting {name}…"));
+        std::thread::spawn(move || {
+            let mut cmd = std::process::Command::new(ffmpeg);
+            #[cfg(windows)]
+            {
+                use std::os::windows::process::CommandExt;
+                cmd.creation_flags(0x08000000);
+            }
+            cmd.args(["-hide_banner", "-loglevel", "error", "-y", "-i"]).arg(&src).args(&args).arg(&out);
+            let line = match cmd.output() {
+                Ok(o) if o.status.success() => format!("Converted: {}", out.display()),
+                Ok(o) => {
+                    let _ = std::fs::remove_file(&out);
+                    let err = String::from_utf8_lossy(&o.stderr);
+                    format!("Convert {name} failed: {}", err.lines().last().unwrap_or("ffmpeg error"))
+                }
+                Err(e) => format!("Convert {name} failed: {e}"),
+            };
+            let _ = tx.send(line);
+        });
+    }
+
     /// Row context-menu item definitions: (label, action).
-    fn ctx_items() -> Vec<(String, Option<RowAct>)> {
+    fn ctx_items(&self) -> Vec<(String, Option<RowAct>)> {
+        use RowAct::*;
+        let mut v = self.ctx_items_base();
+        if !self.queues.is_empty() {
+            v.push(("".into(), None));
+            v.push(("Move to queue: Main".into(), Some(MoveToQueue(0))));
+            for (i, q) in self.queues.iter().enumerate().take(20) {
+                v.push((format!("Move to queue: {}", q.name), Some(MoveToQueue(i as u8 + 1))));
+            }
+        }
+        v
+    }
+
+    fn ctx_items_base(&self) -> Vec<(String, Option<RowAct>)> {
         use RowAct::*;
         vec![
             ("Details".into(), Some(Details)),
@@ -3021,7 +3292,8 @@ impl CraftApp {
         self.grab_results.clear();
         self.grab_notice.clear();
         let exts = crate::grabber::parse_ext_list(&self.grab_exts);
-        let depth_1 = self.grab_depth;
+        let depth = if self.grab_depth { self.grab_levels.clamp(1, 5) } else { 0 };
+        let stay = self.grab_stay;
         let ua = if self.user_agent.trim().is_empty() {
             format!("download_craft/{}", crate::model::APP_VERSION)
         } else {
@@ -3035,7 +3307,7 @@ impl CraftApp {
         };
         self.rt.spawn(async move {
             let out = match opts.build_client() {
-                Ok(client) => crate::grabber::grab_site(&client, &opts, &url, &exts, depth_1, crate::grabber::MAX_PAGES_DEFAULT)
+                Ok(client) => crate::grabber::grab_site(&client, &opts, &url, &exts, depth, stay, crate::grabber::MAX_PAGES_DEFAULT * (depth.max(1) * 2))
                     .await
                     .map_err(|e| e.to_string()),
                 Err(e) => Err(format!("{e:#}")),
@@ -3614,19 +3886,46 @@ impl CraftApp {
     /// spams failures forever (a failed YouTube bot-check would log
     /// endlessly). The user retries explicitly via Resume/Retry or
     /// Tasks → Retry all failed.
-    fn fill_next(&mut self) {
-        if !self.queue_running {
-            return;
+    /// The queue a row runs in: its named queue when that still exists, else
+    /// Main ("").
+    fn queue_of(&self, d: &DownloadItem) -> String {
+        if !d.queue.is_empty() && self.queues.iter().any(|q| q.name == d.queue) {
+            d.queue.clone()
+        } else {
+            String::new()
         }
+    }
+
+    fn fill_next(&mut self) {
+        let mut runs: Vec<(String, usize)> = Vec::new();
+        if self.queue_running {
+            runs.push((String::new(), self.max_concurrent.max(1)));
+        }
+        for q in &self.queues {
+            if q.running {
+                runs.push((q.name.clone(), q.max.max(1)));
+            }
+        }
+        for (name, cap) in runs {
+            self.fill_queue(&name, cap);
+        }
+    }
+
+    fn fill_queue(&mut self, queue: &str, cap: usize) {
         loop {
-            let active = self.tasks.len();
-            if active >= self.max_concurrent.max(1) {
+            let active = self
+                .tasks
+                .keys()
+                .filter(|id| self.downloads.iter().any(|d| d.id == **id && self.queue_of(d) == queue))
+                .count();
+            if active >= cap {
                 return;
             }
             let next = self
                 .downloads
                 .iter()
                 .filter(|d| matches!(d.status, Status::Queued))
+                .filter(|d| self.queue_of(d) == queue)
                 // A Queued row whose task still runs (a refresh re-queued it)
                 // is not startable: `start` returns without changing it, and
                 // picking it again looped forever and froze the window.
@@ -3824,6 +4123,93 @@ impl CraftApp {
                     self.push_log(format!("{n} dropped links - pick them in the window that opened."));
                 }
             }
+        }
+    }
+
+    /// Named queues: start/stop at their times, and sync finished files.
+    fn tick_queues(&mut self) {
+        let now = chrono::Local::now();
+        let today = now.format("%Y-%m-%d").to_string();
+        let hhmm = now.format("%H:%M").to_string();
+        let mut start: Vec<usize> = Vec::new();
+        let mut stop: Vec<usize> = Vec::new();
+        for (i, q) in self.queues.iter_mut().enumerate() {
+            if !q.start_at.is_empty() && q.start_at == hhmm && q.fired_start != today {
+                q.fired_start = today.clone();
+                start.push(i);
+            }
+            if !q.stop_at.is_empty() && q.stop_at == hhmm && q.fired_stop != today {
+                q.fired_stop = today.clone();
+                stop.push(i);
+            }
+        }
+        for i in start {
+            self.queues[i].running = true;
+            self.push_log(format!("Queue {} started on schedule.", self.queues[i].name));
+        }
+        for i in stop {
+            self.stop_named_queue(i);
+            self.push_log(format!("Queue {} stopped on schedule.", self.queues[i].name));
+        }
+        if !self.queues.iter().any(|q| q.running) && self.sync_rx.is_none() && !self.queues.iter().any(|q| q.sync_hours > 0) {
+            return;
+        }
+        self.fill_next();
+        // Queue sync: ask the server for each finished file's size.
+        let due: Vec<String> = self
+            .queues
+            .iter_mut()
+            .filter(|q| q.sync_hours > 0 && q.last_sync.is_none_or(|t| t.elapsed() >= std::time::Duration::from_secs(q.sync_hours * 3600)))
+            .map(|q| {
+                q.last_sync = Some(Instant::now());
+                q.name.clone()
+            })
+            .collect();
+        if !due.is_empty() {
+            if self.sync_tx.is_none() {
+                let (tx, rx) = std::sync::mpsc::channel();
+                self.sync_tx = Some(tx);
+                self.sync_rx = Some(rx);
+            }
+            let tx = self.sync_tx.clone().unwrap();
+            let rows: Vec<(u64, String, String, String)> = self
+                .downloads
+                .iter()
+                .filter(|d| matches!(d.status, Status::Completed) && due.contains(&self.queue_of(d)))
+                .map(|d| (d.id, d.url.clone(), d.referer.clone(), d.cookie.clone()))
+                .collect();
+            let ua = self.user_agent.clone();
+            self.rt.spawn(async move {
+                for (id, url, referer, cookie) in rows {
+                    let opts = EngineOpts { user_agent: ua.clone(), referer, cookie, timeout_secs: 20, ..Default::default() };
+                    let size = match opts.build_client() {
+                        Ok(c) => crate::engine::probe(&c, &opts, &url).await.0,
+                        Err(_) => None,
+                    };
+                    let _ = tx.send((id, size));
+                }
+            });
+        }
+        let answers: Vec<(u64, Option<u64>)> = self.sync_rx.as_ref().map(|rx| rx.try_iter().collect()).unwrap_or_default();
+        for (id, size) in answers {
+            let Some(d) = self.downloads.iter().find(|d| d.id == id) else { continue };
+            if let (Some(now_size), Some(had)) = (size, d.total_bytes) {
+                if now_size > 0 && now_size != had {
+                    let name = d.filename.clone();
+                    self.push_log(format!("Queue sync: {name} changed on the server ({had} -> {now_size} bytes) - downloading it again."));
+                    self.redownload(id);
+                }
+            }
+        }
+    }
+
+    fn stop_named_queue(&mut self, i: usize) {
+        let Some(q) = self.queues.get_mut(i) else { return };
+        q.running = false;
+        let name = q.name.clone();
+        let ids: Vec<u64> = self.downloads.iter().filter(|d| d.queue == name && self.tasks.contains_key(&d.id)).map(|d| d.id).collect();
+        for id in ids {
+            self.pause(id);
         }
     }
 
@@ -6209,6 +6595,28 @@ impl eframe::App for CraftApp {
             self.stats_line = if s.day_bytes > 0 { format!("today {}", format_bytes(s.day_bytes)) } else { String::new() };
         }
         self.enforce_quota();
+        self.tick_queues();
+        while let Ok(line) = self.conv_rx.try_recv() {
+            self.push_log(line);
+        }
+        self.poll_zip();
+        let listed = self.playlist_rx.as_ref().and_then(|(u, rx)| rx.try_recv().ok().map(|r| (u.clone(), r)));
+        if let Some((url, res)) = listed {
+            self.playlist_rx = None;
+            match res {
+                Ok((title, items)) if !items.is_empty() => {
+                    let n = items.len();
+                    let links: Vec<crate::native_host::PageLink> =
+                        items.into_iter().map(|(url, text)| crate::native_host::PageLink { url, text }).collect();
+                    match crate::native_host::open_links_window(&url, &title, "", &links) {
+                        Ok(()) => self.push_log(format!("{title}: {n} videos - pick them in the window that opened.")),
+                        Err(e) => self.push_log(format!("Playlist: {e}")),
+                    }
+                }
+                Ok(_) => self.push_log("The playlist is empty (or private)."),
+                Err(e) => self.push_log(format!("Playlist: {e}")),
+            }
+        }
         // ================= dialogs =================
         if self.show_add {
             if self.add_focus_req {
@@ -6697,6 +7105,13 @@ impl eframe::App for CraftApp {
                         let r = mcheck(ui, &self.man, "Include linked pages (same site)", self.grab_depth);
                         self.hits.push((HitKind::Check(CheckId::GrabDepth), r));
                     });
+                    if self.grab_depth {
+                        ui.horizontal(|ui| {
+                            ui.label("Levels deep:");
+                            ui.add(egui::DragValue::new(&mut self.grab_levels).range(1..=5));
+                            ui.checkbox(&mut self.grab_stay, "Stay inside the start page's folder");
+                        });
+                    }
                     if !self.grab_notice.is_empty() {
                         ui.colored_label(pl().notice, &self.grab_notice);
                     }
@@ -6734,6 +7149,50 @@ impl eframe::App for CraftApp {
             self.show_grabber = open && self.show_grabber;
         }
 
+        if self.zip_pick.is_some() {
+            let mut open = true;
+            let mut fetch = false;
+            let p = self.zip_pick.as_mut().unwrap();
+            egui::Window::new(format!("ZIP contents - {}", p.name))
+                .open(&mut open)
+                .collapsible(false)
+                .default_width(560.0)
+                .show(ctx, |ui| {
+                    ui.label(&p.status);
+                    if !p.entries.is_empty() {
+                        ui.horizontal(|ui| {
+                            if ui.button("All").clicked() {
+                                p.entries.iter_mut().for_each(|(e, on)| *on = e.can_extract());
+                            }
+                            if ui.button("None").clicked() {
+                                p.entries.iter_mut().for_each(|(_, on)| *on = false);
+                            }
+                            let (n, bytes) = p.entries.iter().filter(|(_, on)| *on).fold((0, 0u64), |a, (e, _)| (a.0 + 1, a.1 + e.compressed_size));
+                            ui.label(format!("{n} picked, {} to fetch", format_bytes(bytes)));
+                        });
+                        egui::ScrollArea::vertical().max_height(360.0).show(ui, |ui| {
+                            for (e, on) in p.entries.iter_mut() {
+                                ui.add_enabled_ui(e.can_extract(), |ui| {
+                                    ui.checkbox(on, format!("{}   ({})", e.name, format_bytes(e.size)));
+                                });
+                            }
+                        });
+                        ui.label(format!("Saved to: {}", p.out_dir.display()));
+                        ui.add_enabled_ui(!p.busy, |ui| {
+                            if ui.button("Download picked files").clicked() {
+                                fetch = true;
+                            }
+                        });
+                    }
+                });
+            if fetch {
+                self.zip_fetch_selected();
+            }
+            if !open {
+                self.zip_pick = None;
+            }
+        }
+
         if self.show_queues {
             let mut open = true;
             let n_items = self.downloads.len();
@@ -6763,6 +7222,84 @@ impl eframe::App for CraftApp {
                     .max_height(body_max)
                     .auto_shrink([false, true])
                     .show(ui, |ui| {
+                    // ---- named queues (IDM: several queues) ----
+                    ui.horizontal_wrapped(|ui| {
+                        if ui.selectable_label(self.queue_sel == 0, "Main").clicked() {
+                            self.queue_sel = 0;
+                        }
+                        for i in 0..self.queues.len() {
+                            let label = format!("{}{}", self.queues[i].name, if self.queues[i].running { " ▶" } else { "" });
+                            if ui.selectable_label(self.queue_sel == i + 1, label).clicked() {
+                                self.queue_sel = i + 1;
+                            }
+                        }
+                        ui.add(egui::TextEdit::singleline(&mut self.queue_new_name).hint_text("new queue name").desired_width(120.0));
+                        let name = self.queue_new_name.trim().to_string();
+                        if ui.button("Add queue").clicked() && !name.is_empty() && name != "Main" && !self.queues.iter().any(|q| q.name == name) {
+                            self.queues.push(crate::model::QueueDef { name, max: 2, ..Default::default() });
+                            self.queue_sel = self.queues.len();
+                            self.queue_new_name.clear();
+                            self.save_ui_state();
+                        }
+                    });
+                    ui.separator();
+                    if self.queue_sel > 0 && self.queue_sel <= self.queues.len() {
+                        let i = self.queue_sel - 1;
+                        let mut changed = false;
+                        let mut delete = false;
+                        let mut toggle: Option<bool> = None;
+                        {
+                            let q = &mut self.queues[i];
+                            let members = self.downloads.iter().filter(|d| d.queue == q.name).count();
+                            ui.label(format!("Queue {}: {members} item(s){}", q.name, if q.running { ", running" } else { "" }));
+                            ui.horizontal(|ui| {
+                                if ui.button(if q.running { "Stop this queue" } else { "Start this queue" }).clicked() {
+                                    toggle = Some(!q.running);
+                                }
+                                if ui.button("Delete queue").clicked() {
+                                    delete = true;
+                                }
+                            });
+                            ui.horizontal(|ui| {
+                                ui.label("Downloads at the same time:");
+                                changed |= ui.add(egui::DragValue::new(&mut q.max).range(1..=16)).changed();
+                            });
+                            ui.horizontal(|ui| {
+                                ui.label("Start at (HH:MM):");
+                                changed |= ui.add(egui::TextEdit::singleline(&mut q.start_at).desired_width(60.0)).changed();
+                                ui.label("Stop at:");
+                                changed |= ui.add(egui::TextEdit::singleline(&mut q.stop_at).desired_width(60.0)).changed();
+                            });
+                            ui.horizontal(|ui| {
+                                ui.label("Check finished files for newer versions every");
+                                changed |= ui.add(egui::DragValue::new(&mut q.sync_hours).range(0..=720)).changed();
+                                ui.label("hours (0 = never)");
+                            });
+                            ui.small("Move rows here with right-click → Move to queue.");
+                        }
+                        if let Some(run) = toggle {
+                            if run {
+                                self.queues[i].running = true;
+                                self.fill_next();
+                            } else {
+                                self.stop_named_queue(i);
+                            }
+                        }
+                        if delete {
+                            let name = self.queues[i].name.clone();
+                            self.stop_named_queue(i);
+                            for d in self.downloads.iter_mut().filter(|d| d.queue == name) {
+                                d.queue.clear();
+                            }
+                            self.queues.remove(i);
+                            self.queue_sel = 0;
+                            changed = true;
+                            self.save_queue();
+                        }
+                        if changed {
+                            self.save_ui_state();
+                        }
+                    } else {
                     ui.label(format!("{n_items} item(s) in queue, {n_active} active."));
                     ui.horizontal(|ui| {
                         let r = mbutton(ui, &self.man, "Start Queue", 130.0, 32.0, false);
@@ -6895,6 +7432,7 @@ impl eframe::App for CraftApp {
                         ui.small("Scheduler already fired this session.");
                         let r = mbutton(ui, &self.man, "Reset Scheduler", 140.0, 30.0, false);
                         self.hits.push((HitKind::Btn(ButtonId::QSchedReset), r));
+                    }
                     }
                     ui.separator();
                     ui.collapsing("Log", |ui| {
@@ -7936,8 +8474,38 @@ impl CraftApp {
     }
 
     /// Row context-menu rows for `render_popup`.
-    fn ctx_rows(id: u64) -> Vec<(String, Option<HitKind>)> {
-        Self::ctx_items()
+    fn ctx_rows(&self, id: u64) -> Vec<(String, Option<HitKind>)> {
+        let mut items = self.ctx_items();
+        if let Some(d) = self.downloads.iter().find(|d| d.id == id) {
+            let ext = std::path::Path::new(&d.filename)
+                .extension()
+                .map(|e| e.to_string_lossy().to_ascii_lowercase())
+                .unwrap_or_default();
+            let mut extra: Vec<(String, Option<RowAct>)> = Vec::new();
+            if ext == "zip" && d.url.starts_with("http") {
+                extra.push(("ZIP: pick files to download…".into(), Some(RowAct::ZipPick)));
+            }
+            const MEDIA: &[&str] = &["mp4", "mkv", "webm", "mov", "avi", "flv", "wmv", "m4v", "ts", "3gp", "mp3", "m4a", "aac", "opus", "ogg", "wav", "flac", "wma"];
+            if matches!(d.status, Status::Completed) && MEDIA.contains(&ext.as_str()) {
+                if ext != "mp3" {
+                    extra.push(("Convert to MP3 (audio)".into(), Some(RowAct::Convert(0))));
+                }
+                if !["mp3", "m4a", "aac", "opus", "ogg", "wav", "flac", "wma"].contains(&ext.as_str()) {
+                    if ext != "mp4" {
+                        extra.push(("Convert to MP4".into(), Some(RowAct::Convert(1))));
+                    }
+                    extra.push(("Make a smaller MP4 (720p)".into(), Some(RowAct::Convert(2))));
+                }
+            }
+            if !extra.is_empty() {
+                let at = items.iter().position(|(_, a)| matches!(a, Some(RowAct::CopyUrl))).unwrap_or(items.len());
+                extra.push(("".into(), None));
+                for (k, e) in extra.into_iter().enumerate() {
+                    items.insert(at + k, e);
+                }
+            }
+        }
+        items
             .into_iter()
             .map(|(label, act)| {
                 (
@@ -8021,6 +8589,20 @@ impl CraftApp {
         if !is_download_url(self.add_url.trim()) {
             self.show_add = true;
             self.push_log("Add download: invalid URL (need http/https).");
+            return;
+        }
+        // A YouTube playlist or channel: list its videos to pick from.
+        if crate::engine::is_youtube_list(self.add_url.trim()) {
+            let url = self.add_url.trim().to_string();
+            let opts = EngineOpts { proxy_url: self.proxy_url.clone(), user_agent: self.user_agent.clone(), ..Default::default() };
+            let (tx, rx) = std::sync::mpsc::channel();
+            let u = url.clone();
+            self.rt.spawn(async move {
+                let _ = tx.send(crate::engine::playlist_entries(&u, &opts).await.map_err(|e| format!("{e:#}")));
+            });
+            self.playlist_rx = Some((url, rx));
+            self.show_add = false;
+            self.push_log("Listing the playlist with yt-dlp… a window opens to pick the videos.");
             return;
         }
         let csum = crate::model::normalize_sha256(&self.add_checksum);
@@ -8481,7 +9063,7 @@ impl CraftApp {
     }
 
     fn render_ctx_menu(&mut self, ctx: &egui::Context, id: u64, pos: egui::Pos2) {
-        let rows = Self::ctx_rows(id);
+        let rows = self.ctx_rows(id);
         self.render_popup(ctx, "ctx_menu", pos, 230.0, rows);
     }
 

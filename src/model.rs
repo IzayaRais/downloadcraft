@@ -199,6 +199,36 @@ pub struct DownloadItem {
     /// Other URLs for the same file (mirrors): connections spread over them.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub mirrors: Vec<String>,
+    /// Named queue this row belongs to; empty = the Main queue.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub queue: String,
+}
+
+/// A named queue besides Main (IDM: several queues, each with its own
+/// schedule and number of simultaneous downloads).
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct QueueDef {
+    pub name: String,
+    /// Downloads at the same time.
+    pub max: usize,
+    /// Start / stop by itself at this local time ("HH:MM"; empty = never).
+    #[serde(default)]
+    pub start_at: String,
+    #[serde(default)]
+    pub stop_at: String,
+    /// Check finished files for a newer version on the server every N hours
+    /// (0 = never) and download the changed ones again (IDM's queue sync).
+    #[serde(default)]
+    pub sync_hours: u64,
+    #[serde(skip)]
+    pub running: bool,
+    /// Date the start / stop time last fired (once a day each).
+    #[serde(skip)]
+    pub fired_start: String,
+    #[serde(skip)]
+    pub fired_stop: String,
+    #[serde(skip)]
+    pub last_sync: Option<std::time::Instant>,
 }
 
 /// "https://a/f.iso | https://b/f.iso": the first is the download, the rest
@@ -376,6 +406,7 @@ impl DownloadItem {
             start_at: String::new(),
             browser: None,
             mirrors: Vec::new(),
+            queue: String::new(),
         }
     }
 

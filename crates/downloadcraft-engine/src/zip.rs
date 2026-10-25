@@ -2,7 +2,9 @@
 //!
 //! A ZIP keeps its table of contents (the central directory) at the end of
 //! the file. Fetching only the last few kilobytes with a Range request is
-//! enough to show what is inside a multi-gigabyte archive.
+//! enough to show what is inside a multi-gigabyte archive, and one more
+//! Range request fetches a single file out of it (IDM's "download part of a
+//! ZIP"): only that file's compressed bytes cross the network.
 
 use crate::{Error, RequestFn};
 
@@ -14,6 +16,80 @@ pub struct ZipEntry {
     pub size: u64,
     pub compressed_size: u64,
     pub is_dir: bool,
+    /// 0 = stored, 8 = deflate (the only two this crate unpacks).
+    pub method: u16,
+    /// Where the entry's local header starts in the archive.
+    pub local_offset: u64,
+}
+
+impl ZipEntry {
+    /// Whether [`extract_remote`] can unpack it.
+    pub fn can_extract(&self) -> bool {
+        !self.is_dir && (self.method == 0 || self.method == 8)
+    }
+}
+
+/// Fetch one entry of the remote ZIP at `url` and write it, unpacked, to
+/// `dest`. Two Range requests: the local header (its name and extra field
+/// can differ from the directory's) and the compressed bytes, which are
+/// inflated as they stream in. Returns the bytes written.
+pub async fn extract_remote(
+    request: &RequestFn,
+    url: &str,
+    entry: &ZipEntry,
+    dest: &std::path::Path,
+) -> Result<u64, Error> {
+    use futures_util::StreamExt;
+    use std::io::Write;
+    if !entry.can_extract() {
+        return Err(Error::Network(format!("{}: compression method {} is not supported", entry.name, entry.method)));
+    }
+    let (head, _, _) = fetch_range(request, url, (entry.local_offset, 30)).await?;
+    if !head.starts_with(b"PK\x03\x04") {
+        return Err(bad("local header not found"));
+    }
+    let name_len = u16_at(&head, 26).ok_or_else(|| bad("short local header"))?;
+    let extra_len = u16_at(&head, 28).ok_or_else(|| bad("short local header"))?;
+    let data_at = entry.local_offset + 30 + name_len + extra_len;
+    if let Some(dir) = dest.parent() {
+        std::fs::create_dir_all(dir)?;
+    }
+    let tmp = dest.with_extension("dczip");
+    let file = std::fs::File::create(&tmp)?;
+    let mut sink: Box<dyn Write + Send> = if entry.method == 8 {
+        Box::new(flate2::write::DeflateDecoder::new(std::io::BufWriter::new(file)))
+    } else {
+        Box::new(std::io::BufWriter::new(file))
+    };
+    if entry.compressed_size > 0 {
+        let end = data_at + entry.compressed_size - 1;
+        let resp = request(url)
+            .header(reqwest::header::RANGE, format!("bytes={data_at}-{end}"))
+            .send()
+            .await
+            .map_err(|e| Error::Network(e.to_string()))?;
+        if resp.status().as_u16() != 206 {
+            let _ = std::fs::remove_file(&tmp);
+            return Err(Error::Http { status: resp.status().as_u16(), url: url.to_string() });
+        }
+        let mut body = resp.bytes_stream();
+        while let Some(chunk) = body.next().await {
+            let chunk = chunk.map_err(|e| Error::Network(e.to_string()))?;
+            sink.write_all(&chunk).map_err(|e| bad(&format!("could not unpack: {e}")))?;
+        }
+    }
+    sink.flush()?;
+    drop(sink);
+    let written = std::fs::metadata(&tmp)?.len();
+    if written != entry.size {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(bad(&format!("{} unpacked to {written} bytes, expected {}", entry.name, entry.size)));
+    }
+    if dest.exists() {
+        std::fs::remove_file(dest)?;
+    }
+    std::fs::rename(&tmp, dest)?;
+    Ok(written)
 }
 
 /// How much of the tail to fetch: the end record plus a comment of up to
@@ -123,6 +199,8 @@ fn parse_directory(dir: &[u8], max: usize) -> Result<Vec<ZipEntry>, Error> {
     let mut i = 0;
     while out.len() < max && dir.get(i..).is_some_and(|s| s.starts_with(b"PK\x01\x02")) {
         let short = || bad("directory entry cut short");
+        let method = u16_at(dir, i + 10).ok_or_else(short)? as u16;
+        let mut local = u32_at(dir, i + 42).ok_or_else(short)?;
         let mut comp = u32_at(dir, i + 20).ok_or_else(short)?;
         let mut size = u32_at(dir, i + 24).ok_or_else(short)?;
         let name_len = u16_at(dir, i + 28).ok_or_else(short)? as usize;
@@ -145,11 +223,15 @@ fn parse_directory(dir: &[u8], max: usize) -> Result<Vec<ZipEntry>, Error> {
                 }
                 if comp == 0xFFFF_FFFF {
                     comp = u64_at(extra, f).unwrap_or(comp);
+                    f += 8;
+                }
+                if local == 0xFFFF_FFFF {
+                    local = u64_at(extra, f).unwrap_or(local);
                 }
             }
             e += 4 + len;
         }
-        out.push(ZipEntry { is_dir: name.ends_with('/'), name, size, compressed_size: comp });
+        out.push(ZipEntry { is_dir: name.ends_with('/'), name, size, compressed_size: comp, method, local_offset: local });
         i = name_at + name_len + extra_len + comment_len;
     }
     Ok(out)
@@ -207,6 +289,9 @@ pub(crate) mod tests {
                 assert_eq!(e[0].size, 5);
                 assert!(e[1].is_dir);
                 assert_eq!(e[2].size, 300);
+                assert_eq!(e[0].local_offset, 0);
+                assert_eq!(e[1].local_offset, 30 + 5 + 5);
+                assert!(e[0].can_extract() && !e[1].can_extract());
             }
             Parsed::NeedDirectory { .. } => panic!("directory was in the tail"),
         }
