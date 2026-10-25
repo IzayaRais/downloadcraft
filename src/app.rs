@@ -5423,6 +5423,9 @@ impl eframe::App for CraftApp {
             crate::fonts::ensure_text(ctx, &d.filename);
         }
         crate::fonts::ensure_text(ctx, &self.add_file);
+        if let Some(text) = crate::i18n::take_font_text() {
+            crate::fonts::ensure_text(ctx, &text);
+        }
         crate::tray::set_context(ctx);
         self.watch_ui_state();
         // The tray helpers work on the native window (parking = visible but
@@ -5994,19 +5997,19 @@ impl eframe::App for CraftApp {
                         ui.set_width(ui.available_width());
                         let cur = self.filter.clone();
                         let cats: [(&str, &str, &str); 6] = [
-                            ("Image", MI_IMAGE, "Pictures"),
-                            ("Video", MI_SLIDESHOW, "Videos"),
-                            ("Music", MI_MUSIC, "Music"),
-                            ("Document", MI_DOC, "Documents"),
-                            ("Compressed", MI_ARCHIVE, "Compressed"),
-                            ("Apps", MI_GRID, "Apps"),
+                            ("Image", MI_IMAGE, crate::i18n::t("Pictures")),
+                            ("Video", MI_SLIDESHOW, crate::i18n::t("Videos")),
+                            ("Music", MI_MUSIC, crate::i18n::t("Music")),
+                            ("Document", MI_DOC, crate::i18n::t("Documents")),
+                            ("Compressed", MI_ARCHIVE, crate::i18n::t("Compressed")),
+                            ("Apps", MI_GRID, crate::i18n::t("Apps")),
                         ];
                         let statuses: [(&str, &str, &str, usize, bool); 5] = [
-                            ("Downloading", MI_GET_APP, "Downloading", n_active, n_active > 0),
-                            ("Queued", MI_FILTER, "Queued", n_queued, false),
-                            ("Paused", MI_PAUSE, "Paused", n_paused, false),
-                            ("Completed", MI_CHECK_CIRCLE, "Finished", n_done, false),
-                            ("Failed", MI_CANCEL, "Failed", n_failed, false),
+                            ("Downloading", MI_GET_APP, crate::i18n::t("Downloading"), n_active, n_active > 0),
+                            ("Queued", MI_FILTER, crate::i18n::t("Queued"), n_queued, false),
+                            ("Paused", MI_PAUSE, crate::i18n::t("Paused"), n_paused, false),
+                            ("Completed", MI_CHECK_CIRCLE, crate::i18n::t("Finished"), n_done, false),
+                            ("Failed", MI_CANCEL, crate::i18n::t("Failed"), n_failed, false),
                         ];
                         egui::ScrollArea::vertical()
                             .id_salt("side_nav")
@@ -6158,15 +6161,15 @@ impl eframe::App for CraftApp {
                 ui.add_space(6.0);
                 let n_checked = self.selected_ids().len();
                 let mut tools: Vec<(ToolId, &str, &str, bool, &str)> = Vec::new();
-                tools.push((ToolId::ResumeSel, MI_PLAY_CIRCLE, "Resume", true, "Resume the selected downloads (all paused when none is checked)"));
-                tools.push((ToolId::StopSel, MI_STOP_CIRCLE, "Stop", true, "Pause the selected downloads (all active when none is checked)"));
-                tools.push((ToolId::StopAll, MI_PAUSE_CIRCLE, "Stop All", true, "Pause every active download now"));
-                tools.push((ToolId::Delete, MI_DELETE, "Delete", n_checked > 0, "Remove the checked rows from the list"));
-                tools.push((ToolId::StartQueue, MI_PLAY, "Start Queue", true, "Start queued downloads"));
-                tools.push((ToolId::StopQueue, MI_STOP, "Stop Queue", true, "Stop starting new downloads (active ones finish)"));
-                tools.push((ToolId::Queues, MI_REORDER, "Open Queue", true, "Queue status, scheduler and log"));
-                tools.push((ToolId::Grabber, MI_PUBLIC, "Site Grabber", true, "Collect file links from a web page"));
-                tools.push((ToolId::Settings, MI_TUNE, "Settings", true, "Open Settings in its own window"));
+                tools.push((ToolId::ResumeSel, MI_PLAY_CIRCLE, crate::i18n::t("Resume"), true, crate::i18n::t("Resume the selected downloads (all paused when none is checked)")));
+                tools.push((ToolId::StopSel, MI_STOP_CIRCLE, crate::i18n::t("Stop"), true, crate::i18n::t("Pause the selected downloads (all active when none is checked)")));
+                tools.push((ToolId::StopAll, MI_PAUSE_CIRCLE, crate::i18n::t("Stop All"), true, crate::i18n::t("Pause every active download now")));
+                tools.push((ToolId::Delete, MI_DELETE, crate::i18n::t("Delete"), n_checked > 0, crate::i18n::t("Remove the checked rows from the list")));
+                tools.push((ToolId::StartQueue, MI_PLAY, crate::i18n::t("Start Queue"), true, crate::i18n::t("Start queued downloads")));
+                tools.push((ToolId::StopQueue, MI_STOP, crate::i18n::t("Stop Queue"), true, crate::i18n::t("Stop starting new downloads (active ones finish)")));
+                tools.push((ToolId::Queues, MI_REORDER, crate::i18n::t("Open Queue"), true, crate::i18n::t("Queue status, scheduler and log")));
+                tools.push((ToolId::Grabber, MI_PUBLIC, crate::i18n::t("Site Grabber"), true, crate::i18n::t("Collect file links from a web page")));
+                tools.push((ToolId::Settings, MI_TUNE, crate::i18n::t("Settings"), true, crate::i18n::t("Open Settings in its own window")));
                 ui.horizontal_wrapped(|ui| {
                     ui.add_space(10.0);
                     ui.spacing_mut().item_spacing = egui::vec2(TOOL_GAP, 2.0);
@@ -8515,7 +8518,7 @@ impl CraftApp {
             .into_iter()
             .map(|(label, act)| {
                 (
-                    label,
+                    crate::i18n::t(&label).to_string(),
                     act.map(|a| HitKind::CtxItem(a, id)),
                 )
             })

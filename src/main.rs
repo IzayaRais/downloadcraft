@@ -14,6 +14,7 @@ mod engine;
 mod fonts;
 mod ftp;
 mod grabber;
+mod i18n;
 mod links;
 mod manual;
 mod model;

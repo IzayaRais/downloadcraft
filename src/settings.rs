@@ -35,6 +35,8 @@ const PANE_YTDLP: usize = 2;
 struct Settings {
     // Appearance
     theme: String,
+    /// Interface language code ("en", or a lang/<code>.json file).
+    language: String,
     close_to_tray: bool,
     /// Pop the standalone "Download complete" dialog when a transfer ends.
     show_complete: bool,
@@ -107,6 +109,7 @@ impl Default for Settings {
     fn default() -> Self {
         Self {
             theme: "dark".to_string(),
+            language: "en".to_string(),
             close_to_tray: cfg!(windows),
             show_complete: true,
             save_dir: dirs::download_dir()
@@ -174,6 +177,7 @@ fn load() -> Settings {
         }
     };
     str_in("theme", &mut s.theme);
+    str_in("language", &mut s.language);
     str_in("save_dir", &mut s.save_dir);
     str_in("user_agent", &mut s.user_agent);
     str_in("proxy_url", &mut s.proxy_url);
@@ -347,6 +351,7 @@ fn save(s: &Settings) -> bool {
         o.insert(k.to_string(), v);
     };
     set(obj, "theme", s.theme.clone().into());
+    set(obj, "language", s.language.clone().into());
     set(obj, "close_to_tray", s.close_to_tray.into());
     set(obj, "ffmpeg_custom_path", s.ffmpeg_custom_path.clone().into());
     set(obj, "show_complete", s.show_complete.into());
@@ -619,6 +624,9 @@ pub fn run() -> eframe::Result<()> {
 
 impl eframe::App for SettingsApp {
     fn update(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
+        if let Some(text) = crate::i18n::take_font_text() {
+            crate::fonts::ensure_text(ctx, &text);
+        }
         // Register the native handle once so the title bar can follow the
         // theme (this is its own process, same helper as the main window).
         {
@@ -881,22 +889,26 @@ fn wrapped(ui: &mut Ui, s: impl Into<String>, font: FontId, color: Color32) -> R
 
 /// `h2` of the concept: 16 px semibold with a 16 px gap below.
 fn h2(ui: &mut Ui, s: &str) {
+    let s = crate::i18n::t(s);
     txt(ui, s, semi(16.0), tok().text);
     ui.add_space(16.0);
 }
 
 /// Setting label: 12 px, secondary colour.
 fn lbl(ui: &mut Ui, s: &str) {
+    let s = crate::i18n::t(s);
     txt(ui, s, reg(12.0), tok().text2);
 }
 
 /// 10 px muted hint.
 fn hint(ui: &mut Ui, s: &str) {
+    let s = crate::i18n::t(s);
     wrapped(ui, s, reg(10.0), tok().muted);
 }
 
 /// Plain button: `--btn-bg` / `--btn-border`, 5 px radius, 6×16 padding.
 fn button(ui: &mut Ui, label: &str, primary: bool) -> Response {
+    let label = crate::i18n::t(label);
     let t = tok();
     let enabled = ui.is_enabled();
     let fg = if primary {
@@ -1048,6 +1060,7 @@ fn checkbox(
     font_size: f32,
     full: bool,
 ) -> bool {
+    let label = crate::i18n::t(label);
     let t = tok();
     let galley = ui
         .painter()
@@ -1341,6 +1354,7 @@ fn theme_tile(
 /// A settings row with its label + hint on the left and a toggle on the right
 /// (the mock's `.opt-row`). Only the switch is clickable.
 fn switch_row(ui: &mut Ui, salt: &str, on: &mut bool, label: &str, hint: &str) -> bool {
+    let (label, hint) = (crate::i18n::t(label), crate::i18n::t(hint));
     let t = tok();
     let w = ui.available_width().max(120.0);
     let sw = 34.0;
@@ -1413,6 +1427,7 @@ fn card(
 ) {
     let t = tok();
     let mut scope = ui.new_child(egui::UiBuilder::new().id_salt(("engine_card", title)));
+    let title = crate::i18n::t(title);
     egui::Frame::new()
         .fill(t.card)
         .stroke(Stroke::new(1.0, t.border))
@@ -1505,6 +1520,7 @@ fn field_row(
     badge: Option<&str>,
     hint_text: Option<&str>,
 ) -> Ui {
+    let (label, hint_text) = (crate::i18n::t(label), hint_text.map(crate::i18n::t));
     let t = tok();
     let full = ui.available_width();
     let label_w = 138.0_f32.min((full * 0.42).max(92.0));
@@ -1809,6 +1825,7 @@ fn window_row(ui: &mut Ui, idx: usize, w: &mut SpeedWindow) -> bool {
 
 /// Sidebar entry: 14 px icon + 12 px label, 6 px radius, accent active row.
 fn rail_item(ui: &mut Ui, glyph: &str, label: &str, active: bool) -> bool {
+    let label = crate::i18n::t(label);
     let t = tok();
     let w = ui.available_width();
     let (rect, resp) = ui.allocate_exact_size(Vec2::new(w, 30.0), Sense::click());
@@ -2399,6 +2416,23 @@ impl SettingsApp {
         if let Some(k) = picked {
             self.s.theme = k;
         }
+
+        // ---- Language: one lang/<code>.json per language ----
+        let mut open_lang = true;
+        let langs = crate::i18n::available();
+        let lang = &mut self.s.language;
+        card(ui, "Language", None, &mut open_lang, |ui| {
+            let shown = langs.iter().find(|(c, _)| c == lang).map(|(_, n)| n.clone()).unwrap_or_else(|| lang.clone());
+            egui::ComboBox::from_id_salt("language")
+                .selected_text(shown)
+                .show_ui(ui, |ui| {
+                    for (code, name) in &langs {
+                        ui.selectable_value(lang, code.clone(), name);
+                    }
+                });
+            ui.add_space(4.0);
+            hint(ui, "Takes effect the next time Download Craft starts. To add a language, put <code>.json in the lang folder next to the program; missing texts are listed in lang/<code>.missing.json in the settings folder.");
+        });
 
         // ---- Window behaviour ----
         #[cfg(windows)]
