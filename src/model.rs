@@ -340,7 +340,7 @@ impl DownloadItem {
             status: Status::Queued,
             speed_bps: 0.0,
             created_at: Local::now(),
-            connections: connections.clamp(1, 16),
+            connections: connections.clamp(1, 32),
             selected: false,
             referer: String::new(),
             cookie: String::new(),
@@ -1006,7 +1006,7 @@ pub fn drop_resume_state(dest: &std::path::Path) {
         let _ = std::fs::remove_file(dest.with_extension(format!("dcpart{i}")));
     }
     let _ = std::fs::remove_file(dest.with_extension("hlsmap"));
-    downloadcraft_engine::remove_partial(dest);
+    crate::engine::remove_partial(dest);
 }
 
 /// Outcome of `append_to_queue`.

@@ -209,6 +209,8 @@ pub struct EngineOpts {
     /// YouTube visitor id for a yt-dlp retry after a bot check (empty =
     /// yt-dlp's own). Set only by the fallback chain.
     pub ytdlp_visitor_data: String,
+    /// Name of this download's log (the queue id); empty = no log.
+    pub log_key: String,
 }
 
 /// Request headers captured by the extension for one download. They are
@@ -294,8 +296,69 @@ impl Default for EngineOpts {
             captured_headers: CapturedHeaders::default(),
             browser: None,
             ytdlp_visitor_data: String::new(),
+            log_key: String::new(),
         }
     }
+}
+
+// ---- per-download log (IDM keeps one per download) -------------------------
+
+/// Where download `key`'s log lives (`<config>/logs/<key>.log`).
+pub fn job_log_path(key: &str) -> Option<PathBuf> {
+    if key.is_empty() || !key.chars().all(|c| c.is_ascii_alphanumeric() || c == '-') {
+        return None;
+    }
+    crate::model::config_dir().map(|d| d.join("logs").join(format!("{key}.log")))
+}
+
+/// Append one line to download `key`'s log, keeping the file small.
+pub fn job_log(key: &str, line: impl AsRef<str>) {
+    let Some(path) = job_log_path(key) else { return };
+    if let Some(dir) = path.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    if std::fs::metadata(&path).map(|m| m.len() > 256 * 1024).unwrap_or(false) {
+        if let Ok(old) = std::fs::read_to_string(&path) {
+            let keep = &old[old.len() / 2..];
+            let cut = keep.find('\n').map(|i| &keep[i + 1..]).unwrap_or(keep);
+            let _ = std::fs::write(&path, cut);
+        }
+    }
+    use std::io::Write;
+    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&path) {
+        let _ = writeln!(f, "[{}] {}", chrono::Local::now().format("%H:%M:%S"), line.as_ref().replace(['\r', '\n'], " "));
+    }
+}
+
+/// The folder chosen for unfinished downloads (Settings -> Download Engine
+/// -> Temporary folder); None = next to the file.
+pub fn work_dir() -> Option<PathBuf> {
+    let d = crate::model::ui_pref_str("temp_dir", "");
+    let d = d.trim();
+    (!d.is_empty()).then(|| PathBuf::from(d))
+}
+
+/// Unfinished engine data for `dest`, in the temporary folder or next to it.
+pub fn has_partial(dest: &std::path::Path) -> bool {
+    downloadcraft_engine::has_partial(dest) || work_dir().is_some_and(|w| downloadcraft_engine::has_partial_in(dest, Some(&w)))
+}
+
+/// Drop the engine's unfinished data for `dest` wherever it is.
+pub fn remove_partial(dest: &std::path::Path) {
+    downloadcraft_engine::remove_partial(dest);
+    if let Some(w) = work_dir() {
+        downloadcraft_engine::remove_partial_in(dest, Some(&w));
+    }
+}
+
+/// Every unfinished-data path of `dest` (for deleting leftovers).
+pub fn partial_paths(dest: &std::path::Path) -> Vec<PathBuf> {
+    let mut v = vec![downloadcraft_engine::data_path(dest), downloadcraft_engine::journal_path(dest)];
+    if let Some(w) = work_dir() {
+        v.push(downloadcraft_engine::data_path_in(dest, Some(&w)));
+        v.push(downloadcraft_engine::journal_path_in(dest, Some(&w)));
+    }
+    v
 }
 
 impl EngineOpts {
@@ -555,7 +618,7 @@ fn resume_meta_path(dest: &std::path::Path) -> std::path::PathBuf {
 fn cleanup_completed_resume(dest: &std::path::Path) {
     if !dest.is_file() || dest.with_extension("dcpart").exists()
         || (0..16).any(|i| dest.with_extension(format!("dcpart{i}")).exists())
-        || downloadcraft_engine::has_partial(dest) {
+        || has_partial(dest) {
         return;
     }
     let _ = std::fs::remove_file(resume_meta_path(dest));
@@ -3762,9 +3825,19 @@ pub async fn download(
 ) -> Result<()> {
     shared.expected_duration.store(opts.expected_duration_secs, Ordering::SeqCst);
     shared.expects_audio.store(opts.require_audio, Ordering::SeqCst);
+    let log = opts.log_key.clone();
+    job_log(&log, format!("start: {url} ({connections} connections)"));
     if let Err(e) = download_inner(url.clone(), dest.clone(), connections, opts.clone(), shared.clone()).await {
-        fallback_chain(e, &url, &dest, connections, &opts, &shared).await?;
+        job_log(&log, format!("failed: {e:#}"));
+        if let Err(e) = fallback_chain(e, &url, &dest, connections, &opts, &shared).await {
+            job_log(&log, format!("gave up: {e:#}"));
+            return Err(e);
+        }
     }
+    if let Some(n) = mutex_guard(&shared.note).clone() {
+        job_log(&log, format!("note: {n}"));
+    }
+    job_log(&log, format!("done: {} bytes", shared.downloaded.load(Ordering::SeqCst)));
     verify_completed_media(&dest, &shared).await?;
     cleanup_completed_job(&dest, &shared);
     Ok(())
@@ -3806,6 +3879,7 @@ async fn fallback_chain(
                     eprintln!("[dbg] native YouTube engine failed ({err:#}); continuing with yt-dlp");
                 }
                 shared.set_note(format!("the app's own YouTube engine failed ({err:#}) - yt-dlp took over"));
+                job_log(&opts.log_key, "falling back to yt-dlp");
                 reset_counters(shared);
                 match download_with_ytdlp(&exe, &page, &actual, connections, opts, shared).await {
                     Ok(()) => return Ok(()),
@@ -3837,6 +3911,7 @@ async fn fallback_chain(
             eprintln!("[dbg] refused ({err:#}); asking the browser page to fetch it");
         }
         reset_counters(shared);
+        job_log(&opts.log_key, "server refused the app: fetching inside the browser page");
         match page_fetch_file(url, page, &actual, shared).await {
             Ok(()) => {
                 shared.set_note("the server refused the app, so the file was fetched inside the browser page");
@@ -4383,7 +4458,7 @@ async fn download_inner(
     if opts.allow_rename && dest.exists() && !opts.overwrite_existing {
         let resumable_here = dest.with_extension("dcpart").exists()
             || (0..16).any(|i| dest.with_extension(format!("dcpart{i}")).exists())
-            || downloadcraft_engine::has_partial(&dest);
+            || has_partial(&dest);
         if !resumable_here {
             dest = crate::model::conflict_free_dest(&dest);
             if let Some(name) = dest
@@ -4397,7 +4472,7 @@ async fn download_inner(
         let _ = tokio::fs::remove_file(&dest).await;
     }
 
-    let conns = connections.clamp(1, 16);
+    let conns = connections.clamp(1, 32);
     // Facebook/Instagram CDNs throttle parallel Range requests (idle-socket
     // drops, short segments, 403/416 on later ranges). Start those hosts on
     // a single sequential stream instead of burning retries on N-way Ranges.
@@ -4423,7 +4498,7 @@ async fn download_inner(
         // partial download to continue (the last halving step).
         let use_segmented = supports_range
             && matches!(total_opt, Some(t) if t >= 1024 * 1024)
-            && (seg_parts > 1 || downloadcraft_engine::has_partial(&dest))
+            && (seg_parts > 1 || has_partial(&dest))
             && !fell_back_single;
         last_segmented = use_segmented;
         let r = if use_segmented {
@@ -4462,7 +4537,7 @@ async fn download_inner(
                 // A plain-stream fallback finished: the engine's partial
                 // data (kept in case that failed too) is no longer needed.
                 if !last_segmented {
-                    downloadcraft_engine::remove_partial(&dest);
+                    remove_partial(&dest);
                 }
                 break;
             }
@@ -4481,7 +4556,7 @@ async fn download_inner(
                         // rebinds it on first write.)
                         let _ = tokio::fs::remove_file(dest.with_extension("dcpart")).await;
                         let _ = tokio::fs::remove_file(dest.with_extension("dcmeta")).await;
-                        downloadcraft_engine::remove_partial(&dest);
+                        remove_partial(&dest);
                         for i in 0..16 {
                             let _ = tokio::fs::remove_file(
                                 dest.with_extension(format!("dcpart{i}")),
@@ -6432,7 +6507,7 @@ async fn adaptive_leg(
 ) -> Result<()> {
     let strict = is_fragile_cdn(url) || is_googlevideo_url(url);
     let can_chunk = strict && matches!(total, Some(t) if t > 0);
-    let parts = conns.clamp(1, 16);
+    let parts = conns.clamp(1, 32);
     let can_segment = range && matches!(total, Some(t) if t >= 1024 * 1024) && parts > 1;
     if can_segment {
         // Legs start at zero (fresh work dir), so the counter holds only
@@ -6453,7 +6528,7 @@ async fn adaptive_leg(
                         // Stale parts belong to the failed split; the
                         // chunked round rebinds its own offset, and the
                         // counter restarts with it (never double-counts).
-                        downloadcraft_engine::remove_partial(leg_dest);
+                        remove_partial(leg_dest);
                         for i in 0..16 {
                             let _ = tokio::fs::remove_file(
                                 leg_dest.with_extension(format!("dcpart{i}")),
@@ -6598,7 +6673,7 @@ async fn download_adaptive_inner(
     tokio::fs::create_dir_all(&work).await?;
     let v_dest = work.join("v");
     let a_dest = work.join("a");
-    let conns = connections.clamp(1, 16);
+    let conns = connections.clamp(1, 32);
     let limiter = std::sync::Arc::new(
         RateLimiter::new(opts.speed_limit_bps).with_global(opts.global_limit.clone()),
     );
@@ -8230,7 +8305,7 @@ async fn segmented(
     // Strict googlevideo edges 403 ranges above ~2 MiB: ask in windows.
     let strict = is_googlevideo_url(url);
     let config = dce::Config {
-        connections: connections.clamp(1, 16),
+        connections: connections.clamp(1, 32),
         max_request: strict.then_some(STRICT_PART_MAX),
         min_split: if strict { STRICT_PART_MAX } else { 1024 * 1024 },
         stall_timeout: std::time::Duration::from_secs(opts.timeout_secs.clamp(15, 120)),
@@ -8262,8 +8337,8 @@ async fn segmented(
     for i in 0..16 {
         let _ = tokio::fs::remove_file(dest.with_extension(format!("dcpart{i}"))).await;
     }
-    let job = dce::Job::new(url, dest.clone()).size_hint(Some(total), true);
-    run_dce(dl, job, url, total, &shared).await.map(|_| ())
+    let job = dce::Job::new(url, dest.clone()).size_hint(Some(total), true).work_dir(work_dir());
+    run_dce(dl, job, url, total, &shared, &opts.log_key).await.map(|_| ())
 }
 
 /// A form (POST) download the browser handed over: repeat the POST with its
@@ -8286,7 +8361,7 @@ async fn post_download(
     }
     let limiter = Arc::new(RateLimiter::new(opts.speed_limit_bps).with_global(opts.global_limit.clone()));
     let config = dce::Config {
-        connections: connections.clamp(1, 16),
+        connections: connections.clamp(1, 32),
         stall_timeout: std::time::Duration::from_secs(opts.timeout_secs.clamp(15, 120)),
         max_retries: opts.max_retries.max(1),
         ..dce::Config::default()
@@ -8295,8 +8370,8 @@ async fn post_download(
     let request: dce::RequestFn = Arc::new(move |u: &str| o.apply(c.post(u), Some(u)).body(body.clone()));
     let dl = dce::Downloader::with_request(request).config(config).limiter(limiter);
     shared.resumable.store(false, Ordering::SeqCst);
-    let job = dce::Job::new(url, dest.clone());
-    let out = run_dce(dl, job, url, 0, shared).await?;
+    let job = dce::Job::new(url, dest.clone()).work_dir(work_dir());
+    let out = run_dce(dl, job, url, 0, shared, &opts.log_key).await?;
     // Name from the server's Content-Disposition when ours is a placeholder.
     if opts.allow_rename {
         let cur = dest.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
@@ -8322,11 +8397,17 @@ async fn run_dce(
     url: &str,
     total: u64,
     shared: &Arc<SharedState>,
+    log: &str,
 ) -> Result<downloadcraft_engine::Outcome> {
     use downloadcraft_engine as dce;
-    if std::env::var("DOWNLOAD_CRAFT_DEBUG").is_ok() {
-        dl = dl.on_event(Arc::new(|e: &dce::Event| eprintln!("[dbg] engine: {e}")));
-    }
+    let dbg = std::env::var("DOWNLOAD_CRAFT_DEBUG").is_ok();
+    let key = log.to_string();
+    dl = dl.on_event(Arc::new(move |e: &dce::Event| {
+        if dbg {
+            eprintln!("[dbg] engine: {e}");
+        }
+        job_log(&key, e.to_string());
+    }));
     let progress = Arc::new(dce::Progress::default());
     let control = Arc::new(dce::Control::default());
     let done = Arc::new(AtomicBool::new(false));

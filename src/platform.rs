@@ -106,6 +106,28 @@ pub fn open(path: &Path, reveal: bool) {
         let _ = (path, reveal);
     }
 }
+/// A short system sound: "done" or "failed" (best effort, never blocks).
+pub fn play_sound(ok: bool) {
+    #[cfg(windows)]
+    {
+        use windows_sys::Win32::System::Diagnostics::Debug::MessageBeep;
+        use windows_sys::Win32::UI::WindowsAndMessaging::{MB_ICONASTERISK, MB_ICONHAND};
+        unsafe {
+            MessageBeep(if ok { MB_ICONASTERISK } else { MB_ICONHAND });
+        }
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let f = if ok { "/System/Library/Sounds/Glass.aiff" } else { "/System/Library/Sounds/Basso.aiff" };
+        let _ = std::process::Command::new("afplay").arg(f).spawn();
+    }
+    #[cfg(all(unix, not(target_os = "macos")))]
+    {
+        let id = if ok { "complete" } else { "dialog-error" };
+        let _ = std::process::Command::new("canberra-gtk-play").args(["-i", id]).spawn();
+    }
+}
+
 pub fn power(action: &str) -> Result<(), String> {
     #[cfg(target_os = "macos")]
     let mut command = {

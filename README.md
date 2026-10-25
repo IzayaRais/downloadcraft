@@ -112,7 +112,7 @@ Full notes: [Release 0.9.8](https://github.com/hungry-detective/downloadcraft/re
 ## 🚀 Features
 
 **Downloading**
-- **Dynamic segmentation** (1–16 connections): a free connection takes over half of whatever would finish
+- **Dynamic segmentation** (1–32 connections): a free connection takes over half of whatever would finish
   last, so no connection idles while another crawls. Crash-safe resume, self-healing connections and
   automatic link refresh. See [the engine](#-the-engine).
 - A global speed limit, per-download connections and a per-server connection cap.

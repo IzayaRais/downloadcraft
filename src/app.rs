@@ -1833,6 +1833,8 @@ pub struct CraftApp {
     /// Pop the standalone "Download complete" dialog when a download finishes.
     /// Its own "Don't show this dialog again" checkbox clears this.
     show_complete: bool,
+    /// Sounds for finished / failed downloads (Settings -> Storage).
+    sounds: bool,
     queue_running: bool,
     had_active: bool,
     timeout_secs: u64,
@@ -2002,6 +2004,7 @@ impl CraftApp {
             max_concurrent: 3,
         per_host_conns: 0,
             show_complete: true,
+            sounds: false,
             queue_running: false,
             had_active: false,
             timeout_secs: 60,
@@ -2423,6 +2426,9 @@ impl CraftApp {
                     if let Some(n) = g("per_host_conns").and_then(|x| x.as_u64()) {
                         self.per_host_conns = (n as usize).clamp(0, 64);
                     }
+                    if let Some(b) = g("sounds").and_then(|x| x.as_bool()) {
+                        self.sounds = b;
+                    }
                     if let Some(b) = g("show_complete").and_then(|x| x.as_bool()) {
                         self.show_complete = b;
                     }
@@ -2456,7 +2462,7 @@ impl CraftApp {
                         self.theme = s.to_string();
                     }
                     if let Some(n) = g("connections_default").and_then(|x| x.as_u64()) {
-                        self.connections_default = (n as usize).clamp(1, 16);
+                        self.connections_default = (n as usize).clamp(1, 32);
                     }
                     if let Some(n) = g("speed_limit_kbps").and_then(|x| x.as_u64()) {
                         self.speed_limit_kbps = n;
@@ -2519,8 +2525,7 @@ impl CraftApp {
         for i in 0..16 {
             out.push(dest.with_extension(format!("dcpart{i}")));
         }
-        out.push(downloadcraft_engine::data_path(dest));
-        out.push(downloadcraft_engine::journal_path(dest));
+        out.extend(crate::engine::partial_paths(dest));
         out
     }
 
@@ -3481,6 +3486,7 @@ impl CraftApp {
             per_host_conns: self.per_host_conns,
             browser: item.browser.clone(),
             ytdlp_visitor_data: String::new(),
+            log_key: item.id.to_string(),
         };
         let shared2 = shared.clone();
         // Adaptive pairs (video-only + audio) merge via ffmpeg on completion.
@@ -3698,6 +3704,55 @@ impl CraftApp {
         self.downloads.retain(|d| d.id != id);
         self.push_log(format!("Removed #{id}"));
         self.save_queue();
+    }
+
+    /// IDM-style list keys (only while no text field has the keyboard and no
+    /// dialog is open): Ctrl+A checks every visible row, Delete removes the
+    /// checked rows (files stay), Space pauses or resumes them, Enter opens a
+    /// finished file or the details of anything else.
+    fn list_shortcuts(&mut self, ctx: &egui::Context) {
+        if self.show_add || ctx.wants_keyboard_input() {
+            return;
+        }
+        let (all, del, space, enter) = ctx.input(|i| {
+            (
+                i.modifiers.command && i.key_pressed(egui::Key::A),
+                i.key_pressed(egui::Key::Delete),
+                i.key_pressed(egui::Key::Space),
+                i.key_pressed(egui::Key::Enter),
+            )
+        });
+        if all {
+            let ids = self.visible_ids();
+            for d in self.downloads.iter_mut() {
+                if ids.contains(&d.id) {
+                    d.selected = true;
+                }
+            }
+        }
+        let ids = self.selected_ids();
+        if ids.is_empty() {
+            return;
+        }
+        if del {
+            let n = ids.len();
+            for id in ids {
+                self.remove(id);
+            }
+            self.push_log(format!("Removed {n} selected download(s)."));
+        } else if space {
+            for id in ids {
+                let act = match self.downloads.iter().find(|d| d.id == id).map(|d| &d.status) {
+                    Some(Status::Downloading) => RowAct::Pause,
+                    Some(Status::Completed) | None => continue,
+                    _ => RowAct::Resume,
+                };
+                self.do_row_act(act, id);
+            }
+        } else if enter && ids.len() == 1 {
+            let done = self.downloads.iter().any(|d| d.id == ids[0] && matches!(d.status, Status::Completed));
+            self.do_row_act(if done { RowAct::OpenFile } else { RowAct::Details }, ids[0]);
+        }
     }
 
     /// Checked rows the user can see. A row checked under another filter or
@@ -4013,6 +4068,9 @@ impl CraftApp {
                             d.total_bytes = None;
                         }
                         if !repaired {
+                            if self.sounds {
+                                crate::platform::play_sound(false);
+                            }
                             notify(
                                 "Download Craft — download failed",
                                 &format!("#{id}: {reason}"),
@@ -4066,6 +4124,9 @@ impl CraftApp {
     /// Called with an immutable borrow-safe snapshot after a download completes.
     fn on_download_finished(&mut self, name: &str, path: &std::path::Path) {
         notify("Download Craft — download finished", name);
+        if self.sounds {
+            crate::platform::play_sound(true);
+        }
         if !self.antivirus_cmd.trim().is_empty() {
             match crate::platform::antivirus_command(&self.antivirus_cmd,path) {
                 Ok(mut cmd) => {
@@ -5954,6 +6015,7 @@ impl eframe::App for CraftApp {
             );
         }
 
+        self.list_shortcuts(ctx);
         // ================= dialogs =================
         if self.show_add {
             if self.add_focus_req {
@@ -6217,7 +6279,7 @@ impl eframe::App for CraftApp {
                             (((self.add_conns as f64) - 1.0) / 15.0).clamp(0.0, 1.0) as f32;
                         dm_slider(&p, &self.man, srect, frac);
                         self.hits.push((
-                            HitKind::Slider(SliderId::AddConns, 1.0, 16.0, false),
+                            HitKind::Slider(SliderId::AddConns, 1.0, 32.0, false),
                             srect,
                         ));
                         p.text(
@@ -7715,11 +7777,11 @@ impl CraftApp {
 
     fn slider_set(&mut self, id: SliderId, v: f64) {
         match id {
-            SliderId::AddConns => self.add_conns = (v as usize).clamp(1, 16),
+            SliderId::AddConns => self.add_conns = (v as usize).clamp(1, 32),
             SliderId::LimitKB => self.speed_limit_kbps = (v as u64).clamp(50, 20000),
             SliderId::Timeout => self.timeout_secs = (v as u64).clamp(5, 600),
             SliderId::Retries => self.max_retries = (v as u32).clamp(1, 20),
-            SliderId::DefConns => self.connections_default = (v as usize).clamp(1, 16),
+            SliderId::DefConns => self.connections_default = (v as usize).clamp(1, 32),
             SliderId::QMax => {
                 self.max_concurrent = (v as usize).clamp(1, 16);
                 self.fill_next();

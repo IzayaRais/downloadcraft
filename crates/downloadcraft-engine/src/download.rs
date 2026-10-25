@@ -4,8 +4,8 @@
 use crate::journal::Journal;
 use crate::segments::{Claim, SegmentMap, OPEN_END};
 use crate::{
-    data_path, file, journal_path, remove_partial, sniff, Control, Downloader, Error, Event, Job,
-    Outcome, Progress, SegmentView,
+    file, remove_partial_in, sniff, Control, Downloader, Error, Event, Job, Outcome, Progress,
+    SegmentView,
 };
 use futures_util::StreamExt;
 use std::path::PathBuf;
@@ -411,7 +411,7 @@ pub(crate) async fn run(
             if let Some(f) = &dl.events {
                 f(&Event::Restarted { reason: why });
             }
-            remove_partial(&job.dest);
+            remove_partial_in(&job.dest, job.work_dir.as_deref());
             let fresh = Job { size_hint: None, ranges_hint: false, ..job };
             run_once(dl, fresh, progress, control).await
         }
@@ -420,8 +420,8 @@ pub(crate) async fn run(
 }
 
 fn load_resume(job: &Job, key: &str) -> Option<Journal> {
-    let j = Journal::load(&journal_path(&job.dest))?;
-    let len = std::fs::metadata(data_path(&job.dest)).ok()?.len();
+    let j = Journal::load(&job.journal())?;
+    let len = std::fs::metadata(job.data()).ok()?.len();
     (j.key == key && len == j.total && job.size_hint.is_none_or(|t| t == j.total)).then_some(j)
 }
 
@@ -435,9 +435,11 @@ async fn run_once(
     let conns = cfg.connections.clamp(1, 32);
     let min_split = cfg.min_split.max(64 * 1024);
     let key = job.resume_key.clone().unwrap_or_else(|| job.url.clone());
-    let data = data_path(&job.dest);
-    if let Some(dir) = job.dest.parent().filter(|d| !d.as_os_str().is_empty()) {
-        std::fs::create_dir_all(dir)?;
+    let data = job.data();
+    for dir in [job.dest.parent(), data.parent()].into_iter().flatten() {
+        if !dir.as_os_str().is_empty() {
+            std::fs::create_dir_all(dir)?;
+        }
     }
     let mut meta = Meta::default();
     let (map, ranges_ok) = match load_resume(&job, &key) {
@@ -447,7 +449,7 @@ async fn run_once(
             (SegmentMap::from_remaining(j.total, &j.remaining, min_split), true)
         }
         None => {
-            remove_partial(&job.dest);
+            remove_partial_in(&job.dest, job.work_dir.as_deref());
             match job.size_hint {
                 Some(t) if job.ranges_hint && t > 0 => {
                     file::create(&data, Some(t))?;
@@ -473,7 +475,7 @@ async fn run_once(
     let run = Arc::new(Run {
         dl: dl.clone(),
         url: RwLock::new(job.url.clone()),
-        journal: journal_path(&job.dest),
+        journal: job.journal(),
         data,
         key,
         map: Mutex::new(map),
@@ -663,7 +665,11 @@ async fn finish(run: &Arc<Run>) -> Result<Outcome, Error> {
     }
     if tokio::fs::rename(&run.data, &run.job.dest).await.is_err() {
         let _ = tokio::fs::remove_file(&run.job.dest).await;
-        tokio::fs::rename(&run.data, &run.job.dest).await?;
+        if tokio::fs::rename(&run.data, &run.job.dest).await.is_err() {
+            // Work folder on another drive: copy, then drop the working copy.
+            tokio::fs::copy(&run.data, &run.job.dest).await?;
+            let _ = tokio::fs::remove_file(&run.data).await;
+        }
     }
     let _ = tokio::fs::remove_file(&run.journal).await;
     let meta = lock(&run.meta);

@@ -142,11 +142,14 @@ pub struct Job {
     /// What a resume journal must belong to (default: the URL). Use a stable
     /// id when the URL changes between runs (signed links).
     pub resume_key: Option<String>,
+    /// Keep the unfinished data and journal in this folder (a fast or roomy
+    /// disk) instead of next to `dest`; the finished file is moved to `dest`.
+    pub work_dir: Option<PathBuf>,
 }
 
 impl Job {
     pub fn new(url: impl Into<String>, dest: impl Into<PathBuf>) -> Self {
-        Self { url: url.into(), dest: dest.into(), size_hint: None, ranges_hint: false, resume_key: None }
+        Self { url: url.into(), dest: dest.into(), size_hint: None, ranges_hint: false, resume_key: None, work_dir: None }
     }
 
     pub fn size_hint(mut self, size: Option<u64>, ranges: bool) -> Self {
@@ -158,6 +161,20 @@ impl Job {
     pub fn resume_key(mut self, key: impl Into<String>) -> Self {
         self.resume_key = Some(key.into());
         self
+    }
+
+    /// See [`Job::work_dir`]. `None` = next to the destination.
+    pub fn work_dir(mut self, dir: Option<PathBuf>) -> Self {
+        self.work_dir = dir.filter(|d| !d.as_os_str().is_empty());
+        self
+    }
+
+    pub(crate) fn data(&self) -> PathBuf {
+        data_path_in(&self.dest, self.work_dir.as_deref())
+    }
+
+    pub(crate) fn journal(&self) -> PathBuf {
+        journal_path_in(&self.dest, self.work_dir.as_deref())
     }
 }
 
@@ -354,24 +371,62 @@ impl From<std::io::Error> for Error {
 
 /// Where a job's data lives while downloading.
 pub fn data_path(dest: &Path) -> PathBuf {
-    journal::with_suffix(dest, ".dcdata")
+    data_path_in(dest, None)
 }
 
 /// Where a job's resume journal lives.
 pub fn journal_path(dest: &Path) -> PathBuf {
-    journal::with_suffix(dest, ".dcjournal")
+    journal_path_in(dest, None)
+}
+
+/// The working copy of `dest` inside `work_dir` (or next to `dest`). The
+/// name carries a hash of the full destination, so two files with the same
+/// name in different folders never share one.
+fn work_base(dest: &Path, work_dir: Option<&Path>) -> PathBuf {
+    match work_dir {
+        None => dest.to_path_buf(),
+        Some(dir) => {
+            let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+            for b in dest.to_string_lossy().as_bytes() {
+                h = (h ^ *b as u64).wrapping_mul(0x100_0000_01b3);
+            }
+            let name = dest.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+            dir.join(format!("{h:016x}-{name}"))
+        }
+    }
+}
+
+/// [`data_path`] with a work folder (see [`Job::work_dir`]).
+pub fn data_path_in(dest: &Path, work_dir: Option<&Path>) -> PathBuf {
+    journal::with_suffix(&work_base(dest, work_dir), ".dcdata")
+}
+
+/// [`journal_path`] with a work folder.
+pub fn journal_path_in(dest: &Path, work_dir: Option<&Path>) -> PathBuf {
+    journal::with_suffix(&work_base(dest, work_dir), ".dcjournal")
 }
 
 /// Whether an unfinished download for `dest` can be resumed.
 pub fn has_partial(dest: &Path) -> bool {
-    data_path(dest).is_file() && journal_path(dest).is_file()
+    has_partial_in(dest, None)
+}
+
+/// [`has_partial`] with a work folder.
+pub fn has_partial_in(dest: &Path, work_dir: Option<&Path>) -> bool {
+    data_path_in(dest, work_dir).is_file() && journal_path_in(dest, work_dir).is_file()
 }
 
 /// Delete the resume state of `dest` (data and journal).
 pub fn remove_partial(dest: &Path) {
-    let _ = std::fs::remove_file(data_path(dest));
-    let _ = std::fs::remove_file(journal_path(dest));
-    let _ = std::fs::remove_file(journal::with_suffix(&journal_path(dest), ".tmp"));
+    remove_partial_in(dest, None)
+}
+
+/// [`remove_partial`] with a work folder.
+pub fn remove_partial_in(dest: &Path, work_dir: Option<&Path>) {
+    let j = journal_path_in(dest, work_dir);
+    let _ = std::fs::remove_file(data_path_in(dest, work_dir));
+    let _ = std::fs::remove_file(&j);
+    let _ = std::fs::remove_file(journal::with_suffix(&j, ".tmp"));
 }
 
 /// The engine. Cheap to clone; one instance can run many downloads.

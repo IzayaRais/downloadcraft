@@ -68,6 +68,10 @@ struct Settings {
     ffmpeg_custom_path: String,
     /// Max simultaneous connections per host across all downloads (0 = off).
     per_host_conns: usize,
+    /// Where unfinished downloads are kept (empty = next to the file).
+    temp_dir: String,
+    /// Play a sound when a download finishes or fails.
+    sounds: bool,
     // Browser capture (pushed to the extension over its live connection)
     capture_auto: bool,
     /// File extensions to take over from the browser ("zip exe mp4 ..");
@@ -123,6 +127,8 @@ impl Default for Settings {
             ffmpeg_source: "managed".to_string(),
             ffmpeg_custom_path: String::new(),
             per_host_conns: 0,
+            temp_dir: String::new(),
+            sounds: false,
             capture_auto: true,
             capture_types: String::new(),
             capture_skip_sites: String::new(),
@@ -205,6 +211,12 @@ fn load() -> Settings {
     if let Some(x) = g("ffmpeg_custom_path").and_then(|x| x.as_str()) {
         s.ffmpeg_custom_path = x.to_string();
     }
+    if let Some(x) = g("temp_dir").and_then(|x| x.as_str()) {
+        s.temp_dir = x.to_string();
+    }
+    if let Some(b) = g("sounds").and_then(|x| x.as_bool()) {
+        s.sounds = b;
+    }
     if let Some(b) = g("capture_auto").and_then(|x| x.as_bool()) {
         s.capture_auto = b;
     }
@@ -235,7 +247,7 @@ fn load() -> Settings {
         s.per_host_conns = (n as usize).clamp(0, 64);
     }
     if let Some(n) = g("connections_default").and_then(|x| x.as_u64()) {
-        s.connections_default = (n as usize).clamp(1, 16);
+        s.connections_default = (n as usize).clamp(1, 32);
     }
     if let Some(n) = g("speed_limit_kbps").and_then(|x| x.as_u64()) {
         s.speed_limit_kbps = n;
@@ -330,6 +342,8 @@ fn save(s: &Settings) -> bool {
     set(obj, "ffmpeg_source", s.ffmpeg_source.clone().into());
     set(obj, "ffmpeg_custom_path", s.ffmpeg_custom_path.clone().into());
     set(obj, "per_host_conns", (s.per_host_conns as u64).into());
+    set(obj, "temp_dir", s.temp_dir.trim().to_string().into());
+    set(obj, "sounds", s.sounds.into());
     set(obj, "capture_auto", s.capture_auto.into());
     set(obj, "capture_types", normalize_types(&s.capture_types).into());
     set(obj, "capture_skip_sites", s.capture_skip_sites.trim().to_string().into());
@@ -2401,7 +2415,18 @@ impl SettingsApp {
                     s.save_dir = p.to_string_lossy().to_string();
                 }
             }
+            let mut c = field_row(ui, "temp_dir", "Temporary folder", None, Some("Unfinished downloads wait here (a fast disk), then move to the save folder. Empty = next to the file."));
+            let iw = (c.available_width() - 34.0).max(60.0);
+            input_box(&mut c, "engine_temp_dir", &mut s.temp_dir, iw, true, false, "next to the file");
+            c.add_space(6.0);
+            if icon_sq(&mut c, "\u{e2c7}", 28.0, 6.0).on_hover_text("Browse…").clicked() {
+                if let Some(p) = rfd::FileDialog::new().pick_folder() {
+                    s.temp_dir = p.to_string_lossy().to_string();
+                }
+            }
             ui.add_space(6.0);
+            checkbox(ui, &mut s.sounds, "Play a sound when a download finishes or fails", 14.0, 11.5, true);
+            ui.add_space(1.0);
             checkbox(
                 ui,
                 &mut s.category_folders,
@@ -2425,7 +2450,7 @@ impl SettingsApp {
         card(ui, "Performance", None, &mut self.open_perf, |ui| {
             let mut c = field_row(ui, "connections", "Default connections", None, None);
             let mut conn = s.connections_default as f64;
-            if slider_row(&mut c, "connections", &mut conn, 1.0, 16.0) {
+            if slider_row(&mut c, "connections", &mut conn, 1.0, 32.0) {
                 s.connections_default = conn.round() as usize;
             }
             let mut c = field_row(

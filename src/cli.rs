@@ -166,6 +166,7 @@ fn opts_for(item: &DownloadItem, limit_bps: u64) -> EngineOpts {
     o.cookie = item.cookie.clone();
     o.captured_headers = crate::engine::CapturedHeaders::for_url(&item.url, &item.extra_headers);
     o.browser = item.browser.clone();
+    o.log_key = item.id.to_string();
     o.username = item.username.clone();
     o.password = item.password.clone();
     o.expected_sha256 = item.checksum_sha256.clone();
@@ -497,7 +498,7 @@ fn run_engine(
         .map(|s| s.to_string_lossy().to_string())
         .unwrap_or_else(|| url.clone());
     let handle = rt.spawn(async move {
-        download(url, dest, connections.clamp(1, 16), opts, s2).await
+        download(url, dest, connections.clamp(1, 32), opts, s2).await
     });
     let t0 = std::time::Instant::now();
     let mut last = 0u64;

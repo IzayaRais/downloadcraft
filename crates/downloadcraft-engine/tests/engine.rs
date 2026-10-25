@@ -453,6 +453,28 @@ async fn small_windows_for_strict_cdns() {
 }
 
 #[tokio::test]
+async fn a_work_folder_keeps_the_partial_elsewhere() {
+    let srv = Server::start(Behaviour { size: 3 * MIB, rate: 1024 * 1024, ..Default::default() }).await;
+    let dest = tmp("workdir");
+    let work = dest.parent().unwrap().join("scratch");
+    let dl = Downloader::new(reqwest::Client::new()).config(quick());
+    let job = Job::new(srv.url("/f"), &dest).size_hint(Some(3 * MIB as u64), true).work_dir(Some(work.clone()));
+    let control = Arc::new(Control::default());
+    let c = control.clone();
+    tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(800)).await;
+        c.cancel();
+    });
+    let _ = dl.download(job.clone(), Arc::new(Progress::default()), control).await;
+    assert!(downloadcraft_engine::has_partial_in(&dest, Some(&work)));
+    assert!(!downloadcraft_engine::has_partial(&dest), "nothing next to the destination");
+    let out = get(&dl, job).await.unwrap();
+    assert!(out.resumed > 0);
+    assert_eq!(std::fs::read(&dest).unwrap(), body(3 * MIB, 1));
+    assert!(!downloadcraft_engine::has_partial_in(&dest, Some(&work)));
+}
+
+#[tokio::test]
 async fn progress_reports_segments_and_connections() {
     let srv = Server::start(Behaviour { size: 4 * MIB, rate: 1024 * 1024, ..Default::default() }).await;
     let dest = tmp("progress");

@@ -88,7 +88,7 @@ pub(crate) fn load_prefs() -> UiPrefs {
             .unwrap_or_else(|| crate::model::default_download_dir().to_string_lossy().into_owned());
     }
     if let Some(n) = v.get("connections_default").and_then(|x| x.as_u64()) {
-        p.connections = (n as usize).clamp(1, 16);
+        p.connections = (n as usize).clamp(1, 32);
     }
     if let Some(b) = v.get("category_folders").and_then(|x| x.as_bool()) {
         p.category_folders = b;
@@ -1295,9 +1295,9 @@ impl eframe::App for ConfirmApp {
                     egui::pos2(row.min.x + 92.0, row.min.y + 5.0),
                     egui::vec2(row.width() - 144.0, 20.0),
                 );
-                let frac = ((self.connections as f32 - 1.0) / 15.0).clamp(0.0, 1.0);
+                let frac = ((self.connections as f32 - 1.0) / 31.0).clamp(0.0, 1.0);
                 if let Some(nf) = slider_row(ui, srect, "conns", frac) {
-                    self.connections = ((nf * 15.0).round() as usize + 1).clamp(1, 16);
+                    self.connections = ((nf * 31.0).round() as usize + 1).clamp(1, 32);
                 }
                 p.text(
                     egui::pos2(row.max.x, row.center().y),

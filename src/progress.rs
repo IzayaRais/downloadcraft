@@ -283,11 +283,12 @@ fn card_h(n: usize) -> f32 {
     361.0 + TBL_STEP * n as f32
 }
 
-/// The concept's three tabs, in its order.
-const TABS: [(DmIcon, &str); 3] = [
+/// The concept's tabs, plus the per-download log.
+const TABS: [(DmIcon, &str); 4] = [
     (DmIcon::Info, "Info"),
     (DmIcon::Chart, "Speed"),
     (DmIcon::Sliders, "Settings"),
+    (DmIcon::Doc, "Log"),
 ];
 
 /// Card-local rect (origin = the card's top-left, border included).
@@ -362,6 +363,11 @@ fn kv_row(
 
 struct ProgressApp {
     id: u64,
+    /// Speed samples for the Speed tab graph (newest last).
+    speed_hist: std::collections::VecDeque<f64>,
+    /// Tail of this download's log (Log tab), re-read once a second.
+    log_lines: Vec<String>,
+    log_at: Instant,
     /// Set whenever the card's height changes; cleared once the window has been
     /// re-centred, so a growing part list never drifts off the middle.
     recenter: bool,
@@ -393,6 +399,18 @@ impl ProgressApp {
         let items = read_queue();
         self.item = items.into_iter().find(|d| d.id == self.id);
         self.snap = read_snap(self.id);
+        // Speed graph: the last ~30 s (one sample per refresh).
+        self.speed_hist.push_back(if self.snap.live { self.snap.speed.max(0.0) } else { 0.0 });
+        while self.speed_hist.len() > 120 {
+            self.speed_hist.pop_front();
+        }
+        if self.tab == 3 && self.log_at.elapsed() >= Duration::from_secs(1) {
+            self.log_at = Instant::now();
+            self.log_lines = crate::engine::job_log_path(&self.id.to_string())
+                .and_then(|p| std::fs::read_to_string(p).ok())
+                .map(|t| t.lines().rev().take(13).map(str::to_string).collect::<Vec<_>>().into_iter().rev().collect())
+                .unwrap_or_default();
+        }
         // Queue file lags live counters: prefer the snapshot while active.
         // Keep displayed progress monotonic across retry legs (see app).
         if self.snap.live {
@@ -480,6 +498,9 @@ pub fn run() -> eframe::Result<()> {
     // Seed controls from shared settings (global limit + finish action).
     let (limit_input, finish_sel) = read_ui_prefs();
     let mut app = ProgressApp {
+        speed_hist: Default::default(),
+        log_lines: Vec::new(),
+        log_at: Instant::now().checked_sub(Duration::from_secs(5)).unwrap_or_else(Instant::now),
         id,
         recenter: true,
         last_poll: Instant::now() - Duration::from_secs(10),
@@ -758,6 +779,7 @@ impl ProgressApp {
         match self.tab {
             1 => self.body_speed(ui, o, item, downloading),
             2 => self.body_settings(ui, o),
+            3 => self.body_log(ui, o),
             _ => self.body_info(ui, o, item, downloading),
         }
         self.progress_bar(ui, o, item, frac);
@@ -915,12 +937,17 @@ impl ProgressApp {
         let ctx = ui.ctx().clone();
         let p = ui.painter().clone();
         let cap: u64 = self.limit_input.trim().parse().unwrap_or(0);
+        let live_conns = self.snap.parts.iter().filter(|(s, e, d)| s + d <= *e).count();
         kv_row(
             &p,
             o,
             84.0,
             "Connections:",
-            format!("{} threads (fixed at start)", item.connections),
+            if downloading && live_conns > 0 {
+                format!("up to {}, {} parts left (the engine adapts)", item.connections, live_conns)
+            } else {
+                format!("up to {}", item.connections)
+            },
             pl().dm_txt,
             reg(12.0),
         );
@@ -988,19 +1015,66 @@ impl ProgressApp {
             None => "Type a number in KB/s and press Apply — 0 means unlimited.".to_string(),
         };
         p.text(
-            egui::pos2(o.x + PAD_X, o.y + 212.0),
+            egui::pos2(o.x + PAD_X, o.y + 204.0),
             egui::Align2::LEFT_TOP,
             note,
             reg(10.0),
             pl().dm_dim,
         );
-        p.text(
-            egui::pos2(o.x + PAD_X, o.y + 228.0),
-            egui::Align2::LEFT_TOP,
-            "Tip: Settings → Speed windows automates caps by time of day.",
-            reg(10.0),
-            pl().dm_lbl,
-        );
+        // Speed over the last ~30 seconds.
+        let g = at(o, PAD_X, 220.0, PROG_W, 38.0);
+        p.rect_filled(g, 4.0, pl().dm_line);
+        let peak = self.speed_hist.iter().cloned().fold(0.0_f64, f64::max);
+        if peak > 0.0 && self.speed_hist.len() > 1 {
+            let n = self.speed_hist.len();
+            let pts: Vec<egui::Pos2> = self
+                .speed_hist
+                .iter()
+                .enumerate()
+                .map(|(i, v)| {
+                    egui::pos2(
+                        g.left() + 2.0 + (g.width() - 4.0) * i as f32 / (n - 1) as f32,
+                        g.bottom() - 3.0 - (g.height() - 6.0) * (*v / peak) as f32,
+                    )
+                })
+                .collect();
+            p.add(egui::Shape::line(pts, egui::Stroke::new(1.5, DM_ACC)));
+            p.text(
+                egui::pos2(g.right() - 6.0, g.top() + 4.0),
+                egui::Align2::RIGHT_TOP,
+                format!("peak {}/s", format_bytes(peak as u64)),
+                reg(9.0),
+                pl().dm_dim,
+            );
+        } else {
+            p.text(g.center(), egui::Align2::CENTER_CENTER, "speed graph appears while downloading", reg(9.5), pl().dm_dim);
+        }
+    }
+
+    /// The engine's log for this download: connections, retries, fallbacks.
+    fn body_log(&mut self, ui: &mut egui::Ui, o: egui::Pos2) {
+        let p = ui.painter().clone();
+        if self.log_lines.is_empty() {
+            p.text(
+                egui::pos2(o.x + PAD_X, o.y + 86.0),
+                egui::Align2::LEFT_TOP,
+                "Nothing logged yet. Each start, connection, retry and fallback of this download shows up here.",
+                reg(10.5),
+                pl().dm_dim,
+            );
+            return;
+        }
+        let font = egui::FontId::monospace(10.0);
+        for (i, line) in self.log_lines.iter().enumerate() {
+            let shown = elide_mid(&p, line, font.clone(), PROG_W);
+            p.text(
+                egui::pos2(o.x + PAD_X, o.y + 80.0 + i as f32 * 13.5),
+                egui::Align2::LEFT_TOP,
+                shown,
+                font.clone(),
+                pl().dm_txt,
+            );
+        }
     }
 
     /// Concept Settings tab: what happens when the queue drains.
