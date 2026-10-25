@@ -196,6 +196,18 @@ pub struct DownloadItem {
     /// downloads added any other way.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub browser: Option<BrowserContext>,
+    /// Other URLs for the same file (mirrors): connections spread over them.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub mirrors: Vec<String>,
+}
+
+/// "https://a/f.iso | https://b/f.iso": the first is the download, the rest
+/// are mirrors of it (IDM's alternative addresses).
+pub fn split_mirrors(text: &str) -> (String, Vec<String>) {
+    let mut parts = text.split(['|', '\n']).map(str::trim).filter(|s| !s.is_empty());
+    let main = parts.next().unwrap_or("").to_string();
+    let mirrors = parts.filter(|u| is_download_url(u) && *u != main).map(str::to_string).collect();
+    (main, mirrors)
 }
 
 /// The browser's side of a captured download, so the app can repeat the
@@ -363,6 +375,7 @@ impl DownloadItem {
             priority: 0,
             start_at: String::new(),
             browser: None,
+            mirrors: Vec::new(),
         }
     }
 
@@ -1007,6 +1020,152 @@ pub fn drop_resume_state(dest: &std::path::Path) {
     }
     let _ = std::fs::remove_file(dest.with_extension("hlsmap"));
     crate::engine::remove_partial(dest);
+    let _ = std::fs::remove_file(dest.with_extension("dcftp"));
+    let _ = std::fs::remove_file(dest.with_extension("dcftpparts"));
+}
+
+// ---- saved site logins (IDM "Site logins") ----------------------------------
+
+/// A login used automatically for one site.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SiteLogin {
+    /// "example.com" (also its subdomains) or "files.example.com".
+    pub host: String,
+    pub user: String,
+    pub pass: String,
+}
+
+#[derive(Serialize, Deserialize)]
+struct StoredLogin {
+    host: String,
+    user: String,
+    /// The password, protected for this Windows user (DPAPI) and base64'd;
+    /// elsewhere base64 in a file only the user can read.
+    pass: String,
+}
+
+fn logins_path() -> Option<std::path::PathBuf> {
+    config_dir().map(|d| d.join("logins.json"))
+}
+
+#[cfg(windows)]
+fn protect(data: &[u8], encrypt: bool) -> Option<Vec<u8>> {
+    use windows_sys::Win32::Foundation::LocalFree;
+    use windows_sys::Win32::Security::Cryptography::{CryptProtectData, CryptUnprotectData, CRYPT_INTEGER_BLOB};
+    let input = CRYPT_INTEGER_BLOB { cbData: data.len() as u32, pbData: data.as_ptr() as *mut u8 };
+    let mut out = CRYPT_INTEGER_BLOB { cbData: 0, pbData: std::ptr::null_mut() };
+    let ok = unsafe {
+        if encrypt {
+            CryptProtectData(&input, std::ptr::null(), std::ptr::null(), std::ptr::null(), std::ptr::null(), 0, &mut out)
+        } else {
+            CryptUnprotectData(&input, std::ptr::null_mut(), std::ptr::null(), std::ptr::null(), std::ptr::null(), 0, &mut out)
+        }
+    };
+    if ok == 0 || out.pbData.is_null() {
+        return None;
+    }
+    let v = unsafe { std::slice::from_raw_parts(out.pbData, out.cbData as usize).to_vec() };
+    unsafe {
+        LocalFree(out.pbData as _);
+    }
+    Some(v)
+}
+
+#[cfg(not(windows))]
+fn protect(data: &[u8], _encrypt: bool) -> Option<Vec<u8>> {
+    Some(data.to_vec())
+}
+
+/// The saved logins (passwords decrypted).
+pub fn site_logins() -> Vec<SiteLogin> {
+    let stored: Vec<StoredLogin> = logins_path()
+        .and_then(|p| std::fs::read_to_string(p).ok())
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_default();
+    stored
+        .into_iter()
+        .filter_map(|s| {
+            let pass = protect(&base64_decode(&s.pass)?, false)?;
+            Some(SiteLogin { host: s.host, user: s.user, pass: String::from_utf8(pass).ok()? })
+        })
+        .collect()
+}
+
+/// Save the logins (passwords protected for this user).
+pub fn save_site_logins(list: &[SiteLogin]) -> bool {
+    let Some(p) = logins_path() else { return false };
+    let stored: Vec<StoredLogin> = list
+        .iter()
+        .filter(|l| !l.host.trim().is_empty() && !l.user.trim().is_empty())
+        .filter_map(|l| {
+            Some(StoredLogin {
+                host: l.host.trim().trim_start_matches("*.").to_ascii_lowercase(),
+                user: l.user.trim().to_string(),
+                pass: base64_encode(&protect(l.pass.as_bytes(), true)?),
+            })
+        })
+        .collect();
+    let ok = serde_json::to_string_pretty(&stored).ok().is_some_and(|j| atomic_write(&p, j.as_bytes()).is_ok());
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o600));
+    }
+    ok
+}
+
+/// The saved login for `url`'s host (or a parent domain), if any.
+pub fn login_for(url: &str) -> Option<(String, String)> {
+    let host = url::Url::parse(url).ok()?.host_str()?.to_ascii_lowercase();
+    site_logins()
+        .into_iter()
+        .filter(|l| host == l.host || host.ends_with(&format!(".{}", l.host)))
+        .max_by_key(|l| l.host.len())
+        .map(|l| (l.user, l.pass))
+}
+
+// ---- refresh download address (IDM) ----------------------------------------
+
+/// "Refresh download address": row `id` waits (until `until`, unix seconds)
+/// for the next link the browser extension sends, which then replaces its
+/// expired link instead of opening a new download.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RefreshWait {
+    pub id: u64,
+    pub until: i64,
+}
+
+fn refresh_wait_path() -> Option<std::path::PathBuf> {
+    config_dir().map(|d| d.join("refresh_wait.json"))
+}
+
+/// The row waiting for a fresh link, if the wait has not run out.
+pub fn refresh_wait() -> Option<RefreshWait> {
+    let w: RefreshWait = serde_json::from_str(&std::fs::read_to_string(refresh_wait_path()?).ok()?).ok()?;
+    (w.until > Local::now().timestamp()).then_some(w)
+}
+
+/// Start (Some) or end (None) a wait for a fresh link.
+pub fn set_refresh_wait(w: Option<RefreshWait>) {
+    let Some(p) = refresh_wait_path() else { return };
+    match w {
+        Some(w) => {
+            let _ = atomic_write(&p, serde_json::to_string(&w).unwrap_or_default().as_bytes());
+        }
+        None => {
+            let _ = std::fs::remove_file(p);
+        }
+    }
+}
+
+/// Bind `dest`'s single-stream resume state to a new URL for the same file
+/// (a refreshed link), so the bytes already on disk are kept.
+pub fn rebind_resume(dest: &std::path::Path, new_url: &str) {
+    let meta = dest.with_extension("dcmeta");
+    if let Some(mut v) = std::fs::read_to_string(&meta).ok().and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok()) {
+        v["url"] = serde_json::Value::from(new_url);
+        let _ = std::fs::write(&meta, v.to_string());
+    }
 }
 
 /// Outcome of `append_to_queue`.

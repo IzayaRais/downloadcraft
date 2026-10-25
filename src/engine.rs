@@ -211,6 +211,109 @@ pub struct EngineOpts {
     pub ytdlp_visitor_data: String,
     /// Name of this download's log (the queue id); empty = no log.
     pub log_key: String,
+    /// Mirrors of the file (other URLs serving the same bytes).
+    pub mirrors: Vec<String>,
+    /// Allow HTTP/2 (off by default: one TCP connection per segment is the
+    /// whole point of a segmented download). The fallback chain turns it on
+    /// for servers that refuse HTTP/1.1.
+    pub http2: bool,
+    /// HTTP Digest login learned from the server's challenge (shared by
+    /// every clone of these options).
+    pub digest: Arc<std::sync::Mutex<Option<DigestAuth>>>,
+}
+
+/// An HTTP Digest challenge (RFC 7616, MD5 / qop=auth).
+#[derive(Debug, Clone, Default)]
+pub struct DigestAuth {
+    realm: String,
+    nonce: String,
+    opaque: Option<String>,
+    qop_auth: bool,
+    nc: u32,
+}
+
+impl DigestAuth {
+    /// Parse `WWW-Authenticate: Digest realm="…", nonce="…", qop="auth"`.
+    pub fn parse(header: &str) -> Option<Self> {
+        let rest = header.trim().strip_prefix("Digest")?.trim();
+        let mut d = DigestAuth::default();
+        let mut algo_ok = true;
+        for part in split_auth_params(rest) {
+            let (k, v) = part.split_once('=')?;
+            let v = v.trim().trim_matches('"').to_string();
+            match k.trim().to_ascii_lowercase().as_str() {
+                "realm" => d.realm = v,
+                "nonce" => d.nonce = v,
+                "opaque" => d.opaque = Some(v),
+                "qop" => d.qop_auth = v.split(',').any(|q| q.trim() == "auth"),
+                "algorithm" => algo_ok = v.eq_ignore_ascii_case("MD5"),
+                _ => {}
+            }
+        }
+        (algo_ok && !d.nonce.is_empty()).then_some(d)
+    }
+
+    /// The Authorization header for one request.
+    pub fn header(&mut self, user: &str, pass: &str, method: &str, uri: &str) -> String {
+        use md5::{Digest, Md5};
+        let hex = |s: String| format!("{:x}", Md5::digest(s.as_bytes()));
+        let ha1 = hex(format!("{user}:{}:{pass}", self.realm));
+        let ha2 = hex(format!("{method}:{uri}"));
+        self.nc += 1;
+        let nc = format!("{:08x}", self.nc);
+        let cnonce = format!("{:016x}", chrono::Local::now().timestamp_nanos_opt().unwrap_or(0) as u64 ^ 0x9e37_79b9_7f4a_7c15);
+        let mut h = if self.qop_auth {
+            let resp = hex(format!("{ha1}:{}:{nc}:{cnonce}:auth:{ha2}", self.nonce));
+            format!(r#"Digest username="{user}", realm="{}", nonce="{}", uri="{uri}", qop=auth, nc={nc}, cnonce="{cnonce}", response="{resp}""#, self.realm, self.nonce)
+        } else {
+            let resp = hex(format!("{ha1}:{}:{ha2}", self.nonce));
+            format!(r#"Digest username="{user}", realm="{}", nonce="{}", uri="{uri}", response="{resp}""#, self.realm, self.nonce)
+        };
+        if let Some(o) = &self.opaque {
+            h.push_str(&format!(r#", opaque="{o}""#));
+        }
+        h.push_str(", algorithm=MD5");
+        h
+    }
+}
+
+/// Split `a="x, y", b=z` on the commas between parameters.
+fn split_auth_params(s: &str) -> Vec<String> {
+    let (mut out, mut cur, mut quoted) = (Vec::new(), String::new(), false);
+    for c in s.chars() {
+        match c {
+            '"' => {
+                quoted = !quoted;
+                cur.push(c);
+            }
+            ',' if !quoted => {
+                if !cur.trim().is_empty() {
+                    out.push(cur.trim().to_string());
+                }
+                cur.clear();
+            }
+            _ => cur.push(c),
+        }
+    }
+    if !cur.trim().is_empty() {
+        out.push(cur.trim().to_string());
+    }
+    out
+}
+
+/// Ask the server once, without credentials, whether it wants a Digest
+/// login; remember the challenge for every later request.
+async fn learn_digest(client: &reqwest::Client, opts: &EngineOpts, url: &str) {
+    let Ok(resp) = client.get(url).header(reqwest::header::RANGE, "bytes=0-0").send().await else { return };
+    if resp.status() != reqwest::StatusCode::UNAUTHORIZED {
+        return;
+    }
+    for v in resp.headers().get_all(reqwest::header::WWW_AUTHENTICATE) {
+        if let Some(d) = v.to_str().ok().and_then(DigestAuth::parse) {
+            *mutex_guard(&opts.digest) = Some(d);
+            return;
+        }
+    }
 }
 
 /// Request headers captured by the extension for one download. They are
@@ -297,6 +400,9 @@ impl Default for EngineOpts {
             browser: None,
             ytdlp_visitor_data: String::new(),
             log_key: String::new(),
+            mirrors: Vec::new(),
+            http2: false,
+            digest: Default::default(),
         }
     }
 }
@@ -353,7 +459,12 @@ pub fn remove_partial(dest: &std::path::Path) {
 
 /// Every unfinished-data path of `dest` (for deleting leftovers).
 pub fn partial_paths(dest: &std::path::Path) -> Vec<PathBuf> {
-    let mut v = vec![downloadcraft_engine::data_path(dest), downloadcraft_engine::journal_path(dest)];
+    let mut v = vec![
+        downloadcraft_engine::data_path(dest),
+        downloadcraft_engine::journal_path(dest),
+        dest.with_extension("dcftp"),
+        dest.with_extension("dcftpparts"),
+    ];
     if let Some(w) = work_dir() {
         v.push(downloadcraft_engine::data_path_in(dest, Some(&w)));
         v.push(downloadcraft_engine::journal_path_in(dest, Some(&w)));
@@ -425,7 +536,6 @@ impl EngineOpts {
             .user_agent(self.user_agent.clone())
             .redirect(redirect)
             .local_address(std::net::IpAddr::from([0, 0, 0, 0]))
-            .http1_only()
             .tcp_nodelay(true)
             .pool_idle_timeout(std::time::Duration::from_secs(30))
             .pool_max_idle_per_host(16)
@@ -434,6 +544,9 @@ impl EngineOpts {
             // Connect timeout ONLY: reqwest's `timeout` limits the whole
             // transfer, which wrongly kills big files on slow links.
             b = b.connect_timeout(std::time::Duration::from_secs(self.timeout_secs));
+        }
+        if !self.http2 {
+            b = b.http1_only();
         }
         if !self.proxy_url.trim().is_empty() {
             b = b.proxy(reqwest::Proxy::all(self.proxy_url.trim())?);
@@ -529,7 +642,17 @@ impl EngineOpts {
                 }
             }
         }
-        if !self.username.trim().is_empty() {
+        let digest = if self.username.trim().is_empty() { None } else { mutex_guard(&self.digest).clone() };
+        if let (Some(mut d), Some(u)) = (digest, url) {
+            let uri = reqwest::Url::parse(u)
+                .map(|x| format!("{}{}", x.path(), x.query().map(|q| format!("?{q}")).unwrap_or_default()))
+                .unwrap_or_else(|_| "/".into());
+            let h = d.header(self.username.trim(), &self.password, "GET", &uri);
+            if let Some(stored) = mutex_guard(&self.digest).as_mut() {
+                stored.nc = d.nc;
+            }
+            r = r.header(reqwest::header::AUTHORIZATION, h);
+        } else if !self.username.trim().is_empty() {
             r = r.basic_auth(
                 self.username.trim(),
                 if self.password.is_empty() {
@@ -3903,6 +4026,22 @@ async fn fallback_chain(
             }
         }
     }
+    // A server that refuses HTTP/1.1 (505, or a protocol error before any
+    // byte): try once more over HTTP/2.
+    let low = format!("{err:#}").to_ascii_lowercase();
+    if !opts.http2
+        && shared.downloaded.load(Ordering::SeqCst) == 0
+        && (low.contains("505") || low.contains("http2") || low.contains("protocol") || low.contains("connection closed before message completed"))
+    {
+        job_log(&opts.log_key, "retrying over HTTP/2");
+        let mut o2 = opts.clone();
+        o2.http2 = true;
+        reset_counters(shared);
+        match download_inner(url.to_string(), dest.clone(), connections, o2, shared.clone()).await {
+            Ok(()) => return Ok(()),
+            Err(e) => err = e,
+        }
+    }
     let from_ext = opts.browser.as_ref().is_some_and(|b| b.from_extension);
     let page = opts.referer.trim();
     let refused = is_final_http_error(&err) || format!("{err:#}").contains("web page instead of the file");
@@ -4006,6 +4145,13 @@ async fn download_inner(
     mut opts: EngineOpts,
     shared: Arc<SharedState>,
 ) -> Result<()> {
+    // Settings -> Site logins: a saved login for this host.
+    if opts.username.trim().is_empty() {
+        if let Some((u, p)) = crate::model::login_for(&url) {
+            opts.username = u;
+            opts.password = p;
+        }
+    }
     // The browser's user agent and proxy for a capture it handed over: the
     // server and the network path stay the ones that worked in the browser.
     if let Some(b) = opts.browser.clone() {
@@ -4095,7 +4241,7 @@ async fn download_inner(
         let limiter = std::sync::Arc::new(
             RateLimiter::new(opts.speed_limit_bps).with_global(opts.global_limit.clone()),
         );
-        return crate::ftp::download_ftp(&url, &dest, &opts, shared, limiter).await;
+        return crate::ftp::download_ftp(&url, &dest, &opts, shared, limiter, connections).await;
     }
     if is_playlist_url(&url) {
         if url.to_ascii_lowercase().split(['?', '#']).next().unwrap_or("").ends_with(".mpd")
@@ -4113,6 +4259,9 @@ async fn download_inner(
         Some(c) => c,
         None => opts.build_client()?,
     };
+    if !opts.username.trim().is_empty() && mutex_guard(&opts.digest).is_none() {
+        learn_digest(&client, &opts, &url).await;
+    }
 
     if let Some(parent) = dest.parent() {
         tokio::fs::create_dir_all(parent).await?;
@@ -8346,7 +8495,11 @@ async fn segmented(
     for i in 0..16 {
         let _ = tokio::fs::remove_file(dest.with_extension(format!("dcpart{i}"))).await;
     }
-    let job = dce::Job::new(url, dest.clone()).size_hint(Some(total), true).work_dir(work_dir());
+    let job = dce::Job::new(url, dest.clone())
+        .size_hint(Some(total), true)
+        .work_dir(work_dir())
+        .resume_key(dest.to_string_lossy())
+        .mirrors(opts.mirrors.clone());
     run_dce(dl, job, url, total, &shared, &opts.log_key).await.map(|_| ())
 }
 
@@ -10909,6 +11062,21 @@ mod browser_capture_tests {
         assert_eq!(std::fs::read(&out).unwrap(), b"page-fetched bytes");
         assert_eq!(shared.total.load(Ordering::SeqCst), 18);
         let _ = std::fs::remove_file(&out);
+    }
+
+    #[test]
+    fn digest_login_matches_the_rfc_example() {
+        // RFC 2617 section 3.5.
+        let mut d = DigestAuth::parse(r#"Digest realm="testrealm@host.com", qop="auth,auth-int", nonce="dcd98b7102dd2f0e8b11d0f600bfb0c093", opaque="5ccc069c403ebaf9f0171e9517f40e41""#).unwrap();
+        use md5::{Digest, Md5};
+        let ha1 = format!("{:x}", Md5::digest(b"Mufasa:testrealm@host.com:Circle Of Life"));
+        assert_eq!(ha1, "939e7578ed9e3c518a452acee763bce9");
+        let h = d.header("Mufasa", "Circle Of Life", "GET", "/dir/index.html");
+        assert!(h.starts_with(r#"Digest username="Mufasa", realm="testrealm@host.com""#));
+        assert!(h.contains("qop=auth, nc=00000001"));
+        assert!(h.contains(r#"opaque="5ccc069c403ebaf9f0171e9517f40e41""#));
+        assert!(DigestAuth::parse("Basic realm=x").is_none());
+        assert!(DigestAuth::parse(r#"Digest realm="r", nonce="n", algorithm=SHA-256"#).is_none());
     }
 
     #[test]

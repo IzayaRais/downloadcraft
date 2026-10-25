@@ -1781,6 +1781,7 @@ enum RowAct {
     OpenFolder,
     OpenFile,
     CopyUrl,
+    RefreshAddress,
     Details,
     VerifyChecksum,
 }
@@ -1937,6 +1938,8 @@ pub struct CraftApp {
     add_headers: std::collections::BTreeMap<String, String>,
     /// The browser's side of the capture being confirmed (see BrowserContext).
     add_browser: Option<crate::model::BrowserContext>,
+    /// Mirrors typed into the Add box ("url | mirror | mirror").
+    add_mirrors: Vec<String>,
     /// Details dialog "Start at" text while it is being typed, per row id:
     /// only a complete HH:MM is saved to the row, so reloading the field
     /// from the row every frame threw away each keystroke of "02:30".
@@ -2095,6 +2098,7 @@ impl CraftApp {
             add_cookie: String::new(),
             add_headers: std::collections::BTreeMap::new(),
             add_browser: None,
+            add_mirrors: Vec::new(),
             det_start_draft: (u64::MAX, String::new()),
             add_user: String::new(),
             add_pass: String::new(),
@@ -2757,7 +2761,54 @@ impl CraftApp {
                 }
             }
             RowAct::VerifyChecksum => self.verify_checksum(id),
+            RowAct::RefreshAddress => {
+                let Some(d) = self.downloads.iter().find(|d| d.id == id) else { return };
+                let page = d.referer.clone();
+                let name = d.filename.clone();
+                crate::model::set_refresh_wait(Some(crate::model::RefreshWait {
+                    id,
+                    until: chrono::Local::now().timestamp() + 10 * 60,
+                }));
+                if let Ok(u) = url::Url::parse(&page) {
+                    crate::platform::open_url(u.as_str());
+                }
+                self.push_log(format!(
+                    "Refresh address for {name}: click its download link again in the browser (within 10 minutes) - the new link continues this download."
+                ));
+            }
         }
+    }
+
+    /// A capture that arrived while a row waits for a fresh link: it becomes
+    /// that row's link (cookies and browser context too), the bytes already
+    /// downloaded are kept, and the row resumes.
+    fn apply_refreshed_link(&mut self, id: u64, item: crate::native_host::InboxItem) {
+        let Some(d) = self.downloads.iter_mut().find(|d| d.id == id) else { return };
+        if let (Some(have), Some(got)) = (d.total_bytes, item.size) {
+            if have > 0 && got > 0 && have != got {
+                self.push_log(format!("Refresh address: the new link is a different size ({got} vs {have} bytes) - ignored, still waiting."));
+                return;
+            }
+        }
+        crate::model::set_refresh_wait(None);
+        let dest = d.dest_path();
+        d.url = item.url.clone();
+        if let Some(c) = item.cookie.filter(|c| !c.is_empty()) {
+            d.cookie = c;
+        }
+        if let Some(r) = item.referer.or(item.page_url).filter(|r| !r.is_empty()) {
+            d.referer = r;
+        }
+        d.extra_headers = item.headers.unwrap_or_default();
+        d.browser = item.browser;
+        if matches!(d.status, Status::Failed(_)) {
+            d.status = Status::Paused;
+        }
+        let name = d.filename.clone();
+        crate::model::rebind_resume(&dest, &item.url);
+        self.save_queue();
+        self.push_log(format!("Refresh address: new link for {name} - continuing."));
+        self.resume(id);
     }
 
     /// Row context-menu item definitions: (label, action).
@@ -2772,6 +2823,7 @@ impl CraftApp {
             ("Verify checksum".into(), Some(VerifyChecksum)),
             ("".into(), None),
             ("Copy URL".into(), Some(CopyUrl)),
+            ("Refresh download address".into(), Some(RefreshAddress)),
             ("Open file location".into(), Some(OpenFolder)),
             ("Open file".into(), Some(OpenFile)),
             ("".into(), None),
@@ -3516,6 +3568,9 @@ impl CraftApp {
             browser: item.browser.clone(),
             ytdlp_visitor_data: String::new(),
             log_key: item.id.to_string(),
+            mirrors: item.mirrors.clone(),
+            http2: false,
+            digest: Default::default(),
         };
         let shared2 = shared.clone();
         // Adaptive pairs (video-only + audio) merge via ffmpeg on completion.
@@ -4368,6 +4423,20 @@ impl CraftApp {
                 .map(|dt| now_ts - dt.timestamp())
                 .unwrap_or(i64::MAX)
         };
+        // A row waiting for a fresh link takes the newest capture at once.
+        if let Some(w) = crate::model::refresh_wait() {
+            let mut items = items;
+            items.sort_by(|a, b| b.received_at.cmp(&a.received_at));
+            let fresh = items.remove(0);
+            if items.is_empty() {
+                let _ = std::fs::remove_file(&path);
+            } else if let Ok(json) = serde_json::to_string_pretty(&items) {
+                Self::atomic_write(&path, json.as_bytes());
+            }
+            drop(_guard);
+            self.apply_refreshed_link(w.id, fresh);
+            return false;
+        }
         let mut keep: Vec<crate::native_host::InboxItem> = Vec::new();
         let mut next: Option<crate::native_host::InboxItem> = None;
         // Already queued = same URL at the same quality (another quality of
@@ -7943,6 +8012,12 @@ impl CraftApp {
             self.show_add = false;
             return;
         }
+        // "url | mirror | mirror": one download, several sources.
+        if self.add_url.contains('|') {
+            let (main, mirrors) = crate::model::split_mirrors(&self.add_url);
+            self.add_url = main;
+            self.add_mirrors = mirrors;
+        }
         if !is_download_url(self.add_url.trim()) {
             self.show_add = true;
             self.push_log("Add download: invalid URL (need http/https).");
@@ -8011,6 +8086,7 @@ impl CraftApp {
         // a later manual add.
         item.extra_headers = std::mem::take(&mut self.add_headers);
         item.browser = self.add_browser.take();
+        item.mirrors = std::mem::take(&mut self.add_mirrors);
         item.username = self.add_user.clone();
         item.password = self.add_pass.clone();
         item.checksum_sha256 = csum;

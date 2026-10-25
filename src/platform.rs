@@ -82,6 +82,19 @@ fn version_output_timeout(mut command: Command, timeout: std::time::Duration) ->
     Some(std::process::Output {status,stdout,stderr:Vec::new()})
 }
 
+/// Open a web page in the default browser.
+pub fn open_url(url: &str) {
+    if !(url.starts_with("http://") || url.starts_with("https://")) {
+        return;
+    }
+    #[cfg(windows)]
+    let _ = Command::new("rundll32.exe").args(["url.dll,FileProtocolHandler", url]).spawn();
+    #[cfg(target_os = "macos")]
+    let _ = Command::new("open").arg(url).spawn();
+    #[cfg(all(unix, not(target_os = "macos")))]
+    let _ = Command::new("xdg-open").arg(url).spawn();
+}
+
 pub fn open(path: &Path, reveal: bool) {
     #[cfg(target_os = "macos")]
     {

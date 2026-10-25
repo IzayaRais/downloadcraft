@@ -128,7 +128,46 @@ fn parse_pasv(text: &str) -> Result<(String, u16)> {
 
 /// Download `url` to `dest` over plain FTP with REST resume. `limiter` is
 /// the shared token bucket (global speed cap honored like HTTP legs).
+/// Download `url` over FTP: several parts at once when the server tells the
+/// size (and allows the logins), otherwise one connection with REST resume.
 pub async fn download_ftp(
+    url: &str,
+    dest: &std::path::PathBuf,
+    opts: &EngineOpts,
+    shared: Arc<SharedState>,
+    limiter: Arc<RateLimiter>,
+    connections: usize,
+) -> Result<()> {
+    // A single-connection partial from an earlier run continues as it was.
+    if connections > 1 && !dest.with_extension("dcpart").exists() {
+        if let Some(parent) = dest.parent().filter(|p| !p.as_os_str().is_empty()) {
+            tokio::fs::create_dir_all(parent).await?;
+        }
+        match try_segmented_ftp(url, dest, connections, opts, &shared, &limiter).await {
+            Ok(true) => {
+                if !opts.expected_sha256.trim().is_empty() {
+                    if let Err(e) = crate::engine::verify_checksum(dest, &opts.expected_sha256).await {
+                        let _ = tokio::fs::remove_file(dest).await;
+                        return Err(e);
+                    }
+                }
+                return Ok(());
+            }
+            Ok(false) => {}
+            Err(e) if shared.cancelled.load(Ordering::SeqCst) || e.to_string() == "cancelled" => return Err(e),
+            // The server would not take several logins (or a part kept
+            // failing): one connection, from the start.
+            Err(_) => {
+                let _ = tokio::fs::remove_file(dest.with_extension("dcftp")).await;
+                let _ = tokio::fs::remove_file(dest.with_extension("dcftpparts")).await;
+                shared.downloaded.store(0, Ordering::SeqCst);
+            }
+        }
+    }
+    download_ftp_single(url, dest, opts, shared, limiter).await
+}
+
+async fn download_ftp_single(
     url: &str,
     dest: &std::path::PathBuf,
     opts: &EngineOpts,
@@ -378,6 +417,222 @@ async fn transfer_once(
     Err(anyhow!("ftp transfer aborted ({code} {text}) — resuming"))
 }
 
+// ---- segmented FTP (IDM's FTPSession: several logins, one part each) --------
+
+/// Log in on a fresh control connection and switch to binary mode.
+async fn ftp_login(
+    t: &FtpTarget,
+    connect_to: u64,
+) -> Result<(tokio::io::BufReader<tokio::net::tcp::OwnedReadHalf>, tokio::net::tcp::OwnedWriteHalf)> {
+    let ctrl = tokio::time::timeout(
+        std::time::Duration::from_secs(connect_to),
+        tokio::net::TcpStream::connect((t.host.as_str(), t.port)),
+    )
+    .await
+    .map_err(|_| anyhow!("ftp connect timed out ({connect_to}s)"))?
+    .map_err(|e| anyhow!("ftp connect: {e}"))?;
+    let (cr, cw) = ctrl.into_split();
+    let mut r = tokio::io::BufReader::new(cr);
+    let mut w = cw;
+    let (code, text) = read_reply(&mut r).await?;
+    if !(220..300).contains(&code) {
+        return Err(anyhow!("ftp server refused ({code} {text})"));
+    }
+    let (code, _) = cmd(&mut w, &mut r, &format!("USER {}", t.user)).await?;
+    if code == 331 || code == 332 {
+        let (code, text) = cmd(&mut w, &mut r, &format!("PASS {}", t.pass)).await?;
+        if !(200..300).contains(&code) {
+            return Err(anyhow!("ftp login refused ({code} {text})"));
+        }
+    } else if !(200..300).contains(&code) {
+        return Err(anyhow!("ftp login refused ({code})"));
+    }
+    let (code, text) = cmd(&mut w, &mut r, "TYPE I").await?;
+    if !(200..300).contains(&code) {
+        return Err(anyhow!("ftp server refused binary mode ({code} {text})"));
+    }
+    Ok((r, w))
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+struct FtpParts {
+    url: String,
+    total: u64,
+    /// [start, end (inclusive), done]
+    parts: Vec<(u64, u64, u64)>,
+}
+
+/// One part: its own login, REST to where it stands, RETR, read exactly its
+/// range, write it at its offset. Retries on its own; fails only after
+/// `max_retries` attempts in a row without progress.
+#[allow(clippy::too_many_arguments)]
+async fn ftp_part(
+    t: Arc<FtpTarget>,
+    data: std::path::PathBuf,
+    idx: usize,
+    start: u64,
+    end: u64,
+    done: Arc<std::sync::atomic::AtomicU64>,
+    opts: EngineOpts,
+    shared: Arc<SharedState>,
+    limiter: Arc<RateLimiter>,
+) -> Result<()> {
+    use tokio::io::{AsyncReadExt, AsyncSeekExt};
+    let len = end - start + 1;
+    let connect_to = opts.timeout_secs.clamp(5, 120);
+    let stall_secs = opts.timeout_secs.clamp(15, 120);
+    let mut stalled = 0u32;
+    while done.load(Ordering::SeqCst) < len {
+        if shared.cancelled.load(Ordering::SeqCst) {
+            return Err(anyhow!("cancelled"));
+        }
+        crate::engine::wait_if_paused(&shared).await?;
+        let before = done.load(Ordering::SeqCst);
+        let attempt: Result<()> = async {
+            let (mut r, mut w) = ftp_login(&t, connect_to).await?;
+            let (code, text) = cmd(&mut w, &mut r, "PASV").await?;
+            if !(200..300).contains(&code) {
+                return Err(anyhow!("ftp PASV refused ({code} {text})"));
+            }
+            let (ip, port) = parse_pasv(&text)?;
+            let mut sock = tokio::net::TcpStream::connect((ip.as_str(), port)).await.map_err(|e| anyhow!("ftp data connect: {e}"))?;
+            let at = start + done.load(Ordering::SeqCst);
+            if at > 0 {
+                let (code, text) = cmd(&mut w, &mut r, &format!("REST {at}")).await?;
+                if !(300..400).contains(&code) {
+                    return Err(anyhow!("REST rejected ({code} {text})"));
+                }
+            }
+            let (code, text) = cmd(&mut w, &mut r, &format!("RETR {}", t.path)).await?;
+            if !(100..200).contains(&code) {
+                return Err(anyhow!("ftp retrieve refused ({code} {text})"));
+            }
+            let mut file = tokio::fs::OpenOptions::new().write(true).open(&data).await.map_err(|e| anyhow!(io_message(&e)))?;
+            file.seek(std::io::SeekFrom::Start(at)).await?;
+            let mut buf = vec![0u8; 64 * 1024];
+            while done.load(Ordering::SeqCst) < len {
+                crate::engine::wait_if_paused(&shared).await?;
+                let want = ((len - done.load(Ordering::SeqCst)) as usize).min(buf.len());
+                let n = tokio::time::timeout(std::time::Duration::from_secs(stall_secs), sock.read(&mut buf[..want]))
+                    .await
+                    .map_err(|_| anyhow!("stalled (no data for {stall_secs}s)"))?
+                    .map_err(|e| anyhow!("ftp data: {e}"))?;
+                if n == 0 {
+                    break;
+                }
+                file.write_all(&buf[..n]).await.map_err(|e| anyhow!(io_message(&e)))?;
+                done.fetch_add(n as u64, Ordering::SeqCst);
+                shared.downloaded.fetch_add(n as u64, Ordering::SeqCst);
+                if let Ok(mut g) = shared.part_done.lock() {
+                    if let Some(slot) = g.get_mut(idx) {
+                        *slot = done.load(Ordering::SeqCst);
+                    }
+                }
+                limiter.consume(n as u64).await;
+            }
+            file.flush().await?;
+            // The part is complete (or the server stopped): close the data
+            // connection early and leave; the server's 426 is expected.
+            drop(sock);
+            let _ = tokio::time::timeout(std::time::Duration::from_secs(2), cmd(&mut w, &mut r, "QUIT")).await;
+            Ok(())
+        }
+        .await;
+        let after = done.load(Ordering::SeqCst);
+        if after >= len {
+            return Ok(());
+        }
+        if after > before {
+            stalled = 0;
+        } else {
+            stalled += 1;
+            if stalled >= opts.max_retries.max(1) {
+                return Err(attempt.err().unwrap_or_else(|| anyhow!("ftp part {idx} made no progress")));
+            }
+        }
+        tokio::time::sleep(std::time::Duration::from_secs(1 << stalled.min(4))).await;
+    }
+    Ok(())
+}
+
+/// Several parts at once when the server tells the size and it is worth it.
+/// `Ok(false)` = not applicable (no size, small file): use one connection.
+async fn try_segmented_ftp(
+    url: &str,
+    dest: &std::path::PathBuf,
+    connections: usize,
+    opts: &EngineOpts,
+    shared: &Arc<SharedState>,
+    limiter: &Arc<RateLimiter>,
+) -> Result<bool> {
+    let t = Arc::new(parse_target(url)?);
+    let (mut r, mut w) = ftp_login(&t, opts.timeout_secs.clamp(5, 120)).await?;
+    let (code, text) = cmd(&mut w, &mut r, &format!("SIZE {}", t.path)).await?;
+    let _ = cmd(&mut w, &mut r, "QUIT").await;
+    let total: u64 = if code == 213 { text.split_whitespace().last().and_then(|s| s.parse().ok()).unwrap_or(0) } else { 0 };
+    const MIN_PART: u64 = 2 * 1024 * 1024;
+    if total < 2 * MIN_PART {
+        return Ok(false);
+    }
+    let n = (connections.min(8) as u64).min(total / MIN_PART).max(2);
+    let data = dest.with_extension("dcftp");
+    let side = dest.with_extension("dcftpparts");
+    // Resume a previous segmented run of the same file.
+    let previous: Option<FtpParts> = std::fs::read_to_string(&side)
+        .ok()
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .filter(|p: &FtpParts| p.url == url && p.total == total && data.is_file());
+    let parts: Vec<(u64, u64, u64)> = match previous {
+        Some(p) => p.parts,
+        None => {
+            let f = std::fs::OpenOptions::new().create(true).write(true).truncate(true).open(&data).map_err(|e| anyhow!(io_message(&e)))?;
+            f.set_len(total).map_err(|e| anyhow!(io_message(&e)))?;
+            let chunk = total / n;
+            (0..n).map(|i| (i * chunk, if i + 1 == n { total - 1 } else { (i + 1) * chunk - 1 }, 0)).collect()
+        }
+    };
+    shared.total.store(total, Ordering::SeqCst);
+    shared.has_total.store(true, Ordering::SeqCst);
+    shared.resumable.store(true, Ordering::SeqCst);
+    shared.downloaded.store(parts.iter().map(|p| p.2).sum(), Ordering::SeqCst);
+    *mutex_guard(&shared.part_total) = parts.iter().map(|p| (p.0, p.1)).collect();
+    *mutex_guard(&shared.part_done) = parts.iter().map(|p| p.2).collect();
+    let dones: Vec<Arc<std::sync::atomic::AtomicU64>> = parts.iter().map(|p| Arc::new(std::sync::atomic::AtomicU64::new(p.2))).collect();
+    let save = {
+        let (side, url, dones, parts) = (side.clone(), url.to_string(), dones.clone(), parts.clone());
+        move || {
+            let p = FtpParts { url: url.clone(), total, parts: parts.iter().zip(&dones).map(|(p, d)| (p.0, p.1, d.load(Ordering::SeqCst))).collect() };
+            if let Ok(j) = serde_json::to_string(&p) {
+                let _ = std::fs::write(&side, j);
+            }
+        }
+    };
+    let mut set = tokio::task::JoinSet::new();
+    for (i, p) in parts.iter().enumerate() {
+        set.spawn(ftp_part(t.clone(), data.clone(), i, p.0, p.1, dones[i].clone(), opts.clone(), shared.clone(), limiter.clone()));
+    }
+    let mut failed: Option<anyhow::Error> = None;
+    let mut tick = tokio::time::interval(std::time::Duration::from_secs(3));
+    loop {
+        tokio::select! {
+            r = set.join_next() => match r {
+                None => break,
+                Some(Ok(Ok(()))) => {}
+                Some(Ok(Err(e))) => { failed.get_or_insert(e); }
+                Some(Err(e)) => { failed.get_or_insert(anyhow!("ftp part: {e}")); }
+            },
+            _ = tick.tick() => save(),
+        }
+    }
+    save();
+    if let Some(e) = failed {
+        return Err(e);
+    }
+    tokio::fs::rename(&data, dest).await.map_err(|e| anyhow!(io_message(&e)))?;
+    let _ = std::fs::remove_file(&side);
+    Ok(true)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -521,7 +776,24 @@ mod tests {
     async fn dl(url: &str, dest: &std::path::PathBuf) -> Result<()> {
         let shared = Arc::new(SharedState::new());
         let lim = Arc::new(RateLimiter::new(0));
-        download_ftp(url, dest, &ftp_opts(), shared, lim).await
+        download_ftp(url, dest, &ftp_opts(), shared, lim, 1).await
+    }
+
+    #[tokio::test]
+    async fn ftp_downloads_in_parts() {
+        let body: Vec<u8> = (0..9_000_000u32).map(|i| (i.wrapping_mul(7) % 251) as u8).collect();
+        let addr = spawn_ftp(body.clone(), None).await;
+        let dir = std::env::temp_dir().join(format!("dc_ftpseg_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let dest = dir.join("seg.bin");
+        let shared = Arc::new(SharedState::new());
+        download_ftp(&format!("ftp://{addr}/file.bin"), &dest, &ftp_opts(), shared.clone(), Arc::new(RateLimiter::new(0)), 4)
+            .await
+            .expect("segmented ftp");
+        assert_eq!(std::fs::read(&dest).unwrap(), body);
+        assert_eq!(mutex_guard(&shared.part_total).len(), 4, "four parts");
+        assert!(!dest.with_extension("dcftpparts").exists());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[tokio::test]

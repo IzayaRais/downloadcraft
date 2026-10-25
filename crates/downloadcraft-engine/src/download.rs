@@ -129,6 +129,9 @@ enum Fail {
 
 struct Run {
     dl: Downloader,
+    /// Mirrors still in use (see Job::mirrors).
+    mirrors: Mutex<Vec<String>>,
+    has_mirrors: bool,
     job: Job,
     data: PathBuf,
     journal: PathBuf,
@@ -257,8 +260,28 @@ impl Run {
         Ok(())
     }
 
+    /// Which mirror connection `w` uses (None = the main URL).
+    fn mirror_for(&self, w: usize) -> Option<String> {
+        let m = lock(&self.mirrors);
+        let i = w % (m.len() + 1);
+        (i > 0).then(|| m[i - 1].clone())
+    }
+
+    fn drop_mirror(&self, url: &str, why: &str) {
+        let mut m = lock(&self.mirrors);
+        if let Some(i) = m.iter().position(|u| u == url) {
+            m.remove(i);
+            drop(m);
+            self.emit(Event::Retry { worker: 0, error: format!("mirror {url} dropped: {why}") });
+        }
+    }
+
     /// The first ETag / Last-Modified seen is the file's identity.
     fn check_validators(&self, etag: Option<String>, lm: Option<String>) -> Result<(), Fail> {
+        // Mirrors each have their own ETag/date: the size is the identity.
+        if self.has_mirrors {
+            return Ok(());
+        }
         let mut meta = lock(&self.meta);
         let strong = |e: &Option<String>| e.clone().filter(|v| !v.starts_with("W/"));
         if let (Some(a), Some(b)) = (strong(&meta.etag), strong(&etag)) {
@@ -474,6 +497,8 @@ async fn run_once(
         .is_some_and(|e| matches!(e.to_ascii_lowercase().as_str(), "html" | "htm" | "xhtml" | "shtml"));
     let run = Arc::new(Run {
         dl: dl.clone(),
+        mirrors: Mutex::new(job.mirrors.clone()),
+        has_mirrors: !job.mirrors.is_empty(),
         url: RwLock::new(job.url.clone()),
         journal: job.journal(),
         data,
@@ -725,7 +750,24 @@ async fn worker(run: Arc<Run>, w: usize) {
         *lock(&stat.started) = Instant::now();
         stat.restart.store(false, Ordering::SeqCst);
         stat.active.store(true, Ordering::SeqCst);
-        let res = fetch(&run, w, &stat, claim, &mut out).await;
+        let mirror = run.mirror_for(w);
+        let res = fetch(&run, w, &stat, claim, &mut out, mirror.as_deref()).await;
+        // A mirror that refuses or serves something else is dropped; the
+        // segment goes back to the pool for the main URL or another mirror.
+        let res = match (res, mirror) {
+            (Err(f), Some(m)) if !matches!(f, Fail::Cancelled | Fail::Retry { progressed: true, .. }) => {
+                let why = match &f {
+                    Fail::Fatal(e) => e.to_string(),
+                    Fail::Refused { status, .. } => format!("HTTP {status}"),
+                    Fail::Retry { msg, .. } => msg.clone(),
+                    Fail::Throttled { status, .. } => format!("HTTP {status}"),
+                    _ => "ignores ranges".into(),
+                };
+                run.drop_mirror(&m, &why);
+                Ok(())
+            }
+            (r, _) => r,
+        };
         stat.active.store(false, Ordering::SeqCst);
         stat.streaming.store(false, Ordering::SeqCst);
         lock(&run.map).release(claim.id, w);
@@ -792,9 +834,13 @@ async fn fetch(
     stat: &WorkerStat,
     claim: Claim,
     out: &mut Option<Arc<std::fs::File>>,
+    mirror: Option<&str>,
 ) -> Result<(), Fail> {
     let cfg = &run.dl.config;
-    let url = run.url.read().unwrap_or_else(|e| e.into_inner()).clone();
+    let url = match mirror {
+        Some(m) => m.to_string(),
+        None => run.url.read().unwrap_or_else(|e| e.into_inner()).clone(),
+    };
     let Claim { id, pos, end } = claim;
     let req_end = match cfg.max_request {
         Some(mr) => end.min(pos.saturating_add(mr.max(64 * 1024))),
@@ -909,7 +955,7 @@ async fn fetch(
     // Follow-up requests go straight to the redirect target (one round trip
     // less); a refusal there falls back to the original URL.
     let landed = resp.url().as_str().to_string();
-    if landed != url {
+    if landed != url && mirror.is_none() {
         let mut cur = run.url.write().unwrap_or_else(|e| e.into_inner());
         if *cur == url {
             *cur = landed;

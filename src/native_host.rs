@@ -900,6 +900,9 @@ pub fn run() -> eframe::Result<()> {
                     continue;
                 }
                 match queue_download(&msg) {
+                    // A row is waiting for a fresh link ("Refresh download
+                    // address"): the app takes this capture, no dialog.
+                    Ok(_) if crate::model::refresh_wait().is_some() => write_message(&Reply::ok()),
                     Ok(_is_new) => {
                         write_message(&Reply::ok());
                         // IDM-style: pop the standalone Download File Info

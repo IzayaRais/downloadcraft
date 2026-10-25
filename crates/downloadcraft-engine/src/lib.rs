@@ -145,11 +145,15 @@ pub struct Job {
     /// Keep the unfinished data and journal in this folder (a fast or roomy
     /// disk) instead of next to `dest`; the finished file is moved to `dest`.
     pub work_dir: Option<PathBuf>,
+    /// Other URLs serving the same file (IDM "alternative addresses"):
+    /// connections spread over them, and a mirror that refuses or serves a
+    /// different file is dropped. The size must match; ETags may differ.
+    pub mirrors: Vec<String>,
 }
 
 impl Job {
     pub fn new(url: impl Into<String>, dest: impl Into<PathBuf>) -> Self {
-        Self { url: url.into(), dest: dest.into(), size_hint: None, ranges_hint: false, resume_key: None, work_dir: None }
+        Self { url: url.into(), dest: dest.into(), size_hint: None, ranges_hint: false, resume_key: None, work_dir: None, mirrors: Vec::new() }
     }
 
     pub fn size_hint(mut self, size: Option<u64>, ranges: bool) -> Self {
@@ -160,6 +164,12 @@ impl Job {
 
     pub fn resume_key(mut self, key: impl Into<String>) -> Self {
         self.resume_key = Some(key.into());
+        self
+    }
+
+    /// See [`Job::mirrors`].
+    pub fn mirrors(mut self, urls: Vec<String>) -> Self {
+        self.mirrors = urls.into_iter().filter(|u| u.starts_with("http://") || u.starts_with("https://")).collect();
         self
     }
 

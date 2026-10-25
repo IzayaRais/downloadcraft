@@ -97,6 +97,8 @@ struct Settings {
     browser_fallback: bool,
     /// YouTube engine order: "auto", "native" or "ytdlp".
     youtube_engine: String,
+    /// Saved site logins (kept in logins.json, passwords protected).
+    logins: Vec<crate::model::SiteLogin>,
     // Updates
     update_check_on: bool,
 }
@@ -147,6 +149,7 @@ impl Default for Settings {
             notify_done: true,
             browser_fallback: true,
             youtube_engine: "auto".to_string(),
+            logins: Vec::new(),
             update_check_on: true,
         }
     }
@@ -221,6 +224,7 @@ fn load() -> Settings {
     if let Some(x) = g("ffmpeg_custom_path").and_then(|x| x.as_str()) {
         s.ffmpeg_custom_path = x.to_string();
     }
+    s.logins = crate::model::site_logins();
     if let Some(x) = g("temp_dir").and_then(|x| x.as_str()) {
         s.temp_dir = x.to_string();
     }
@@ -365,6 +369,9 @@ fn save(s: &Settings) -> bool {
     set(obj, "ffmpeg_custom_path", s.ffmpeg_custom_path.clone().into());
     set(obj, "per_host_conns", (s.per_host_conns as u64).into());
     set(obj, "temp_dir", s.temp_dir.trim().to_string().into());
+    if s.logins != crate::model::site_logins() {
+        crate::model::save_site_logins(&s.logins);
+    }
     set(obj, "sounds", s.sounds.into());
     set(obj, "quota_mb", s.quota_mb.trim().parse::<u64>().unwrap_or(0).into());
     set(obj, "quota_hours", s.quota_hours.trim().parse::<u64>().unwrap_or(1).clamp(1, 720).into());
@@ -3559,6 +3566,39 @@ impl SettingsApp {
             if button(ui, "Reset defaults", false).clicked() {
                 self.s.folder_rules = default_folder_rules();
             }
+        });
+
+        // ---- site logins (IDM "Site logins") ----
+        ui.add_space(18.0);
+        lbl(ui, "Site logins (used automatically for that site and its subdomains):");
+        ui.add_space(8.0);
+        let avail = ui.available_width();
+        let w = ((avail - 60.0) / 3.0).max(70.0);
+        let mut del: Option<usize> = None;
+        for i in 0..self.s.logins.len() {
+            let l = &mut self.s.logins[i];
+            ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing.x = 8.0;
+                field(ui, &mut l.host, Some(w), "example.com");
+                field(ui, &mut l.user, Some(w), "user name");
+                ui.add(egui::TextEdit::singleline(&mut l.pass).password(true).desired_width(w).hint_text("password"));
+                if rule_btn(ui, "\u{e5cd}", true).clicked() {
+                    del = Some(i);
+                }
+            });
+            ui.add_space(8.0);
+        }
+        if let Some(i) = del {
+            self.s.logins.remove(i);
+        }
+        if button(ui, "Add login", false).clicked() {
+            self.s.logins.push(crate::model::SiteLogin::default());
+        }
+        ui.add_space(4.0);
+        hint(ui, if cfg!(windows) {
+            "Passwords are encrypted for your Windows account (DPAPI)."
+        } else {
+            "Passwords are stored in a file only your account can read."
         });
     }
 

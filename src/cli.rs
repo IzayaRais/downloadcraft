@@ -167,6 +167,7 @@ fn opts_for(item: &DownloadItem, limit_bps: u64) -> EngineOpts {
     o.captured_headers = crate::engine::CapturedHeaders::for_url(&item.url, &item.extra_headers);
     o.browser = item.browser.clone();
     o.log_key = item.id.to_string();
+    o.mirrors = item.mirrors.clone();
     o.username = item.username.clone();
     o.password = item.password.clone();
     o.expected_sha256 = item.checksum_sha256.clone();

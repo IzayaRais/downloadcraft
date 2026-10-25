@@ -453,6 +453,23 @@ async fn small_windows_for_strict_cdns() {
 }
 
 #[tokio::test]
+async fn connections_spread_over_mirrors_and_bad_ones_are_dropped() {
+    // /old dies at once (403); /f and /g serve the file.
+    let srv = Server::start(Behaviour { size: 6 * MIB, old_dies_after: 1, rate: 2 * MIB as u64, ..Default::default() }).await;
+    srv.served.store(10, Ordering::SeqCst);
+    let dest = tmp("mirrors");
+    let (log, ev) = recorder();
+    let job = Job::new(srv.url("/f"), &dest)
+        .size_hint(Some(6 * MIB as u64), true)
+        .mirrors(vec![srv.url("/g"), srv.url("/old")]);
+    get(&Downloader::new(reqwest::Client::new()).config(quick()).on_event(ev), job).await.unwrap();
+    assert_eq!(std::fs::read(&dest).unwrap(), body(6 * MIB, 1));
+    let reqs = srv.requests.lock().unwrap().clone();
+    assert!(reqs.iter().any(|r| r.starts_with("/g ")), "the mirror was used");
+    assert!(log.lock().unwrap().iter().any(|e| e.contains("mirror") && e.contains("/old")), "the bad mirror was dropped");
+}
+
+#[tokio::test]
 async fn a_work_folder_keeps_the_partial_elsewhere() {
     let srv = Server::start(Behaviour { size: 3 * MIB, rate: 1024 * 1024, ..Default::default() }).await;
     let dest = tmp("workdir");
