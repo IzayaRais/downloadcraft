@@ -538,6 +538,9 @@ impl eframe::App for ProgressApp {
     }
 
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        if let Some(it) = &self.item {
+            crate::fonts::ensure_text(ctx, &it.filename);
+        }
         // Theme switches made in the main app while this window is open: the
         // process only read ui.json at start-up, so poll the resolved key
         // (which also catches OS flips under "system").
@@ -552,13 +555,15 @@ impl eframe::App for ProgressApp {
         }
         // Fast enough that the speed readout visibly moves while a transfer
         // runs: the app republishes progress.json about ten times a second.
-        if self.last_poll.elapsed() >= Duration::from_millis(150) {
+        if self.last_poll.elapsed() >= Duration::from_millis(250) {
             self.refresh();
         }
         if self.handoff {
             Self::close_soon(ctx);
         }
-        ctx.request_repaint_after(Duration::from_millis(150));
+        // The app republishes progress ~4 times a second: no point drawing
+        // more often than that.
+        ctx.request_repaint_after(Duration::from_millis(250));
 
         // The card follows the concept's own rules: one 25px row per part,
         // everything else fixed. A monitor-sized cap keeps a 32-connection

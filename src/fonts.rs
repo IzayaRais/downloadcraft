@@ -141,95 +141,188 @@ fn load_system(
     }
 }
 
-/// Register Material Icons, Segoe UI and the system script fallbacks.
+/// Which script-fallback key (from `SYSTEM_FONTS`) draws `c`; None when the
+/// base fonts already cover it (Latin, Greek, Cyrillic, Arabic, Hebrew on
+/// Windows via Segoe UI; Bengali via the bundled face).
+fn wanted_key(c: char) -> Option<&'static str> {
+    let u = c as u32;
+    if cfg!(windows) {
+        Some(match u {
+            0x0530..=0x058F | 0x10A0..=0x10FF => "sylfaen",
+            0x07C0..=0x07FF | 0x1200..=0x139F | 0x2D80..=0x2DDF => "ebrima",
+            0x0900..=0x097F | 0x0A00..=0x0DFF => "nirmala",
+            0x0E00..=0x0EFF => "leelawadee",
+            0x0F00..=0x0FFF => "himalaya",
+            0x1000..=0x109F => "myanmar",
+            0x1100..=0x11FF | 0x3130..=0x318F | 0xAC00..=0xD7AF => "malgun",
+            0x3040..=0x30FF | 0x31F0..=0x31FF => "yugoth",
+            0x2E80..=0x2FDF | 0x3000..=0x303F | 0x3400..=0x4DBF | 0x4E00..=0x9FFF | 0xF900..=0xFAFF | 0xFF00..=0xFFEF => "msyh",
+            0x2190..=0x2BFF | 0x1F000..=0x1FAFF => "seguisym",
+            _ => return None,
+        })
+    } else {
+        Some(match u {
+            0x0600..=0x06FF => "arabic",
+            0x0900..=0x097F => "devanagari",
+            0x0980..=0x09FF => "bengali",
+            0x0E00..=0x0E7F => "thai",
+            0x1100..=0x11FF | 0x2E80..=0x9FFF | 0xAC00..=0xD7AF | 0xF900..=0xFAFF | 0xFF00..=0xFFEF => "cjk",
+            _ => return None,
+        })
+    }
+}
+
+/// Fonts of this process: what is registered, and which script fallbacks
+/// were already looked for. Script fonts are big (Microsoft YaHei alone is
+/// ~20 MB) and every window is its own process, so each one is loaded the
+/// first time a character of its script is drawn, not up front.
+struct FontState {
+    defs: egui::FontDefinitions,
+    /// egui's own family lists, which every rebuild starts from.
+    base_families: std::collections::BTreeMap<egui::FontFamily, Vec<String>>,
+    fallbacks: Vec<String>,
+    has_reg: bool,
+    has_semi: bool,
+    primary: bool,
+    tried: std::collections::HashSet<&'static str>,
+}
+
+static FONTS: std::sync::Mutex<Option<FontState>> = std::sync::Mutex::new(None);
+
+impl FontState {
+    /// (Re)build the family lists from the fonts registered so far.
+    fn apply_families(&mut self) {
+        let fonts = &mut self.defs;
+        fonts.families = self.base_families.clone();
+        {
+            let prop = fonts.families.entry(egui::FontFamily::Proportional).or_default();
+            if self.primary && self.has_reg {
+                prop.insert(0, "segoe".to_owned());
+            }
+            for key in &self.fallbacks {
+                if !prop.contains(key) {
+                    prop.push(key.clone());
+                }
+            }
+            prop.push("material".to_owned());
+        }
+        // Monospace falls back the same way: the URL and destination boxes
+        // are drawn in it, and a name in any script has to stay readable.
+        {
+            let mono = fonts.families.entry(egui::FontFamily::Monospace).or_default();
+            for key in &self.fallbacks {
+                if !mono.contains(key) {
+                    mono.push(key.clone());
+                }
+            }
+        }
+        // Named families: the regular cut prefers Segoe UI, then the app
+        // font, so icon glyphs and every script keep resolving in dialogs.
+        let base = fonts.families[&egui::FontFamily::Proportional].clone();
+        let regular = if self.has_reg {
+            let mut v = vec!["segoe".to_owned()];
+            v.extend(base.iter().filter(|f| f.as_str() != "segoe").cloned());
+            v
+        } else {
+            base
+        };
+        // Semibold keeps the concept's weight for Latin and falls through to
+        // the same fallbacks for everything else.
+        let semibold = if self.has_semi {
+            let mut v = vec!["segoe_semi".to_owned()];
+            v.extend(regular.iter().filter(|f| f.as_str() != "segoe").cloned());
+            v
+        } else {
+            regular.clone()
+        };
+        fonts.families.insert(egui::FontFamily::Name(FONT_UI.into()), regular);
+        fonts.families.insert(egui::FontFamily::Name(FONT_SEMI.into()), semibold);
+        // Icon-only family: Material Icons and nothing else, so no system
+        // font can shadow a PUA icon codepoint (see `icon`).
+        fonts.families.insert(egui::FontFamily::Name(FONT_ICON.into()), vec!["material".to_owned()]);
+    }
+}
+
+/// Register Material Icons, Segoe UI and the bundled Bengali face. Other
+/// script fonts follow on demand (`ensure_text`).
 ///
 /// `primary` also promotes Segoe UI to the head of the proportional family,
 /// which is what the standalone dialogs want (their whole surface is the
 /// concept). The manager window passes `false`, so only the named families are
 /// added and its own typography stays untouched.
 pub fn install(cc: &eframe::CreationContext<'_>, primary: bool) {
-    let mut fonts = egui::FontDefinitions::default();
-    fonts.font_data.insert(
+    let mut defs = egui::FontDefinitions::default();
+    let base_families = defs.families.clone();
+    defs.font_data.insert(
         "material".to_owned(),
         std::sync::Arc::new(egui::FontData::from_static(include_bytes!(
             "../assets/fonts/MaterialIcons-Regular.ttf"
         ))),
     );
-    let has_reg = load_system(&mut fonts, "segoe", if cfg!(windows) { "segoeui.ttf" } else if cfg!(target_os="macos") { "Helvetica.ttc" } else { "DejaVuSans.ttf" }, 0);
-    let has_semi = load_system(&mut fonts, "segoe_semi", if cfg!(windows) { "seguisb.ttf" } else if cfg!(target_os="macos") { "Helvetica.ttc" } else { "DejaVuSans-Bold.ttf" }, 0);
-    fonts.font_data.insert("bundled-bengali".into(), std::sync::Arc::new(egui::FontData::from_static(include_bytes!("../assets/fonts/NotoSansBengali.ttf"))));
-    // Script fallbacks, in the order they are consulted. Segoe UI leads: it
-    // covers Greek, Cyrillic, Arabic, Hebrew and the wider Latin ranges.
+    let has_reg = load_system(&mut defs, "segoe", if cfg!(windows) { "segoeui.ttf" } else if cfg!(target_os="macos") { "Helvetica.ttc" } else { "DejaVuSans.ttf" }, 0);
+    let has_semi = load_system(&mut defs, "segoe_semi", if cfg!(windows) { "seguisb.ttf" } else if cfg!(target_os="macos") { "Helvetica.ttc" } else { "DejaVuSans-Bold.ttf" }, 0);
+    defs.font_data.insert("bundled-bengali".into(), std::sync::Arc::new(egui::FontData::from_static(include_bytes!("../assets/fonts/NotoSansBengali.ttf"))));
+    // Segoe UI leads the fallbacks: it covers Greek, Cyrillic, Arabic,
+    // Hebrew and the wider Latin ranges.
     let mut fallbacks: Vec<String> = Vec::new();
     if has_reg {
         fallbacks.push("segoe".to_owned());
     }
-    for &(key, file, index) in SYSTEM_FONTS {
-        if load_system(&mut fonts, key, file, index) {
-            fallbacks.push(key.to_owned());
-        }
-    }
     fallbacks.push("bundled-bengali".into());
-    {
-        let prop = fonts
-            .families
-            .entry(egui::FontFamily::Proportional)
-            .or_default();
-        if primary && has_reg {
-            prop.insert(0, "segoe".to_owned());
+    let mut st = FontState { defs, base_families, fallbacks, has_reg, has_semi, primary, tried: Default::default() };
+    st.apply_families();
+    cc.egui_ctx.set_fonts(st.defs.clone());
+    *FONTS.lock().unwrap_or_else(|e| e.into_inner()) = Some(st);
+}
+
+/// Make sure `text` can be drawn: loads the script fallback fonts its
+/// characters need (once per process). Cheap for text already covered -
+/// call it with whatever is about to be shown.
+pub fn ensure_text(ctx: &egui::Context, text: &str) {
+    if text.is_ascii() {
+        return;
+    }
+    let mut guard = FONTS.lock().unwrap_or_else(|e| e.into_inner());
+    let Some(st) = guard.as_mut() else { return };
+    let mut changed = false;
+    for c in text.chars() {
+        if (c as u32) < 0x0530 {
+            continue;
         }
-        for key in &fallbacks {
-            if !prop.contains(key) {
-                prop.push(key.clone());
+        let Some(key) = wanted_key(c) else { continue };
+        if !st.tried.insert(key) {
+            continue;
+        }
+        if let Some(&(k, file, index)) = SYSTEM_FONTS.iter().find(|(k, _, _)| *k == key) {
+            if load_system(&mut st.defs, k, file, index) {
+                // Before the bundled Bengali face, which is a last resort.
+                let at = st.fallbacks.iter().position(|f| f == "bundled-bengali").unwrap_or(st.fallbacks.len());
+                st.fallbacks.insert(at, k.to_owned());
+                changed = true;
             }
         }
-        prop.push("material".to_owned());
     }
-    // Monospace falls back the same way: the URL and destination boxes are
-    // drawn in it, and a name in any script has to stay readable there too.
-    {
-        let mono = fonts
-            .families
-            .entry(egui::FontFamily::Monospace)
-            .or_default();
-        for key in &fallbacks {
-            if !mono.contains(key) {
-                mono.push(key.clone());
-            }
+    if changed {
+        st.apply_families();
+        ctx.set_fonts(st.defs.clone());
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn scripts_map_to_their_fallback_font() {
+        if cfg!(windows) {
+            assert_eq!(wanted_key('中'), Some("msyh"));
+            assert_eq!(wanted_key('한'), Some("malgun"));
+            assert_eq!(wanted_key('ひ'), Some("yugoth"));
+            assert_eq!(wanted_key('क'), Some("nirmala"));
+            assert_eq!(wanted_key('ไ'), Some("leelawadee"));
         }
+        // Covered by the base fonts: nothing to load.
+        assert_eq!(wanted_key('a'), None);
+        assert_eq!(wanted_key('Ж'), None);
     }
-    // Named families: the regular cut prefers Segoe UI, then the app font, so
-    // icon glyphs (Material Icons) and every script keep resolving inside the
-    // dialog too.
-    let base = fonts.families[&egui::FontFamily::Proportional].clone();
-    let regular = if has_reg {
-        let mut v = vec!["segoe".to_owned()];
-        v.extend(base.iter().filter(|f| f.as_str() != "segoe").cloned());
-        v
-    } else {
-        base
-    };
-    // Semibold keeps the concept's weight for Latin and falls through to the
-    // same fallbacks for everything else (a Bangla heading is still semibold
-    // *looking* because the fallback face is picked per glyph, not per run).
-    let semibold = if has_semi {
-        let mut v = vec!["segoe_semi".to_owned()];
-        v.extend(regular.iter().filter(|f| f.as_str() != "segoe").cloned());
-        v
-    } else {
-        regular.clone()
-    };
-    fonts
-        .families
-        .insert(egui::FontFamily::Name(FONT_UI.into()), regular);
-    fonts
-        .families
-        .insert(egui::FontFamily::Name(FONT_SEMI.into()), semibold);
-    // Icon-only family: Material Icons and nothing else, so no system font can
-    // shadow a PUA icon codepoint (see `icon`).
-    fonts.families.insert(
-        egui::FontFamily::Name(FONT_ICON.into()),
-        vec!["material".to_owned()],
-    );
-    cc.egui_ctx.set_fonts(fonts);
 }

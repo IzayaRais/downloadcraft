@@ -856,6 +856,8 @@ impl eframe::App for ConfirmApp {
     /// Same bulletproofing as the progress window: Close can no-op, so back
     /// it with a delayed exit once the dialog is done.
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        crate::fonts::ensure_text(ctx, &self.filename);
+        crate::fonts::ensure_text(ctx, &self.description);
         if self.done {
             ctx.send_viewport_cmd(egui::ViewportCommand::Close);
             if !self.exited {

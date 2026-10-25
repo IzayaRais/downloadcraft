@@ -435,6 +435,7 @@ impl eframe::App for CompleteApp {
     }
 
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        crate::fonts::ensure_text(ctx, &self.item.filename);
         // Follow theme switches made in the main app while this dialog is up
         // (separate process: ui.json is the only channel).
         if self.theme_check.elapsed() >= Duration::from_secs(1) {

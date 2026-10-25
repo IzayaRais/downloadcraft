@@ -5,6 +5,13 @@ edition = "2021"
 description = "Download Craft — a lightweight, offline-first download manager (egui GUI + CLI)"
 license = "MIT"
 
+[profile.release]
+# Smaller and a little faster: whole-program optimisation, one codegen unit,
+# no debug symbols in the shipped binary.
+lto = "thin"
+codegen-units = 1
+strip = true
+
 [workspace]
 members = [".", "crates/downloadcraft-engine"]
 

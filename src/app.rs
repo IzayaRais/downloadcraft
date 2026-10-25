@@ -1557,6 +1557,7 @@ fn tool_button(
 /// click, instead of a banner pushing the list down.
 fn add_url_button(ui: &mut egui::Ui, man: &ManState, hot: bool) -> egui::Rect {
     if !hot {
+        ui.ctx().data_mut(|d| d.remove::<f64>(egui::Id::new("add_url_hot_since")));
         return tool_button(ui, man, MI_ADD, "Add URL", true, "Add a download by URL");
     }
     let label = "Add URL";
@@ -1570,11 +1571,19 @@ fn add_url_button(ui: &mut egui::Ui, man: &ManState, hot: bool) -> egui::Rect {
         egui::Sense::hover(),
     );
     let hov = man.hover(&rect);
-    // Breathing accent: enough motion to catch the eye, no layout shift.
-    let t = ui.input(|i| i.time) as f32;
-    let pulse = 0.5 + 0.5 * (t * 2.6).sin();
-    ui.ctx()
-        .request_repaint_after(std::time::Duration::from_millis(70));
+    // Breathing accent: enough motion to catch the eye, no layout shift -
+    // for the first seconds only, then a steady tint (an endless animation
+    // kept the whole window redrawing 14 times a second).
+    let now = ui.input(|i| i.time);
+    let since_id = egui::Id::new("add_url_hot_since");
+    let since = ui.ctx().data_mut(|d| *d.get_temp_mut_or_insert_with(since_id, || now));
+    let t = now as f32;
+    let animate = now - since < 6.0;
+    let pulse = if animate { 0.5 + 0.5 * (t * 2.6).sin() } else { 0.5 };
+    if animate {
+        ui.ctx()
+            .request_repaint_after(std::time::Duration::from_millis(70));
+    }
     let p = ui.painter();
     p.rect_filled(
         rect,
@@ -4774,6 +4783,11 @@ const DATE_W: f32 = 104.0;
 
 impl eframe::App for CraftApp {
     fn update(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
+        // Script fonts load the first time a name needs them (see fonts).
+        for d in &self.downloads {
+            crate::fonts::ensure_text(ctx, &d.filename);
+        }
+        crate::fonts::ensure_text(ctx, &self.add_file);
         crate::tray::set_context(ctx);
         self.watch_ui_state();
         // The tray helpers work on the native window (parking = visible but
@@ -4883,12 +4897,14 @@ impl eframe::App for CraftApp {
         // the tray nobody watches the charts, so a slower tick keeps the
         // app fully alive (inbox, completions, heartbeat) without burning
         // frames on an invisible window.
-        let tick_ms = if crate::tray::is_parked() {
-            200
-        } else if self.tasks.is_empty() {
-            250
+        // Footprint: every repaint redraws the whole window, so idle it only
+        // wakes once a second (inbox, schedule, completions) and a live list
+        // four times a second - enough for the speed column. Input repaints
+        // at once anyway.
+        let tick_ms = if crate::tray::is_parked() || self.tasks.is_empty() {
+            1000
         } else {
-            100
+            250
         };
         ctx.request_repaint_after(std::time::Duration::from_millis(tick_ms));
 
