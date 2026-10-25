@@ -40,6 +40,8 @@ function hostSend(msg) {
   if (typeof DCBridge !== "undefined") return DCBridge.send(msg);
   return api.runtime.sendNativeMessage(HOST, msg);
 }
+// Start the live link now: the start-up ping below already goes through it.
+if (typeof DCBridge !== "undefined") DCBridge.start(HOST);
 
 function markSeen(url, filename) {
   seen.set(url + "|" + (filename || ""), Date.now());
@@ -1676,7 +1678,6 @@ if (typeof DCBridge !== "undefined") {
     }
     if (cfg.notify) notifyUser(`dc-${m.id}`, "Download failed", `${name}: ${m.error || "failed"}`);
   });
-  DCBridge.start(HOST);
 }
 
 // First run, and whenever the app cannot be reached: one page that says what
