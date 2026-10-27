@@ -3,7 +3,12 @@
 try {
   document.querySelectorAll("[data-i18n]").forEach((el) => {
     const m = chrome.i18n && chrome.i18n.getMessage(el.getAttribute("data-i18n"));
-    if (m) el.textContent = m;
+    if (!m) return;
+    // Replace only the text: elements inside (the Videos tab's counter)
+    // must stay, the list code fills them.
+    const text = [...el.childNodes].find((n) => n.nodeType === 3 && n.nodeValue.trim());
+    if (text) text.nodeValue = m;
+    else if (!el.children.length) el.textContent = m;
   });
 } catch (e) { /* keep English */ }
 
