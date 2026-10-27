@@ -445,6 +445,11 @@ pub(crate) const MI_TUNE: &str = "\u{e429}";
 pub(crate) const MI_INSERT_FILE: &str = "\u{e24d}";
 /// Collapsed / expanded affordances for the sidebar sections.
 const MI_OPEN: &str = "\u{e89e}";
+const MI_CHECK: &str = "\u{e5ca}";
+/// Popup-menu label prefixes: a ticked choice, and an unticked one in the
+/// same group (indented to line up with the ticked one).
+const POPUP_CHECK: &str = "\u{1}";
+const POPUP_INDENT: &str = "\u{2}";
 const MI_FOLDER_OPEN: &str = "\u{e2c8}";
 const MI_INFO: &str = "\u{e88e}";
 const MI_REPLAY: &str = "\u{e042}";
@@ -6282,11 +6287,15 @@ impl eframe::App for CraftApp {
             .show(ctx, |ui| {
                 let avail = ui.available_size();
                 let (outer, _) = ui.allocate_exact_size(avail, egui::Sense::hover());
-                // Two cards: the toolbar on its own, the list below it. Their
-                // backgrounds are placed first and sized once the toolbar has
-                // laid out (it can wrap to two lines on a narrow window).
-                let toolbar_bg = ui.painter().add(egui::Shape::Noop);
-                let list_bg = ui.painter().add(egui::Shape::Noop);
+                // One card for the toolbar and the list, a hairline between
+                // them (the toolbar's height is known once it has laid out).
+                ui.painter().rect(
+                    outer,
+                    RADIUS,
+                    pl().central_bg,
+                    egui::Stroke::new(1.0_f32, pl().card_bd),
+                    egui::StrokeKind::Inside,
+                );
                 // Everything below lives inside the cards' 1px border.
                 let mut card = ui.new_child(
                     egui::UiBuilder::new()
@@ -6330,26 +6339,14 @@ impl eframe::App for CraftApp {
                     });
                 });
                 ui.add_space(7.0);
-                // The toolbar card ends here; a gap, then the list card.
+                // The toolbar ends here: a hairline, then the list.
                 let split = ui.cursor().min.y;
-                let card_shape = |r: egui::Rect| {
-                    egui::Shape::Rect(egui::epaint::RectShape::new(
-                        r,
-                        RADIUS,
-                        pl().central_bg,
-                        egui::Stroke::new(1.0_f32, pl().card_bd),
-                        egui::StrokeKind::Inside,
-                    ))
-                };
-                ui.painter().set(
-                    toolbar_bg,
-                    card_shape(egui::Rect::from_min_max(outer.min, egui::pos2(outer.max.x, split + 1.0))),
+                ui.painter().hline(
+                    (outer.min.x + 1.0)..=(outer.max.x - 1.0),
+                    split + 0.5,
+                    egui::Stroke::new(1.0_f32, pl().card_bd),
                 );
-                ui.painter().set(
-                    list_bg,
-                    card_shape(egui::Rect::from_min_max(egui::pos2(outer.min.x, split + 7.0), outer.max)),
-                );
-                ui.add_space(8.0);
+                ui.add_space(1.0);
                 // A link found on the clipboard is surfaced on the toolbar's
                 // Add URL button (see `add_url_button`), not as a banner here:
                 // the banner pushed the whole list down by a row.
@@ -6453,6 +6450,10 @@ impl eframe::App for CraftApp {
                             egui::vec2(CHECK_W, HDR_H),
                             egui::Sense::hover(),
                         );
+                        // The row layout can push cells below the band's top;
+                        // every cell is put on the band so its title sits in
+                        // the middle.
+                        let cr = egui::Rect::from_min_size(egui::pos2(cr.min.x, hdr_top.y), egui::vec2(cr.width(), HDR_H));
                         paint_check(
                             ui.painter(),
                             egui::Rect::from_center_size(cr.center(), egui::vec2(13.0, 13.0)),
@@ -6466,6 +6467,7 @@ impl eframe::App for CraftApp {
                                 egui::vec2(w, HDR_H),
                                 egui::Sense::hover(),
                             );
+                            let r = egui::Rect::from_min_size(egui::pos2(r.min.x, hdr_top.y), egui::vec2(w, HDR_H));
                             let sorted = self.sort_col == *col;
                             let arrow = if sorted {
                                 if self.sort_asc { " ▲" } else { " ▼" }
@@ -8685,8 +8687,12 @@ impl CraftApp {
                     22 => "light",
                     _ => "",
                 };
+                // Marked here, drawn as a tick icon by `render_popup` (the
+                // text font has no check mark glyph: it showed as a box).
                 if !key.is_empty() && self.theme == key {
-                    text = format!("✓ {text}");
+                    text = format!("{POPUP_CHECK}{text}");
+                } else if !key.is_empty() {
+                    text = format!("{POPUP_INDENT}{text}");
                 }
             }
             out.push((text, Some(HitKind::MenuItem(act))));
@@ -9167,6 +9173,7 @@ impl CraftApp {
 
     /// Generic manual popup list. Records item hits; clicks dispatch from
     /// process_hits. Empty labels render as separators.
+    #[allow(clippy::too_many_lines)]
     fn render_popup(
         &mut self,
         ctx: &egui::Context,
@@ -9214,8 +9221,28 @@ impl CraftApp {
                             if self.man.hover(&r) {
                                 ui.painter().rect_filled(r, 4.0, pl().surface_lt);
                             }
+                            let (checked, label) = match label.strip_prefix(POPUP_CHECK) {
+                                Some(rest) => (Some(true), rest.to_string()),
+                                None => match label.strip_prefix(POPUP_INDENT) {
+                                    Some(rest) => (Some(false), rest.to_string()),
+                                    None => (None, label),
+                                },
+                            };
+                            let mut tx = r.min.x + 10.0;
+                            if let Some(on) = checked {
+                                if on {
+                                    ui.painter().text(
+                                        egui::pos2(r.min.x + 17.0, r.center().y),
+                                        egui::Align2::CENTER_CENTER,
+                                        MI_CHECK,
+                                        crate::fonts::icon(15.0),
+                                        pl().primary,
+                                    );
+                                }
+                                tx = r.min.x + 30.0;
+                            }
                             ui.painter().text(
-                                egui::pos2(r.min.x + 10.0, r.center().y),
+                                egui::pos2(tx, r.center().y),
                                 egui::Align2::LEFT_CENTER,
                                 label,
                                 egui::FontId::proportional(12.5),
@@ -9299,13 +9326,9 @@ impl CraftApp {
         v.push(item("Refresh download address", MI_REFRESH, "", RefreshAddress));
         v.push(item("Verify checksum", MI_VERIFIED, "", VerifyChecksum));
         v.push(CtxEntry::Sep);
-        // One remove row: holding Shift turns it into "remove and delete
-        // the file" (the old menu had both as separate rows).
-        v.push(if shift {
-            CtxEntry::Item { label: t("Remove + delete file"), icon: MI_DELETE_FOREVER, hint: "Shift", act: RemoveFile, danger: true }
-        } else {
-            CtxEntry::Item { label: t("Remove"), icon: MI_DELETE, hint: "Del", act: Remove, danger: true }
-        });
+        let _ = shift;
+        v.push(CtxEntry::Item { label: t("Remove"), icon: MI_DELETE, hint: "Del", act: Remove, danger: true });
+        v.push(CtxEntry::Item { label: t("Remove + delete file"), icon: MI_DELETE_FOREVER, hint: "", act: RemoveFile, danger: true });
         v
     }
 
