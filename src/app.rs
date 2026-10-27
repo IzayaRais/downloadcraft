@@ -1518,20 +1518,19 @@ pub(crate) fn line_icon(p: &egui::Painter, center: egui::Pos2, size: f32, key: &
     }
 }
 
-/// Room kept free beside the rows for the thin scroll bar that floats over
-/// their right edge (see [`modern_scrollbars`]).
+/// Room the thin scroll bar's strip takes beside the rows: margin, bar,
+/// margin (see [`modern_scrollbars`]).
 pub(crate) const SB_SPACE: f32 = 8.0;
 
-/// Thin, see-through scroll bars that are always shown (IDM shows both bars
-/// on its lists; these keep that without the heavy look): no track, a 4 px
-/// soft handle over the content that widens a little under the pointer and
-/// takes the accent while dragged. Applies to the scroll areas this `ui`
-/// creates next.
+/// Thin scroll bars: no track, a 4 px soft handle that takes the accent
+/// while dragged. They sit in their own strip beside / below the rows
+/// (floating over the rows let the last row show through the bar).
+/// Applies to the scroll areas this `ui` creates next.
 pub(crate) fn modern_scrollbars(ui: &mut egui::Ui) {
     let st = ui.style_mut();
     st.spacing.scroll = egui::style::ScrollStyle {
-        floating: true,
-        bar_width: 7.0,
+        floating: false,
+        bar_width: 4.0,
         floating_width: 4.0,
         floating_allocated_width: 0.0,
         handle_min_length: 28.0,

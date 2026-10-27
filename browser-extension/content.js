@@ -1714,8 +1714,8 @@
         transition:width .15s ease,opacity .15s ease; }
       :host(:hover) .grip, .bar:focus-within .grip { flex-basis:16px;width:16px;opacity:1; }
       .grip:active { cursor:grabbing; }
-      .download { touch-action:none;flex:0 0 auto;gap:8px;height:28px;padding:0 12px 0 2px;border-radius:14px; }
-      .dot { width:24px;height:24px;border-radius:12px;background:var(--acc);color:#fff;display:flex;align-items:center;justify-content:center;flex:none; }
+      .download { touch-action:none;flex:0 0 auto;gap:7px;height:28px;padding:0 12px 0 5px;border-radius:14px; }
+      .dot { width:18px;height:18px;border-radius:9px;background:var(--acc);color:#fff;display:flex;align-items:center;justify-content:center;flex:none; }
       .label { white-space:nowrap; }
       .close { flex:0 0 26px;width:26px;height:26px;border-radius:13px;color:var(--dim); }
       .close:hover { color:var(--x-fg);background:var(--x-bg); }
@@ -1726,7 +1726,7 @@
     const main = document.createElement("button");main.type="button";main.className="download";
     main.title=title;main.setAttribute("aria-label","Download this video");
     const dot=document.createElement("span");dot.className="dot";
-    dot.appendChild(svgIcon(13,ICON_DOWN,2.6));
+    dot.appendChild(svgIcon(11,ICON_DOWN,2.8));
     main.appendChild(dot);
     const label=document.createElement("span");label.className="label";label.textContent=dcT("barDownload","Download");
     main.appendChild(label);
