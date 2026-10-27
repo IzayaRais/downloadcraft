@@ -20,7 +20,7 @@ const fn = new Function(
    return { fbCleanCaption, fbCaptionUsable, fbPickCaption, fbJsonTexts,
             fbThumbOk, fbThumbScore, fbPickThumb, fbQuality, fbQualityCap, fbFilename,
             fbReelKeyOf, fbPickVideo, fbVideoKey, fbAudioItem, fbReelMedia, fbMenuRows,
-            fbJsonIsCurrent };`
+            fbJsonIsCurrent, fbIdsNear, fbOrderFor, fbPermalink };`
 );
 const fb = fn({ title: "" }, {});
 
@@ -460,5 +460,68 @@ describe("reel menu rows", () => {
     const d = fb.fbMenuRows(info(), [{ url: NEW_LEG, mime: "video/mp4", seenAt: 10 }]);
     assert.equal(d.pair, null);
     assert.deepEqual(d.audio, []);
+  });
+});
+
+// A tiny DOM: enough of parentElement / querySelectorAll / getAttribute.
+function node(tag, attrs, kids) {
+  const n = { tag, attrs: attrs || {}, kids: kids || [], parentElement: null };
+  for (const k of n.kids) k.parentElement = n;
+  n.getAttribute = (k) => (k in n.attrs ? n.attrs[k] : null);
+  n.querySelectorAll = (sel) => {
+    const out = [];
+    const walk = (x) => {
+      for (const k of x.kids) {
+        if ((sel === "video" && k.tag === "video") || (sel === "a[href]" && k.tag === "a" && k.attrs.href)) out.push(k);
+        walk(k);
+      }
+    };
+    walk(n);
+    return out;
+  };
+  return n;
+}
+
+describe("the clicked feed video", () => {
+  // Two posts in a feed, each with its video and a link to it.
+  const v1 = node("video");
+  const v2 = node("video");
+  const post1 = node("div", {}, [node("div", {}, [v1]), node("a", { href: "/somepage/videos/1111111111/" }), node("a", { href: "/hashtag/x" })]);
+  const post2 = node("div", {}, [node("div", {}, [v2]), node("a", { href: "https://www.facebook.com/reel/2222222222?s=1" })]);
+  node("div", {}, [post1, post2]);
+
+  it("reads the id from its own post, never the neighbour's", () => {
+    assert.deepEqual(fb.fbIdsNear(v1).map((x) => x.id), ["1111111111"]);
+    assert.deepEqual(fb.fbIdsNear(v2).map((x) => x.id), ["2222222222"]);
+  });
+
+  const stored = [
+    { id: "2222222222", dur: 30 }, // fetched last: the old pick
+    { id: "1111111111", dur: 61 },
+    { id: "3333333333", dur: 12 },
+  ];
+
+  it("puts the clicked video's data first", () => {
+    const o = fb.fbOrderFor(stored, fb.fbIdsNear(v1), 61.2);
+    assert.equal(o.list[0].id, "1111111111");
+    assert.equal(o.known, true);
+  });
+
+  it("waits for a known id whose data has not arrived instead of offering another video", () => {
+    const o = fb.fbOrderFor(stored.slice(0, 1), fb.fbIdsNear(v1), 61);
+    assert.deepEqual(o.list, []);
+    assert.equal(o.missing, "1111111111");
+  });
+
+  it("falls back to the one video of the same length, then to the old order", () => {
+    assert.equal(fb.fbOrderFor(stored, [], 12.4).list[0].id, "3333333333");
+    const o = fb.fbOrderFor(stored, [], 99);
+    assert.equal(o.known, false);
+    assert.equal(o.list[0].id, "2222222222");
+  });
+
+  it("builds a page yt-dlp can download that one video from", () => {
+    assert.equal(fb.fbPermalink("2222222222", "/reel/2222222222"), "https://www.facebook.com/reel/2222222222");
+    assert.equal(fb.fbPermalink("1111111111", "/p/videos/1111111111/"), "https://www.facebook.com/watch/?v=1111111111");
   });
 });

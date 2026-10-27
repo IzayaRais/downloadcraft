@@ -973,13 +973,70 @@
     return use.slice().sort((a, b) => (Number(b.seenAt) || 0) - (Number(a.seenAt) || 0));
   }
 
-  function fbInfo() {
+  // The Facebook video ids a <video> in the feed belongs to, nearest first:
+  // its post links to it (/reel/<id>, /videos/<id>, /watch/?v=<id>). The walk
+  // stops at the first ancestor that holds another video too, so a
+  // neighbouring post's links are never taken. [{ id, href }].
+  function fbIdsNear(v, maxUp) {
+    const out = [];
+    let el = v;
+    for (let i = 0; el && i < (maxUp || 25); i++) {
+      el = el.parentElement;
+      if (!el || !el.querySelectorAll) break;
+      let vids = [];
+      try { vids = Array.from(el.querySelectorAll("video")); } catch (e) { vids = []; }
+      if (vids.some((x) => x !== v)) break;
+      let links = [];
+      try { links = Array.from(el.querySelectorAll("a[href]")); } catch (e) { links = []; }
+      for (const a of links) {
+        const href = String((a.getAttribute && a.getAttribute("href")) || a.href || "");
+        const id = fbReelKeyOf(href);
+        if (id && !out.some((x) => x.id === id)) out.push({ id, href });
+      }
+      // The first box with a video link is the post: going higher would
+      // reach the feed and its other posts.
+      if (out.length) break;
+    }
+    return out;
+  }
+
+  // A link yt-dlp (in the app) can download one video from.
+  function fbPermalink(id, href) {
+    if (/\/reel\//i.test(String(href || ""))) return `https://www.facebook.com/reel/${id}`;
+    return `https://www.facebook.com/watch/?v=${id}`;
+  }
+
+  // The stored videos reordered for the <video> the user clicked: its own id
+  // (from its post's links) first, else the only stored video as long as it.
+  // `known` = true when the clicked video was identified at all; when its id
+  // is known but its data has not arrived, `missing` names it, so the caller
+  // waits for it instead of offering a neighbour.
+  function fbOrderFor(list, ids, dur) {
+    const all = Array.isArray(list) ? list : [];
+    const idList = (ids || []).map((x) => x.id);
+    let hit = null;
+    for (const id of idList) {
+      hit = all.find((e) => e.id === id);
+      if (hit) break;
+    }
+    if (hit) return { list: [hit, ...all.filter((e) => e !== hit)], known: true, missing: "" };
+    if (idList.length) return { list: [], known: true, missing: idList[0] };
+    const d = Number(dur);
+    if (Number.isFinite(d) && d > 0) {
+      const same = all.filter((e) => e.dur > 0 && Math.abs(e.dur - d) <= 1.5);
+      if (same.length === 1) return { list: [same[0], ...all.filter((e) => e !== same[0])], known: true, missing: "" };
+    }
+    return { list: all, known: false, missing: "" };
+  }
+
+  function fbInfo(clicked) {
     fbSyncReel();
     let html = "";
     try { html = document.documentElement.innerHTML.slice(0, 1500000); } catch (e) {}
-    // The reel on screen, not the first <video> the document happens to hold:
-    // Facebook keeps the neighbours mounted and preloaded.
-    const video = fbActiveVideo() || document.querySelector("video");
+    // The video whose button was clicked; else the reel on screen, not the
+    // first <video> the document happens to hold: Facebook keeps the
+    // neighbours mounted and preloaded.
+    const video = clicked || fbActiveVideo() || document.querySelector("video");
     // Only while the page still describes itself (see fbJsonIsCurrent).
     const current = fbJsonIsCurrent();
     const urls = current ? fbJsonUrls(html) : { hd: "", sd: "" };
@@ -2807,21 +2864,36 @@
     // The reel's own qualities from Facebook's JSON beat the pieces the
     // sniffer caught (each piece used to become its own row). Clicked before
     // either exists: wait for them ("Resolving…").
+    // The <video> this button belongs to. In the feed many videos play and
+    // preload at once, so "the newest one the page fetched" is often a
+    // neighbour; the clicked video's own post links name it.
+    const video = pill.__dcVideo && pill.__dcVideo.isConnected !== false ? pill.__dcVideo : null;
+    const onReelPage = !!fbReelKeyOf(location.href);
+    const ids = video && !onReelPage ? fbIdsNear(video) : [];
+    let vdur = 0;
+    try { vdur = video ? video.duration : 0; } catch (e) { vdur = 0; }
     const gather = async () => {
-      const info = fbInfo();
+      const info = fbInfo(video);
       const items = await sniffedNow();
       const data = fbMenuRows(info, items);
-      const stored = fbStoredVideos(items)[0];
-      const rows = stored ? fbStoredRows(stored, info) : data.rows.slice();
-      if (stored && !rows.length) rows.push(...data.rows);
+      const order = onReelPage ? { list: fbStoredVideos(items), known: true, missing: "" }
+        : fbOrderFor(fbStoredVideos(items), ids, vdur);
+      const stored = order.list[0];
+      const rows = stored ? fbStoredRows(stored, info) : [];
+      // The tab's sniffed pieces are only trusted when the clicked video
+      // could not be told apart at all (the old behaviour) or on a reel page.
+      if (!rows.length && !order.missing) rows.push(...data.rows);
       return rows.length ? { info, data, rows } : null;
     };
     barBusy(pill, "Resolving…");
     waitFor(gather, (got) => {
       barBusy(pill, null);
       if (!got) {
-        const info = fbInfo();
-        sendDownload(location.href, fbFilename(info.title), null, null, null, null, info.durSec || null);
+        const info = fbInfo(video);
+        // The clicked video's own page beats the feed's address: the app's
+        // yt-dlp then downloads exactly that video.
+        const target = ids.length ? fbPermalink(ids[0].id, ids[0].href) : location.href;
+        sendDownload(target, fbFilename(info.title), null, null, null, null, info.durSec || null);
         return;
       }
       const { info, data, rows } = got;
