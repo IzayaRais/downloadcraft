@@ -2479,6 +2479,10 @@ impl CraftApp {
             let mine = serde_json::json!({
                 "columns": order,
                 "widths": widths,
+                // 2 = Name keeps a width of its own (columns push each
+                // other, as in IDM); before that a saved Name width was
+                // ignored and must not be applied now.
+                "widths_v": 2,
                 "max_concurrent": self.max_concurrent,
                 "per_host_conns": self.per_host_conns,
                 "show_complete": self.show_complete,
@@ -2562,6 +2566,9 @@ impl CraftApp {
                             {
                                 self.col_w.insert(c, (f as f32).clamp(col_min(c), 900.0));
                             }
+                        }
+                        if v.get("widths_v").and_then(|x| x.as_u64()) != Some(2) {
+                            self.col_w.remove(&SortCol::Name);
                         }
                     }
                     let g = |k: &str| v.get(k);
