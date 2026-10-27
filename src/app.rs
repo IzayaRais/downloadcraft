@@ -603,19 +603,6 @@ fn win_lim_key(i: usize) -> &'static str {
 /// Selected rows take a raised fill and the accent colour (no bar); hovered
 /// rows take a softer wash. Manual-input version: reserves space, paints,
 /// returns the hit rect; the whole row is one click target.
-/// The colour of a sidebar entry's icon: the category's own tint, the
-/// state's colour for the status filters.
-fn side_tint(key: &str) -> egui::Color32 {
-    match key {
-        "All" | "Downloading" => pl().primary,
-        "Paused" => egui::Color32::from_rgb(0xfb, 0xbf, 0x24),
-        "Completed" => egui::Color32::from_rgb(0x34, 0xd3, 0x99),
-        "Failed" => egui::Color32::from_rgb(0xf8, 0x71, 0x71),
-        "Queued" | "Unfinished" | "Incomplete" => pl().dim,
-        k => cat_color(k),
-    }
-}
-
 fn side_nav_row(
     ui: &mut egui::Ui,
     man: &ManState,
@@ -624,7 +611,7 @@ fn side_nav_row(
     label: &str,
     count: Option<usize>,
     dot: bool,
-    tint: egui::Color32,
+    key: &str,
 ) -> egui::Rect {
     const H: f32 = 24.0;
     let w = ui.available_width().max(40.0);
@@ -646,13 +633,8 @@ fn side_nav_row(
             pl().success,
         );
     } else {
-        p.text(
-            egui::pos2(rect.min.x + 15.0, rect.center().y),
-            egui::Align2::CENTER_CENTER,
-            icon.to_string(),
-            crate::fonts::icon(15.0),
-            tint,
-        );
+        let _ = icon;
+        line_icon(p, egui::pos2(rect.min.x + 15.0, rect.center().y), 15.0, key, fg);
     }
     p.text(
         egui::pos2(rect.min.x + 30.0, rect.center().y),
@@ -714,6 +696,22 @@ fn icon_btn(ui: &mut egui::Ui, glyph: &str, tip: &str) -> egui::Response {
             .corner_radius(RADIUS),
     )
     .on_hover_text(tip)
+}
+
+/// A status in two lines that fit the row: the text, and a thin bar under
+/// it showing how far the file has come.
+fn status_bar_at(p: &egui::Painter, rect: egui::Rect, text: &str, frac: f32, color: egui::Color32) {
+    let x0 = rect.min.x + 10.0;
+    let x1 = (rect.max.x - 14.0).max(x0 + 20.0);
+    let font = egui::FontId::proportional(11.0);
+    let shown = truncate_to_width(p, text, font.clone(), color, x1 - x0);
+    p.text(egui::pos2(x0, rect.center().y - 5.0), egui::Align2::LEFT_CENTER, shown, font, color);
+    let bar = egui::Rect::from_min_max(egui::pos2(x0, rect.center().y + 7.0), egui::pos2(x1, rect.center().y + 10.0));
+    p.rect_filled(bar, 1.5, pl().surface_lt);
+    let fw = (bar.width() * frac.clamp(0.0, 1.0)).max(if frac > 0.0 { 3.0 } else { 0.0 });
+    if fw > 0.0 {
+        p.rect_filled(egui::Rect::from_min_size(bar.min, egui::vec2(fw, bar.height())), 1.5, color);
+    }
 }
 
 /// A status as a coloured dot and text (the redesign's list style).
@@ -1422,6 +1420,99 @@ pub(crate) fn truncate_to_width(
     parts[..lo].concat() + "…"
 }
 
+/// One-colour outline icons for categories and states, drawn as strokes so
+/// they follow the theme's text colour in dark and light alike (the icon
+/// font only has filled glyphs). `key` is a category or state name.
+pub(crate) fn line_icon(p: &egui::Painter, center: egui::Pos2, size: f32, key: &str, color: egui::Color32) {
+    let k = size / 16.0;
+    let o = center - egui::vec2(8.0 * k, 8.0 * k);
+    let pt = |x: f32, y: f32| o + egui::vec2(x * k, y * k);
+    let st = egui::Stroke::new(1.35_f32 * k.max(0.9), color);
+    let line = |pts: &[(f32, f32)]| {
+        p.add(egui::Shape::line(pts.iter().map(|&(x, y)| pt(x, y)).collect(), st));
+    };
+    let closed = |pts: &[(f32, f32)]| {
+        p.add(egui::Shape::closed_line(pts.iter().map(|&(x, y)| pt(x, y)).collect(), st));
+    };
+    let rrect = |x0: f32, y0: f32, x1: f32, y1: f32, rad: f32| {
+        p.rect_stroke(egui::Rect::from_min_max(pt(x0, y0), pt(x1, y1)), rad * k, st, egui::StrokeKind::Middle);
+    };
+    let circle = |x: f32, y: f32, rad: f32| {
+        p.circle_stroke(pt(x, y), rad * k, st);
+    };
+    let page = || {
+        closed(&[(4.0, 1.5), (10.0, 1.5), (13.0, 4.5), (13.0, 14.5), (4.0, 14.5)]);
+        line(&[(10.0, 1.5), (10.0, 4.5), (13.0, 4.5)]);
+    };
+    match key {
+        "Image" => {
+            rrect(1.5, 2.5, 14.5, 13.5, 2.0);
+            circle(5.5, 6.0, 1.3);
+            line(&[(2.0, 12.0), (6.0, 8.5), (9.0, 11.0), (11.0, 9.0), (14.0, 11.5)]);
+        }
+        "Music" => {
+            line(&[(6.0, 12.0), (6.0, 3.5), (13.5, 2.0), (13.5, 10.5)]);
+            line(&[(6.0, 6.0), (13.5, 4.5)]);
+            circle(4.2, 12.2, 1.9);
+            circle(11.7, 10.7, 1.9);
+        }
+        "Video" => {
+            rrect(1.5, 4.0, 10.5, 12.0, 2.0);
+            closed(&[(10.5, 7.0), (14.5, 4.8), (14.5, 11.2), (10.5, 9.0)]);
+        }
+        "Apps" => {
+            rrect(2.0, 2.0, 7.0, 7.0, 1.2);
+            rrect(9.0, 2.0, 14.0, 7.0, 1.2);
+            rrect(2.0, 9.0, 7.0, 14.0, 1.2);
+            rrect(9.0, 9.0, 14.0, 14.0, 1.2);
+        }
+        "Document" => {
+            page();
+            line(&[(6.0, 8.0), (11.0, 8.0)]);
+            line(&[(6.0, 11.0), (11.0, 11.0)]);
+        }
+        "Compressed" => {
+            page();
+            line(&[(8.5, 2.0), (8.5, 3.0)]);
+            line(&[(8.5, 4.5), (8.5, 5.5)]);
+            line(&[(8.5, 7.0), (8.5, 8.0)]);
+            rrect(7.3, 9.3, 9.7, 12.3, 0.6);
+        }
+        "All" => {
+            closed(&[(1.5, 3.5), (6.0, 3.5), (7.5, 5.0), (14.5, 5.0), (14.5, 13.0), (1.5, 13.0)]);
+        }
+        "Downloading" => {
+            line(&[(8.0, 2.0), (8.0, 10.5)]);
+            line(&[(4.5, 7.0), (8.0, 10.5), (11.5, 7.0)]);
+            line(&[(3.0, 13.5), (13.0, 13.5)]);
+        }
+        "Queued" => {
+            line(&[(3.0, 4.0), (13.0, 4.0)]);
+            line(&[(3.0, 8.0), (13.0, 8.0)]);
+            line(&[(3.0, 12.0), (9.0, 12.0)]);
+        }
+        "Paused" => {
+            circle(8.0, 8.0, 6.2);
+            line(&[(6.5, 5.5), (6.5, 10.5)]);
+            line(&[(9.5, 5.5), (9.5, 10.5)]);
+        }
+        "Completed" => {
+            circle(8.0, 8.0, 6.2);
+            line(&[(5.2, 8.2), (7.2, 10.2), (10.9, 6.2)]);
+        }
+        "Failed" => {
+            circle(8.0, 8.0, 6.2);
+            line(&[(5.8, 5.8), (10.2, 10.2)]);
+            line(&[(10.2, 5.8), (5.8, 10.2)]);
+        }
+        "Unfinished" | "Incomplete" => {
+            circle(8.0, 8.0, 6.2);
+            line(&[(8.0, 4.8), (8.0, 8.0), (10.4, 9.6)]);
+        }
+        _ => page(),
+    }
+}
+
 /// Room kept free beside the rows for the thin scroll bar that floats over
 /// their right edge (see [`modern_scrollbars`]).
 pub(crate) const SB_SPACE: f32 = 8.0;
@@ -1465,16 +1556,10 @@ pub(crate) fn modern_scrollbars(ui: &mut egui::Ui) {
 /// mark and the file name on one line: the sidebar and the icon already say
 /// the category, a second line repeating it was noise.
 fn name_cell(p: &egui::Painter, rect: egui::Rect, icon: &str, fname: &str, cat: &str) {
-    // The category mark on a soft tile of its own colour.
-    let tile = egui::Rect::from_center_size(egui::pos2(rect.min.x + 17.0, rect.center().y), egui::vec2(22.0, 22.0));
-    p.rect_filled(tile, 6.0, cat_color(cat).gamma_multiply(0.16));
-    p.text(
-        tile.center(),
-        egui::Align2::CENTER_CENTER,
-        icon.to_owned(),
-        crate::fonts::icon(14.0),
-        cat_color(cat),
-    );
+    // One-colour outline mark, as in AB Download Manager: it follows the
+    // theme instead of a colour per category.
+    let _ = icon;
+    line_icon(p, egui::pos2(rect.min.x + 17.0, rect.center().y), 16.0, cat, pl().txt.gamma_multiply(0.7));
     let tx = rect.min.x + 32.0;
     let max_tw = (rect.max.x - 8.0 - tx).max(20.0);
     let name = truncate_to_width(p, fname, egui::FontId::proportional(12.0), pl().txt, max_tw);
@@ -6091,7 +6176,7 @@ impl eframe::App for CraftApp {
                                         label,
                                         n,
                                         dot,
-                                        side_tint(key),
+                                        key,
                                     );
                                     hits.push((HitKind::SideRow(key.to_string()), r));
                                 };
@@ -6154,7 +6239,7 @@ impl eframe::App for CraftApp {
                                         "Unfinished",
                                         Some(n_incomplete),
                                         false,
-                                        side_tint("Unfinished"),
+                                        "Unfinished",
                                     );
                                     self.hits
                                         .push((HitKind::SideRow("Unfinished".to_string()), r));
@@ -6224,9 +6309,9 @@ impl eframe::App for CraftApp {
                 tools.push((ToolId::Delete, MI_DELETE, crate::i18n::t("Delete"), n_checked > 0, crate::i18n::t("Remove the checked rows from the list")));
                 tools.push((ToolId::Queues, MI_REORDER, crate::i18n::t("Queues"), true, crate::i18n::t("Queues: start, stop, schedule (also in Tasks)")));
                 tools.push((ToolId::Grabber, MI_PUBLIC, crate::i18n::t("Grabber"), true, crate::i18n::t("Collect file links from a web page")));
-                ui.add_space(8.0);
+                ui.add_space(7.0);
                 ui.horizontal(|ui| {
-                    ui.add_space(8.0);
+                    ui.add_space(7.0);
                     ui.spacing_mut().item_spacing = egui::vec2(TOOL_GAP, 2.0);
                     let r = add_url_button(ui, &self.man, self.clipboard_url.is_some());
                     self.hits.push((HitKind::Tool(ToolId::AddUrl), r));
@@ -6244,7 +6329,7 @@ impl eframe::App for CraftApp {
                         self.hits.push((HitKind::Tool(ToolId::Settings), r));
                     });
                 });
-                ui.add_space(6.0);
+                ui.add_space(7.0);
                 // The toolbar card ends here; a gap, then the list card.
                 let split = ui.cursor().min.y;
                 let card_shape = |r: egui::Rect| {
@@ -6262,9 +6347,9 @@ impl eframe::App for CraftApp {
                 );
                 ui.painter().set(
                     list_bg,
-                    card_shape(egui::Rect::from_min_max(egui::pos2(outer.min.x, split + 11.0), outer.max)),
+                    card_shape(egui::Rect::from_min_max(egui::pos2(outer.min.x, split + 7.0), outer.max)),
                 );
-                ui.add_space(16.0);
+                ui.add_space(8.0);
                 // A link found on the clipboard is surfaced on the toolbar's
                 // Add URL button (see `add_url_button`), not as a banner here:
                 // the banner pushed the whole list down by a row.
@@ -6301,7 +6386,7 @@ impl eframe::App for CraftApp {
                     // columns (no gutters), Name left-aligned, every numeric
                     // column right-aligned, and one rule under the header.
                     const ROW_H: f32 = 34.0;
-                    const HDR_H: f32 = 22.0;
+                    const HDR_H: f32 = 30.0;
                     let cols = self.col_order.clone();
                     // The always-visible vertical bar keeps its own strip.
                     let avail_w = ui.available_width() - SB_SPACE;
@@ -6447,7 +6532,7 @@ impl eframe::App for CraftApp {
                                 .id_salt("dl_v")
                                 .max_height(body_h)
                                 .auto_shrink([false, false])
-                                .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysVisible)
+                                .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::VisibleWhenNeeded)
                                 .show(ui, |ui| {
                                     // Rows are flush: the list's rhythm comes
                                     // from ROW_H plus the faint row rule, not
@@ -6585,47 +6670,25 @@ impl eframe::App for CraftApp {
                                         SortCol::Status => match &st {
                                             Status::Downloading => {
                                                 // While a phase that moves no bytes is
-                                                // running, the pill names it instead of
+                                                // running, the text names it instead of
                                                 // sitting on a motionless 0%.
-                                                let pill = if preparing.is_empty() {
-                                                    format!("{}%", (prog * 100.0) as u32)
+                                                let text = if preparing.is_empty() {
+                                                    format!("{}% {}", (prog * 100.0) as u32, crate::i18n::t("Downloading"))
                                                 } else {
                                                     preparing.clone()
                                                 };
-                                                status_pill_at(
-                                                    &p,
-                                                    egui::Rect::from_min_size(
-                                                        egui::pos2(
-                                                            crect.min.x,
-                                                            crect.center().y - 15.0,
-                                                        ),
-                                                        egui::vec2(w, 19.0),
-                                                    ),
-                                                    &pill,
-                                                    pl().primary,
-                                                    true,
-                                                );
-                                                paint_progress(
-                                                    &p,
-                                                    crect.center().x,
-                                                    crect.center().y + 7.0,
-                                                    (w - 16.0).max(20.0),
-                                                    prog,
-                                                );
+                                                status_bar_at(&p, crect, &text, prog, pl().primary);
                                             }
                                             Status::Queued => {
                                                 cell_text(&p, crect, "Added", 10.5, pl().dim, true);
                                             }
                                             Status::Paused => {
-                                                status_dot_at(
+                                                status_bar_at(
                                                     &p,
                                                     crect,
-                                                    &format!(
-                                                        "{} · {}%",
-                                                        crate::i18n::t("Paused"),
-                                                        (prog * 100.0) as u32
-                                                    ),
-                                                    egui::Color32::from_rgb(0xfb, 0xbf, 0x24),
+                                                    &format!("{}% {}", (prog * 100.0) as u32, crate::i18n::t("Paused")),
+                                                    prog,
+                                                    egui::Color32::from_rgb(0xf5, 0x9e, 0x0b),
                                                 );
                                             }
                                             Status::Completed => {

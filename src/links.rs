@@ -658,7 +658,7 @@ impl LinksApp {
         egui::ScrollArea::both()
             .id_salt("links-rows")
             .auto_shrink([false, false])
-            .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysVisible)
+            .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::VisibleWhenNeeded)
             .show_rows(&mut child, ROW_H, shown.len(), |ui, range| {
                 ui.spacing_mut().item_spacing.y = 0.0;
                 let time = ui.input(|i| i.time) as f32;
