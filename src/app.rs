@@ -709,6 +709,11 @@ fn status_bar_at(p: &egui::Painter, rect: egui::Rect, text: &str, frac: f32, col
     let x0 = rect.min.x + 10.0;
     let x1 = (rect.max.x - 14.0).max(x0 + 20.0);
     let font = egui::FontId::proportional(11.0);
+    // "62% Downloading" in a narrow column: the percentage alone reads
+    // better than a word cut in half.
+    let full = p.layout_no_wrap(text.to_string(), font.clone(), color).size().x;
+    let short = text.split_whitespace().next().unwrap_or(text);
+    let text = if full > x1 - x0 && short.ends_with('%') { short } else { text };
     let shown = truncate_to_width(p, text, font.clone(), color, x1 - x0);
     p.text(egui::pos2(x0, rect.center().y - 5.0), egui::Align2::LEFT_CENTER, shown, font, color);
     let bar = egui::Rect::from_min_max(egui::pos2(x0, rect.center().y + 7.0), egui::pos2(x1, rect.center().y + 10.0));
@@ -6399,9 +6404,12 @@ impl eframe::App for CraftApp {
                         .map(|c| (*c, col_w_of(&self.col_w, *c)))
                         .collect();
                     let fixed_sum: f32 = fixed.iter().map(|(_, w)| *w).sum();
+                    // Name also takes any room left over, so a wide window has
+                    // no empty band at the right of the list.
+                    let fill = avail_w - CHECK_W - fixed_sum;
                     let name_w = match self.col_w.get(&SortCol::Name) {
-                        Some(w) => *w,
-                        None => (avail_w - CHECK_W - fixed_sum).max(col_min(SortCol::Name)),
+                        Some(w) => w.max(fill),
+                        None => fill.max(col_min(SortCol::Name)),
                     };
                     let col_ws: Vec<f32> = cols
                         .iter()
