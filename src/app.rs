@@ -839,6 +839,7 @@ enum ButtonId {
     WinDel(usize),
     UpdCheck,
     UpdDownload,
+    UpdRestart,
 }
 
 /// Checkbox identity for manual routing.
@@ -1922,6 +1923,13 @@ fn ctx_row(p: &egui::Painter, r: egui::Rect, icon: &str, label: &str, hint: &str
     crate::shaped::draw(p, egui::pos2(tx, r.center().y), egui::Align2::LEFT_CENTER, &shown, egui::FontId::proportional(12.0), col);
 }
 
+/// What the one-click update reports while it runs.
+enum SelfUpdMsg {
+    Status(String),
+    Installed(usize),
+    Failed(String),
+}
+
 #[derive(Clone, Copy)]
 enum RowAct {
     Resume,
@@ -2096,9 +2104,13 @@ pub struct CraftApp {
     update_check_on: bool,
     update_status: String,
     update_busy: bool,
-    update_rx: Option<std::sync::mpsc::Receiver<(String, Option<String>, bool)>>,
+    update_rx: Option<std::sync::mpsc::Receiver<(String, Option<crate::selfupdate::Asset>, bool)>>,
     /// Portable-update asset URL from the last check (P5), if any.
-    update_asset: Option<String>,
+    update_asset: Option<crate::selfupdate::Asset>,
+    /// One-click update in progress: its messages, and "installed, restart
+    /// when the downloads are done".
+    selfupd_rx: Option<std::sync::mpsc::Receiver<SelfUpdMsg>>,
+    update_restart_ready: bool,
     /// A newer release exists: only then does the title bar show its update
     /// chip. (An asset URL can be missing while an update still exists.)
     update_found: bool,
@@ -2294,6 +2306,8 @@ impl CraftApp {
             update_busy: false,
             update_rx: None,
             update_asset: None,
+            selfupd_rx: None,
+            update_restart_ready: false,
             update_found: false,
             update_auto_done: false,
             speed_hist: std::collections::HashMap::new(),
@@ -2346,6 +2360,9 @@ impl CraftApp {
                 Ok(false) => {}
             }
         }
+        // Files an earlier update moved aside (the running program cannot
+        // delete its own).
+        crate::selfupdate::cleanup();
         app.poll_inbox();
         app.merge_queue_from_disk();
         app.check_wake();
@@ -2470,6 +2487,7 @@ impl CraftApp {
                 "resume" => self.resume(id),
                 "cancel" => self.cancel_task(id),
                 "pause_all" => self.stop_all(),
+                "self_update" => self.start_self_update(),
                 "resume_all" => self.start_queue(),
                 "limit" => {
                     if let Some(k) = c.get("kbps").and_then(|x| x.as_u64()) {
@@ -3603,11 +3621,113 @@ impl CraftApp {
         });
     }
 
+    /// One-click update of the portable build: download and check the zip,
+    /// replace the app's files (all or nothing), restart into the new
+    /// version. Anything that cannot be done that way (no portable folder,
+    /// a failure on the way) falls back to downloading the zip.
+    fn start_self_update(&mut self) {
+        let Some(asset) = self.update_asset.clone() else {
+            self.push_log("No update known — check for updates first.");
+            return;
+        };
+        let target = if cfg!(windows) { crate::selfupdate::portable_dir() } else { None };
+        let Some(target) = target else {
+            self.update_status = "This copy cannot update itself (its folder is not writable, or it is a developer build): the update zip is downloading instead.".into();
+            self.download_update_asset();
+            return;
+        };
+        if self.selfupd_rx.is_some() {
+            return;
+        }
+        let (tx, rx) = std::sync::mpsc::channel();
+        self.selfupd_rx = Some(rx);
+        self.update_busy = true;
+        self.update_status = format!("Downloading {}…", asset.name);
+        let ua = format!("download_craft/{}", crate::model::APP_VERSION);
+        self.rt.spawn(async move {
+            let res: anyhow::Result<usize> = async {
+                let client = reqwest::Client::builder().user_agent(ua).build()?;
+                let txp = tx.clone();
+                let mut last = -1i32;
+                let zip = crate::selfupdate::download(&client, &asset, move |f| {
+                    let pct = (f * 100.0) as i32;
+                    if pct != last && pct % 5 == 0 {
+                        last = pct;
+                        let _ = txp.send(SelfUpdMsg::Status(format!("Downloading update… {pct}%")));
+                    }
+                })
+                .await?;
+                let _ = tx.send(SelfUpdMsg::Status("Checked. Installing…".into()));
+                tokio::task::spawn_blocking(move || {
+                    let dir = crate::selfupdate::unpack(&zip)?;
+                    crate::selfupdate::install(&dir, &target)
+                })
+                .await?
+            }
+            .await;
+            let _ = tx.send(match res {
+                Ok(n) => SelfUpdMsg::Installed(n),
+                Err(e) => SelfUpdMsg::Failed(format!("{e:#}")),
+            });
+        });
+    }
+
+    fn poll_self_update(&mut self) {
+        let Some(rx) = self.selfupd_rx.as_ref() else { return };
+        let msgs: Vec<SelfUpdMsg> = rx.try_iter().collect();
+        for m in msgs {
+            match m {
+                SelfUpdMsg::Status(s) => self.update_status = s,
+                SelfUpdMsg::Installed(n) => {
+                    self.selfupd_rx = None;
+                    self.update_busy = false;
+                    self.update_found = false;
+                    self.push_log(format!("Update installed ({n} files)."));
+                    self.update_restart_ready = true;
+                    if self.tasks.is_empty() {
+                        self.restart_for_update();
+                    } else {
+                        self.update_status = format!(
+                            "Update installed. Restart to use it ({} download(s) still running resume after the restart).",
+                            self.tasks.len()
+                        );
+                    }
+                }
+                SelfUpdMsg::Failed(e) => {
+                    self.selfupd_rx = None;
+                    self.update_busy = false;
+                    self.push_log(format!("Update failed: {e}"));
+                    self.update_status = format!("Update failed ({e}). Nothing was changed; the update zip is downloading instead.");
+                    self.download_update_asset();
+                }
+            }
+        }
+    }
+
+    /// Start the new version and close this one cleanly (the list and the
+    /// settings are saved on the way out).
+    fn restart_for_update(&mut self) {
+        self.save_queue();
+        self.save_ui_state();
+        match crate::selfupdate::relaunch() {
+            Ok(()) => {
+                self.update_status = "Restarting into the new version…".into();
+                #[cfg(windows)]
+                crate::tray::request_quit();
+                #[cfg(not(windows))]
+                std::process::exit(0);
+            }
+            Err(e) => {
+                self.update_status = format!("Update installed, but the restart failed ({e:#}): close and reopen Download Craft.");
+            }
+        }
+    }
+
     /// Queue the portable update asset as a normal download (P5).
     /// Never self-replaces: the .zip lands in Downloads and the log +
     /// notification tell the user where to unzip it.
     fn download_update_asset(&mut self) {
-        let Some(url) = self.update_asset.clone() else {
+        let Some(url) = self.update_asset.as_ref().map(|a| a.url.clone()) else {
             self.push_log("No update asset known — check for updates first.");
             return;
         };
@@ -5455,7 +5575,7 @@ fn ensure_native_host(browser:&str)->Result<bool,String>{
 /// asset when one is newer. Network failures become a status string —
 /// never a popup, never an auto-download. The third field says "a newer
 /// release exists", which is what puts the chip in the title bar.
-async fn update_check_async() -> (String, Option<String>, bool) {
+async fn update_check_async() -> (String, Option<crate::selfupdate::Asset>, bool) {
     let current = env!("CARGO_PKG_VERSION");
     let client = match reqwest::Client::builder()
         .user_agent(format!("download_craft/{current}"))
@@ -5465,8 +5585,14 @@ async fn update_check_async() -> (String, Option<String>, bool) {
         Ok(c) => c,
         Err(e) => return (format!("Update check failed: {e:#}"), None, false),
     };
+    // DOWNLOAD_CRAFT_UPDATE_API points the check at another release JSON
+    // (used to test updates end to end without publishing one).
+    let api = std::env::var("DOWNLOAD_CRAFT_UPDATE_API")
+        .ok()
+        .filter(|u| !u.trim().is_empty())
+        .unwrap_or_else(|| "https://api.github.com/repos/hungry-detective/downloadcraft/releases/latest".to_string());
     let resp = client
-        .get("https://api.github.com/repos/hungry-detective/downloadcraft/releases/latest")
+        .get(api)
         .header("Accept", "application/vnd.github+json")
         .send()
         .await;
@@ -5492,7 +5618,7 @@ async fn update_check_async() -> (String, Option<String>, bool) {
             .unwrap_or("https://github.com/hungry-detective/downloadcraft/releases");
         (
             format!("Update available: {tag} (you have v{current}) — {url}"),
-            crate::model::pick_windows_asset(&v),
+            crate::selfupdate::pick_asset(&v),
             true,
         )
     } else {
@@ -5654,6 +5780,7 @@ impl eframe::App for CraftApp {
                 self.update_auto_done = true;
                 self.start_update_check();
             }
+            self.poll_self_update();
             if let Some(rx) = self.update_rx.as_ref() {
                 let mut got = None;
                 while let Ok(m) = rx.try_recv() {
@@ -8429,9 +8556,9 @@ impl eframe::App for CraftApp {
             } else {
                 Some(lay(&self.update_status, f_small.clone(), p.dim, body_w))
             };
-            let hint_g = if self.update_asset.is_some() {
+            let hint_g = if self.update_asset.is_some() && !self.update_restart_ready {
                 Some(lay(
-                    "Portable .zip lands in your downloads — unzip over the app folder to upgrade.",
+                    "Update now downloads the new version, checks it, replaces this copy's files and restarts. Your list and settings stay.",
                     f_small.clone(),
                     p.dm_lbl,
                     body_w,
@@ -8618,13 +8745,16 @@ impl eframe::App for CraftApp {
                         false,
                     );
                     self.hits.push((HitKind::Btn(ButtonId::UpdCheck), b1));
-                    if self.update_asset.is_some() && !self.update_busy {
+                    if self.update_restart_ready {
+                        let b2 = about_btn(&pf, &self.man, b1.right() + 8.0, y, "Restart now", Some("\u{e5d5}"), true);
+                        self.hits.push((HitKind::Btn(ButtonId::UpdRestart), b2));
+                    } else if self.update_asset.is_some() && !self.update_busy {
                         let b2 = about_btn(
                             &pf,
                             &self.man,
                             b1.right() + 8.0,
                             y,
-                            "Download update",
+                            "Update now",
                             Some("\u{e171}"),
                             true,
                         );
@@ -9034,7 +9164,8 @@ impl CraftApp {
                 }
             }
             ButtonId::UpdCheck => self.start_update_check(),
-            ButtonId::UpdDownload => self.download_update_asset(),
+            ButtonId::UpdDownload => self.start_self_update(),
+            ButtonId::UpdRestart => self.restart_for_update(),
             ButtonId::QStart => self.start_queue(),
             ButtonId::QStop => self.stop_queue(),
             ButtonId::QSchedReset => self.scheduler_started = false,

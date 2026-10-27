@@ -22,6 +22,7 @@ mod native_host;
 mod progress;
 mod settings;
 mod shaped;
+mod selfupdate;
 mod sysproxy;
 mod winauth;
 #[cfg(windows)]
@@ -92,8 +93,14 @@ fn main() -> eframe::Result<()> {
     if args.iter().any(|a| a == "--mini") {
         return basket::run_mini();
     }
+    // Started by a one-click update: wait for the old version to close,
+    // then start the window as usual.
+    let after_update = args.iter().any(|a| a == "--wait-pid");
+    if after_update {
+        selfupdate::wait_for_previous(&args);
+    }
     // CLI mode when a subcommand is given (`--help` works too).
-    if args.len() > 1 {
+    if args.len() > 1 && !after_update {
         match cli::Cli::try_parse_from(&args) {
             Ok(c) => {
                 if let Err(e) = cli::run(c) {

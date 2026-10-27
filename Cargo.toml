@@ -44,6 +44,8 @@ image = { version = "0.25", default-features = false, features = ["png"] }
 rustybuzz = "0.20.1"
 unicode-segmentation = "1.13.3"
 flate2 = "1"
+# Self-update: unpack the portable release zip.
+zip = { version = "2", default-features = false, features = ["deflate"] }
 
 [target.'cfg(windows)'.dependencies]
 tray-icon = "0.20"
