@@ -133,43 +133,211 @@
     return b;
   }
 
-  function mergeFragmented(v, a) {
-    const tracks = [[v, 1], [a, 2]];
-    const trex = tracks.map(([p, id]) => {
-      const t = p.mvex && boxes(p.b, p.mvex.body, p.mvex.end).find((x) => x.type === "trex");
-      return t ? withTrackId(copy(p.b, t), id) : null;
-    }).filter(Boolean);
-    const moov = box("moov", mergedMvhd(v, a),
-      withTrackId(copy(v.b, v.trak), 1), withTrackId(copy(a.b, a.trak), 2),
-      box("mvex", ...trex));
-    // Fragments of both, in time order (seconds), each moof given its new
-    // track id and sequence number. An explicit base-data-offset is absolute,
-    // so it moves with the fragment.
-    const list = [];
-    for (const [p, id] of tracks) {
-      for (const f of p.frags) list.push({ p, id, f, t: p.timescale ? f.time / p.timescale : 0 });
-    }
-    list.sort((x, y) => x.t - y.t || x.id - y.id);
-    const head = concat([v.ftyp ? copy(v.b, v.ftyp) : box("ftyp"), moov]);
-    const parts = [head];
-    let pos = head.length;
-    let seq = 1;
-    for (const { p, id, f } of list) {
-      const piece = withTrackId(p.b.slice(f.start, f.end), id);
-      const moof = boxes(piece, 0, piece.length)[0];
-      const mfhd = child(piece, moof, "mfhd");
-      if (mfhd) put32(piece, mfhd.body + 4, seq++);
-      for (const traf of boxes(piece, moof.body, moof.end).filter((x) => x.type === "traf")) {
-        const tfhd = child(piece, traf, "tfhd");
-        if (tfhd && (u32(piece, tfhd.body) & 0x1)) {
-          const at = tfhd.body + 8;
-          put64(piece, at, u64(piece, at) + (pos - f.start));
+  const s32 = (b, i) => { const x = u32(b, i); return x > 0x7fffffff ? x - 4294967296 : x; };
+
+  // Every sample of a fragmented track, in order: where its bytes are in the
+  // source, its size, duration, composition offset and whether it is a sync
+  // sample. A gap between fragments (tfdt ahead of the running time) is
+  // added to the sample before it, so the timeline stays where it was.
+  function samplesOf(p) {
+    const b = p.b;
+    const trex = p.mvex && boxes(b, p.mvex.body, p.mvex.end).find((x) => x.type === "trex");
+    const dflt = trex
+      ? { dur: u32(b, trex.body + 12), size: u32(b, trex.body + 16), flags: u32(b, trex.body + 20) }
+      : { dur: 0, size: 0, flags: 0 };
+    const samples = [];
+    const chunks = [];
+    let time = 0;
+    for (const f of p.frags) {
+      for (const traf of boxes(b, f.moof.body, f.moof.end).filter((x) => x.type === "traf")) {
+        const tfhd = child(b, traf, "tfhd");
+        if (!tfhd) continue;
+        const tf = u32(b, tfhd.body) & 0xffffff;
+        let at = tfhd.body + 8;
+        let base = f.moof.start;
+        if (tf & 0x1) { base = u64(b, at); at += 8; }
+        if (tf & 0x2) at += 4;
+        let tDur = dflt.dur, tSize = dflt.size, tFlags = dflt.flags;
+        if (tf & 0x8) { tDur = u32(b, at); at += 4; }
+        if (tf & 0x10) { tSize = u32(b, at); at += 4; }
+        if (tf & 0x20) { tFlags = u32(b, at); at += 4; }
+        const tfdt = child(b, traf, "tfdt");
+        if (tfdt) {
+          const start = b[tfdt.body] === 1 ? u64(b, tfdt.body + 4) : u32(b, tfdt.body + 4);
+          if (start > time && samples.length) samples[samples.length - 1].dur += start - time;
+          time = Math.max(time, start);
+        }
+        let ptr = base;
+        for (const trun of boxes(b, traf.body, traf.end).filter((x) => x.type === "trun")) {
+          const version = b[trun.body];
+          const rf = u32(b, trun.body) & 0xffffff;
+          const n = u32(b, trun.body + 4);
+          let q = trun.body + 8;
+          if (rf & 0x1) { ptr = base + s32(b, q); q += 4; }
+          let first = null;
+          if (rf & 0x4) { first = u32(b, q); q += 4; }
+          const chunk = { count: 0, bytes: 0, t: p.timescale ? time / p.timescale : 0, from: samples.length };
+          for (let k = 0; k < n; k++) {
+            let dur = tDur, size = tSize, flags = tFlags, cts = 0;
+            if (rf & 0x100) { dur = u32(b, q); q += 4; }
+            if (rf & 0x200) { size = u32(b, q); q += 4; }
+            if (rf & 0x400) { flags = u32(b, q); q += 4; }
+            if (rf & 0x800) { cts = version ? s32(b, q) : u32(b, q); q += 4; }
+            if (k === 0 && first !== null) flags = first;
+            if (ptr + size > b.length) throw new Error("mp4: sample outside the file");
+            samples.push({ off: ptr, size, dur, cts, sync: !(flags & 0x10000) });
+            ptr += size;
+            time += dur;
+            chunk.count++;
+            chunk.bytes += size;
+          }
+          if (chunk.count) chunks.push(chunk);
         }
       }
-      parts.push(piece);
-      pos += piece.length;
     }
-    return concat(parts);
+    return { samples, chunks, duration: time };
+  }
+
+  const full = (type, version, ...parts) => box(type, new Uint8Array([version, 0, 0, 0]), ...parts);
+  const be32 = (v) => { const o = new Uint8Array(4); put32(o, 0, v >>> 0); return o; };
+  const be64 = (v) => { const o = new Uint8Array(8); put64(o, 0, v); return o; };
+  // Run-length entries: [[count, value], ...].
+  function runs(values) {
+    const out = [];
+    for (const v of values) {
+      const last = out[out.length - 1];
+      if (last && last[1] === v) last[0]++; else out.push([1, v]);
+    }
+    return out;
+  }
+
+  // A sample table (stbl) for the track, with the given chunk offsets.
+  function sampleTable(p, t, offsets, wide) {
+    const { samples, chunks } = t;
+    const stsd = child(p.b, path(p.b, p.trak, ["mdia", "minf", "stbl"]), "stsd");
+    const parts = [copy(p.b, stsd)];
+    const stts = runs(samples.map((x) => x.dur));
+    parts.push(full("stts", 0, be32(stts.length), ...stts.flatMap(([n, d]) => [be32(n), be32(d)])));
+    if (samples.some((x) => x.cts)) {
+      const ctts = runs(samples.map((x) => x.cts));
+      parts.push(full("ctts", samples.some((x) => x.cts < 0) ? 1 : 0, be32(ctts.length), ...ctts.flatMap(([n, c]) => [be32(n), be32(c)])));
+    }
+    if (samples.some((x) => !x.sync)) {
+      const sync = [];
+      samples.forEach((x, k) => { if (x.sync) sync.push(k + 1); });
+      parts.push(full("stss", 0, be32(sync.length), ...sync.map(be32)));
+    }
+    const stsc = [];
+    chunks.forEach((c, k) => {
+      if (!stsc.length || stsc[stsc.length - 1][1] !== c.count) stsc.push([k + 1, c.count]);
+    });
+    parts.push(full("stsc", 0, be32(stsc.length), ...stsc.flatMap(([f, n]) => [be32(f), be32(n), be32(1)])));
+    parts.push(full("stsz", 0, be32(0), be32(samples.length), ...samples.map((x) => be32(x.size))));
+    parts.push(wide
+      ? full("co64", 0, be32(offsets.length), ...offsets.map(be64))
+      : full("stco", 0, be32(offsets.length), ...offsets.map(be32)));
+    return box("stbl", ...parts);
+  }
+
+  // tkhd/mdhd/mvhd durations: 32-bit in version 0, 64-bit in version 1.
+  function setDuration(b, at32, at64, value) {
+    if (b[8] === 1) put64(b, at64, value); else put32(b, at32, Math.min(value, 0xffffffff));
+  }
+
+  // The track's trak with its new id, durations and sample table. An edit
+  // list in a fragmented file may give a duration of 0 ("to the end"),
+  // which a plain file reads as an empty edit: it gets the real length.
+  function plainTrak(p, t, id, movieScale, offsets, wide) {
+    const toMovie = (d) => (p.timescale ? Math.round((d * movieScale) / p.timescale) : 0);
+    const movieDur = toMovie(t.duration);
+    const rebuild = (b, x) => {
+      if (x.type === "stbl") return sampleTable(p, t, offsets, wide);
+      const c = copy(b, x);
+      if (x.type === "tkhd") {
+        put32(c, 8 + (c[8] === 1 ? 20 : 12), id);
+        setDuration(c, 8 + 20, 8 + 28, movieDur);
+        return c;
+      }
+      if (x.type === "mdhd") {
+        setDuration(c, 8 + 16, 8 + 24, t.duration);
+        return c;
+      }
+      if (x.type === "elst") {
+        const v1 = c[8] === 1;
+        const step = v1 ? 20 : 12;
+        for (let k = 0, n = u32(c, 12); k < n; k++) {
+          const at = 16 + k * step;
+          const d = v1 ? u64(c, at) : u32(c, at);
+          const mt = v1 ? s32(c, at + 12) : s32(c, at + 4);
+          if (d === 0 && mt >= 0) {
+            const rest = Math.max(0, movieDur - toMovie(mt));
+            if (v1) put64(c, at, rest); else put32(c, at, Math.min(rest, 0xffffffff));
+          }
+        }
+        return c;
+      }
+      if (CONTAINERS.has(x.type)) return box(x.type, ...boxes(b, x.body, x.end).map((y) => rebuild(b, y)));
+      return c;
+    };
+    return rebuild(p.b, p.trak);
+  }
+
+  // Fragmented inputs (DASH) become one plain MP4: ftyp, moov with a full
+  // sample table per track, one mdat. Players seek in it reliably; the
+  // fragmented join (no index) made some of them lose the sound partway
+  // through or after a seek.
+  function mergeFragmented(v, a) {
+    const tracks = [[v, 1], [a, 2]].map(([p, id]) => ({ p, id, t: samplesOf(p) }));
+    for (const { t } of tracks) if (!t.samples.length) throw new Error("mp4: a track has no samples");
+    // mdat layout: each fragment's run of samples is one chunk, chunks of
+    // both tracks interleaved by time, so playback reads forward.
+    const order = [];
+    for (const tr of tracks) tr.t.chunks.forEach((c, k) => order.push({ tr, k, t: c.t }));
+    order.sort((x, y) => x.t - y.t || x.tr.id - y.tr.id);
+    const mediaSize = order.reduce((n, o) => n + o.tr.t.chunks[o.k].bytes, 0);
+    const movieScale = (v.mvhd && u32(v.b, v.mvhd.body + (v.b[v.mvhd.body] === 1 ? 20 : 12))) || 1000;
+    const ftyp = box("ftyp", new Uint8Array([105, 115, 111, 109]), be32(512),
+      new Uint8Array([105, 115, 111, 109, 105, 115, 111, 50, 97, 118, 99, 49, 109, 112, 52, 49]));
+    const mdatHead = mediaSize + 8 > 0xffffffff ? 16 : 8;
+    const build = (wide, base) => {
+      const offs = new Map(tracks.map((tr) => [tr.id, []]));
+      let pos = base;
+      for (const o of order) { offs.get(o.tr.id)[o.k] = pos; pos += o.tr.t.chunks[o.k].bytes; }
+      const mvhd = v.mvhd ? copy(v.b, v.mvhd) : null;
+      if (!mvhd) throw new Error("mp4: no mvhd");
+      const longest = Math.max(...tracks.map((tr) => (tr.p.timescale ? Math.round((tr.t.duration * movieScale) / tr.p.timescale) : 0)));
+      setDuration(mvhd, 8 + 16, 8 + 24, longest);
+      put32(mvhd, mvhd.length - 4, 3);
+      return box("moov", mvhd, ...tracks.map((tr) => plainTrak(tr.p, tr.t, tr.id, movieScale, offs.get(tr.id), wide)));
+    };
+    // Offsets depend on the moov's size, which only depends on the offset
+    // width: size it once, then build with the real offsets.
+    let wide = false;
+    let size = build(false, 0).length;
+    if (ftyp.length + size + mdatHead + mediaSize > 0xffffffff) {
+      wide = true;
+      size = build(true, 0).length;
+    }
+    const moov = build(wide, ftyp.length + size + mdatHead);
+    const out = new Uint8Array(ftyp.length + moov.length + mdatHead + mediaSize);
+    out.set(ftyp, 0);
+    out.set(moov, ftyp.length);
+    let at = ftyp.length + moov.length;
+    if (mdatHead === 16) {
+      put32(out, at, 1); out.set([109, 100, 97, 116], at + 4); put64(out, at + 8, mediaSize + 16);
+    } else {
+      put32(out, at, mediaSize + 8); out.set([109, 100, 97, 116], at + 4);
+    }
+    at += mdatHead;
+    for (const o of order) {
+      const c = o.tr.t.chunks[o.k];
+      for (let j = c.from; j < c.from + c.count; j++) {
+        const x = o.tr.t.samples[j];
+        out.set(o.tr.p.b.subarray(x.off, x.off + x.size), at);
+        at += x.size;
+      }
+    }
+    return out;
   }
 
   function mergePlain(v, a) {

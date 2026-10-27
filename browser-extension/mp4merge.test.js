@@ -37,15 +37,29 @@ for (const [kind, v, a] of [
   ["fragmented (relative offsets)", "v_frag.mp4", "a_frag.m4a"],
   ["fragmented (absolute offsets)", "v_frag_abs.mp4", "a_frag_abs.m4a"],
 ]) {
-  it(`joins ${kind} video and audio into one two-track file`, () => {
+  it(`joins ${kind} video and audio into one plain, indexed file`, () => {
     const out = M.merge(read(v), read(a));
     const p = M.parse(out);
     assert.deepEqual(trackIds(out.slice(p.moov.start, p.moov.end)), [1, 2]);
-    assert.equal(p.frags.length, M.parse(read(v)).frags.length + M.parse(read(a)).frags.length);
-    const types = topTypes(out);
-    assert.equal(types[0], "ftyp");
-    assert.equal(types[1], "moov");
-    assert.ok(types.includes("moof") && types.includes("mdat"));
+    // No fragments left: one moov with a sample table per track, one mdat
+    // (players seek in this layout reliably).
+    assert.equal(p.frags.length, 0);
+    assert.deepEqual(topTypes(out), ["ftyp", "moov", "mdat"]);
+    const s = Buffer.from(out.slice(p.moov.start, p.moov.end));
+    for (const t of ["stts", "stsz", "stsc", "stco"]) {
+      assert.equal(s.toString("latin1").split(t).length - 1, 2, `${t} per track`);
+    }
+    assert.ok(!s.includes("mvex"), "no fragment header");
+    // Every sample's bytes are in the file: the media is the sum of both.
+    const sizes = (src) => {
+      const b = Buffer.from(src);
+      let n = 0;
+      for (let i = b.indexOf("trun"); i >= 0; i = b.indexOf("trun", i + 4)) n++;
+      return n;
+    };
+    assert.ok(sizes(read(v)) > 0 && sizes(read(a)) > 0);
+    const mdat = out.length - (p.moov.end);
+    assert.ok(mdat > 8);
   });
 }
 
