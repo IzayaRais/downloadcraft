@@ -2059,6 +2059,11 @@ pub struct CraftApp {
     finish_action: String,
     category_folders: bool,
     close_to_tray: bool,
+    /// Start with Windows (on by default); the Run entry follows this copy.
+    start_with_windows: bool,
+    /// Launched at sign-in: go to the tray as soon as the window exists.
+    start_hidden: bool,
+    startup_frames: u8,
     theme: String,
     theme_applied: String,
     /// The main window is moved into the middle of the work area once, on the
@@ -2265,6 +2270,9 @@ impl CraftApp {
             // Closing the window tucks the app into the tray (IDM-style); the
             // tray's Exit is how you quit. The Tasks menu switches it off.
             close_to_tray: cfg!(windows),
+            start_with_windows: cfg!(windows),
+            start_hidden: crate::autostart::is_startup_launch(&std::env::args().collect::<Vec<_>>()),
+            startup_frames: 0,
             theme: "dark".to_string(),
             theme_applied: String::new(),
             placement_done: false,
@@ -2361,6 +2369,9 @@ impl CraftApp {
                 Ok(false) => {}
             }
         }
+        // Start with Windows: the Run entry points at this copy, wherever it
+        // is now (a moved portable folder follows), or is removed when off.
+        crate::autostart::sync(app.start_with_windows);
         // Files an earlier update moved aside (the running program cannot
         // delete its own).
         crate::selfupdate::cleanup();
@@ -2572,8 +2583,12 @@ impl CraftApp {
         let changed = self.last_ui_mtime.get().map(|t| mtime > t).unwrap_or(true);
         if changed && !self.show_add {
             self.last_ui_mtime.set(Some(mtime));
+            let was = self.start_with_windows;
             self.load_ui_state();
             self.refresh_speed_limit();
+            if self.start_with_windows != was {
+                crate::autostart::sync(self.start_with_windows);
+            }
             self.push_log("Settings reloaded from disk.");
         }
     }
@@ -2610,6 +2625,7 @@ impl CraftApp {
                 "queues": self.queues,
                 "category_folders": self.category_folders,
                 "close_to_tray": self.close_to_tray,
+                "start_with_windows": self.start_with_windows,
                 "theme": self.theme,
                 "connections_default": self.connections_default,
                 "speed_limit_kbps": self.speed_limit_kbps,
@@ -2746,6 +2762,9 @@ impl CraftApp {
                     }
                     if let Some(b) = g("close_to_tray").and_then(|x| x.as_bool()) {
                         self.close_to_tray = cfg!(windows) && b;
+                    }
+                    if let Some(b) = g("start_with_windows").and_then(|x| x.as_bool()) {
+                        self.start_with_windows = cfg!(windows) && b;
                     }
                     if let Some(s) = g("theme").and_then(|x| x.as_str()) {
                         self.theme = s.to_string();
@@ -3592,6 +3611,13 @@ impl CraftApp {
     /// Send the window to the tray (the title bar's close button, or the OS
     /// close while the tray is on). Parking, not hiding: a hidden window
     /// stops painting, which freezes transfers and the browser inbox.
+    /// True from the second frame on: the native window and its handle
+    /// exist by then.
+    fn frame_count_for_startup(&mut self) -> bool {
+        self.startup_frames = self.startup_frames.saturating_add(1);
+        self.startup_frames >= 2
+    }
+
     fn park_to_tray(&mut self) {
         crate::tray::park();
         // Say where the window went the first time, or a vanish reads as a
@@ -5712,6 +5738,19 @@ impl eframe::App for CraftApp {
                 if let raw_window_handle::RawWindowHandle::Win32(w) = handle.as_raw() {
                     crate::tray::set_hwnd(w.hwnd.get());
                 }
+            }
+        }
+        // Started at sign-in: straight to the tray (minimized when the tray
+        // is off, so it is never running with no way back to it).
+        if self.start_hidden && self.frame_count_for_startup() {
+            self.start_hidden = false;
+            if self.close_to_tray {
+                if self.tray.is_none() {
+                    self.tray = build_tray();
+                }
+                crate::tray::park();
+            } else {
+                ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(true));
             }
         }
         // Every frame is counted, and a watchdog thread restarts the loop if the

@@ -38,6 +38,7 @@ struct Settings {
     /// Interface language code ("en", or a lang/<code>.json file).
     language: String,
     close_to_tray: bool,
+    start_with_windows: bool,
     /// Pop the standalone "Download complete" dialog when a transfer ends.
     show_complete: bool,
     // Engine
@@ -111,6 +112,7 @@ impl Default for Settings {
             theme: "dark".to_string(),
             language: "en".to_string(),
             close_to_tray: cfg!(windows),
+            start_with_windows: cfg!(windows),
             show_complete: true,
             save_dir: dirs::download_dir()
                 .map(|p| p.to_string_lossy().to_string())
@@ -187,6 +189,9 @@ fn load() -> Settings {
     if let Some(p) = g("ffmpeg_custom_path").and_then(|v|v.as_str()) { s.ffmpeg_custom_path=p.to_string(); }
     if let Some(b) = g("close_to_tray").and_then(|x| x.as_bool()) {
         s.close_to_tray = cfg!(windows) && b;
+    }
+    if let Some(b) = g("start_with_windows").and_then(|x| x.as_bool()) {
+        s.start_with_windows = cfg!(windows) && b;
     }
     if let Some(b) = g("show_complete").and_then(|x| x.as_bool()) {
         s.show_complete = b;
@@ -353,6 +358,7 @@ fn save(s: &Settings) -> bool {
     set(obj, "theme", s.theme.clone().into());
     set(obj, "language", s.language.clone().into());
     set(obj, "close_to_tray", s.close_to_tray.into());
+    set(obj, "start_with_windows", s.start_with_windows.into());
     set(obj, "ffmpeg_custom_path", s.ffmpeg_custom_path.clone().into());
     set(obj, "show_complete", s.show_complete.into());
     set(obj, "save_dir", s.save_dir.clone().into());
@@ -2438,6 +2444,7 @@ impl SettingsApp {
         #[cfg(windows)]
         {
             let mut tray = self.s.close_to_tray;
+            let mut startup = self.s.start_with_windows;
             let mut open_window = self.open_window;
             card(ui, "Window", None, &mut open_window, |ui| {
                 switch_row(
@@ -2447,9 +2454,18 @@ impl SettingsApp {
                     "Minimize to system tray instead of quitting",
                     "Closing the window keeps downloads running in the background.",
                 );
+                ui.add_space(6.0);
+                switch_row(
+                    ui,
+                    "start_with_windows",
+                    &mut startup,
+                    "Start with Windows",
+                    "Opens in the tray when you sign in, from wherever this copy is now (a moved folder is followed).",
+                );
             });
             self.open_window = open_window;
             self.s.close_to_tray = tray;
+            self.s.start_with_windows = startup;
         }
     }
 

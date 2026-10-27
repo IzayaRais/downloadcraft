@@ -23,6 +23,7 @@ mod progress;
 mod settings;
 mod shaped;
 mod selfupdate;
+mod autostart;
 mod sysproxy;
 mod winauth;
 #[cfg(windows)]
@@ -96,11 +97,13 @@ fn main() -> eframe::Result<()> {
     // Started by a one-click update: wait for the old version to close,
     // then start the window as usual.
     let after_update = args.iter().any(|a| a == "--wait-pid");
+    // A sign-in launch (Start with Windows) opens the window into the tray.
+    let at_startup = autostart::is_startup_launch(&args);
     if after_update {
         selfupdate::wait_for_previous(&args);
     }
     // CLI mode when a subcommand is given (`--help` works too).
-    if args.len() > 1 && !after_update {
+    if args.len() > 1 && !after_update && !at_startup {
         match cli::Cli::try_parse_from(&args) {
             Ok(c) => {
                 if let Err(e) = cli::run(c) {
