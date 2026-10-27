@@ -6393,7 +6393,9 @@ impl eframe::App for CraftApp {
                             } else {
                                 pl().dim
                             };
-                            cell_text(ui.painter(), r, &txt, 9.5, color, *col != SortCol::Name);
+                            // Name and Status read from the left (statuses are a dot and
+                            // text); the numbers line up on the right.
+                            cell_text(ui.painter(), r, &txt, 9.5, color, !matches!(*col, SortCol::Name | SortCol::Status));
                             self.hits.push((HitKind::HdrCol(*col), r.intersect(hdr_clip)));
                             {
                                 // Divider grab strip on the column's right edge
