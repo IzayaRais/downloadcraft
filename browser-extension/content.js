@@ -1485,6 +1485,20 @@
     window.addEventListener("resize", followMenu, { passive: true });
   } catch (e) { /* best effort */ }
 
+  // The YouTube player on screen: the watch page's #movie_player, or on
+  // Shorts #shorts-player (YouTube keeps a hidden 0x0 #movie_player there,
+  // and a button inside it is never seen).
+  function ytPlayer() {
+    let best = null;
+    let area = 0;
+    for (const p of document.querySelectorAll("#movie_player, #shorts-player, .html5-video-player")) {
+      const r = p.getBoundingClientRect();
+      const a = r.width * r.height;
+      if (a > area) { area = a; best = p; }
+    }
+    return best;
+  }
+
   function placeInPlayer(btn, panel) {
     if (!btn) return false;
     const setArrow = (side) => {
@@ -1505,10 +1519,12 @@
       a.style.borderBottomColor = top ? "transparent" : T.border;
     };
     if(applySavedBarPosition(btn)){positionDraggedPanel(btn,panel);return true;}
-    const player = document.getElementById("movie_player");
+    const player = ytPlayer();
     if (player) {
       btn.style.position = "absolute";
-      btn.style.top = "12px";
+      // Shorts keep their own More / Full screen buttons in the top-right
+      // corner, on a layer above the player: sit just below them.
+      btn.style.top = player.id === "shorts-player" ? "72px" : "12px";
       btn.style.right = "12px";
       btn.style.bottom = "auto";
       // Clear what a saved (dragged) placement left behind: a stale left or
@@ -2787,7 +2803,7 @@
           else { if(v.__dcBtn.__dcClose)v.__dcBtn.__dcClose.remove(); v.__dcBtn.remove();v.__dcBtn=null; }
         }
         // Skip anything inside YouTube's player (covered by its own button).
-        try { if (v.closest && v.closest("#movie_player")) continue; } catch (e) {}
+        try { if (v.closest && v.closest(".html5-video-player")) continue; } catch (e) {}
         // Skip tiny preview thumbnails.
         const r = v.getBoundingClientRect ? v.getBoundingClientRect() : null;
         if (r && (r.width < 120 || r.height < 70)) continue;
