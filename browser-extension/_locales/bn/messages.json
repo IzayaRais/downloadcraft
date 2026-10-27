@@ -100,5 +100,29 @@
   },
   "barDownload": {
     "message": "ডাউনলোড"
+  },
+  "menuDownloadVideo": {
+    "message": "Download Craft দিয়ে ভিডিও ডাউনলোড করুন"
+  },
+  "popOneClick": {
+    "message": "শেষ বেছে নেওয়া কোয়ালিটিতে এক ক্লিকে ডাউনলোড"
+  },
+  "popOneClickHint": {
+    "message": "ভিডিও বোতাম শেষবার বেছে নেওয়া কোয়ালিটি ডাউনলোড করে; ▾ মেনু খোলে।"
+  },
+  "barMoreQualities": {
+    "message": "অন্য কোয়ালিটি"
+  },
+  "barAudio": {
+    "message": "অডিও"
+  },
+  "qualityBest": {
+    "message": "সেরা"
+  },
+  "chipAudioOnly": {
+    "message": "শুধু অডিও, MP3 হিসেবে"
+  },
+  "panelSocialHint": {
+    "message": "অ্যাপ এই পোস্টের ভিডিও শব্দসহ নামিয়ে আনে।"
   }
 }

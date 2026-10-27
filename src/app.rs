@@ -5927,6 +5927,10 @@ impl eframe::App for CraftApp {
         if self.last_inbox_check.elapsed().as_secs() >= 2 {
             self.last_inbox_check = Instant::now();
             crate::model::touch_heartbeat();
+            // Notes the browser extension sent (e.g. a site changed layout).
+            for note in crate::native_host::take_extension_notes() {
+                self.push_log(format!("Browser extension: {note}"));
+            }
             self.watch_ui_state();
             self.merge_queue_from_disk();
             self.check_wake();

@@ -804,6 +804,28 @@ async function sendToHostPing() {
   await syncBrowserDownloadUI();
 }
 
+// Pages where "Download video with Download Craft" is also on the page menu.
+const VIDEO_SITE_PATTERNS = [
+  "*://*.youtube.com/*", "*://*.facebook.com/*", "*://*.instagram.com/*", "*://*.tiktok.com/*",
+  "*://*.x.com/*", "*://x.com/*", "*://*.twitter.com/*", "*://*.reddit.com/*", "*://*.vimeo.com/*", "*://vimeo.com/*",
+];
+
+// A page's self-check found something the video button relies on missing
+// (the site's layout changed): one line in the app's log, at most once a
+// day per kind of problem.
+async function layoutReport(key, text) {
+  try {
+    const day = 24 * 3600 * 1000;
+    const { dcReports = {} } = await api.storage.local.get({ dcReports: {} });
+    const now = Date.now();
+    if (dcReports[key] && now - dcReports[key] < day) return;
+    dcReports[key] = now;
+    for (const k of Object.keys(dcReports)) if (now - dcReports[k] > 7 * day) delete dcReports[k];
+    await api.storage.local.set({ dcReports });
+    await hostSend({ type: "report", note: `${String(text).slice(0, 260)} (extension ${EXT_VER})` });
+  } catch (e) { /* the app is not running: next time */ }
+}
+
 // Text from _locales in the browser's language, English when there is none.
 function msg(key, english) {
   try { return (chrome.i18n && chrome.i18n.getMessage(key)) || english; } catch (e) { return english; }
@@ -816,7 +838,21 @@ chrome.runtime.onInstalled.addListener((details) => {
     chrome.contextMenus.create({
       id: "send-to-download-craft",
       title: msg("menuDownload", "Download with Download Craft"),
-      contexts: ["link", "video", "audio"],
+      contexts: ["link", "audio"],
+    });
+    // The video under the pointer, as its button would download it. Video
+    // sites cover the player with their own layers (the click target is not
+    // the <video>), so on those the item is on the page menu too.
+    chrome.contextMenus.create({
+      id: "download-video",
+      title: msg("menuDownloadVideo", "Download video with Download Craft"),
+      contexts: ["video"],
+    });
+    chrome.contextMenus.create({
+      id: "download-video-page",
+      title: msg("menuDownloadVideo", "Download video with Download Craft"),
+      contexts: ["page", "frame"],
+      documentUrlPatterns: VIDEO_SITE_PATTERNS,
     });
     // IDM's "Download all links": every link on the page (or in the
     // selection) into the app's pick-and-queue list.
@@ -957,6 +993,20 @@ async function sendAllLinks(tab, selectionOnly) {
 }
 
 chrome.contextMenus.onClicked.addListener((info, tab) => {
+  if (info.menuItemId === "download-video" || info.menuItemId === "download-video-page") {
+    const fallback = () => {
+      const src = /^https?:\/\//i.test(info.srcUrl || "") ? info.srcUrl : null;
+      const url = src || info.frameUrl || info.pageUrl || (tab && tab.url);
+      if (!url || !/^https?:\/\//i.test(url)) return;
+      markSeen(url, null);
+      sendToHost(url, null, { pageUrl: info.pageUrl || (tab && tab.url) || null }).then((ok) => { hostOk = ok; setBadge(); });
+    };
+    if (!tab || !(tab.id >= 0)) { fallback(); return; }
+    api.tabs.sendMessage(tab.id, { type: "ctxDownloadVideo" }, { frameId: info.frameId || 0 })
+      .then((r) => { if (!r || !r.ok) fallback(); })
+      .catch(fallback);
+    return;
+  }
   if (info.menuItemId === "download-all-links") {
     sendAllLinks(tab, !!info.selectionText);
     return;
@@ -1317,6 +1367,11 @@ try {
 
 // ---- popup / content-script messages ----
 chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
+  if (msg && msg.type === "layoutReport" && sender && sender.id === chrome.runtime.id && typeof msg.key === "string") {
+    layoutReport(msg.key.slice(0, 80), msg.text || msg.key);
+    sendResponse({ ok: true });
+    return false;
+  }
   // The offscreen runner reports here (fire-and-forget, no reply needed).
   if (msg && msg.from === "offscreen" && sender && sender.id === chrome.runtime.id) {
     const j = bdlJobs.get(msg.id);

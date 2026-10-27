@@ -34,7 +34,7 @@ Updated 28 Oct 2026, for 0.9.9.
 
 | | Item | Notes |
 |---|---|---|
-| 🟠 | Instagram reels | Instagram CDN files are recognised, but there is no extractor like the Facebook one (reel id, the visible player, its own qualities). |
+| 🟠 | Instagram, TikTok, X, Reddit on real accounts | The button finds the post under it and the app fetches it with yt-dlp (checked on TikTok). Instagram and X need a signed-in browser; their page layouts were not checked live, and Reddit could not be opened in the test browser. The extension's self-check reports a missing post link to the app's log. |
 | 🟢 | Permission audit | Check every permission in `manifest.json` is still used before a store review; the reasons are in `docs/STORE_LISTING.md`. |
 | 🟢 | Welcome page per browser | The page covers private-window access; wording for Edge / Opera / Firefox and an "app too old" state are not there. |
 | 🟢 | Binary native messaging | IDM sends binary frames; JSON works and is fast enough, so only if a measurement says otherwise. |

@@ -100,5 +100,29 @@
   },
   "barDownload": {
     "message": "Download"
+  },
+  "menuDownloadVideo": {
+    "message": "Download video with Download Craft"
+  },
+  "popOneClick": {
+    "message": "One-click download in my last quality"
+  },
+  "popOneClickHint": {
+    "message": "The video button downloads the quality you picked last; its ▾ opens the menu."
+  },
+  "barMoreQualities": {
+    "message": "Other qualities"
+  },
+  "barAudio": {
+    "message": "audio"
+  },
+  "qualityBest": {
+    "message": "Best"
+  },
+  "chipAudioOnly": {
+    "message": "Audio only, as MP3"
+  },
+  "panelSocialHint": {
+    "message": "The app fetches this post's video with its sound."
   }
 }

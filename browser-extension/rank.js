@@ -616,6 +616,67 @@
     try { return new URL(String(u)).pathname; } catch (e) { return ""; }
   }
 
+  // ---- Instagram, TikTok, X, Reddit ----
+  // The canonical link of a post holding one video (never a profile or a
+  // feed), or "". Mirrors the app's social_video_page, which hands these
+  // links to yt-dlp (the video, its separate audio, the real qualities).
+  const SOCIAL_HOSTS = ["instagram.com", "tiktok.com", "x.com", "twitter.com", "reddit.com"];
+  const bareHost = (h) => String(h || "").toLowerCase().replace(/^(?:www|m|old|mobile)\./, "");
+  function socialSite(hostname) {
+    const h = bareHost(hostname);
+    return SOCIAL_HOSTS.includes(h) ? h : "";
+  }
+  function socialPostUrl(href, base) {
+    let u;
+    try { u = new URL(String(href || ""), base || undefined); } catch (e) { return ""; }
+    if (!/^https?:$/.test(u.protocol)) return "";
+    const host = bareHost(u.hostname);
+    const p = u.pathname.split("/").filter(Boolean);
+    const id = (s) => /^[A-Za-z0-9_-]+$/.test(s || "");
+    const num = (s) => /^\d+$/.test(s || "");
+    if (host === "instagram.com") {
+      for (let i = 0; i + 1 < p.length; i++) {
+        if (/^(?:reel|reels|p|tv)$/.test(p[i]) && id(p[i + 1])) {
+          return `https://www.instagram.com/${p[i] === "reels" ? "reel" : p[i]}/${p[i + 1]}/`;
+        }
+      }
+      return "";
+    }
+    if (host === "tiktok.com") {
+      for (let i = 0; i + 1 < p.length; i++) {
+        if (p[i] === "video" && num(p[i + 1])) {
+          const user = i > 0 && p[i - 1].startsWith("@") ? p[i - 1] : "@";
+          return `https://www.tiktok.com/${user}/video/${p[i + 1]}`;
+        }
+      }
+      return "";
+    }
+    if (host === "x.com" || host === "twitter.com") {
+      return p.length >= 3 && p[1] === "status" && num(p[2]) && p[0] !== "i" ? `https://x.com/${p[0]}/status/${p[2]}` : "";
+    }
+    if (host === "reddit.com") {
+      return p.length >= 4 && p[0] === "r" && p[2] === "comments" && id(p[3]) ? `https://www.reddit.com/r/${p[1]}/comments/${p[3]}/` : "";
+    }
+    return "";
+  }
+
+  // The remembered quality ("720p") among the heights on offer: that one,
+  // else the best below it, else the lowest above it. -1 when none.
+  function pickHeight(heights, pref) {
+    const want = parseInt(pref, 10);
+    if (!(want > 0)) return -1;
+    let best = -1;
+    heights.forEach((h, i) => {
+      if (!(h > 0)) return;
+      const cur = best < 0 ? null : heights[best];
+      if (cur === null) { best = i; return; }
+      const okH = h <= want, okC = cur <= want;
+      if (okH && (!okC || h > cur)) best = i;
+      else if (!okH && !okC && h < cur) best = i;
+    });
+    return best;
+  }
+
   // How many videos the popup's Videos tab lists for a page snapshot (the
   // toolbar badge shows the same number). Facebook sends each video as many
   // audio/video pieces; they count once, as the video they belong to.
@@ -642,7 +703,7 @@
     return n;
   }
 
-  const DCRank = { fbVideos, fbPathOf, countVideos, attachmentDownload, videoDismissKey, directDownloadLink, addDirectExtensions, hideDownloadUI, playerEvidence, playlistReferences, samePlayer, completePlaylist, isVimeoAdaptive, isVimeoFragment, vimeoVideoPage, isPlaylistUrl, isSegmentUrl, canonicalUrl, kindOf, scoreMedia, classifyResponse, sniffBytes, forwardHeaders, extOf, dispositionFilename, collapseDupes, fmtDur, panelTokens, dcThemeMode, dcSetTheme, paintDcPanel };
+  const DCRank = { fbVideos, fbPathOf, countVideos, socialSite, socialPostUrl, pickHeight, attachmentDownload, videoDismissKey, directDownloadLink, addDirectExtensions, hideDownloadUI, playerEvidence, playlistReferences, samePlayer, completePlaylist, isVimeoAdaptive, isVimeoFragment, vimeoVideoPage, isPlaylistUrl, isSegmentUrl, canonicalUrl, kindOf, scoreMedia, classifyResponse, sniffBytes, forwardHeaders, extOf, dispositionFilename, collapseDupes, fmtDur, panelTokens, dcThemeMode, dcSetTheme, paintDcPanel };
   g.DCRank = DCRank;
   if (typeof module !== "undefined" && module.exports) module.exports = DCRank;
 })(typeof globalThis !== "undefined" ? globalThis : this);

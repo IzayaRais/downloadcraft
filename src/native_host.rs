@@ -24,6 +24,9 @@ use serde::{Deserialize, Serialize};
 struct Incoming {
     #[serde(rename = "type")]
     kind: String,
+    /// "report": one line for the app's log (a site's layout changed, ...).
+    #[serde(default)]
+    note: Option<String>,
     url: Option<String>,
     filename: Option<String>,
     /// Page the download was captured from (IDM-style referer fallback).
@@ -389,6 +392,45 @@ pub struct InboxItem {
     pub audio_expected: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub browser: Option<crate::model::BrowserContext>,
+}
+
+/// Lines the browser extension asked to show in the app's log.
+pub fn notes_path() -> Option<std::path::PathBuf> {
+    crate::model::config_dir().map(|p| p.join("extension_notes.txt"))
+}
+
+/// Append one note (single line, bounded); the file is capped so a page
+/// that reports in a loop cannot grow it.
+fn append_extension_note(text: &str) {
+    let Some(path) = notes_path() else { return };
+    let line: String = text.chars().filter(|c| !c.is_control()).take(300).collect();
+    if line.trim().is_empty() {
+        return;
+    }
+    let _guard = crate::model::fs_lock("extension_notes");
+    let mut lines: Vec<String> = std::fs::read_to_string(&path)
+        .map(|s| s.lines().map(str::to_string).collect())
+        .unwrap_or_default();
+    if lines.iter().any(|l| l == &line) {
+        return;
+    }
+    lines.push(line);
+    let keep = lines.len().saturating_sub(50);
+    let _ = std::fs::write(&path, lines[keep..].join("
+") + "
+");
+}
+
+/// Take every pending note (the app shows them in its log).
+pub fn take_extension_notes() -> Vec<String> {
+    let Some(path) = notes_path() else { return Vec::new() };
+    let _guard = crate::model::fs_lock("extension_notes");
+    let text = std::fs::read_to_string(&path).unwrap_or_default();
+    if text.is_empty() {
+        return Vec::new();
+    }
+    let _ = std::fs::remove_file(&path);
+    text.lines().filter(|l| !l.trim().is_empty()).map(str::to_string).collect()
 }
 
 pub fn inbox_path() -> Option<std::path::PathBuf> {
@@ -859,6 +901,12 @@ pub fn run() -> eframe::Result<()> {
                 Ok(()) => write_message(&Reply::ok()),
                 Err(e) => write_message(&Reply::err(e)),
             },
+            "report" => {
+                if let Some(text) = msg.note.as_deref() {
+                    append_extension_note(text);
+                }
+                write_message(&Reply::ok());
+            }
             "ping" => write_message(&Reply {
                 kind: "pong".into(),
                 version: Some(1),

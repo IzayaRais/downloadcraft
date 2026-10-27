@@ -1139,6 +1139,40 @@ fn vimeo_download_target(raw: &str, referer: &str) -> Result<Option<String>> {
     Err(anyhow!("Vimeo URL is only a playback fragment — capture the full manifest or the specific Vimeo player URL"))
 }
 
+/// The page of one video post on Instagram, TikTok, X / Twitter or Reddit
+/// (never a profile or a feed): the browser extension hands these over for
+/// the video under its button.
+pub(crate) fn social_video_page(raw: &str) -> bool {
+    let Ok(u) = url::Url::parse(raw) else { return false };
+    if !matches!(u.scheme(), "http" | "https") {
+        return false;
+    }
+    let host = u.host_str().unwrap_or("").to_ascii_lowercase();
+    let host = host.strip_prefix("www.").or_else(|| host.strip_prefix("m.")).or_else(|| host.strip_prefix("old.")).unwrap_or(&host).to_string();
+    let parts: Vec<&str> = u.path().split('/').filter(|p| !p.is_empty()).collect();
+    let id = |s: &&str| !s.is_empty() && s.bytes().all(|c| c.is_ascii_alphanumeric() || c == b'_' || c == b'-');
+    let digits = |s: &&str| !s.is_empty() && s.bytes().all(|c| c.is_ascii_digit());
+    match host.as_str() {
+        "instagram.com" => {
+            // /reel/<id>, /reels/<id>, /p/<id>, /tv/<id>, also /<user>/reel/<id>
+            parts.windows(2).any(|w| matches!(w[0], "reel" | "reels" | "p" | "tv") && id(&w[1]))
+        }
+        // /@user/video/<digits> (the user part may be empty: /@/video/<id>)
+        "tiktok.com" => parts.windows(2).any(|w| w[0] == "video" && digits(&w[1])),
+        "x.com" | "twitter.com" | "mobile.twitter.com" => {
+            parts.len() >= 3 && parts[1] == "status" && digits(&parts[2])
+        }
+        "reddit.com" => parts.len() >= 4 && parts[0] == "r" && parts[2] == "comments" && id(&parts[3]),
+        "v.redd.it" => parts.len() == 1 && id(&parts[0]),
+        _ => false,
+    }
+}
+
+/// The extension's "Audio only" choice: yt-dlp fetches the best audio.
+pub(crate) fn wants_audio_only(pref: &str) -> bool {
+    pref.trim().eq_ignore_ascii_case("audio")
+}
+
 fn vimeo_needs_audio(raw: &str) -> bool {
     is_vimeo_video_page(raw) || is_vimeo_adaptive(raw)
 }
@@ -4280,6 +4314,9 @@ async fn download_inner(
     // proves nothing about the full video's size or completeness.
     let resolve_page = match vimeo_download_target(&url, &opts.referer)? {
         Some(page) => Some(page),
+        // A post on Instagram, TikTok, X or Reddit: yt-dlp knows each site's
+        // player (the video and its separate audio, the real qualities).
+        None if social_video_page(&url) => Some(url.clone()),
         None => fragment_page(&normalize_media_url(&url), &opts.referer)?,
     };
     if let Some(page) = resolve_page {
@@ -6593,13 +6630,22 @@ async fn download_with_ytdlp(
         .arg("--merge-output-format")
         .arg("mp4")
         .arg("-f")
-        .arg(if vimeo_needs_audio(url) || opts.require_audio {
+        .arg(if wants_audio_only(&opts.quality_pref) {
+            "ba[ext=m4a]/ba/b".to_string()
+        } else if vimeo_needs_audio(url) || opts.require_audio {
             audio_required_format(&opts.quality_pref, merge_ffmpeg.is_some())
         } else {
             ytdlp_format_with(&opts.quality_pref, merge_ffmpeg.is_some())
         })
         .arg("-o")
-        .arg(ytdlp_out_name(dest).replace('%',"%%"));
+        .arg(if wants_audio_only(&opts.quality_pref) {
+            // The audio arrives as m4a/webm and becomes .mp3 afterwards:
+            // yt-dlp names each step's extension itself.
+            let stem = dest.file_stem().map(|s| s.to_string_lossy().to_string()).unwrap_or_else(|| "audio".into());
+            format!("{}.%(ext)s", stem.replace('%', "%%"))
+        } else {
+            ytdlp_out_name(dest).replace('%',"%%")
+        });
     // Fragments and other in-progress pieces go to one hidden parts folder
     // next to the file instead of dozens of ".part-FragN" files in the
     // user's folder; only the finished file lands in it. Same drive, so the
@@ -6615,6 +6661,10 @@ async fn download_with_ytdlp(
     }
     if let Some(ff) = &merge_ffmpeg {
         cmd.arg("--ffmpeg-location").arg(ff);
+        // Audio only: an MP3 (best VBR); without ffmpeg the m4a as served.
+        if wants_audio_only(&opts.quality_pref) {
+            cmd.arg("-x").arg("--audio-format").arg("mp3").arg("--audio-quality").arg("0");
+        }
     }
     // Without a JS runtime yt-dlp cannot solve YouTube's player challenges:
     // extraction fails on many videos and it reports only "The page needs to
@@ -9363,6 +9413,38 @@ mod tests {
         // No slice params: identity.
         let plain = "https://scontent.fdac90-1.fna.fbcdn.net/v.mp4?oh=1";
         assert_eq!(normalize_media_url(plain), plain);
+    }
+
+    #[test]
+    fn social_video_pages() {
+        for u in [
+            "https://www.instagram.com/reel/C9xYz_AbC12/",
+            "https://www.instagram.com/p/C9xYz-AbC12/?img_index=1",
+            "https://www.instagram.com/someone/reel/C9xYzAbC12/",
+            "https://www.tiktok.com/@some.user/video/7301234567890123456",
+            "https://www.tiktok.com/@/video/7301234567890123456",
+            "https://x.com/someone/status/1790000000000000000",
+            "https://twitter.com/someone/status/1790000000000000000/video/1",
+            "https://www.reddit.com/r/videos/comments/1abcde/some_title/",
+            "https://old.reddit.com/r/videos/comments/1abcde/",
+            "https://v.redd.it/abc123xyz",
+        ] {
+            assert!(social_video_page(u), "{u}");
+        }
+        for u in [
+            "https://www.instagram.com/someone/",
+            "https://www.instagram.com/explore/",
+            "https://www.tiktok.com/@some.user",
+            "https://www.tiktok.com/foryou",
+            "https://x.com/someone",
+            "https://x.com/home",
+            "https://www.reddit.com/r/videos/",
+            "https://www.youtube.com/watch?v=abc",
+            "https://example.com/reel/abc",
+        ] {
+            assert!(!social_video_page(u), "{u}");
+        }
+        assert!(wants_audio_only("audio") && wants_audio_only(" Audio ") && !wants_audio_only("720p"));
     }
 
     #[test]

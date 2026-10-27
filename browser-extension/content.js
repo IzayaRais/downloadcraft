@@ -1802,6 +1802,8 @@
       .dot { width:18px;height:18px;border-radius:9px;background:var(--acc);color:#fff;display:flex;align-items:center;justify-content:center;flex:none; }
       .label { white-space:nowrap; }
       .close { flex:0 0 26px;width:26px;height:26px;border-radius:13px;color:var(--dim); }
+      .more { flex:0 0 22px;width:22px;height:26px;border-radius:13px;color:var(--dim); }
+      :host([data-dc-compact]:not(:hover)) .bar:not(:focus-within) .more { display:none; }
       .close:hover { color:var(--x-fg);background:var(--x-bg); }
       [hidden] { display:none !important; }
       svg { display:block;flex:none;width:14px;height:14px;pointer-events:none; }
@@ -1823,9 +1825,12 @@
     grip.title="Drag to move · arrow keys move when focused";
     grip.setAttribute("aria-label","Move video download bar");
     grip.appendChild(svgIcon(12,"M8 5h.01M8 12h.01M8 19h.01M16 5h.01M16 12h.01M16 19h.01",3));
-    bar.append(grip,main,close);root.append(style,bar);
+    const more=document.createElement("button");more.type="button";more.className="more";more.hidden=true;
+    more.title=dcT("barMoreQualities","Other qualities");more.setAttribute("aria-label","Other qualities");
+    more.appendChild(svgIcon(12,"M6 9l6 6 6-6",2.4));
+    bar.append(grip,main,more,close);root.append(style,bar);
     installBarDrag(host,main,grip);
-    host.__dcMain=main;host.__dcClose=close;host.__dcLabel=label;
+    host.__dcMain=main;host.__dcClose=close;host.__dcLabel=label;host.__dcMore=more;
     host.setAttribute("data-dc-bar","1");
     paintBar(host);
     wakeBar(host);
@@ -2731,7 +2736,7 @@
         res: e.res,
         size: e.size > 0 ? (e.approx ? "~" : "") + fmtSize(e.size) : "",
         tip: e.tip,
-        send: e.send,
+        send: () => { rememberQuality(e.h + "p"); e.send(); },
         onPick: () => api.setInfo(infoOf(e)),
       });
       if (e.st) sizePairs.push({ item: it, sizeEl: it.sizeEl, st: e.st });
@@ -2749,12 +2754,24 @@
       api.addChip({
         label: `♪ ${(st.disp || "m4a").toUpperCase()} ${kb}`,
         tip: `${st.label || "audio"}${st._size > 0 ? " · " + fmtSize(st._size) : ""} — audio-only track`,
-        send: () => sendDownload(st.url, tagged(fname, st), st.mime, st._size || null, null, null, st._dur || null),
+        send: () => { rememberQuality("audio"); sendDownload(st.url, tagged(fname, st), st.mime, st._size || null, null, null, st._dur || null); },
       });
     }
     api.sync();
     enrichSizes(sizePairs);
     markQueuedRows(sizePairs);
+    // One click: the remembered quality among this video's rows (the
+    // nearest one at or below it), or its best audio track.
+    const bestAudioTrack = [...(info.audio || [])].sort((a, b) => (b.br || 0) - (a.br || 0))[0] || null;
+    btn.__dcQuickFor = () => {
+      if (!prefQuality) return null;
+      if (prefQuality === "audio") {
+        return bestAudioTrack ? { label: dcT("barAudio", "audio"), run: () => sendDownload(bestAudioTrack.url, tagged(fname, bestAudioTrack), bestAudioTrack.mime, bestAudioTrack._size || null, null, null, bestAudioTrack._dur || null) } : null;
+      }
+      const i = typeof DCRank !== "undefined" && DCRank.pickHeight ? DCRank.pickHeight(entries.map((e) => e.h), prefQuality) : -1;
+      return i >= 0 ? { label: entries[i].h + "p", run: entries[i].send } : null;
+    };
+    applyQuick(btn);
     appendSniffed(api, new Set([
       ...info.streams.map((s) => s.url),
       ...(info.videoOnly || []).map((s) => s.url),
@@ -2778,6 +2795,7 @@
       ev.stopPropagation();
       if (btn.__dcBusy) return;
       if (api.panel.style.display !== "none") { api.hide(); return; }
+      if (!clickedMore(ev, btn) && btn.__dcQuick) { btn.__dcQuick.run(); return; }
       if (ready) { open(); return; }
       ytOpenWhenReady = info.videoId;
       barBusy(btn, dcT("busyResolving", "Resolving…"));
@@ -2817,6 +2835,23 @@
     });
   } catch (e) { /* storage unavailable: stay on */ }
 
+  // The video whose qualities were read from the page (self-check).
+  let ytParsedFor = "";
+  function youtubeSelfCheck() {
+    const id = ytVideoId();
+    if (!id || !detectionOn) return;
+    const player = ytPlayer();
+    layoutCheck("yt-player", !player, "YouTube: no video player element found on a video page (the layout may have changed); the button sits in the window corner");
+    const shorts = /^\/shorts\//.test(location.pathname);
+    if (shorts) {
+      layoutCheck("yt-shorts-row", !document.querySelector("ytd-shorts-player-controls #right-controls, #shorts-player-controls #right-controls, ytd-reel-video-renderer #right-controls"),
+        "YouTube Shorts: the top control row (#right-controls) is gone (the layout may have changed); the button sits in the player corner");
+    }
+    // The qualities come from the page's own player data; without it the
+    // app still resolves the video, only slower and without the menu sizes.
+    if (!shorts) layoutCheck("yt-data", ytParsedFor !== id, "YouTube: the page's player data could not be read (the page may have changed); the app resolves videos itself", 20000);
+  }
+
   function refreshYouTube() {
     const id = detectionOn ? ytVideoId() : null;
     const oldBtn = document.getElementById("dc-yt-btn");
@@ -2836,7 +2871,9 @@
     // its player-API fallback — so the button always appears.
     // ytStreams() matches the CURRENT video id, so SPA autoplay can
     // never show the previous video's title/streams.
-    const info = ytStreams() || { videoId: id, title: document.title.replace(/ - YouTube$/, ""), thumb: `https://i.ytimg.com/vi/${id}/hqdefault.jpg`, streams: [], videoOnly: [], audio: [], subs: [] };
+    const parsed = ytStreams();
+    ytParsedFor = parsed ? id : "";
+    const info = parsed || { videoId: id, title: document.title.replace(/ - YouTube$/, ""), thumb: `https://i.ytimg.com/vi/${id}/hqdefault.jpg`, streams: [], videoOnly: [], audio: [], subs: [] };
     try {
       if (IS_TOP) chrome.storage.local.set({
         downloadCraftVideos: [{
@@ -2885,7 +2922,7 @@
       document.querySelectorAll("[data-dc-pill]").forEach((el) => {
         if (el.dataset.gen !== String(GEN)) el.remove();
       });
-      const vids = [...document.querySelectorAll("video")].slice(0, 10);
+      const vids = pageVideos().slice(0, 10);
       for (const v of vids) {
         const key = dismissalKey(v,null);
         if (dismissedVideos.has(key)) continue;
@@ -2914,6 +2951,16 @@
           if (isFacebookPage()) {
             handleFbPill(pill);
             return;
+          }
+          if (isSocialPage()) {
+            const post = socialPostFor(v);
+            layoutCheck("social-post-" + location.hostname, !post,
+              `${location.hostname}: no post link found next to a video (the site's layout may have changed); the page was sent instead`, 0);
+            if (post) {
+              if (!clickedMore(ev, pill) && pill.__dcQuick) pill.__dcQuick.run();
+              else openSocialMenu(pill, post, v);
+              return;
+            }
           }
           const direct = mediaUrlOf(v);
           if (direct) {
@@ -2951,6 +2998,10 @@
             }, 14, 600);
           }
         };
+        if (isSocialPage()) {
+          pill.__dcQuickFor = () => { const post = socialPostFor(v); return post ? socialQuick(post, v) : null; };
+          applyQuick(pill);
+        }
         try {
           pill.__dcVideo=v;
           document.documentElement.appendChild(pill);
@@ -2960,6 +3011,165 @@
         } catch (e) { /* overlay is best-effort */ }
       }
     } catch (e) { /* ignore */ }
+  }
+
+  // ---------- Remembered quality: one click ----------
+  // The quality picked last ("720p", or "audio") is what the button
+  // downloads in one click; its ▾ opens the menu for anything else.
+  // Popup → Settings switches this off.
+  let prefQuality = "";
+  let oneClickOn = true;
+  function rememberQuality(q) {
+    if (!q || q === prefQuality) return;
+    prefQuality = q;
+    try { chrome.storage.local.set({ dcQuality: q }); } catch (e) { /* this page only */ }
+    refreshQuickBars();
+  }
+  function refreshQuickBars() {
+    try { document.querySelectorAll("[data-dc-bar]").forEach(applyQuick); } catch (e) { /* ignore */ }
+  }
+  try {
+    chrome.storage.local.get({ dcQuality: "", oneClickQuality: true }, (r) => {
+      if (chrome.runtime.lastError || !r) return;
+      prefQuality = String(r.dcQuality || "");
+      oneClickOn = r.oneClickQuality !== false;
+      refreshQuickBars();
+    });
+    chrome.storage.onChanged.addListener((ch, area) => {
+      if (area !== "local" || !alive()) return;
+      if (ch.dcQuality) prefQuality = String(ch.dcQuality.newValue || "");
+      if (ch.oneClickQuality) oneClickOn = ch.oneClickQuality.newValue !== false;
+      if (ch.dcQuality || ch.oneClickQuality) refreshQuickBars();
+    });
+  } catch (e) { /* menu only */ }
+  // host.__dcQuickFor() -> {label, run} | null decides what one click does.
+  function applyQuick(host) {
+    try {
+      const q = oneClickOn && host.__dcQuickFor ? host.__dcQuickFor() : null;
+      host.__dcQuick = q;
+      const lab = host.__dcLabel;
+      const word = dcT("barDownload", "Download");
+      const text = q ? `${word} ${q.label}` : word;
+      if (lab && !host.__dcBusy && lab.textContent !== text) {
+        lab.textContent = text;
+        host.__dcIdleText = undefined;
+        host.__dcW = 0;
+      }
+      if (host.__dcMore) host.__dcMore.hidden = !q;
+    } catch (e) { /* cosmetic */ }
+  }
+  // Was the click on the bar's ▾ (open the menu) rather than the button?
+  function clickedMore(ev, host) {
+    try { return !!host.__dcMore && ev.composedPath().includes(host.__dcMore); } catch (e) { return false; }
+  }
+
+  // ---------- Self-check: tell the app when a site's layout changed ----------
+  // Something the button relies on (YouTube's control row, its player data,
+  // a post's link) missing for a while is reported once per page; the
+  // extension's worker keeps one report per day per kind, and the app shows
+  // it in its log. Brief gaps (a feed redrawing) are not reported.
+  const layoutMissingSince = new Map();
+  const layoutReported = new Set();
+  function layoutCheck(key, missing, text, graceMs = 8000) {
+    try {
+      if (!missing) { layoutMissingSince.delete(key); return; }
+      const now = Date.now();
+      if (!layoutMissingSince.has(key)) { layoutMissingSince.set(key, now); if (graceMs > 0) return; }
+      if (now - layoutMissingSince.get(key) < graceMs || layoutReported.has(key)) return;
+      layoutReported.add(key);
+      chrome.runtime.sendMessage({ type: "layoutReport", key, text, page: location.hostname }, () => void chrome.runtime.lastError);
+    } catch (e) { /* best effort */ }
+  }
+
+  // ---------- Instagram, TikTok, X, Reddit ----------
+  // The post the video under the button belongs to. In a feed many posts
+  // play at once: the post's own links (Reddit's permalink attribute,
+  // TikTok's player id) name it. The climb stops where a container holds
+  // more than one video: past that point the links belong to other posts.
+  function socialPostFor(video) {
+    const R = typeof DCRank !== "undefined" ? DCRank : null;
+    if (!R || !R.socialPostUrl) return "";
+    const site = R.socialSite(location.hostname);
+    let el = video;
+    // Out of a player's shadow DOM (Reddit) into the post around it.
+    const up = (n) => n.parentElement || (n.getRootNode && n.getRootNode() !== document ? n.getRootNode().host : null) || null;
+    for (let depth = 0; el && depth < 16; depth++, el = up(el)) {
+      if (el.getAttribute) {
+        const pl = el.getAttribute("permalink") || el.getAttribute("data-permalink") || el.getAttribute("content-href");
+        if (pl) {
+          const u = R.socialPostUrl(pl, location.origin);
+          if (u) return u;
+        }
+        const tt = site === "tiktok.com" && /(?:^|-)(\d{15,25})$/.exec(el.id || "");
+        if (tt) {
+          // The post's own link (with the author) when the page has one.
+          const a = document.querySelector(`a[href*="/video/${tt[1]}"]`);
+          return (a && R.socialPostUrl(a.getAttribute("href"), location.origin)) || `https://www.tiktok.com/@/video/${tt[1]}`;
+        }
+      }
+      if (depth >= 1 && el.querySelectorAll) {
+        if (el.querySelectorAll("video").length > 1) break;
+        for (const a of el.querySelectorAll("a[href]")) {
+          const u = R.socialPostUrl(a.getAttribute("href"), location.origin);
+          if (u) return u;
+        }
+      }
+    }
+    return R.socialPostUrl(location.href);
+  }
+  // Every <video> on the page, including those inside a player's open
+  // shadow DOM (Reddit's shreddit-player keeps its video there).
+  function pageVideos() {
+    const out = [...document.querySelectorAll("video")];
+    try {
+      for (const host of document.querySelectorAll("shreddit-player, shreddit-player-2, [data-dc-shadow-player]")) {
+        if (host.shadowRoot) out.push(...host.shadowRoot.querySelectorAll("video"));
+      }
+    } catch (e) { /* light DOM only */ }
+    return out;
+  }
+  function isSocialPage() {
+    try { return !!(typeof DCRank !== "undefined" && DCRank.socialSite && DCRank.socialSite(location.hostname)); } catch (e) { return false; }
+  }
+  const SOCIAL_QUALITIES = ["best", "1080p", "720p", "480p", "360p"];
+  function socialSend(post, q, video) {
+    const title = String(document.title || "video").replace(/\s*[|•·]\s*(Instagram|TikTok|X|Reddit).*$/i, "").replace(/ on X: .*$/i, "").trim().slice(0, 90) || "video";
+    const stem = title.replace(/[<>:"/\\|?*\u0000-\u001f]/g, "_").replace(/\.+$/, "").trim() || "video";
+    const audio = q === "audio";
+    const name = audio ? `${stem}.mp3` : q && q !== "best" ? `${stem} [${q}].mp4` : `${stem}.mp4`;
+    let dur = null;
+    try { const d = Math.round(video.duration); if (Number.isFinite(d) && d > 0 && d < 86400) dur = d; } catch (e) { /* unknown */ }
+    sendDownload(post, name, audio ? "audio/mpeg" : "video/mp4", null, null, q === "best" ? null : q, audio ? null : dur);
+  }
+  function socialQuick(post, video) {
+    if (!prefQuality) return null;
+    return { label: prefQuality === "audio" ? dcT("barAudio", "audio") : prefQuality, run: () => socialSend(post, prefQuality, video) };
+  }
+  // Instagram / TikTok / X / Reddit: the post's qualities (the app fetches
+  // the one picked with its sound), plus audio only as MP3.
+  function openSocialMenu(pill, post, video) {
+    try { document.querySelectorAll("#dc-social-panel").forEach((m) => m.remove()); } catch (e) {}
+    let api = null;
+    const pick = (q) => { rememberQuality(q); socialSend(post, q, video); };
+    api = dcPanel({
+      title: String(document.title || "Video").slice(0, 120),
+      thumb: (video && video.poster) || "",
+      dur: (() => { try { const d = video.duration; return Number.isFinite(d) && d > 0 ? fmtDurSec(d) : ""; } catch (e) { return ""; } })(),
+      res: "", size: "", format: "MP4",
+      hint: dcT("panelSocialHint", "The app fetches this post's video with its sound."),
+      onSendLink: () => pick("best"),
+      onPrimary: () => { const it = api.selected(); if (it && it.q && it.q.send) it.q.send(); },
+    });
+    api.panel.id = "dc-social-panel";
+    for (const q of SOCIAL_QUALITIES) {
+      const res = q === "best" ? dcT("qualityBest", "Best") : q;
+      const it = api.addQuality({ format: "MP4", res, size: "", tip: `${res} · MP4`, send: () => pick(q), onPick: () => api.setInfo({ res, size: "", format: "MP4" }) });
+      if (q === prefQuality) { api.select(it); api.setInfo({ res, size: "", format: "MP4" }); }
+    }
+    api.addChip({ label: "♪ MP3", tip: dcT("chipAudioOnly", "Audio only, as MP3"), send: () => pick("audio") });
+    installDcCloser();
+    api.show();
+    placePanelBy(pill, api.panel);
   }
 
   function isFacebookPage() {
@@ -3114,10 +3324,66 @@
     } catch (e) { /* background unreachable */ }
   }
 
+  // Right-click → "Download video with Download Craft": the video under the
+  // pointer (sites cover it with their own layers, so the click target is
+  // rarely the <video> itself), else the biggest one on screen. It does what
+  // its button does: YouTube's menu, a post's qualities, Facebook's menu.
+  let lastCtxVideo = null;
+  try {
+    document.addEventListener("contextmenu", (e) => {
+      try {
+        lastCtxVideo = (document.elementsFromPoint(e.clientX, e.clientY) || []).find((el) => el.tagName === "VIDEO") || null;
+      } catch (x) { lastCtxVideo = null; }
+    }, true);
+  } catch (e) { /* menu falls back to the page */ }
+  function biggestVideo() {
+    let best = null, area = 0;
+    for (const v of document.querySelectorAll("video")) {
+      const r = v.getBoundingClientRect();
+      const vis = Math.max(0, Math.min(r.right, innerWidth) - Math.max(r.left, 0)) * Math.max(0, Math.min(r.bottom, innerHeight) - Math.max(r.top, 0));
+      if (vis > area) { area = vis; best = v; }
+    }
+    return best;
+  }
+  function downloadContextVideo() {
+    const v = (lastCtxVideo && lastCtxVideo.isConnected) ? lastCtxVideo : biggestVideo();
+    lastCtxVideo = null;
+    if (ytVideoId() && (!v || (v.closest && v.closest(".html5-video-player")))) {
+      refreshYouTube();
+      const b = document.getElementById("dc-yt-btn");
+      if (b && b.__dcOpen && b.dataset.ready === "1") { b.__dcOpen(); return; }
+      if (b) { b.click(); return; }
+      sendDownload(location.href, undefined, null);
+      return;
+    }
+    if (v && v.__dcBtn && v.__dcBtn.isConnected) { v.__dcBtn.click(); return; }
+    if (v && isSocialPage()) {
+      const post = socialPostFor(v);
+      if (post) { openSocialMenuAt(post, v); return; }
+    }
+    const direct = v ? mediaUrlOf(v) : "";
+    sendDownload(direct || location.href, undefined, v && v.getAttribute ? v.getAttribute("type") : null);
+  }
+  // A post's menu with no bar on screen (its video was too small for one or
+  // the bar was hidden): anchored to the video's top-right corner.
+  function openSocialMenuAt(post, video) {
+    const anchor = document.createElement("div");
+    const r = video.getBoundingClientRect();
+    anchor.style.cssText = `position:fixed;left:${Math.max(8, r.right - 40)}px;top:${Math.max(8, r.top + 8)}px;width:32px;height:32px;pointer-events:none;`;
+    document.documentElement.appendChild(anchor);
+    openSocialMenu(anchor, post, video);
+    setTimeout(() => anchor.remove(), 0);
+  }
+
   // Popup peek: the popup asks the ACTIVE tab directly so it never shows
   // another tab's stale snapshot (global storage keys are fallback only).
   try {
     chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
+      if (msg && msg.type === "ctxDownloadVideo" && alive()) {
+        try { downloadContextVideo(); } catch (e) { /* ignore */ }
+        sendResponse({ ok: true });
+        return false;
+      }
       if (msg && msg.type === "restoreVideoButtons" && alive()) {
         dismissedVideos.clear();
         refreshYouTube();ensureUniversalButtons();
@@ -3349,6 +3615,7 @@
         if (id && !dismissedVideos.has(dismissalKey(null, id))) refreshYouTube();
       } catch (e) { /* ignore */ }
     }
+    try { youtubeSelfCheck(); } catch (e) { /* ignore */ }
   }, 1000);
   __dcTimers.push(watcher);
 })();

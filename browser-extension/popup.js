@@ -141,6 +141,11 @@ $("detect").onchange = () => setDetect($("detect").checked);
 $("autoBtn").onclick = () => setAuto(!$("auto").checked);
 $("detectBtn").onclick = () => setDetect(!$("detect").checked);
 $("deep").onchange = () => chrome.runtime.sendMessage({ type: "setDeepDetect", value: $("deep").checked });
+// One click in the last-picked quality (the page's video buttons read it).
+try {
+  chrome.storage.local.get({ oneClickQuality: true }, (r) => { if (!chrome.runtime.lastError) $("oneClick").checked = !r || r.oneClickQuality !== false; });
+} catch (e) { /* stays unchecked */ }
+$("oneClick").onchange = () => { try { chrome.storage.local.set({ oneClickQuality: $("oneClick").checked }); } catch (e) {} };
 $("hideUI").onchange = () => {
   chrome.runtime.sendMessage({ type: "setBrowserUI", value: $("hideUI").checked }, (res) => {
     status(res && res.ok ? "Browser download UI preference saved" : "This browser could not change its download UI.", res && res.ok ? "ok" : "bad");
