@@ -478,7 +478,9 @@
   // The light/dark switch as a drawn icon (a sun in dark mode, a moon in
   // light mode). False where no DOM can draw it (the caller writes a glyph).
   const TOGGLE_PATHS = {
-    sun: ["M12 8a4 4 0 1 0 0 8a4 4 0 1 0 0-8z", "M12 2v2M12 20v2M4.9 4.9l1.4 1.4M17.7 17.7l1.4 1.4M2 12h2M20 12h2M4.9 19.1l1.4-1.4M17.7 6.3l1.4-1.4"],
+    // A round core and eight short rays, all on the centre (12, 12).
+    sun: ["M12 8.4a3.6 3.6 0 1 0 0 7.2a3.6 3.6 0 1 0 0-7.2z",
+      "M12 3.6v1.8M12 18.6v1.8M3.6 12h1.8M18.6 12h1.8M6.06 6.06l1.27 1.27M16.67 16.67l1.27 1.27M6.06 17.94l1.27-1.27M16.67 7.33l1.27-1.27"],
     moon: ["M20.5 14.5A8.5 8.5 0 0 1 9.5 3.5a8.5 8.5 0 1 0 11 11z"],
   };
   function toggleIcon(el, kind) {
@@ -489,8 +491,8 @@
       const NS = "http://www.w3.org/2000/svg";
       const svg = doc.createElementNS(NS, "svg");
       svg.setAttribute("viewBox", "0 0 24 24");
-      svg.setAttribute("width", "13");
-      svg.setAttribute("height", "13");
+      svg.setAttribute("width", "14");
+      svg.setAttribute("height", "14");
       svg.setAttribute("fill", "none");
       svg.setAttribute("stroke", "currentColor");
       svg.setAttribute("stroke-width", "2");
@@ -504,6 +506,11 @@
       }
       el.textContent = "";
       el.appendChild(svg);
+      // Centred whatever the page's button styles say.
+      el.style.display = "grid";
+      el.style.placeItems = "center";
+      el.style.padding = "0";
+      el.style.lineHeight = "0";
       el.setAttribute("data-dc-icon", kind);
       el.title = kind === "sun" ? "Light theme" : "Dark theme";
       return true;

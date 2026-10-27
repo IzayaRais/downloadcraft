@@ -1580,6 +1580,14 @@
       btn.removeAttribute("data-dc-compact");
       btn.style.alignSelf = btn.style.margin = "";
     }
+    if (!player && ytVideoId()) {
+      // The page is still loading its player: wait for it (the watcher
+      // places the button once it exists) instead of a window corner.
+      btn.style.display = "none";
+      if (panel) panel.style.display = "none";
+      return false;
+    }
+    if (btn.style.display === "none") btn.style.display = "block";
     if(applySavedBarPosition(btn)){positionDraggedPanel(btn,panel);return true;}
     if (player) {
       btn.style.position = "absolute";
@@ -1998,6 +2006,12 @@
       if (ev && ev.stopPropagation) ev.stopPropagation();
       dcSetTheme(dcThemeMode() === "light" ? "dark" : "light");
       try { allPanels().forEach(paintDcPanel); } catch (e) { /* theme is best-effort */ }
+      // The row under the pointer keeps its hover colour inline: give it
+      // the new theme's, or it stays dark/light until the pointer leaves.
+      try {
+        const row = b.closest('[data-dc-p="sendrow"]');
+        if (row && row.matches(":hover")) row.style.background = dcPanelTokens().hover;
+      } catch (e) { /* cosmetic */ }
     };
     return b;
   }
@@ -2841,6 +2855,8 @@
     const id = ytVideoId();
     if (!id || !detectionOn) return;
     const player = ytPlayer();
+    const waiting = document.getElementById("dc-yt-btn");
+    if (waiting && waiting.style.display === "none" && player) placeInPlayer(waiting, document.getElementById("dc-yt-panel"));
     layoutCheck("yt-player", !player, "YouTube: no video player element found on a video page (the layout may have changed); the button sits in the window corner");
     const shorts = /^\/shorts\//.test(location.pathname);
     if (shorts) {
