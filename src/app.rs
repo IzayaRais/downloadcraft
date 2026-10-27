@@ -1487,21 +1487,11 @@ fn col_w_of(map: &std::collections::HashMap<SortCol, f32>, c: SortCol) -> f32 {
     map.get(&c).copied().unwrap_or(col_default(c))
 }
 
-/// New widths while the divider between `left` and `right` is dragged by
-/// `dx`: the divider follows the pointer, so one side grows by what the other
-/// loses. Name takes whatever room the others leave, so its own width is
-/// never stored - only its neighbour changes.
-fn divider_widths(left: SortCol, right: SortCol, start_l: f32, start_r: f32, dx: f32) -> Vec<(SortCol, f32)> {
-    const MAX: f32 = 900.0;
-    if left == SortCol::Name {
-        return vec![(right, (start_r - dx).clamp(col_min(right), MAX))];
-    }
-    if right == SortCol::Name {
-        return vec![(left, (start_l + dx).clamp(col_min(left), MAX))];
-    }
-    // Both fixed: the move is limited by whichever side hits its minimum.
-    let dx = dx.clamp(col_min(left) - start_l, start_r - col_min(right));
-    vec![(left, start_l + dx), (right, start_r - dx)]
+/// The width of `col` while its right-hand divider is dragged by `dx`, as in
+/// IDM: only that column changes, every column to its right moves along, and
+/// the list scrolls sideways once the columns are wider than the window.
+fn dragged_width(col: SortCol, start_w: f32, dx: f32) -> f32 {
+    (start_w + dx).clamp(col_min(col), 900.0)
 }
 
 /// Uniform toolbar metrics: every action button shares one height.
@@ -1767,7 +1757,7 @@ enum HitKind {
     HdrCol(SortCol),
     HdrCheck,
     /// The divider between a column and its right neighbour.
-    ResizeCol(SortCol, SortCol),
+    ResizeCol(SortCol),
     CtxItem(RowAct, u64),
     Btn(ButtonId),
     Check(CheckId),
@@ -1782,14 +1772,8 @@ enum HitKind {
 /// OS's job now that the app uses native decorations).
 #[derive(Clone, Copy)]
 enum ResizeCap {
-    /// Dragging the divider between `col` and its right neighbour `right`.
-    Col {
-        col: SortCol,
-        right: SortCol,
-        start_x: f32,
-        start_w: f32,
-        start_right: f32,
-    },
+    /// Dragging the divider on the right edge of `col`.
+    Col { col: SortCol, start_x: f32, start_w: f32 },
 }
 
 #[derive(Clone, Copy)]
@@ -1869,6 +1853,10 @@ pub struct CraftApp {
     known_ids: std::collections::HashSet<u64>,
     col_order: Vec<SortCol>,
     col_w: std::collections::HashMap<SortCol, f32>,
+    /// Column widths as drawn last frame (a drag starts from these) and the
+    /// list's sideways scroll, which the header follows.
+    col_shown: Vec<(SortCol, f32)>,
+    list_hoff: f32,
     // ---- power features ----
     max_concurrent: usize,
     /// Named queues besides Main, and the one shown in the Queues window.
@@ -2080,6 +2068,8 @@ impl CraftApp {
                 SortCol::Date,
             ],
             col_w: Default::default(),
+            col_shown: Vec::new(),
+            list_hoff: 0.0,
             max_concurrent: 3,
         per_host_conns: 0,
             show_complete: true,
@@ -6259,36 +6249,25 @@ impl eframe::App for CraftApp {
                     let cols = self.col_order.clone();
                     // The always-visible vertical bar keeps its own strip.
                     let avail_w = ui.available_width() - SB_SPACE;
-                    // The numeric columns keep their stored widths, but when the
-                    // window is too narrow for them plus a readable Name column
-                    // they give space back (down to their own minimums) instead
-                    // of pushing the last column off the card.
-                    let mut fixed: Vec<(SortCol, f32)> = cols
+                    // Every column keeps its own width (IDM): widening one moves
+                    // the ones to its right, and the list scrolls sideways when
+                    // they no longer fit. Name fills the free room until the
+                    // user gives it a width of its own.
+                    let fixed: Vec<(SortCol, f32)> = cols
                         .iter()
                         .filter(|c| **c != SortCol::Name)
                         .map(|c| (*c, col_w_of(&self.col_w, *c)))
                         .collect();
-                    const NAME_MIN: f32 = 132.0;
-                    let mut fixed_sum: f32 = fixed.iter().map(|(_, w)| *w).sum();
-                    let mut name_w = avail_w - CHECK_W - fixed_sum;
-                    if name_w < NAME_MIN {
-                        let need = NAME_MIN - name_w;
-                        let slack: f32 =
-                            fixed.iter().map(|(c, w)| (w - col_min(*c)).max(0.0)).sum();
-                        if slack > 0.0 {
-                            let k = (need / slack).min(1.0);
-                            for (c, w) in fixed.iter_mut() {
-                                *w -= (*w - col_min(*c)).max(0.0) * k;
-                            }
-                            fixed_sum = fixed.iter().map(|(_, w)| *w).sum();
-                            name_w = avail_w - CHECK_W - fixed_sum;
-                        }
-                    }
+                    let fixed_sum: f32 = fixed.iter().map(|(_, w)| *w).sum();
+                    let name_w = match self.col_w.get(&SortCol::Name) {
+                        Some(w) => *w,
+                        None => (avail_w - CHECK_W - fixed_sum).max(col_min(SortCol::Name)),
+                    };
                     let col_ws: Vec<f32> = cols
                         .iter()
                         .map(|c| {
                             if *c == SortCol::Name {
-                                name_w.max(80.0)
+                                name_w
                             } else {
                                 fixed
                                     .iter()
@@ -6299,6 +6278,7 @@ impl eframe::App for CraftApp {
                         })
                         .collect();
                     let total_w: f32 = CHECK_W + col_ws.iter().sum::<f32>();
+                    self.col_shown = cols.iter().copied().zip(col_ws.iter().copied()).collect();
                     // Select-all state, snapshotted before the header.
                     let all_sel = !ids.is_empty()
                         && ids.iter().all(|id| {
@@ -6308,8 +6288,25 @@ impl eframe::App for CraftApp {
                                 .map(|d| d.selected)
                                 .unwrap_or(false)
                         });
-                    // ---- header row (fixed; the concept draws it sticky) ----
-                    ui.horizontal(|ui| {
+                    // ---- header row: sticky above the rows, and moved
+                    // sideways with them when the list scrolls horizontally ----
+                    let hdr_top = ui.cursor().min;
+                    let hdr_clip = egui::Rect::from_min_size(
+                        hdr_top,
+                        egui::vec2(ui.available_width(), HDR_H),
+                    )
+                    .intersect(ui.clip_rect());
+                    ui.allocate_exact_size(egui::vec2(ui.available_width(), HDR_H), egui::Sense::hover());
+                    let mut hdr_ui = ui.new_child(
+                        egui::UiBuilder::new()
+                            .max_rect(egui::Rect::from_min_size(
+                                egui::pos2(hdr_top.x - self.list_hoff, hdr_top.y),
+                                egui::vec2(total_w + 40.0, HDR_H),
+                            ))
+                            .layout(egui::Layout::left_to_right(egui::Align::Center)),
+                    );
+                    hdr_ui.set_clip_rect(hdr_clip);
+                    hdr_ui.horizontal(|ui| {
                         ui.spacing_mut().item_spacing.x = 0.0;
                         let (cr, _) = ui.allocate_exact_size(
                             egui::vec2(CHECK_W, HDR_H),
@@ -6321,7 +6318,7 @@ impl eframe::App for CraftApp {
                             all_sel,
                             self.man.hover(&cr),
                         );
-                        self.hits.push((HitKind::HdrCheck, cr));
+                        self.hits.push((HitKind::HdrCheck, cr.intersect(hdr_clip)));
                         for (ci, col) in cols.iter().enumerate() {
                             let w = col_ws[ci];
                             let (r, _) = ui.allocate_exact_size(
@@ -6341,8 +6338,8 @@ impl eframe::App for CraftApp {
                                 pl().dim
                             };
                             cell_text(ui.painter(), r, &txt, 9.5, color, *col != SortCol::Name);
-                            self.hits.push((HitKind::HdrCol(*col), r));
-                            if ci + 1 < cols.len() {
+                            self.hits.push((HitKind::HdrCol(*col), r.intersect(hdr_clip)));
+                            {
                                 // Divider grab strip on the column's right edge
                                 // (`.resizer`): a faint line always, so it can
                                 // be found, and an accent bar while hovered or
@@ -6372,7 +6369,7 @@ impl eframe::App for CraftApp {
                                         pl().card_bd,
                                     );
                                 }
-                                self.hits.push((HitKind::ResizeCol(*col, cols[ci + 1]), zr));
+                                self.hits.push((HitKind::ResizeCol(*col), zr.intersect(hdr_clip)));
                             }
                         }
                     });
@@ -6386,13 +6383,9 @@ impl eframe::App for CraftApp {
                     // hit-testing stays exact under scrolling ----
                     // Both bars always shown, below and beside the rows.
                     modern_scrollbars(ui);
-                    let body_h = (ui.available_height() - 4.0 - SB_SPACE).max(80.0);
-                    egui::ScrollArea::horizontal()
-                        .id_salt("dl_h")
-                        .auto_shrink([false, false])
-                        .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysVisible)
-                        .show(ui, |ui| {
-                            egui::ScrollArea::vertical()
+                    let body_h = (ui.available_height() - 4.0).max(80.0);
+                    ui.scope(|ui| {
+                            egui::ScrollArea::both()
                                 .id_salt("dl_v")
                                 .max_height(body_h)
                                 .auto_shrink([false, false])
@@ -6408,6 +6401,13 @@ impl eframe::App for CraftApp {
                                     // and swallow the buttons there. Every hit
                                     // is therefore clipped to the viewport.
                                     let view = ui.clip_rect();
+                                    // How far the rows are scrolled sideways:
+                                    // the header follows it.
+                                    let hoff = (view.min.x - ui.max_rect().min.x).max(0.0);
+                                    if (hoff - self.list_hoff).abs() > 0.5 {
+                                        self.list_hoff = hoff;
+                                        ui.ctx().request_repaint();
+                                    }
                                     for id in &ids {
                                         let id = *id;
                                         let (sel, fname, cat, size_s, prog, spd, eta, date, st, preparing) = {
@@ -9178,12 +9178,10 @@ impl CraftApp {
         // Active divider drag continues here (movement, not clicks).
         if let Some(cap) = self.resize_cap.take() {
             match cap {
-                ResizeCap::Col { col, right, start_x, start_w, start_right } => {
+                ResizeCap::Col { col, start_x, start_w } => {
                     if self.man.down_left() {
                         if let Some(p) = self.man.pos() {
-                            for (c, w) in divider_widths(col, right, start_w, start_right, p.x - start_x) {
-                                self.col_w.insert(c, w);
-                            }
+                            self.col_w.insert(col, dragged_width(col, start_w, p.x - start_x));
                         }
                         self.resize_cap = Some(cap);
                     } else {
@@ -9238,7 +9236,7 @@ impl CraftApp {
                     HitKind::RowCheck(id) => format!("check:#{id}"),
                     HitKind::HdrCol(c) => format!("hdr:{}", c.key()),
                     HitKind::HdrCheck => "hdrcheck".to_string(),
-                    HitKind::ResizeCol(c, _) => format!("rz:{}", c.key()),
+                    HitKind::ResizeCol(c) => format!("rz:{}", c.key()),
                     HitKind::MenuBtn(m) => format!("menu:{m}"),
                     HitKind::MenuItem(a) => format!("menuitem:{a}"),
                     HitKind::CtxItem(_, id) => format!("ctx:#{id}"),
@@ -9441,19 +9439,20 @@ impl CraftApp {
                         }
                     }
                 }
-                HitKind::ResizeCol(c, right) => {
+                HitKind::ResizeCol(c) => {
                     if hov {
                         zone_cursor = Some(egui::CursorIcon::ResizeColumn);
                     }
                     if self.man.press_started_in(&rect) {
                         if let Some(p) = self.man.pos() {
                             self.col_drag_used = true;
+                            // From the width on screen: Name may still be
+                            // filling the window, with no stored width yet.
+                            let shown = self.col_shown.iter().find(|(k, _)| *k == c).map(|(_, w)| *w);
                             self.resize_cap = Some(ResizeCap::Col {
                                 col: c,
-                                right,
                                 start_x: p.x,
-                                start_w: col_w_of(&self.col_w, c),
-                                start_right: col_w_of(&self.col_w, right),
+                                start_w: shown.unwrap_or_else(|| col_w_of(&self.col_w, c)),
                             });
                         }
                     }
@@ -9559,18 +9558,14 @@ fn task_can_complete(shared: &SharedState, bytes_landed: bool) -> bool {
 mod audit_completion_tests {
     #[test]
     fn column_dividers_follow_the_pointer() {
-        use super::{divider_widths, col_min, SortCol};
-        // Name | Size: Name takes the rest, so only Size changes, and
-        // dragging right gives Name more room.
-        assert_eq!(divider_widths(SortCol::Name, SortCol::Size, 300.0, 90.0, 20.0), vec![(SortCol::Size, 70.0)]);
-        // Size | Status: one grows by what the other loses (sum unchanged).
-        let w = divider_widths(SortCol::Size, SortCol::Status, 90.0, 110.0, 15.0);
-        assert_eq!(w, vec![(SortCol::Size, 105.0), (SortCol::Status, 95.0)]);
-        // Never below a minimum on either side.
-        let w = divider_widths(SortCol::Size, SortCol::Status, 90.0, 110.0, 500.0);
-        assert_eq!(w[1], (SortCol::Status, col_min(SortCol::Status)));
-        let w = divider_widths(SortCol::Size, SortCol::Status, 90.0, 110.0, -500.0);
-        assert_eq!(w[0], (SortCol::Size, col_min(SortCol::Size)));
+        use super::{dragged_width, col_min, SortCol};
+        // Only the dragged column changes; the others keep their widths and
+        // move along (IDM).
+        assert_eq!(dragged_width(SortCol::Size, 90.0, 15.0), 105.0);
+        assert_eq!(dragged_width(SortCol::Name, 300.0, 120.0), 420.0);
+        // Never below the column's minimum, never absurdly wide.
+        assert_eq!(dragged_width(SortCol::Size, 90.0, -500.0), col_min(SortCol::Size));
+        assert_eq!(dragged_width(SortCol::Status, 110.0, 5000.0), 900.0);
     }
     use super::*;
     #[test]
