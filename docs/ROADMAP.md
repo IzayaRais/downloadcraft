@@ -3,7 +3,7 @@
 The one roadmap. It lists only what is not done yet. Everything else from the
 earlier engine, IDM-parity and extension roadmaps is built and in the code.
 
-Updated 28 Oct 2026, for 0.9.9.
+Updated 28 Oct 2026, for 0.9.10.
 
 **Priority:** 🔴 do first · 🟠 worth doing soon · 🟢 when there is time.
 

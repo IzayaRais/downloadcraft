@@ -16,15 +16,15 @@ yt-dlp, and an extension that works with the app — or on its own.
 
 <br>
 
-[![Download for Windows](https://img.shields.io/badge/Download-Windows-0078D4?style=for-the-badge&logo=data:image/svg%2bxml;base64,PHN2ZyB4bWxucz0naHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmcnIHZpZXdCb3g9JzAgMCAyNCAyNCc+PHBhdGggZmlsbD0nd2hpdGUnIGQ9J00yIDQuMmw4LjUtMS4ydjguNEgyek0xMS42IDIuOUwyMiAxLjV2OS45SDExLjZ6TTIgMTIuNmg4LjVWMjFMMiAxOS44ek0xMS42IDEyLjZIMjJ2OS45bC0xMC40LTEuNHonLz48L3N2Zz4=)](https://github.com/hungry-detective/downloadcraft/releases/download/v0.9.9/DownloadCraft-0.9.9-windows-x64-portable.zip)
+[![Download for Windows](https://img.shields.io/badge/Download-Windows-0078D4?style=for-the-badge&logo=data:image/svg%2bxml;base64,PHN2ZyB4bWxucz0naHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmcnIHZpZXdCb3g9JzAgMCAyNCAyNCc+PHBhdGggZmlsbD0nd2hpdGUnIGQ9J00yIDQuMmw4LjUtMS4ydjguNEgyek0xMS42IDIuOUwyMiAxLjV2OS45SDExLjZ6TTIgMTIuNmg4LjVWMjFMMiAxOS44ek0xMS42IDEyLjZIMjJ2OS45bC0xMC40LTEuNHonLz48L3N2Zz4=)](https://github.com/hungry-detective/downloadcraft/releases/download/v0.9.10/DownloadCraft-0.9.10-windows-x64-portable.zip)
 &nbsp;
-[![Download for macOS](https://img.shields.io/badge/Download-macOS-111111?style=for-the-badge&logo=apple&logoColor=white)](https://github.com/hungry-detective/downloadcraft/releases/download/v0.9.9/DownloadCraft-0.9.9-macos-Universal.zip)
+[![Download for macOS](https://img.shields.io/badge/Download-macOS-111111?style=for-the-badge&logo=apple&logoColor=white)](https://github.com/hungry-detective/downloadcraft/releases/download/v0.9.10/DownloadCraft-0.9.10-macos-Universal.zip)
 &nbsp;
-[![Download for Linux](https://img.shields.io/badge/Download-Linux-E95420?style=for-the-badge&logo=linux&logoColor=white)](https://github.com/hungry-detective/downloadcraft/releases/tag/v0.9.9)
+[![Download for Linux](https://img.shields.io/badge/Download-Linux-E95420?style=for-the-badge&logo=linux&logoColor=white)](https://github.com/hungry-detective/downloadcraft/releases/tag/v0.9.10)
 
-[![Chrome / Edge extension](https://img.shields.io/badge/Extension-Chrome%20%2F%20Edge-4285F4?style=for-the-badge&logo=googlechrome&logoColor=white)](https://github.com/hungry-detective/downloadcraft/releases/download/v0.9.9/DownloadCraft-Chrome-0.9.9.zip)
+[![Chrome / Edge extension](https://img.shields.io/badge/Extension-Chrome%20%2F%20Edge-4285F4?style=for-the-badge&logo=googlechrome&logoColor=white)](https://github.com/hungry-detective/downloadcraft/releases/download/v0.9.10/DownloadCraft-Chrome-0.9.10.zip)
 &nbsp;
-[![Firefox extension](https://img.shields.io/badge/Extension-Firefox-FF7139?style=for-the-badge&logo=firefoxbrowser&logoColor=white)](https://github.com/hungry-detective/downloadcraft/releases/download/v0.9.9/DownloadCraft-Firefox-0.9.9.xpi)
+[![Firefox extension](https://img.shields.io/badge/Extension-Firefox-FF7139?style=for-the-badge&logo=firefoxbrowser&logoColor=white)](https://github.com/hungry-detective/downloadcraft/releases/download/v0.9.10/DownloadCraft-Firefox-0.9.10.xpi)
 
 <sub>Windows 10/11 · macOS 12+ (Apple Silicon & Intel) · Linux x86-64 (DEB, RPM, AppImage) · <a href="https://github.com/hungry-detective/downloadcraft/releases">all releases</a></sub>
 
@@ -36,20 +36,17 @@ yt-dlp, and an extension that works with the app — or on its own.
 
 ---
 
-## ✨ What's new in 0.9.9
+## ✨ What's new in 0.9.10
 
-- **A faster engine.** Idle connections take over the slowest part, so downloads finish together;
-  up to 32 connections, mirrors, FTPS, NTLM/Kerberos company logins and saved site logins.
-- **A new look.** Toolbar and list in one card, outline icons, a compact right-click menu, slim
-  scroll bars, a search box that opens when you point at it, and IDM-style column dragging.
-- **One-click updates.** The portable Windows build downloads, checks and installs a new release, then
-  restarts. 0.9.8 users update by hand once.
-- **Start with Windows**, straight into the tray, from wherever the portable folder lives.
-- **More of IDM**: named queues, playlists, a deeper Site Grabber, ZIP: pick files, Convert to
-  MP3/MP4, batch patterns, IDM list import, statistics, Bengali.
-- **A new video button** in the browser that stays out of the way of the video.
+- **Google Drive links** download the file itself (big files and Docs/Sheets/Slides exports too).
+- **Archives unpack themselves**: ZIP, RAR (multi-part too) and 7z when they finish, or right-click → Extract.
+- **A smarter video button**: Instagram, TikTok, X and Reddit posts, MP3 audio only, one click in the quality
+  you picked last, right-click "Download video", and a neat round button on YouTube Shorts.
+- **Browser downloads keep their sound**: joined videos are now normal, seekable MP4 files.
+- **A tidier app**: redesigned Site Grabber, header icons, a toolbar that fits narrow windows, and
+  double-click a running download to see its progress window.
 
-Full notes: [Release 0.9.9](https://github.com/hungry-detective/downloadcraft/releases/tag/v0.9.9).
+Full notes: [Release 0.9.10](https://github.com/hungry-detective/downloadcraft/releases/tag/v0.9.10).
 
 ---
 
@@ -182,17 +179,17 @@ let done = downloadcraft_engine::Downloader::new(reqwest::Client::new())
 
 | Platform | Download | How |
 |---|---|---|
-| **Windows 10/11** | `DownloadCraft-0.9.9-windows-x64-portable.zip` | Extract and run `download_craft.exe` — nothing to install. |
-| **macOS 12+** | `DownloadCraft-0.9.9-macos-Universal.zip` | Move *Download Craft.app* to Applications (development build, not notarized — right-click → Open the first time). |
-| **Ubuntu / Debian / Mint** | `downloadcraft_0.9.9_amd64.deb` | `sudo apt install ./downloadcraft_0.9.9_amd64.deb` |
-| **Fedora** | `downloadcraft-0.9.9-1.x86_64.rpm` | `sudo dnf install ./downloadcraft-0.9.9-1.x86_64.rpm` |
-| **Other Linux** | `DownloadCraft-0.9.9-x86_64.AppImage` | Make it executable and open it. |
+| **Windows 10/11** | `DownloadCraft-0.9.10-windows-x64-portable.zip` | Extract and run `download_craft.exe` — nothing to install. |
+| **macOS 12+** | `DownloadCraft-0.9.10-macos-Universal.zip` | Move *Download Craft.app* to Applications (development build, not notarized — right-click → Open the first time). |
+| **Ubuntu / Debian / Mint** | `downloadcraft_0.9.10_amd64.deb` | `sudo apt install ./downloadcraft_0.9.10_amd64.deb` |
+| **Fedora** | `downloadcraft-0.9.10-1.x86_64.rpm` | `sudo dnf install ./downloadcraft-0.9.10-1.x86_64.rpm` |
+| **Other Linux** | `DownloadCraft-0.9.10-x86_64.AppImage` | Make it executable and open it. |
 
 **Browser extension**
-1. **Chrome / Edge / Brave:** extract `DownloadCraft-Chrome-0.9.9.zip`, open `chrome://extensions`, turn on
+1. **Chrome / Edge / Brave:** extract `DownloadCraft-Chrome-0.9.10.zip`, open `chrome://extensions`, turn on
    *Developer mode*, choose **Load unpacked** and pick the `browser-extension` folder.
 2. **Firefox:** open `about:debugging#/runtime/this-firefox` → **Load Temporary Add-on…** → pick
-   `DownloadCraft-Firefox-0.9.9.xpi`.
+   `DownloadCraft-Firefox-0.9.10.xpi`.
 3. In the app, open **Settings → Browser Integration** and press **Install** for your browser, so the
    extension can talk to the app. (Without it, the extension still downloads in the browser.)
 
