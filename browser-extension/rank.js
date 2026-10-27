@@ -616,7 +616,33 @@
     try { return new URL(String(u)).pathname; } catch (e) { return ""; }
   }
 
-  const DCRank = { fbVideos, fbPathOf, attachmentDownload, videoDismissKey, directDownloadLink, addDirectExtensions, hideDownloadUI, playerEvidence, playlistReferences, samePlayer, completePlaylist, isVimeoAdaptive, isVimeoFragment, vimeoVideoPage, isPlaylistUrl, isSegmentUrl, canonicalUrl, kindOf, scoreMedia, classifyResponse, sniffBytes, forwardHeaders, extOf, dispositionFilename, collapseDupes, fmtDur, panelTokens, dcThemeMode, dcSetTheme, paintDcPanel };
+  // How many videos the popup's Videos tab lists for a page snapshot (the
+  // toolbar badge shows the same number). Facebook sends each video as many
+  // audio/video pieces; they count once, as the video they belong to.
+  function countVideos(peek) {
+    if (!peek) return 0;
+    let n = (peek.videos || []).length;
+    for (const e of (peek.fb || [])) {
+      const q = (e.video || []).some((v) => (Math.min(v.w || 0, v.h || 0) || v.h || 0) > 0);
+      if (q || (e.progressive || []).length) n++;
+    }
+    const net = peek.net || [];
+    const have = new Set((peek.links || []).map((l) => l.url));
+    const hasPlaylist = net.some((x) => x && kindOf(x) === "playlist");
+    const seen = new Set();
+    for (const x of net) {
+      if (!x || !/^https?:\/\//i.test(x.url || "") || have.has(x.url)) continue;
+      const k = canonicalUrl(x.url);
+      if (seen.has(k)) continue;
+      seen.add(k);
+      if (scoreMedia(x, { hasPlaylist }) < 0) continue;
+      const kind = kindOf(x);
+      if (kind !== "subtitle" && kind !== "segment") n++;
+    }
+    return n;
+  }
+
+  const DCRank = { fbVideos, fbPathOf, countVideos, attachmentDownload, videoDismissKey, directDownloadLink, addDirectExtensions, hideDownloadUI, playerEvidence, playlistReferences, samePlayer, completePlaylist, isVimeoAdaptive, isVimeoFragment, vimeoVideoPage, isPlaylistUrl, isSegmentUrl, canonicalUrl, kindOf, scoreMedia, classifyResponse, sniffBytes, forwardHeaders, extOf, dispositionFilename, collapseDupes, fmtDur, panelTokens, dcThemeMode, dcSetTheme, paintDcPanel };
   g.DCRank = DCRank;
   if (typeof module !== "undefined" && module.exports) module.exports = DCRank;
 })(typeof globalThis !== "undefined" ? globalThis : this);

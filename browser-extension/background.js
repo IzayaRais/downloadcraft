@@ -425,14 +425,36 @@ function noteMedia(tabId, entry) {
     }).catch(() => {});
   } catch (e) { /* ignore */ }
   // Badge counts downloadable videos/streams, never playlist children or
-  // subtitle side files.
+  // subtitle side files: first from this list, then (a moment later) the
+  // number the popup itself lists for the page.
   const badgeN = list.filter((e) => !e.child && e.kind !== "subtitle").length;
-  // A per-tab badge overrides the global one, so while the app is down the
-  // tab keeps the red "!" instead of a count that hides the failure.
+  setTabBadge(tabId, badgeN);
+  scheduleBadge(tabId);
+}
+
+// A per-tab badge overrides the global one, so while the app is down the
+// tab keeps the red "!" instead of a count that hides the failure.
+function setTabBadge(tabId, n) {
   try {
-    api.action.setBadgeText({ text: hostOk ? String(badgeN) : "!", tabId }).catch(() => {});
+    api.action.setBadgeText({ text: hostOk ? (n > 0 ? String(n) : "") : "!", tabId }).catch(() => {});
     api.action.setBadgeBackgroundColor({ color: hostOk ? "#1F6FEB" : "#C42B1C", tabId }).catch(() => {});
   } catch (e) { /* ignore */ }
+}
+
+// The badge shows what the popup's Videos tab will list: ask the page for
+// the same snapshot the popup reads and count it the same way. Media
+// responses arrive in bursts, so one count per tab per moment.
+const badgeTimers = new Map();
+function scheduleBadge(tabId) {
+  if (!(tabId >= 0) || typeof DCRank === "undefined" || !DCRank.countVideos) return;
+  clearTimeout(badgeTimers.get(tabId));
+  badgeTimers.set(tabId, setTimeout(async () => {
+    badgeTimers.delete(tabId);
+    try {
+      const peek = await api.tabs.sendMessage(tabId, { type: "peekState" }, { frameId: 0 });
+      if (peek && (peek.videos || peek.links || peek.net || peek.fb)) setTabBadge(tabId, DCRank.countVideos(peek));
+    } catch (e) { /* no content script on this page: keep the list count */ }
+  }, 700));
 }
 
 function pruneSeen(url, tabId) {
