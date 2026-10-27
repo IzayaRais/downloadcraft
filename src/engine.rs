@@ -596,13 +596,21 @@ impl EngineOpts {
     ) -> reqwest::RequestBuilder {
         r = r
             .header(reqwest::header::ACCEPT, "*/*")
-            .header(reqwest::header::ACCEPT_LANGUAGE, "en-US,en;q=0.9")
+            .header(reqwest::header::ACCEPT_LANGUAGE, "en-US,en;q=0.9");
+        // Google Drive refuses a cross-site CORS fetch (403): its files are
+        // fetched the way a typed-in address is.
+        r = if url.is_some_and(crate::gdrive::is_google_host) {
+            r.header("Sec-Fetch-Dest", "document")
+                .header("Sec-Fetch-Mode", "navigate")
+                .header("Sec-Fetch-Site", "none")
+        } else {
             // Browser streaming headers: FB/IG and other media CDNs throttle
             // or drop non-browser Range requests. These match what the
             // extension captures from a real navigation.
-            .header("Sec-Fetch-Dest", "empty")
-            .header("Sec-Fetch-Mode", "cors")
-            .header("Sec-Fetch-Site", "cross-site");
+            r.header("Sec-Fetch-Dest", "empty")
+                .header("Sec-Fetch-Mode", "cors")
+                .header("Sec-Fetch-Site", "cross-site")
+        };
         // Client Hints: strict googlevideo edges (SABR/adaptive serving)
         // 403 Range requests that lack them — the legacy progressive edge
         // doesn't care, which is why small files always worked. Derived
@@ -1251,6 +1259,19 @@ pub async fn probe(
     if opts.browser.as_ref().is_some_and(|b| b.is_post()) {
         return (None, false, None, None);
     }
+    // A Drive / Docs link: probe the file it serves, not its web page.
+    let drive_target;
+    let url = if crate::gdrive::is_drive_url(url) {
+        match crate::gdrive::resolve(client, opts, url).await {
+            Ok(u) => {
+                drive_target = u;
+                drive_target.as_str()
+            }
+            Err(_) => return (None, false, None, None),
+        }
+    } else {
+        url
+    };
     // Try HEAD first — but ONLY trust success responses. Error pages
     // (403/404 with `Content-Length: 0`) must fall through to the Range
     // fallback: treating 0 as a real total poisons everything downstream
@@ -4249,6 +4270,11 @@ async fn download_inner(
             let _job = claim_dest_job(&dest).ok_or_else(|| anyhow!("this destination is already downloading elsewhere"))?;
             return post_download(&url, &dest, connections, &opts, &shared).await;
         }
+    }
+    // Google Drive / Docs: the share link is a page; download what it serves.
+    if crate::gdrive::is_drive_url(&url) {
+        let client = opts.build_client()?;
+        url = crate::gdrive::resolve(&client, &opts, &url).await?;
     }
     // Resolve Vimeo before probing the CDN: a successful fragment response
     // proves nothing about the full video's size or completeness.

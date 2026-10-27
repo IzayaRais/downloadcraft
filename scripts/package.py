@@ -38,6 +38,9 @@ with tempfile.TemporaryDirectory() as temp:
     shutil.copy2(repo/'LICENSE',root/'LICENSE')
     for license_file in (repo/'assets/fonts').glob('OFL-*.txt'):
         shutil.copy2(license_file,root/license_file.name)
+    shutil.copy2(repo/'NOTICE.md',root/'NOTICE.md')
+    for license_file in (repo/'licenses').glob('*.txt'):
+        shutil.copy2(license_file,root/license_file.name)
     if osname=='macos' and platform.system()=='Darwin':
         subprocess.run(['codesign','--force','--deep','--sign','-',str(contents.parent)],check=True)
     elif osname=='macos' and a.signer:

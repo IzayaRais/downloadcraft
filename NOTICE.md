@@ -1,8 +1,30 @@
 # Third-party notices
 
 Download Craft is original Rust code written for this project. Its interface
-design was inspired by modern download managers — no third-party source
-code is included in this repo.
+design was inspired by modern download managers. The libraries below are
+built into the program; their own licences apply to them.
+
+## UnRAR — UnRAR licence (freeware, not open source)
+
+RAR archives are extracted with the UnRAR source code by Alexander Roshal,
+built in through the `unrar` / `unrar_sys` crates (MIT / Apache-2.0 for the
+Rust wrapper). UnRAR may be used to extract RAR archives free of charge; it
+may not be used to re-create the RAR compression algorithm. Download Craft
+only extracts. The full licence is in `licenses/UnRAR-license.txt` and ships
+next to the program.
+
+- Source: https://www.rarlab.com/rar_add.htm
+
+## sevenz-rust2 — Apache License 2.0
+
+7z archives are extracted with `sevenz-rust2` (© sevenz-rust contributors).
+
+- Source: https://github.com/hasenbanck/sevenz-rust2
+
+## zip — MIT
+
+ZIP archives (and the portable update) use the `zip` crate (© zip-rs
+contributors).
 
 ## Material Icons font — Apache License 2.0
 

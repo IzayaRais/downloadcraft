@@ -39,6 +39,11 @@ struct Settings {
     language: String,
     close_to_tray: bool,
     start_with_windows: bool,
+    /// Extract finished archives, which kinds, where, and delete after.
+    extract_auto: bool,
+    extract_types: String,
+    extract_into_folder: bool,
+    extract_delete: bool,
     /// Pop the standalone "Download complete" dialog when a transfer ends.
     show_complete: bool,
     // Engine
@@ -113,6 +118,10 @@ impl Default for Settings {
             language: "en".to_string(),
             close_to_tray: cfg!(windows),
             start_with_windows: cfg!(windows),
+            extract_auto: false,
+            extract_types: "zip rar 7z".to_string(),
+            extract_into_folder: true,
+            extract_delete: false,
             show_complete: true,
             save_dir: dirs::download_dir()
                 .map(|p| p.to_string_lossy().to_string())
@@ -192,6 +201,18 @@ fn load() -> Settings {
     }
     if let Some(b) = g("start_with_windows").and_then(|x| x.as_bool()) {
         s.start_with_windows = cfg!(windows) && b;
+    }
+    if let Some(b) = g("extract_auto").and_then(|x| x.as_bool()) {
+        s.extract_auto = b;
+    }
+    if let Some(x) = g("extract_types").and_then(|x| x.as_str()) {
+        s.extract_types = x.to_string();
+    }
+    if let Some(b) = g("extract_into_folder").and_then(|x| x.as_bool()) {
+        s.extract_into_folder = b;
+    }
+    if let Some(b) = g("extract_delete").and_then(|x| x.as_bool()) {
+        s.extract_delete = b;
     }
     if let Some(b) = g("show_complete").and_then(|x| x.as_bool()) {
         s.show_complete = b;
@@ -359,6 +380,10 @@ fn save(s: &Settings) -> bool {
     set(obj, "language", s.language.clone().into());
     set(obj, "close_to_tray", s.close_to_tray.into());
     set(obj, "start_with_windows", s.start_with_windows.into());
+    set(obj, "extract_auto", s.extract_auto.into());
+    set(obj, "extract_types", s.extract_types.clone().into());
+    set(obj, "extract_into_folder", s.extract_into_folder.into());
+    set(obj, "extract_delete", s.extract_delete.into());
     set(obj, "ffmpeg_custom_path", s.ffmpeg_custom_path.clone().into());
     set(obj, "show_complete", s.show_complete.into());
     set(obj, "save_dir", s.save_dir.clone().into());
@@ -2631,6 +2656,51 @@ impl SettingsApp {
                 if cfg!(target_os="macos") { &["nothing", "shutdown", "sleep"] } else { &["nothing", "shutdown", "sleep", "hibernate"] },
                 &mut s.finish_action,
             );
+            ui.add_space(8.0);
+            switch_row(
+                ui,
+                "extract_auto",
+                &mut s.extract_auto,
+                "Extract archives when they finish",
+                "ZIP, RAR (also multi-part) and 7z. Password-protected archives are left as they are. Right-click a finished archive → Extract works either way.",
+            );
+            if s.extract_auto {
+                ui.add_space(6.0);
+                let mut c = field_row(ui, "extract_types", "Archive types", None, None);
+                c.horizontal(|ui| {
+                    for (kind, key) in [("ZIP", "zip"), ("RAR", "rar"), ("7z", "7z")] {
+                        let had = s.extract_types.split_whitespace().any(|k| k.eq_ignore_ascii_case(key));
+                        let mut on = had;
+                        checkbox(ui, &mut on, kind, 14.0, 11.5, true);
+                        if on != had {
+                            let kinds: Vec<&str> = ["zip", "rar", "7z"]
+                                .into_iter()
+                                .filter(|k| {
+                                    if *k == key {
+                                        on
+                                    } else {
+                                        s.extract_types.split_whitespace().any(|x| x.eq_ignore_ascii_case(k))
+                                    }
+                                })
+                                .collect();
+                            s.extract_types = kinds.join(" ");
+                        }
+                        ui.add_space(14.0);
+                    }
+                });
+                let mut c = field_row(ui, "extract_where", "Put the files", None, None);
+                let mut place = if s.extract_into_folder { "in a new folder".to_string() } else { "next to the archive".to_string() };
+                segmented(&mut c, "extract_where", &["in a new folder", "next to the archive"], &mut place);
+                s.extract_into_folder = place == "in a new folder";
+                ui.add_space(6.0);
+                switch_row(
+                    ui,
+                    "extract_delete",
+                    &mut s.extract_delete,
+                    "Delete the archive afterwards",
+                    "Only when every file came out; an archive with files that were already there is kept.",
+                );
+            }
         });
 
         // ---- Speed windows ----

@@ -20,6 +20,16 @@ fn main() {
 
     if std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("windows") {
         if let Err(e) = windows_resources() { println!("cargo:warning=windows resources not embedded: {e}"); }
+        // MinGW: the RAR reader is C++ and asks for `-lstdc++ -lpthread`,
+        // which would pick the DLL import libraries: the exe would then need
+        // libstdc++-6.dll, and the DLL pthread collides with the static one
+        // Rust's std links. A folder holding only the static archives is
+        // searched first, so both are linked into the executable.
+        if std::env::var("CARGO_CFG_TARGET_ENV").as_deref() == Ok("gnu") {
+            if let Err(e) = static_cxx_runtime() {
+                println!("cargo:warning=static C++ runtime not set up: {e}");
+            }
+        }
     }
 }
 
@@ -135,4 +145,26 @@ fn find_windres() -> Result<PathBuf, String> {
         }
     }
     Err("windres.exe not found (set the WINDRES env var)".into())
+}
+
+/// Copy MinGW's static libstdc++ and winpthread archives into a folder of
+/// their own and put it on the linker's search path.
+fn static_cxx_runtime() -> Result<(), String> {
+    let dir = scratch_dir()?.join("static-cxx");
+    std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+    let gcc = std::env::var("CC").unwrap_or_else(|_| "x86_64-w64-mingw32-gcc".into());
+    for lib in ["libstdc++.a", "libpthread.a"] {
+        let out = Command::new(&gcc)
+            .arg(format!("-print-file-name={lib}"))
+            .output()
+            .or_else(|_| Command::new("gcc").arg(format!("-print-file-name={lib}")).output())
+            .map_err(|e| format!("gcc: {e}"))?;
+        let found = PathBuf::from(String::from_utf8_lossy(&out.stdout).trim());
+        if !found.is_absolute() || !found.is_file() {
+            return Err(format!("{lib} not found"));
+        }
+        std::fs::copy(&found, dir.join(lib)).map_err(|e| format!("{lib}: {e}"))?;
+    }
+    println!("cargo:rustc-link-search=native={}", dir.display());
+    Ok(())
 }

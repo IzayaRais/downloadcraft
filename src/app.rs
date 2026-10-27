@@ -1946,6 +1946,8 @@ enum RowAct {
     MoveToQueue(u8),
     /// List a ZIP's files and fetch only the picked ones.
     ZipPick,
+    /// Unpack a finished ZIP, RAR or 7z.
+    Extract,
     /// Convert a finished file with ffmpeg: 0 = MP3, 1 = MP4, 2 = smaller MP4.
     Convert(u8),
     Details,
@@ -2057,6 +2059,14 @@ pub struct CraftApp {
     proxy_url: String,
     antivirus_cmd: String,
     finish_action: String,
+    /// Extract finished archives (Settings → On completion).
+    extract_auto: bool,
+    /// Which kinds, as "zip rar 7z".
+    extract_types: String,
+    /// Into a new folder named after the archive (else next to it).
+    extract_into_folder: bool,
+    /// Delete the archive once everything in it is out.
+    extract_delete: bool,
     category_folders: bool,
     close_to_tray: bool,
     /// Start with Windows (on by default); the Run entry follows this copy.
@@ -2266,6 +2276,10 @@ impl CraftApp {
             proxy_url: String::new(),
             antivirus_cmd: String::new(),
             finish_action: "nothing".to_string(),
+            extract_auto: false,
+            extract_types: "zip rar 7z".to_string(),
+            extract_into_folder: true,
+            extract_delete: false,
             category_folders: true,
             // Closing the window tucks the app into the tray (IDM-style); the
             // tray's Exit is how you quit. The Tasks menu switches it off.
@@ -2622,6 +2636,10 @@ impl CraftApp {
                 "proxy_url": self.proxy_url,
                 "antivirus_cmd": self.antivirus_cmd,
                 "finish_action": self.finish_action,
+                "extract_auto": self.extract_auto,
+                "extract_types": self.extract_types,
+                "extract_into_folder": self.extract_into_folder,
+                "extract_delete": self.extract_delete,
                 "queues": self.queues,
                 "category_folders": self.category_folders,
                 "close_to_tray": self.close_to_tray,
@@ -2759,6 +2777,18 @@ impl CraftApp {
                     }
                     if let Some(b) = g("category_folders").and_then(|x| x.as_bool()) {
                         self.category_folders = b;
+                    }
+                    if let Some(b) = g("extract_auto").and_then(|x| x.as_bool()) {
+                        self.extract_auto = b;
+                    }
+                    if let Some(s) = g("extract_types").and_then(|x| x.as_str()) {
+                        self.extract_types = s.to_string();
+                    }
+                    if let Some(b) = g("extract_into_folder").and_then(|x| x.as_bool()) {
+                        self.extract_into_folder = b;
+                    }
+                    if let Some(b) = g("extract_delete").and_then(|x| x.as_bool()) {
+                        self.extract_delete = b;
                     }
                     if let Some(b) = g("close_to_tray").and_then(|x| x.as_bool()) {
                         self.close_to_tray = cfg!(windows) && b;
@@ -3057,6 +3087,11 @@ impl CraftApp {
                 self.push_log(format!("Moved {} row(s) to queue {}.", ids.len(), if name.is_empty() { "Main" } else { &name }));
             }
             RowAct::ZipPick => self.open_zip_pick(id),
+            RowAct::Extract => {
+                if let Some(path) = self.downloads.iter().find(|d| d.id == id).map(|d| d.dest_path()) {
+                    self.extract_archive(&path, true);
+                }
+            }
             RowAct::Convert(kind) => self.convert(id, kind),
             RowAct::RefreshAddress => {
                 let Some(d) = self.downloads.iter().find(|d| d.id == id) else { return };
@@ -4985,6 +5020,88 @@ impl CraftApp {
                 Err(e) => self.push_log(e),
             }
         }
+        self.extract_archive(path, false);
+    }
+
+    /// Unpack a finished archive on a worker thread. `manual` is the row
+    /// menu's Extract; otherwise it is the automatic run after a download,
+    /// which follows Settings → On completion. A multi-part RAR waits until
+    /// every part of it in the list has finished.
+    fn extract_archive(&mut self, path: &std::path::Path, manual: bool) {
+        let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+        let Some(vol) = crate::archive::volume_of(&name) else {
+            if manual {
+                self.push_log(format!("{name} is not a ZIP, RAR or 7z file."));
+            }
+            return;
+        };
+        if !manual {
+            let wanted = self.extract_types.split_whitespace().any(|k| k.eq_ignore_ascii_case(vol.kind.label()));
+            if !self.extract_auto || !wanted {
+                return;
+            }
+            if let Some(set) = &vol.set {
+                let folder = path.parent();
+                let waiting = self.downloads.iter().any(|d| {
+                    crate::archive::in_set(&d.filename, set)
+                        && !matches!(d.status, Status::Completed)
+                        && d.dest_path().parent() == folder
+                });
+                if waiting {
+                    return;
+                }
+            }
+        }
+        let first = path.with_file_name(&vol.first);
+        if !first.is_file() {
+            self.push_log(format!("Extract {name}: {} is not here yet.", vol.first));
+            return;
+        }
+        let into_folder = self.extract_into_folder;
+        let dest = crate::archive::destination(&first, into_folder);
+        let delete = self.extract_delete && !manual;
+        let tx = self.conv_tx.clone();
+        self.push_log(format!("Extracting {}…", vol.first));
+        std::thread::spawn(move || {
+            let shown = vol.first.clone();
+            let line = match crate::archive::extract(&first, &dest) {
+                Ok(out) => {
+                    let mut line = format!("Extracted {} file(s) from {shown} to {}", out.files, out.dest.display());
+                    if out.skipped > 0 {
+                        line += &format!(" — {} already there, kept", out.skipped);
+                    }
+                    if out.refused > 0 {
+                        line += &format!(" — {} unsafe name(s) refused", out.refused);
+                    }
+                    if delete && out.complete() {
+                        let parent = first.parent().map(std::path::Path::to_path_buf).unwrap_or_default();
+                        let mut gone = vec![first.clone()];
+                        if let (Some(set), Ok(rd)) = (&vol.set, std::fs::read_dir(&parent)) {
+                            gone.extend(rd.flatten().map(|e| e.path()).filter(|p| {
+                                p.file_name().is_some_and(|n| crate::archive::in_set(&n.to_string_lossy(), set))
+                            }));
+                        }
+                        gone.sort();
+                        gone.dedup();
+                        for f in gone {
+                            let _ = std::fs::remove_file(f);
+                        }
+                        line += " — archive deleted";
+                    }
+                    notify("Download Craft — extracted", &shown);
+                    line
+                }
+                Err(e) => {
+                    if into_folder {
+                        // Only an empty folder this run created goes away.
+                        let _ = std::fs::remove_dir(&dest);
+                    }
+                    notify("Download Craft — could not extract", &format!("{shown}: {e}"));
+                    format!("Could not extract {shown}: {e}")
+                }
+            };
+            let _ = tx.send(line);
+        });
     }
 
     /// Runs the configured end-of-queue action once everything drained.
@@ -9535,6 +9652,9 @@ impl CraftApp {
             if !sub.is_empty() {
                 v.push(CtxEntry::Sub { label: t("Convert"), icon: MI_TRANSFORM, key: 0, items: sub });
             }
+        }
+        if matches!(d.status, Status::Completed) && crate::archive::volume_of(&d.filename).is_some() {
+            v.push(item("Extract", MI_UNARCHIVE, "", Extract));
         }
         if ext == "zip" && d.url.starts_with("http") {
             v.push(item("ZIP: pick files…", MI_UNARCHIVE, "", ZipPick));

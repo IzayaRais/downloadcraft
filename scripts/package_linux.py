@@ -34,6 +34,8 @@ def install_tree(root,binary):
     docs=root/'usr/share/doc/downloadcraft';docs.mkdir(parents=True)
     for name in ['LICENSE','PORTABLE-BUILDS.md','RELEASE-NOTES.md']:shutil.copy2(REPO/name,docs/name)
     for item in (REPO/'assets/fonts').glob('OFL-*.txt'):shutil.copy2(item,docs/item.name)
+    shutil.copy2(REPO/'NOTICE.md',docs/'NOTICE.md')
+    for item in (REPO/'licenses').glob('*.txt'):shutil.copy2(item,docs/item.name)
 
 def main():
     p=argparse.ArgumentParser()

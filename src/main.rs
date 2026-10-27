@@ -4,6 +4,7 @@
 //! %APPDATA%/download_craft/crash.log and the in-app log/queues panels.
 
 mod aes128;
+mod archive;
 mod app;
 mod basket;
 mod cli;
@@ -13,6 +14,7 @@ mod dm;
 mod engine;
 mod fonts;
 mod ftp;
+mod gdrive;
 mod grabber;
 mod i18n;
 mod links;
