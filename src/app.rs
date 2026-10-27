@@ -1759,21 +1759,24 @@ fn add_url_button(ui: &mut egui::Ui, man: &ManState, hot: bool) -> egui::Rect {
     } else {
         ui.ctx().data_mut(|d| d.remove::<f64>(egui::Id::new("add_url_hot_since")));
     }
-    let fill = if hov { mix(pl().primary, egui::Color32::WHITE, 0.12) } else { pl().primary };
-    p.rect_filled(rect, 8.0, fill);
+    // Like the other toolbar buttons: no fill of its own, a wash on hover.
+    if hov {
+        p.rect_filled(rect, 8.0, pl().surface_lt);
+    }
+    let c = if hov { pl().txt } else { pl().txt.gamma_multiply(0.75) };
     p.text(
         egui::pos2(rect.min.x + 20.0, rect.center().y),
         egui::Align2::CENTER_CENTER,
         MI_ADD.to_string(),
         crate::fonts::icon(17.0),
-        egui::Color32::WHITE,
+        c,
     );
     p.text(
         egui::pos2(rect.min.x + 35.0, rect.center().y),
         egui::Align2::LEFT_CENTER,
         label,
         font,
-        egui::Color32::WHITE,
+        c,
     );
     if hov {
         egui::Tooltip::always_open(ui.ctx().clone(), ui.layer_id(), ui.id().with("toolbar_tip_add_url"), egui::PopupAnchor::Pointer)
