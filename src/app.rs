@@ -445,6 +445,7 @@ pub(crate) const MI_TUNE: &str = "\u{e429}";
 pub(crate) const MI_INSERT_FILE: &str = "\u{e24d}";
 /// Collapsed / expanded affordances for the sidebar sections.
 const MI_OPEN: &str = "\u{e89e}";
+const MI_SPEED: &str = "\u{e9e4}";
 const MI_ARROW_DOWN: &str = "\u{e5db}";
 const MI_CHECK: &str = "\u{e5ca}";
 /// Popup-menu label prefixes: a ticked choice, and an unticked one in the
@@ -833,6 +834,11 @@ enum ButtonId {
     GrabQueue,
     GrabClose,
     GrabPreset,
+    /// A file-type chip: the n-th preset.
+    GrabPresetPick(u8),
+    GrabLevelsDown,
+    GrabLevelsUp,
+    GrabSave,
     RuleAdd,
     RuleDel(usize),
     RuleUp(usize),
@@ -854,6 +860,7 @@ enum CheckId {
     SchedOn,
     AddOverwrite,
     GrabDepth,
+    GrabStay,
     WinOn,
     UpdOn,
 }
@@ -881,6 +888,46 @@ struct SliderCap {
 
 /// Manual push button: reserves space, paints (+hover), returns hit rect.
 /// Primary = filled accent; otherwise dark card. Text centered.
+/// A small caps heading over a group of controls in a dialog.
+fn msection(ui: &mut egui::Ui, text: &str) {
+    ui.label(egui::RichText::new(text).size(10.0).strong().color(pl().dim));
+}
+
+/// A text field in a visible box (the bare field was hard to see on the
+/// dialog's background).
+fn mfield(ui: &mut egui::Ui, id: &str, text: &mut String, hint: &str, width: f32) -> egui::Rect {
+    egui::Frame::new()
+        .fill(pl().surface)
+        .stroke(egui::Stroke::new(1.0_f32, pl().card_bd))
+        .corner_radius(8.0)
+        .inner_margin(egui::Margin::symmetric(10, 7))
+        .show(ui, |ui| {
+            mtext_bare(ui, id, text, hint, (width - 22.0).max(40.0), egui::FontId::proportional(12.5))
+        })
+        .response
+        .rect
+}
+
+/// A pill that is either picked (accent) or not.
+fn mchip(ui: &mut egui::Ui, man: &ManState, label: &str, selected: bool) -> egui::Rect {
+    let font = egui::FontId::proportional(12.0);
+    let w = ui.painter().layout_no_wrap(label.to_string(), font.clone(), pl().txt).size().x + 24.0;
+    let (rect, _) = ui.allocate_exact_size(egui::vec2(w, 28.0), egui::Sense::hover());
+    let p = ui.painter();
+    let hov = man.hover(&rect);
+    let (fill, stroke, col) = if selected {
+        (pl().primary.gamma_multiply(0.22), pl().primary, pl().txt)
+    } else if hov {
+        (pl().surface_lt, pl().card_bd, pl().txt)
+    } else {
+        (pl().surface, pl().card_bd, pl().txt.gamma_multiply(0.8))
+    };
+    p.rect_filled(rect, 14.0, fill);
+    p.rect_stroke(rect, 14.0, egui::Stroke::new(1.0_f32, stroke), egui::StrokeKind::Inside);
+    p.text(rect.center(), egui::Align2::CENTER_CENTER, label, font, col);
+    rect
+}
+
 fn mbutton(
     ui: &mut egui::Ui,
     man: &ManState,
@@ -1990,6 +2037,8 @@ enum RowAct {
     ZipPick,
     /// Unpack a finished ZIP, RAR or 7z.
     Extract,
+    /// The download's own progress window (segments, speed, log).
+    ShowProgress,
     /// Convert a finished file with ffmpeg: 0 = MP3, 1 = MP4, 2 = smaller MP4.
     Convert(u8),
     Details,
@@ -2613,6 +2662,31 @@ impl CraftApp {
     }
 
     /// Launch the standalone Settings window (separate OS process).
+    /// Site Grabber → Save project: the current page, types and depth
+    /// under a name (the page's host when none is given).
+    fn grab_save_project(&mut self) {
+        let name = if self.grab_project_name.trim().is_empty() {
+            url::Url::parse(self.grab_url.trim()).ok().and_then(|u| u.host_str().map(str::to_string)).unwrap_or_else(|| "Project".into())
+        } else {
+            self.grab_project_name.trim().to_string()
+        };
+        let p = crate::model::GrabProject {
+            name: name.clone(),
+            url: self.grab_url.trim().to_string(),
+            exts: self.grab_exts.clone(),
+            follow: self.grab_depth,
+            levels: self.grab_levels,
+            stay: self.grab_stay,
+        };
+        self.grab_projects.retain(|x| x.name != name);
+        self.grab_projects.push(p);
+        self.grab_notice = if crate::model::save_grab_projects(&self.grab_projects) {
+            format!("Saved project \"{name}\".")
+        } else {
+            "Could not save the project.".into()
+        };
+    }
+
     fn open_settings_window() {
         let Ok(exe) = crate::platform::launch_path() else {
             return;
@@ -3129,6 +3203,7 @@ impl CraftApp {
                 self.push_log(format!("Moved {} row(s) to queue {}.", ids.len(), if name.is_empty() { "Main" } else { &name }));
             }
             RowAct::ZipPick => self.open_zip_pick(id),
+            RowAct::ShowProgress => Self::spawn_progress(id),
             RowAct::Extract => {
                 if let Some(path) = self.downloads.iter().find(|d| d.id == id).map(|d| d.dest_path()) {
                     self.extract_archive(&path, true);
@@ -6695,12 +6770,30 @@ impl eframe::App for CraftApp {
                 ui.horizontal(|ui| {
                     ui.add_space(7.0);
                     ui.spacing_mut().item_spacing = egui::vec2(TOOL_GAP, 2.0);
+                    // A narrow window: the buttons drop their labels, then
+                    // the last ones go (Queues and Grabber are also in the
+                    // Tasks / Tools menus), so nothing runs into Settings.
+                    let room = ui.available_width() - (TOOL_H + 8.0 + TOOL_GAP) - 6.0;
+                    let font = egui::FontId::proportional(12.0);
+                    let label_w = |l: &str| ui.painter().layout_no_wrap(l.to_owned(), font.clone(), pl().txt).size().x;
+                    let add_w = 12.0 + 16.0 + 7.0 + label_w(crate::i18n::t("Add URL")) + 14.0;
+                    let sep_w = 13.0 + TOOL_GAP;
+                    let full: f32 = tools.iter().map(|t| 10.0 + 16.0 + 7.0 + label_w(t.2) + 12.0 + TOOL_GAP).sum();
+                    let icons_only = add_w + TOOL_GAP + sep_w + full > room;
+                    let mut fit = tools.len();
+                    if icons_only {
+                        while fit > 0 && add_w + TOOL_GAP + sep_w + fit as f32 * (TOOL_H + TOOL_GAP) > room {
+                            fit -= 1;
+                        }
+                    }
                     let r = add_url_button(ui, &self.man, self.clipboard_url.is_some());
                     self.hits.push((HitKind::Tool(ToolId::AddUrl), r));
                     // A hairline between the primary action and the rest.
                     let (sep, _) = ui.allocate_exact_size(egui::vec2(13.0, TOOL_H), egui::Sense::hover());
                     ui.painter().vline(sep.center().x, (sep.min.y + 6.0)..=(sep.max.y - 6.0), egui::Stroke::new(1.0_f32, pl().card_bd));
-                    for (id, icon, label, enabled, tip) in tools {
+                    for (id, icon, label, enabled, tip) in tools.into_iter().take(fit) {
+                        // Icon only: the label moves into the tooltip.
+                        let (label, tip) = if icons_only { ("", label) } else { (label, tip) };
                         let r = tool_button(ui, &self.man, icon, label, enabled, tip);
                         self.hits.push((HitKind::Tool(id), r));
                     }
@@ -7638,37 +7731,60 @@ impl eframe::App for CraftApp {
                 .max_height((ctx.screen_rect().height() * 0.86).clamp(300.0, 900.0))
                 .frame(modal_frame())
                 .show(ctx, |ui| {
-                    ui.spacing_mut().item_spacing.y = 10.0;
-                    ui.horizontal(|ui| {
-                        let r = mtext(ui, "grab_url", &mut self.grab_url, "https://gallery…", f32::INFINITY, false);
-                        self.hits.push((HitKind::Field("grab_url"), r));
+                    ui.spacing_mut().item_spacing.y = 6.0;
+                    let full = ui.available_width();
+                    ui.label(egui::RichText::new("Find every file a web page links to, then queue the ones you want.").size(11.5).color(pl().dim));
+                    ui.add_space(6.0);
+                    // Page
+                    msection(ui, "PAGE");
+                    let r = mfield(ui, "grab_url", &mut self.grab_url, "https://example.com/gallery", full);
+                    self.hits.push((HitKind::Field("grab_url"), r));
+                    ui.add_space(6.0);
+                    // File types: one chip per preset, the list it fills in
+                    // stays editable below.
+                    msection(ui, "FILE TYPES");
+                    const PRESETS: &[&str] = &["Mixed", "Video", "Audio", "Images", "Documents", "Archives"];
+                    ui.horizontal_wrapped(|ui| {
+                        ui.spacing_mut().item_spacing = egui::vec2(6.0, 6.0);
+                        for (i, name) in PRESETS.iter().enumerate() {
+                            let r = mchip(ui, &self.man, name, self.grab_preset == i);
+                            self.hits.push((HitKind::Btn(ButtonId::GrabPresetPick(i as u8)), r));
+                        }
                     });
-                    ui.horizontal(|ui| {
-                        const PRESETS: &[&str] =
-                            &["Mixed", "Video", "Audio", "Images", "Documents", "Archives"];
-                        let cur = PRESETS[self.grab_preset.min(PRESETS.len() - 1)];
-                        let r = mbutton(ui, &self.man, &format!("Preset: {cur}"), 170.0, 32.0, false);
-                        self.hits.push((HitKind::Btn(ButtonId::GrabPreset), r));
-                        let r = mtext(ui, "grab_exts", &mut self.grab_exts, "exts: mp4,zip,…", 220.0, false);
-                        self.hits.push((HitKind::Field("grab_exts"), r));
-                    });
-                    ui.horizontal(|ui| {
-                        let r = mcheck(ui, &self.man, "Include linked pages (same site)", self.grab_depth);
-                        self.hits.push((HitKind::Check(CheckId::GrabDepth), r));
-                    });
+                    let r = mfield(ui, "grab_exts", &mut self.grab_exts, "mp4, zip, pdf…", full);
+                    self.hits.push((HitKind::Field("grab_exts"), r));
+                    ui.add_space(6.0);
+                    // How far to look
+                    msection(ui, "LINKED PAGES");
+                    let r = mcheck(ui, &self.man, "Also look in pages it links to (same site)", self.grab_depth);
+                    self.hits.push((HitKind::Check(CheckId::GrabDepth), r));
                     if self.grab_depth {
                         ui.horizontal(|ui| {
-                            ui.label("Levels deep:");
-                            ui.add(egui::DragValue::new(&mut self.grab_levels).range(1..=5));
-                            ui.checkbox(&mut self.grab_stay, "Stay inside the start page's folder");
+                            ui.spacing_mut().item_spacing.x = 6.0;
+                            ui.add_space(26.0);
+                            ui.label(egui::RichText::new("Levels deep").size(12.0).color(pl().txt));
+                            let r = mbutton(ui, &self.man, "−", 28.0, 26.0, false);
+                            self.hits.push((HitKind::Btn(ButtonId::GrabLevelsDown), r));
+                            ui.label(egui::RichText::new(self.grab_levels.to_string()).size(12.5).strong().color(pl().txt));
+                            let r = mbutton(ui, &self.man, "+", 28.0, 26.0, false);
+                            self.hits.push((HitKind::Btn(ButtonId::GrabLevelsUp), r));
+                        });
+                        ui.horizontal(|ui| {
+                            ui.add_space(26.0);
+                            let r = mcheck(ui, &self.man, "Stay inside the start page's folder", self.grab_stay);
+                            self.hits.push((HitKind::Check(CheckId::GrabStay), r));
                         });
                     }
-                    // Saved projects: load one, or save the current setup.
+                    ui.add_space(6.0);
+                    // Saved projects
+                    msection(ui, "PROJECTS");
                     ui.horizontal(|ui| {
+                        ui.spacing_mut().item_spacing.x = 8.0;
                         let mut load: Option<crate::model::GrabProject> = None;
                         let mut delete: Option<usize> = None;
                         egui::ComboBox::from_id_salt("grab_projects")
-                            .selected_text(if self.grab_projects.is_empty() { "No saved projects" } else { "Saved projects…" })
+                            .width(150.0)
+                            .selected_text(if self.grab_projects.is_empty() { "No saved projects" } else { "Open a project…" })
                             .show_ui(ui, |ui| {
                                 for (i, p) in self.grab_projects.iter().enumerate() {
                                     ui.horizontal(|ui| {
@@ -7681,29 +7797,11 @@ impl eframe::App for CraftApp {
                                     });
                                 }
                             });
-                        ui.add(egui::TextEdit::singleline(&mut self.grab_project_name).hint_text("Project name").desired_width(150.0));
-                        if ui.button("Save project").clicked() {
-                            let name = if self.grab_project_name.trim().is_empty() {
-                                url::Url::parse(self.grab_url.trim()).ok().and_then(|u| u.host_str().map(str::to_string)).unwrap_or_else(|| "Project".into())
-                            } else {
-                                self.grab_project_name.trim().to_string()
-                            };
-                            let p = crate::model::GrabProject {
-                                name: name.clone(),
-                                url: self.grab_url.trim().to_string(),
-                                exts: self.grab_exts.clone(),
-                                follow: self.grab_depth,
-                                levels: self.grab_levels,
-                                stay: self.grab_stay,
-                            };
-                            self.grab_projects.retain(|x| x.name != name);
-                            self.grab_projects.push(p);
-                            self.grab_notice = if crate::model::save_grab_projects(&self.grab_projects) {
-                                format!("Saved project \"{name}\".")
-                            } else {
-                                "Could not save the project.".into()
-                            };
-                        }
+                        let name_w = (ui.available_width() - 120.0).max(100.0);
+                        let r = mfield(ui, "grab_project_name", &mut self.grab_project_name, "Project name", name_w);
+                        self.hits.push((HitKind::Field("grab_project_name"), r));
+                        let r = mbutton(ui, &self.man, "Save project", 110.0, 32.0, false);
+                        self.hits.push((HitKind::Btn(ButtonId::GrabSave), r));
                         if let Some(p) = load {
                             self.grab_url = p.url;
                             self.grab_exts = p.exts;
@@ -7711,7 +7809,7 @@ impl eframe::App for CraftApp {
                             self.grab_levels = p.levels.clamp(1, 5);
                             self.grab_stay = p.stay;
                             self.grab_project_name = p.name.clone();
-                            self.grab_notice = format!("Loaded \"{}\" - press Find Links to run it again.", p.name);
+                            self.grab_notice = format!("Loaded \"{}\" - press Find links to run it again.", p.name);
                         }
                         if let Some(i) = delete {
                             self.grab_projects.remove(i);
@@ -7719,37 +7817,56 @@ impl eframe::App for CraftApp {
                         }
                     });
                     if !self.grab_notice.is_empty() {
-                        ui.colored_label(pl().notice, &self.grab_notice);
+                        ui.add_space(4.0);
+                        ui.label(egui::RichText::new(&self.grab_notice).size(11.5).color(pl().notice));
                     }
-                    if self.grab_busy {
-                        ui.horizontal(|ui| {
-                            ui.spinner();
-                            ui.label("Crawling…");
-                        });
-                    } else if !self.grab_results.is_empty() {
-                        let n = self.grab_results.len();
-                        ui.label(format!("{n} file link(s) found:"));
-                        egui::ScrollArea::vertical().max_height(180.0).show(ui, |ui| {
-                            for l in self.grab_results.iter().take(40) {
-                                ui.monospace(&l.name);
-                            }
-                            if n > 40 {
-                                ui.weak(format!("…and {} more", n - 40));
-                            }
-                        });
+                    // Results: a card with the count and the names.
+                    if self.grab_busy || !self.grab_results.is_empty() {
+                        ui.add_space(6.0);
+                        egui::Frame::new()
+                            .fill(pl().surface)
+                            .stroke(egui::Stroke::new(1.0_f32, pl().card_bd))
+                            .corner_radius(8.0)
+                            .inner_margin(egui::Margin::symmetric(10, 8))
+                            .show(ui, |ui| {
+                                ui.set_width(ui.available_width());
+                                if self.grab_busy {
+                                    ui.horizontal(|ui| {
+                                        ui.spinner();
+                                        ui.label(egui::RichText::new("Looking for links…").size(12.0).color(pl().txt));
+                                    });
+                                } else {
+                                    let n = self.grab_results.len();
+                                    ui.label(egui::RichText::new(format!("{n} file link{} found", if n == 1 { "" } else { "s" })).size(12.0).strong().color(pl().txt));
+                                    ui.add_space(2.0);
+                                    egui::ScrollArea::vertical().max_height(170.0).show(ui, |ui| {
+                                        ui.spacing_mut().item_spacing.y = 3.0;
+                                        for l in self.grab_results.iter().take(60) {
+                                            ui.horizontal(|ui| {
+                                                ui.label(egui::RichText::new(MI_LINK).font(crate::fonts::icon(13.0)).color(pl().dim));
+                                                ui.label(egui::RichText::new(&l.name).size(11.5).color(pl().txt)).on_hover_text(&l.url);
+                                            });
+                                        }
+                                        if n > 60 {
+                                            ui.label(egui::RichText::new(format!("…and {} more", n - 60)).size(11.0).color(pl().dim));
+                                        }
+                                    });
+                                }
+                            });
                     }
+                    ui.add_space(10.0);
                     ui.horizontal(|ui| {
-                        let r = mbutton(ui, &self.man, "Find Links", 110.0, 36.0, false);
+                        ui.spacing_mut().item_spacing.x = 8.0;
+                        let r = mbutton(ui, &self.man, "Find links", 110.0, 34.0, self.grab_results.is_empty());
                         self.hits.push((HitKind::Btn(ButtonId::GrabStart), r));
-                        let r = mbutton(ui, &self.man, "Queue All", 130.0, 36.0, true);
-                        self.hits.push((HitKind::Btn(ButtonId::GrabQueue), r));
-                        ui.with_layout(
-                            egui::Layout::right_to_left(egui::Align::Center),
-                            |ui| {
-                                let r = mbutton(ui, &self.man, "Close", 110.0, 36.0, false);
-                                self.hits.push((HitKind::Btn(ButtonId::GrabClose), r));
-                            },
-                        );
+                        if !self.grab_results.is_empty() {
+                            let r = mbutton(ui, &self.man, &format!("Queue all ({})", self.grab_results.len()), 140.0, 34.0, true);
+                            self.hits.push((HitKind::Btn(ButtonId::GrabQueue), r));
+                        }
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            let r = mbutton(ui, &self.man, "Close", 90.0, 34.0, false);
+                            self.hits.push((HitKind::Btn(ButtonId::GrabClose), r));
+                        });
                     });
                 });
             self.show_grabber = open && self.show_grabber;
@@ -9348,6 +9465,15 @@ impl CraftApp {
             ButtonId::GrabClose => {
                 self.show_grabber = false;
             }
+            ButtonId::GrabPresetPick(i) => {
+                const PRESETS: &[&str] =
+                    &["Mixed", "Video", "Audio", "Images", "Documents", "Archives"];
+                self.grab_preset = (i as usize).min(PRESETS.len() - 1);
+                self.grab_exts = crate::grabber::preset_exts(PRESETS[self.grab_preset]);
+            }
+            ButtonId::GrabLevelsDown => self.grab_levels = self.grab_levels.saturating_sub(1).max(1),
+            ButtonId::GrabLevelsUp => self.grab_levels = (self.grab_levels + 1).min(5),
+            ButtonId::GrabSave => self.grab_save_project(),
             ButtonId::GrabPreset => {
                 self.grab_preset = (self.grab_preset + 1) % 6;
                 const PRESETS: &[&str] =
@@ -9672,7 +9798,12 @@ impl CraftApp {
             .extension()
             .map(|e| e.to_string_lossy().to_ascii_lowercase())
             .unwrap_or_default();
-        let mut v = vec![
+        let mut v = Vec::new();
+        if self.tasks.contains_key(&id) {
+            v.push(item("Show download window", MI_SPEED, "", ShowProgress));
+            v.push(CtxEntry::Sep);
+        }
+        v.extend([
             item("Open", MI_OPEN, "Enter", OpenFile),
             item("Open folder", MI_FOLDER_OPEN, "", OpenFolder),
             item("Details", MI_INFO, "", Details),
@@ -9680,7 +9811,7 @@ impl CraftApp {
             item("Resume / Retry", MI_PLAY, "Space", Resume),
             item("Pause", MI_PAUSE, "", Pause),
             item("Redownload", MI_REPLAY, "", Redownload),
-        ];
+        ]);
         const MEDIA: &[&str] = &["mp4", "mkv", "webm", "mov", "avi", "flv", "wmv", "m4v", "ts", "3gp", "mp3", "m4a", "aac", "opus", "ogg", "wav", "flac", "wma"];
         const AUDIO: &[&str] = &["mp3", "m4a", "aac", "opus", "ogg", "wav", "flac", "wma"];
         if matches!(d.status, Status::Completed) && MEDIA.contains(&ext.as_str()) {
@@ -9873,7 +10004,7 @@ impl CraftApp {
                     | HitKind::ComboAnchor
                     | HitKind::QMove(_, _)
             );
-            if modal_open && !dialog_kind {
+            if modal_open && !dialog_kind && !matches!(kind, HitKind::Tool(ToolId::Settings)) {
                 continue;
             }
             let hov = self.man.hover(&rect);
@@ -10059,7 +10190,10 @@ impl CraftApp {
                         }
                     }
                     if clk && self.man.take_double() {
-                        self.do_row_act(RowAct::Details, id);
+                        // A running download opens its progress window (as
+                        // IDM does); anything else its details.
+                        let act = if self.tasks.contains_key(&id) { RowAct::ShowProgress } else { RowAct::Details };
+                        self.do_row_act(act, id);
                     }
                 }
                 HitKind::HdrCol(c) => {
@@ -10151,6 +10285,7 @@ impl CraftApp {
                                 self.add_overwrite = !self.add_overwrite
                             }
                             CheckId::GrabDepth => self.grab_depth = !self.grab_depth,
+                            CheckId::GrabStay => self.grab_stay = !self.grab_stay,
                             CheckId::WinOn => {
                                 self.speed_windows_on = !self.speed_windows_on;
                                 self.refresh_speed_limit();
