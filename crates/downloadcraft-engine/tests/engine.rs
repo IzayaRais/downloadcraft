@@ -479,12 +479,17 @@ async fn a_work_folder_keeps_the_partial_elsewhere() {
     let dl = Downloader::new(reqwest::Client::new()).config(quick());
     let job = Job::new(srv.url("/f"), &dest).size_hint(Some(3 * MIB as u64), true).work_dir(Some(work.clone()));
     let control = Arc::new(Control::default());
-    let c = control.clone();
+    let progress = Arc::new(Progress::default());
+    let (c, pr) = (control.clone(), progress.clone());
+    // Stop once some bytes have landed (not after a fixed time: on a busy
+    // machine that was either before the first byte or after the last).
     tokio::spawn(async move {
-        tokio::time::sleep(Duration::from_millis(800)).await;
+        while pr.downloaded() < 256 * 1024 {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
         c.cancel();
     });
-    let _ = dl.download(job.clone(), Arc::new(Progress::default()), control).await;
+    let _ = dl.download(job.clone(), progress, control).await;
     assert!(downloadcraft_engine::has_partial_in(&dest, Some(&work)));
     assert!(!downloadcraft_engine::has_partial(&dest), "nothing next to the destination");
     let out = get(&dl, job).await.unwrap();
