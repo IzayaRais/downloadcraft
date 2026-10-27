@@ -1501,6 +1501,20 @@
     return best;
   }
 
+  // The top-right control row (More, Full screen) of the Short on screen.
+  function shortsControlRow() {
+    let best = null;
+    let dist = Infinity;
+    const mid = window.innerHeight / 2;
+    for (const r of document.querySelectorAll("ytd-shorts-player-controls #right-controls, #shorts-player-controls #right-controls, ytd-reel-video-renderer #right-controls")) {
+      const q = r.getBoundingClientRect();
+      if (!q.width || q.bottom < 0 || q.top > window.innerHeight) continue;
+      const d = Math.abs(q.top - mid);
+      if (d < dist) { dist = d; best = r; }
+    }
+    return best;
+  }
+
   function placeInPlayer(btn, panel) {
     if (!btn) return false;
     const setArrow = (side) => {
@@ -1521,9 +1535,25 @@
       a.style.borderBottomColor = top ? "transparent" : T.border;
     };
     const player = ytPlayer();
-    // Shorts: a compact round button that opens on hover.
-    if (player && player.id === "shorts-player") btn.setAttribute("data-dc-compact", "");
-    else btn.removeAttribute("data-dc-compact");
+    // Shorts: a compact round button in the Short's own top control row,
+    // just left of its More (and Full screen) buttons. It opens on hover.
+    if (player && player.id === "shorts-player") {
+      btn.setAttribute("data-dc-compact", "");
+      const row = shortsControlRow();
+      if (row) {
+        btn.style.position = "relative";
+        btn.style.top = btn.style.right = btn.style.left = btn.style.bottom = "auto";
+        btn.style.width = "max-content";
+        btn.style.alignSelf = "center";
+        btn.style.margin = "0 4px";
+        if (btn.parentElement !== row || row.firstElementChild !== btn) row.insertBefore(btn, row.firstChild);
+        setArrow("top");
+        return true;
+      }
+    } else {
+      btn.removeAttribute("data-dc-compact");
+      btn.style.alignSelf = btn.style.margin = "";
+    }
     if(applySavedBarPosition(btn)){positionDraggedPanel(btn,panel);return true;}
     if (player) {
       btn.style.position = "absolute";
@@ -1732,6 +1762,9 @@
       :host([data-dc-compact]:not(:hover)) .bar:not(:focus-within) .label { display:none; }
       :host([data-dc-compact]:not(:hover)) .bar:not(:focus-within) .download { padding:0 4px; }
       :host([data-dc-compact]:not(:hover)) .bar:not(:focus-within) { padding:0 1px; }
+      :host([data-dc-compact]) .grip { display:none; }
+      /* Shorts: hidden while the feed scrolls, back for the next Short. */
+      :host([data-dc-scrolling]) .bar { opacity:0 !important; pointer-events:none; transition:opacity .1s ease; }
       button { all:unset;box-sizing:border-box;display:flex;align-items:center;justify-content:center;cursor:pointer;
         color:var(--fg);background:transparent;font:600 12.5px/1.2 system-ui,sans-serif; }
       button:hover { background:var(--hover); }
@@ -1795,6 +1828,22 @@
   let lastScrollWake = 0;
   try {
     window.addEventListener("scroll", () => {
+      if (onShorts()) {
+        try {
+          document.querySelectorAll("[data-dc-bar]").forEach((h) => {
+            h.setAttribute("data-dc-scrolling", "");
+            clearTimeout(h.__dcScrollT);
+            h.__dcScrollT = setTimeout(() => {
+              try {
+                h.removeAttribute("data-dc-scrolling");
+                // The next Short may have its own control row by now.
+                if (h.id === "dc-yt-btn") placeInPlayer(h, document.getElementById("dc-yt-panel"));
+              } catch (e) { /* gone */ }
+            }, 450);
+          });
+        } catch (e) { /* ignore */ }
+        return;
+      }
       const now = Date.now();
       if (now - lastScrollWake < 400) return;
       lastScrollWake = now;
@@ -3267,6 +3316,13 @@
       collectLinks();
       ensureUniversalButtons();
       refreshYouTube();
+    } else if (onShorts() && detectionOn && !document.getElementById("dc-yt-btn")) {
+      // YouTube redraws a Short's control row now and then, which takes the
+      // button with it: put it back (unless it was hidden for this video).
+      try {
+        const id = ytVideoId();
+        if (id && !dismissedVideos.has(dismissalKey(null, id))) refreshYouTube();
+      } catch (e) { /* ignore */ }
     }
   }, 1000);
   __dcTimers.push(watcher);
