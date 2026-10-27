@@ -471,7 +471,9 @@ async fn connections_spread_over_mirrors_and_bad_ones_are_dropped() {
 
 #[tokio::test]
 async fn a_work_folder_keeps_the_partial_elsewhere() {
-    let srv = Server::start(Behaviour { size: 3 * MIB, rate: 1024 * 1024, ..Default::default() }).await;
+    // Slow enough that four connections cannot finish before the cancel at
+    // 0.8 s (at 1 MiB/s each they sometimes did, leaving nothing to resume).
+    let srv = Server::start(Behaviour { size: 3 * MIB, rate: 512 * 1024, ..Default::default() }).await;
     let dest = tmp("workdir");
     let work = dest.parent().unwrap().join("scratch");
     let dl = Downloader::new(reqwest::Client::new()).config(quick());
