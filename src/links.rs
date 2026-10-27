@@ -576,7 +576,7 @@ impl LinksApp {
         let card = ui.available_rect_before_wrap();
         ui.painter().rect(card, 8.0, t.bg, Stroke::new(1.0, t.card_bd), egui::StrokeKind::Inside);
         let inner = card.shrink(1.0);
-        let widths = col_widths(&self.cols, inner.width() - CB_W - 10.0);
+        let widths = col_widths(&self.cols, inner.width() - CB_W - crate::app::SB_SPACE);
         let xs = {
             let mut x = inner.min.x + CB_W;
             let mut v = [0.0; 4];
@@ -653,14 +653,17 @@ impl LinksApp {
         let shift = ui.input(|i| i.modifiers.shift);
         let mut clicked: Option<usize> = None;
         let mut child = ui.new_child(egui::UiBuilder::new().max_rect(body));
-        egui::ScrollArea::vertical()
+        // Slim bars, always shown (as in the main list).
+        crate::app::modern_scrollbars(&mut child);
+        egui::ScrollArea::both()
             .id_salt("links-rows")
             .auto_shrink([false, false])
+            .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysVisible)
             .show_rows(&mut child, ROW_H, shown.len(), |ui, range| {
                 ui.spacing_mut().item_spacing.y = 0.0;
                 let time = ui.input(|i| i.time) as f32;
                 for &i in &shown[range] {
-                    let (r, resp) = ui.allocate_exact_size(Vec2::new(body.width(), ROW_H), Sense::click());
+                    let (r, resp) = ui.allocate_exact_size(Vec2::new(body.width() - crate::app::SB_SPACE, ROW_H), Sense::click());
                     let row = &self.rows[i];
                     let p = ui.painter();
                     if row.checked {

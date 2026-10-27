@@ -1405,11 +1405,39 @@ pub(crate) fn truncate_to_width(
     parts[..lo].concat() + "…"
 }
 
-/// Name cell painted with ZERO widgets (icon + filename + type via the
-/// painter only). egui labels always interact — even hover-only ones —
-/// which steals row hover/clicks from the text; painted text cannot.
-/// Layout follows `main_window.html` `.name-cell`: 20px tinted category mark,
-/// 11px title, 9px muted type underneath.
+/// Room an always-visible scroll bar takes beside or below its content
+/// (margin + bar + margin, see [`modern_scrollbars`]).
+pub(crate) const SB_SPACE: f32 = 12.0;
+
+/// Slim, rounded scroll bars that are always shown (IDM shows both bars on
+/// its lists; these keep that, without the heavy Windows look): a faint
+/// track, a handle that brightens on hover and takes the accent while
+/// dragged. Applies to the scroll areas this `ui` creates next.
+pub(crate) fn modern_scrollbars(ui: &mut egui::Ui) {
+    let st = ui.style_mut();
+    st.spacing.scroll = egui::style::ScrollStyle {
+        floating: false,
+        bar_width: 8.0,
+        handle_min_length: 28.0,
+        bar_inner_margin: 2.0,
+        bar_outer_margin: 2.0,
+        ..egui::style::ScrollStyle::solid()
+    };
+    let v = &mut st.visuals;
+    v.extreme_bg_color = pl().surface;
+    v.widgets.inactive.bg_fill = pl().dim.gamma_multiply(0.45);
+    v.widgets.hovered.bg_fill = pl().dim.gamma_multiply(0.8);
+    v.widgets.active.bg_fill = pl().primary;
+    for w in [&mut v.widgets.inactive, &mut v.widgets.hovered, &mut v.widgets.active] {
+        w.corner_radius = egui::CornerRadius::same(4);
+    }
+}
+
+/// Name cell painted with ZERO widgets (icon + filename via the painter
+/// only). egui labels always interact — even hover-only ones — which steals
+/// row hover/clicks from the text; painted text cannot. A tinted category
+/// mark and the file name on one line: the sidebar and the icon already say
+/// the category, a second line repeating it was noise.
 fn name_cell(p: &egui::Painter, rect: egui::Rect, icon: &str, fname: &str, cat: &str) {
     p.text(
         egui::pos2(rect.min.x + 17.0, rect.center().y),
@@ -1420,22 +1448,15 @@ fn name_cell(p: &egui::Painter, rect: egui::Rect, icon: &str, fname: &str, cat: 
     );
     let tx = rect.min.x + 32.0;
     let max_tw = (rect.max.x - 8.0 - tx).max(20.0);
-    let name = truncate_to_width(p, fname, egui::FontId::proportional(11.5), pl().txt, max_tw);
+    let name = truncate_to_width(p, fname, egui::FontId::proportional(12.0), pl().txt, max_tw);
     // The file name may be in any script, so it is drawn shaped.
     crate::shaped::draw(
         p,
-        egui::pos2(tx, rect.center().y - 8.0),
+        egui::pos2(tx, rect.center().y),
         egui::Align2::LEFT_CENTER,
         &name,
-        egui::FontId::proportional(11.5),
+        egui::FontId::proportional(12.0),
         pl().txt,
-    );
-    p.text(
-        egui::pos2(tx, rect.center().y + 9.0),
-        egui::Align2::LEFT_CENTER,
-        cat.to_owned(),
-        egui::FontId::proportional(9.0),
-        pl().dim,
     );
 }
 
@@ -6236,7 +6257,8 @@ impl eframe::App for CraftApp {
                     const ROW_H: f32 = 34.0;
                     const HDR_H: f32 = 22.0;
                     let cols = self.col_order.clone();
-                    let avail_w = ui.available_width();
+                    // The always-visible vertical bar keeps its own strip.
+                    let avail_w = ui.available_width() - SB_SPACE;
                     // The numeric columns keep their stored widths, but when the
                     // window is too narrow for them plus a readable Name column
                     // they give space back (down to their own minimums) instead
@@ -6362,15 +6384,19 @@ impl eframe::App for CraftApp {
                     // ---- body rows: manual geometry inside scroll content.
                     // Row screen rects come straight from layout, so manual
                     // hit-testing stays exact under scrolling ----
-                    let body_h = (ui.available_height() - 4.0).max(80.0);
+                    // Both bars always shown, below and beside the rows.
+                    modern_scrollbars(ui);
+                    let body_h = (ui.available_height() - 4.0 - SB_SPACE).max(80.0);
                     egui::ScrollArea::horizontal()
                         .id_salt("dl_h")
                         .auto_shrink([false, false])
+                        .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysVisible)
                         .show(ui, |ui| {
                             egui::ScrollArea::vertical()
                                 .id_salt("dl_v")
                                 .max_height(body_h)
                                 .auto_shrink([false, false])
+                                .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysVisible)
                                 .show(ui, |ui| {
                                     // Rows are flush: the list's rhythm comes
                                     // from ROW_H plus the faint row rule, not
