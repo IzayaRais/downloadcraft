@@ -75,5 +75,11 @@
   "Current Speed:": "বর্তমান গতি:",
   "Global Speed Cap:": "সর্বোচ্চ গতি:",
   "Unlimited": "সীমাহীন",
-  "Remember this path (category subfolder)": "এই ফোল্ডারটি মনে রাখুন (বিভাগের সাব-ফোল্ডার)"
+  "Remember this path (category subfolder)": "এই ফোল্ডারটি মনে রাখুন (বিভাগের সাব-ফোল্ডার)",
+  "Audio only": "শুধু অডিও",
+  "Same quality": "একই মান",
+  "Smaller file": "ছোট ফাইল",
+  "Convert": "রূপান্তর",
+  "Move to queue": "কিউতে সরান",
+  "Main": "প্রধান"
 }

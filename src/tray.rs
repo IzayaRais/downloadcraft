@@ -142,7 +142,24 @@ unsafe fn raise_existing(hwnd: isize) {
 
 pub fn set_hwnd(hwnd: isize) {
     if hwnd != 0 {
-        HWND.store(hwnd, Ordering::SeqCst);
+        if HWND.swap(hwnd, Ordering::SeqCst) != hwnd {
+            round_corners(hwnd);
+        }
+    }
+}
+
+/// Windows 11 rounded window corners (`DWMWA_WINDOW_CORNER_PREFERENCE` =
+/// 33, `DWMWCP_ROUND` = 2). The app paints its own frame, so Windows would
+/// otherwise keep square corners; Windows 10 ignores the request.
+fn round_corners(hwnd: isize) {
+    let pref: i32 = 2;
+    unsafe {
+        win32::DwmSetWindowAttribute(
+            hwnd,
+            33,
+            &pref as *const i32 as *const std::ffi::c_void,
+            std::mem::size_of::<i32>() as u32,
+        );
     }
 }
 

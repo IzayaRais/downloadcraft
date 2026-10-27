@@ -278,6 +278,9 @@ const COL_NUM_W: f32 = 24.0;
 const COL_DL_X: f32 = IN_R - 170.0;
 const COL_TOT_X: f32 = IN_R - 80.0;
 
+/// Part rows the card grows to; beyond this the table scrolls.
+const MAX_PART_ROWS: usize = 6;
+
 /// Card height with `n` part rows — 493 at the concept's six samples.
 fn card_h(n: usize) -> f32 {
     361.0 + TBL_STEP * n as f32
@@ -605,7 +608,9 @@ impl eframe::App for ProgressApp {
             // (Pause/Resume/Cancel, and Open file/folder + Close once the
             // transfer is done), so a finished download is not a dead end
             // even though the engine drops the part snapshot at the end.
-            Some(_) if parts > 0 && self.parts_open => card_h(parts),
+            // Six rows at most: more connections scroll inside the table
+            // instead of making the window taller.
+            Some(_) if parts > 0 && self.parts_open => card_h(parts.min(MAX_PART_ROWS)),
             Some(_) => PG_PART_HEAD_H,
         };
         let want_h = match crate::model::work_area_rect(ctx) {
@@ -702,13 +707,12 @@ impl ProgressApp {
     fn tabs(&mut self, ui: &mut egui::Ui, o: egui::Pos2) {
         let ctx = ui.ctx().clone();
         let p = ui.painter().clone();
-        let trough = at(o, SEG_X, SEG_Y, SEG_W, SEG_H);
-        p.rect_filled(trough, 6.0, pl().dm_trough);
-        p.rect_stroke(
-            trough,
-            6.0,
-            egui::Stroke::new(1.0_f32, pl().dm_box_bd),
-            egui::StrokeKind::Inside,
+        // No trough: the tabs sit on the window's own background, with a
+        // hairline under the row and an accent underline under the open tab.
+        let base_y = o.y + SEG_Y + SEG_H;
+        p.line_segment(
+            [egui::pos2(o.x + 1.0, base_y - 0.5), egui::pos2(o.x + PG_W - 1.0, base_y - 0.5)],
+            egui::Stroke::new(1.0_f32, pl().dm_line),
         );
         let inner = SEG_W - 2.0 * SEG_PAD;
         let tw = (inner - TAB_GAP * (TABS.len() as f32 - 1.0)) / TABS.len() as f32;
@@ -718,21 +722,16 @@ impl ProgressApp {
             let b = ui.interact(r, egui::Id::new(("pg-tab", i)), egui::Sense::click());
             let sel = self.tab as usize == i;
             if sel {
-                // The pill casts a soft shadow on the trough, so it reads as
-                // raised rather than as a painted block.
                 p.rect_filled(
-                    r.translate(egui::vec2(0.0, 1.0)),
-                    5.0,
-                    egui::Color32::from_black_alpha(90),
+                    egui::Rect::from_min_max(egui::pos2(r.min.x + 6.0, base_y - 2.0), egui::pos2(r.max.x - 6.0, base_y)),
+                    1.0,
+                    DM_ACC2,
                 );
-                dm_gradient(&p, r, 5.0, DM_ACC, DM_ACC2);
-            } else if b.hovered() {
-                p.rect_filled(r, 5.0, pl().dm_hover);
             }
             if b.hovered() {
                 ctx.set_cursor_icon(egui::CursorIcon::PointingHand);
             }
-            let col = if sel { egui::Color32::WHITE } else { pl().dm_lbl };
+            let col = if sel { pl().dm_txt } else if b.hovered() { pl().dm_txt.gamma_multiply(0.8) } else { pl().dm_lbl };
             let font = if sel { semi(11.0) } else { reg(11.0) };
             let gw = p
                 .layout_no_wrap((*name).to_string(), font.clone(), col)
@@ -1223,13 +1222,44 @@ impl ProgressApp {
             }
         } else if frac > 0.0 {
             let w = (PROG_W * frac).max(PROG_H);
-            dm_gradient_x(
-                &p,
-                egui::Rect::from_min_size(track.min, egui::vec2(w, PROG_H)),
-                4.0,
-                DM_ACC,
-                DM_ACC2,
-            );
+            let fill = egui::Rect::from_min_size(track.min, egui::vec2(w, PROG_H));
+            let live = self.snap.live && !matches!(item.status, Status::Paused | Status::Completed | Status::Failed(_));
+            if live {
+                // Soft glow under the filled part.
+                p.rect_filled(fill.expand(2.0), 6.0, DM_ACC2.gamma_multiply(0.18));
+            }
+            dm_gradient_x(&p, fill, 4.0, DM_ACC, DM_ACC2);
+            if live {
+                // Diagonal stripes that keep moving and a light sheen that
+                // sweeps across: the bar reads as busy even when the
+                // percentage creeps.
+                let t = ui.input(|i| i.time) as f32;
+                let clip = p.with_clip_rect(fill.intersect(p.clip_rect()));
+                let step = 12.0;
+                let off = (t * 28.0) % step;
+                let mut x = fill.min.x - PROG_H - step + off;
+                while x < fill.max.x {
+                    clip.add(egui::Shape::convex_polygon(
+                        vec![
+                            egui::pos2(x, fill.max.y),
+                            egui::pos2(x + step / 2.0, fill.max.y),
+                            egui::pos2(x + step / 2.0 + PROG_H, fill.min.y),
+                            egui::pos2(x + PROG_H, fill.min.y),
+                        ],
+                        egui::Color32::from_white_alpha(34),
+                        egui::Stroke::NONE,
+                    ));
+                    x += step;
+                }
+                let sw = (w * 0.35).clamp(24.0, 120.0);
+                let sx = fill.min.x - sw + ((t / 1.6).fract()) * (w + sw * 2.0);
+                let half = sw / 2.0;
+                let left = egui::Rect::from_min_size(egui::pos2(sx, fill.min.y), egui::vec2(half, PROG_H));
+                let right = egui::Rect::from_min_size(egui::pos2(sx + half, fill.min.y), egui::vec2(half, PROG_H));
+                dm_gradient_x(&clip, left, 0.0, egui::Color32::TRANSPARENT, egui::Color32::from_white_alpha(70));
+                dm_gradient_x(&clip, right, 0.0, egui::Color32::from_white_alpha(70), egui::Color32::TRANSPARENT);
+                ui.ctx().request_repaint_after(Duration::from_millis(40));
+            }
         }
         ui.interact(
             egui::Rect::from_min_max(
@@ -1570,10 +1600,11 @@ impl ProgressApp {
             let bar_h = (rows_rect.height() * rows_rect.height() / table_h).max(24.0);
             let t = self.scroll / max_scroll;
             let y = rows_top + (rows_rect.height() - bar_h) * t;
+            // The same thin, see-through handle as the main list's bars.
             p.rect_filled(
-                egui::Rect::from_min_size(egui::pos2(o.x + PG_W - 7.0, y), egui::vec2(3.0, bar_h)),
+                egui::Rect::from_min_size(egui::pos2(o.x + PG_W - 7.0, y), egui::vec2(4.0, bar_h)),
                 2.0,
-                pl().dm_box_bd,
+                pl().dm_dim.gamma_multiply(if rows.hovered() { 0.55 } else { 0.30 }),
             );
         }
     }

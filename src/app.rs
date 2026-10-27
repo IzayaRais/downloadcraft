@@ -444,6 +444,17 @@ pub(crate) const MI_TUNE: &str = "\u{e429}";
 /// Page with a folded corner (table "Other"/unknown rows).
 pub(crate) const MI_INSERT_FILE: &str = "\u{e24d}";
 /// Collapsed / expanded affordances for the sidebar sections.
+const MI_OPEN: &str = "\u{e89e}";
+const MI_FOLDER_OPEN: &str = "\u{e2c8}";
+const MI_INFO: &str = "\u{e88e}";
+const MI_REPLAY: &str = "\u{e042}";
+const MI_TRANSFORM: &str = "\u{e428}";
+const MI_UNARCHIVE: &str = "\u{e169}";
+const MI_PLAYLIST_ADD: &str = "\u{e03b}";
+const MI_LINK: &str = "\u{e157}";
+const MI_REFRESH: &str = "\u{e5d5}";
+const MI_VERIFIED: &str = "\u{e8e8}";
+const MI_DELETE_FOREVER: &str = "\u{e92b}";
 pub(crate) const MI_CHEVRON_RIGHT: &str = "\u{e5cc}";
 pub(crate) const MI_EXPAND_MORE: &str = "\u{e5cf}";
 /// Arrow onto a tray (sidebar "Downloading").
@@ -1405,31 +1416,40 @@ pub(crate) fn truncate_to_width(
     parts[..lo].concat() + "…"
 }
 
-/// Room an always-visible scroll bar takes beside or below its content
-/// (margin + bar + margin, see [`modern_scrollbars`]).
-pub(crate) const SB_SPACE: f32 = 12.0;
+/// Room kept free beside the rows for the thin scroll bar that floats over
+/// their right edge (see [`modern_scrollbars`]).
+pub(crate) const SB_SPACE: f32 = 8.0;
 
-/// Slim, rounded scroll bars that are always shown (IDM shows both bars on
-/// its lists; these keep that, without the heavy Windows look): a faint
-/// track, a handle that brightens on hover and takes the accent while
-/// dragged. Applies to the scroll areas this `ui` creates next.
+/// Thin, see-through scroll bars that are always shown (IDM shows both bars
+/// on its lists; these keep that without the heavy look): no track, a 4 px
+/// soft handle over the content that widens a little under the pointer and
+/// takes the accent while dragged. Applies to the scroll areas this `ui`
+/// creates next.
 pub(crate) fn modern_scrollbars(ui: &mut egui::Ui) {
     let st = ui.style_mut();
     st.spacing.scroll = egui::style::ScrollStyle {
-        floating: false,
-        bar_width: 8.0,
+        floating: true,
+        bar_width: 7.0,
+        floating_width: 4.0,
+        floating_allocated_width: 0.0,
         handle_min_length: 28.0,
         bar_inner_margin: 2.0,
         bar_outer_margin: 2.0,
-        ..egui::style::ScrollStyle::solid()
+        foreground_color: false,
+        dormant_background_opacity: 0.0,
+        active_background_opacity: 0.0,
+        interact_background_opacity: 0.0,
+        dormant_handle_opacity: 1.0,
+        active_handle_opacity: 1.0,
+        interact_handle_opacity: 1.0,
     };
     let v = &mut st.visuals;
-    v.extreme_bg_color = pl().surface;
-    v.widgets.inactive.bg_fill = pl().dim.gamma_multiply(0.45);
-    v.widgets.hovered.bg_fill = pl().dim.gamma_multiply(0.8);
+    v.extreme_bg_color = egui::Color32::TRANSPARENT;
+    v.widgets.inactive.bg_fill = pl().dim.gamma_multiply(0.30);
+    v.widgets.hovered.bg_fill = pl().dim.gamma_multiply(0.55);
     v.widgets.active.bg_fill = pl().primary;
     for w in [&mut v.widgets.inactive, &mut v.widgets.hovered, &mut v.widgets.active] {
-        w.corner_radius = egui::CornerRadius::same(4);
+        w.corner_radius = egui::CornerRadius::same(2);
     }
 }
 
@@ -1759,6 +1779,9 @@ enum HitKind {
     /// The divider between a column and its right neighbour.
     ResizeCol(SortCol),
     CtxItem(RowAct, u64),
+    /// A right-click menu row that opens a submenu (0 = Convert, 1 = Move
+    /// to queue): hovering shows it, a click keeps the menu open.
+    CtxSub(u8),
     Btn(ButtonId),
     Check(CheckId),
     Slider(SliderId, f64, f64, bool), // id, min, max, log
@@ -1774,6 +1797,33 @@ enum HitKind {
 enum ResizeCap {
     /// Dragging the divider on the right edge of `col`.
     Col { col: SortCol, start_x: f32, start_w: f32 },
+}
+
+/// One line of the right-click menu.
+enum CtxEntry {
+    Item { label: String, icon: &'static str, hint: &'static str, act: RowAct, danger: bool },
+    Sep,
+    /// Opens `items` (label, short tag, action) to the side.
+    Sub { label: String, icon: &'static str, key: u8, items: Vec<(String, &'static str, RowAct)> },
+}
+
+/// A menu row: icon, label, and a shortcut hint or a submenu chevron.
+fn ctx_row(p: &egui::Painter, r: egui::Rect, icon: &str, label: &str, hint: &str, col: egui::Color32, chevron: bool) {
+    p.text(egui::pos2(r.min.x + 17.0, r.center().y), egui::Align2::CENTER_CENTER, icon, crate::fonts::icon(15.0), col);
+    let right = if chevron {
+        p.text(egui::pos2(r.max.x - 12.0, r.center().y), egui::Align2::CENTER_CENTER, MI_CHEVRON_RIGHT, crate::fonts::icon(15.0), pl().dim);
+        r.max.x - 24.0
+    } else if !hint.is_empty() {
+        let g = p.layout_no_wrap(hint.to_string(), egui::FontId::proportional(10.5), pl().dim);
+        let w = g.size().x;
+        p.galley(egui::pos2(r.max.x - 10.0 - w, r.center().y - g.size().y / 2.0), g, pl().dim);
+        r.max.x - 18.0 - w
+    } else {
+        r.max.x - 8.0
+    };
+    let tx = r.min.x + 32.0;
+    let shown = truncate_to_width(p, label, egui::FontId::proportional(12.0), col, (right - tx).max(20.0));
+    crate::shaped::draw(p, egui::pos2(tx, r.center().y), egui::Align2::LEFT_CENTER, &shown, egui::FontId::proportional(12.0), col);
 }
 
 #[derive(Clone, Copy)]
@@ -1870,6 +1920,8 @@ pub struct CraftApp {
     playlist_rx: Option<(String, std::sync::mpsc::Receiver<Result<(String, Vec<(String, String)>), String>>)>,
     /// The "ZIP: pick files" window and its worker's messages.
     zip_pick: Option<ZipPick>,
+    /// Which submenu of the right-click menu is open (see HitKind::CtxSub).
+    ctx_sub: Option<u8>,
     zip_rx: Option<std::sync::mpsc::Receiver<ZipMsg>>,
     /// ffmpeg conversions report here (one line each when they end).
     conv_tx: std::sync::mpsc::Sender<String>,
@@ -2082,6 +2134,7 @@ impl CraftApp {
             sync_tx: None,
             playlist_rx: None,
             zip_pick: None,
+            ctx_sub: None,
             zip_rx: None,
             conv_tx: conv_tx_init,
             conv_rx: conv_rx_init,
@@ -3083,40 +3136,6 @@ impl CraftApp {
             };
             let _ = tx.send(line);
         });
-    }
-
-    /// Row context-menu item definitions: (label, action).
-    fn ctx_items(&self) -> Vec<(String, Option<RowAct>)> {
-        use RowAct::*;
-        let mut v = self.ctx_items_base();
-        if !self.queues.is_empty() {
-            v.push(("".into(), None));
-            v.push(("Move to queue: Main".into(), Some(MoveToQueue(0))));
-            for (i, q) in self.queues.iter().enumerate().take(20) {
-                v.push((format!("Move to queue: {}", q.name), Some(MoveToQueue(i as u8 + 1))));
-            }
-        }
-        v
-    }
-
-    fn ctx_items_base(&self) -> Vec<(String, Option<RowAct>)> {
-        use RowAct::*;
-        vec![
-            ("Details".into(), Some(Details)),
-            ("".into(), None),
-            ("Resume / Retry".into(), Some(Resume)),
-            ("Pause".into(), Some(Pause)),
-            ("Redownload".into(), Some(Redownload)),
-            ("Verify checksum".into(), Some(VerifyChecksum)),
-            ("".into(), None),
-            ("Copy URL".into(), Some(CopyUrl)),
-            ("Refresh download address".into(), Some(RefreshAddress)),
-            ("Open file location".into(), Some(OpenFolder)),
-            ("Open file".into(), Some(OpenFile)),
-            ("".into(), None),
-            ("Remove".into(), Some(Remove)),
-            ("Remove + delete file".into(), Some(RemoveFile)),
-        ]
     }
 
     /// On-demand integrity check for a finished file with a stored SHA-256.
@@ -6158,14 +6177,12 @@ impl eframe::App for CraftApp {
             .show(ctx, |ui| {
                 let avail = ui.available_size();
                 let (outer, _) = ui.allocate_exact_size(avail, egui::Sense::hover());
-                ui.painter().rect(
-                    outer,
-                    RADIUS,
-                    pl().central_bg,
-                    egui::Stroke::new(1.0_f32, pl().card_bd),
-                    egui::StrokeKind::Inside,
-                );
-                // Everything below lives inside the card's 1px border.
+                // Two cards: the toolbar on its own, the list below it. Their
+                // backgrounds are placed first and sized once the toolbar has
+                // laid out (it can wrap to two lines on a narrow window).
+                let toolbar_bg = ui.painter().add(egui::Shape::Noop);
+                let list_bg = ui.painter().add(egui::Shape::Noop);
+                // Everything below lives inside the cards' 1px border.
                 let mut card = ui.new_child(
                     egui::UiBuilder::new()
                         .max_rect(outer.shrink(1.0))
@@ -6202,13 +6219,26 @@ impl eframe::App for CraftApp {
                     }
                 });
                 ui.add_space(6.0);
-                // toolbar hairline (`.toolbar { border-bottom }`)
-                let (tr, _) = ui.allocate_exact_size(
-                    egui::vec2(ui.available_width(), 1.0),
-                    egui::Sense::hover(),
+                // The toolbar card ends here; a gap, then the list card.
+                let split = ui.cursor().min.y;
+                let card_shape = |r: egui::Rect| {
+                    egui::Shape::Rect(egui::epaint::RectShape::new(
+                        r,
+                        RADIUS,
+                        pl().central_bg,
+                        egui::Stroke::new(1.0_f32, pl().card_bd),
+                        egui::StrokeKind::Inside,
+                    ))
+                };
+                ui.painter().set(
+                    toolbar_bg,
+                    card_shape(egui::Rect::from_min_max(outer.min, egui::pos2(outer.max.x, split + 1.0))),
                 );
-                ui.painter().rect_filled(tr, 0.0, pl().card_bd);
-                ui.add_space(5.0);
+                ui.painter().set(
+                    list_bg,
+                    card_shape(egui::Rect::from_min_max(egui::pos2(outer.min.x, split + 11.0), outer.max)),
+                );
+                ui.add_space(16.0);
                 // A link found on the clipboard is surfaced on the toolbar's
                 // Add URL button (see `add_url_button`), not as a banner here:
                 // the banner pushed the whole list down by a row.
@@ -8574,48 +8604,6 @@ impl CraftApp {
     }
 
     /// Row context-menu rows for `render_popup`.
-    fn ctx_rows(&self, id: u64) -> Vec<(String, Option<HitKind>)> {
-        let mut items = self.ctx_items();
-        if let Some(d) = self.downloads.iter().find(|d| d.id == id) {
-            let ext = std::path::Path::new(&d.filename)
-                .extension()
-                .map(|e| e.to_string_lossy().to_ascii_lowercase())
-                .unwrap_or_default();
-            let mut extra: Vec<(String, Option<RowAct>)> = Vec::new();
-            if ext == "zip" && d.url.starts_with("http") {
-                extra.push(("ZIP: pick files to download…".into(), Some(RowAct::ZipPick)));
-            }
-            const MEDIA: &[&str] = &["mp4", "mkv", "webm", "mov", "avi", "flv", "wmv", "m4v", "ts", "3gp", "mp3", "m4a", "aac", "opus", "ogg", "wav", "flac", "wma"];
-            if matches!(d.status, Status::Completed) && MEDIA.contains(&ext.as_str()) {
-                if ext != "mp3" {
-                    extra.push(("Convert to MP3 (audio)".into(), Some(RowAct::Convert(0))));
-                }
-                if !["mp3", "m4a", "aac", "opus", "ogg", "wav", "flac", "wma"].contains(&ext.as_str()) {
-                    if ext != "mp4" {
-                        extra.push(("Convert to MP4".into(), Some(RowAct::Convert(1))));
-                    }
-                    extra.push(("Make a smaller MP4 (720p)".into(), Some(RowAct::Convert(2))));
-                }
-            }
-            if !extra.is_empty() {
-                let at = items.iter().position(|(_, a)| matches!(a, Some(RowAct::CopyUrl))).unwrap_or(items.len());
-                extra.push(("".into(), None));
-                for (k, e) in extra.into_iter().enumerate() {
-                    items.insert(at + k, e);
-                }
-            }
-        }
-        items
-            .into_iter()
-            .map(|(label, act)| {
-                (
-                    crate::i18n::t(&label).to_string(),
-                    act.map(|a| HitKind::CtxItem(a, id)),
-                )
-            })
-            .collect()
-    }
-
     fn frac_to_val(frac: f64, min: f64, max: f64, log: bool) -> f64 {
         let f = frac.clamp(0.0, 1.0);
         if log {
@@ -9162,9 +9150,168 @@ impl CraftApp {
         self.render_popup(ctx, "drop_menu", pos, 240.0, rows);
     }
 
+    /// What the right-click menu offers for row `id`, grouped, with icons,
+    /// the shortcuts the list really has, and two submenus.
+    fn ctx_entries(&self, id: u64, shift: bool) -> Vec<CtxEntry> {
+        use RowAct::*;
+        let t = |s: &str| crate::i18n::t(s).to_string();
+        let item = |label: &str, icon: &'static str, hint: &'static str, act: RowAct| CtxEntry::Item {
+            label: t(label),
+            icon,
+            hint,
+            act,
+            danger: false,
+        };
+        let Some(d) = self.downloads.iter().find(|d| d.id == id) else { return Vec::new() };
+        let ext = std::path::Path::new(&d.filename)
+            .extension()
+            .map(|e| e.to_string_lossy().to_ascii_lowercase())
+            .unwrap_or_default();
+        let mut v = vec![
+            item("Open", MI_OPEN, "Enter", OpenFile),
+            item("Open folder", MI_FOLDER_OPEN, "", OpenFolder),
+            item("Details", MI_INFO, "", Details),
+            CtxEntry::Sep,
+            item("Resume / Retry", MI_PLAY, "Space", Resume),
+            item("Pause", MI_PAUSE, "", Pause),
+            item("Redownload", MI_REPLAY, "", Redownload),
+        ];
+        const MEDIA: &[&str] = &["mp4", "mkv", "webm", "mov", "avi", "flv", "wmv", "m4v", "ts", "3gp", "mp3", "m4a", "aac", "opus", "ogg", "wav", "flac", "wma"];
+        const AUDIO: &[&str] = &["mp3", "m4a", "aac", "opus", "ogg", "wav", "flac", "wma"];
+        if matches!(d.status, Status::Completed) && MEDIA.contains(&ext.as_str()) {
+            let mut sub = Vec::new();
+            if ext != "mp3" {
+                sub.push((t("Audio only"), "MP3", Convert(0)));
+            }
+            if !AUDIO.contains(&ext.as_str()) {
+                if ext != "mp4" {
+                    sub.push((t("Same quality"), "MP4", Convert(1)));
+                }
+                sub.push((t("Smaller file"), "720p", Convert(2)));
+            }
+            if !sub.is_empty() {
+                v.push(CtxEntry::Sub { label: t("Convert"), icon: MI_TRANSFORM, key: 0, items: sub });
+            }
+        }
+        if ext == "zip" && d.url.starts_with("http") {
+            v.push(item("ZIP: pick files…", MI_UNARCHIVE, "", ZipPick));
+        }
+        if !self.queues.is_empty() {
+            let mut sub = vec![(t("Main"), "", MoveToQueue(0))];
+            for (i, q) in self.queues.iter().enumerate().take(20) {
+                sub.push((q.name.clone(), "", MoveToQueue(i as u8 + 1)));
+            }
+            v.push(CtxEntry::Sub { label: t("Move to queue"), icon: MI_PLAYLIST_ADD, key: 1, items: sub });
+        }
+        v.push(CtxEntry::Sep);
+        v.push(item("Copy URL", MI_LINK, "", CopyUrl));
+        v.push(item("Refresh download address", MI_REFRESH, "", RefreshAddress));
+        v.push(item("Verify checksum", MI_VERIFIED, "", VerifyChecksum));
+        v.push(CtxEntry::Sep);
+        // One remove row: holding Shift turns it into "remove and delete
+        // the file" (the old menu had both as separate rows).
+        v.push(if shift {
+            CtxEntry::Item { label: t("Remove + delete file"), icon: MI_DELETE_FOREVER, hint: "Shift", act: RemoveFile, danger: true }
+        } else {
+            CtxEntry::Item { label: t("Remove"), icon: MI_DELETE, hint: "Del", act: Remove, danger: true }
+        });
+        v
+    }
+
     fn render_ctx_menu(&mut self, ctx: &egui::Context, id: u64, pos: egui::Pos2) {
-        let rows = self.ctx_rows(id);
-        self.render_popup(ctx, "ctx_menu", pos, 230.0, rows);
+        const W: f32 = 214.0;
+        const ROW: f32 = 26.0;
+        const SEP: f32 = 9.0;
+        const PAD: f32 = 5.0;
+        let shift = ctx.input(|i| i.modifiers.shift);
+        let entries = self.ctx_entries(id, shift);
+        let h: f32 = entries.iter().map(|e| if matches!(e, CtxEntry::Sep) { SEP } else { ROW }).sum::<f32>() + PAD * 2.0 + 2.0;
+        let scr = ctx.screen_rect();
+        let pos = egui::pos2(pos.x.min(scr.max.x - W - 8.0).max(8.0), pos.y.min(scr.max.y - h - 8.0).max(8.0));
+        let mut sub_at: Option<(egui::Rect, Vec<(String, &'static str, RowAct)>)> = None;
+        let open_sub = self.ctx_sub;
+        egui::Area::new(egui::Id::new("ctx_menu"))
+            .order(egui::Order::Foreground)
+            .fixed_pos(pos)
+            .show(ctx, |ui| {
+                let (rect, _) = ui.allocate_exact_size(egui::vec2(W, h), egui::Sense::hover());
+                let p = ui.painter();
+                p.rect(rect, 10.0, pl().modal_bg, egui::Stroke::new(1.0_f32, pl().modal_bd), egui::StrokeKind::Inside);
+                let mut y = rect.min.y + PAD + 1.0;
+                for e in entries {
+                    match e {
+                        CtxEntry::Sep => {
+                            p.hline(
+                                (rect.min.x + PAD + 6.0)..=(rect.max.x - PAD - 6.0),
+                                y + SEP / 2.0,
+                                egui::Stroke::new(1.0_f32, pl().card_bd),
+                            );
+                            y += SEP;
+                        }
+                        CtxEntry::Item { label, icon, hint, act, danger } => {
+                            let r = egui::Rect::from_min_size(egui::pos2(rect.min.x + PAD, y), egui::vec2(W - PAD * 2.0, ROW));
+                            let hov = self.man.hover(&r);
+                            if hov {
+                                p.rect_filled(r, 6.0, pl().surface_lt);
+                                self.ctx_sub = None;
+                            }
+                            let col = if danger { pl().error } else if hov { pl().txt } else { pl().txt.gamma_multiply(0.85) };
+                            ctx_row(p, r, icon, &label, hint, col, false);
+                            self.hits.push((HitKind::CtxItem(act, id), r));
+                            y += ROW;
+                        }
+                        CtxEntry::Sub { label, icon, key, items } => {
+                            let r = egui::Rect::from_min_size(egui::pos2(rect.min.x + PAD, y), egui::vec2(W - PAD * 2.0, ROW));
+                            let on = self.man.hover(&r) || open_sub == Some(key);
+                            if on {
+                                p.rect_filled(r, 6.0, pl().surface_lt);
+                            }
+                            ctx_row(p, r, icon, &label, "", pl().txt, true);
+                            self.hits.push((HitKind::CtxSub(key), r));
+                            if open_sub == Some(key) {
+                                sub_at = Some((r, items));
+                            }
+                            y += ROW;
+                        }
+                    }
+                }
+            });
+        // The open submenu, beside its row (to the left when there is no
+        // room on the right).
+        if let Some((row, items)) = sub_at {
+            const SW: f32 = 196.0;
+            let sh = items.len() as f32 * ROW + PAD * 2.0 + 2.0;
+            let mut x = row.max.x + PAD + 2.0;
+            if x + SW > scr.max.x - 8.0 {
+                x = (pos.x - SW - 2.0).max(8.0);
+            }
+            let y = (row.min.y - PAD - 1.0).min(scr.max.y - sh - 8.0).max(8.0);
+            egui::Area::new(egui::Id::new("ctx_sub_menu"))
+                .order(egui::Order::Foreground)
+                .fixed_pos(egui::pos2(x, y))
+                .show(ctx, |ui| {
+                    let (rect, _) = ui.allocate_exact_size(egui::vec2(SW, sh), egui::Sense::hover());
+                    let p = ui.painter();
+                    p.rect(rect, 10.0, pl().modal_bg, egui::Stroke::new(1.0_f32, pl().modal_bd), egui::StrokeKind::Inside);
+                    let mut y = rect.min.y + PAD + 1.0;
+                    for (label, tag, act) in items {
+                        let r = egui::Rect::from_min_size(egui::pos2(rect.min.x + PAD, y), egui::vec2(SW - PAD * 2.0, ROW));
+                        let hov = self.man.hover(&r);
+                        if hov {
+                            p.rect_filled(r, 6.0, pl().surface_lt);
+                        }
+                        let mut tx = r.min.x + 10.0;
+                        if !tag.is_empty() {
+                            p.text(egui::pos2(tx, r.center().y), egui::Align2::LEFT_CENTER, tag, egui::FontId::proportional(10.0), pl().primary);
+                            tx += 36.0;
+                        }
+                        let name = truncate_to_width(p, &label, egui::FontId::proportional(12.0), pl().txt, r.max.x - tx - 8.0);
+                        crate::shaped::draw(p, egui::pos2(tx, r.center().y), egui::Align2::LEFT_CENTER, &name, egui::FontId::proportional(12.0), if hov { pl().txt } else { pl().txt.gamma_multiply(0.85) });
+                        self.hits.push((HitKind::CtxItem(act, id), r));
+                        y += ROW;
+                    }
+                });
+        }
     }
 
     /// Match recorded hit rects (reverse = topmost first) against manual
@@ -9214,6 +9361,7 @@ impl CraftApp {
                 kind,
                 HitKind::MenuItem(_)
                     | HitKind::CtxItem(_, _)
+                    | HitKind::CtxSub(_)
                     | HitKind::Btn(_)
                     | HitKind::Check(_)
                     | HitKind::Slider(..)
@@ -9240,6 +9388,7 @@ impl CraftApp {
                     HitKind::MenuBtn(m) => format!("menu:{m}"),
                     HitKind::MenuItem(a) => format!("menuitem:{a}"),
                     HitKind::CtxItem(_, id) => format!("ctx:#{id}"),
+                    HitKind::CtxSub(n) => format!("ctxsub:{n}"),
                     HitKind::Btn(_) => "btn".to_string(),
                     HitKind::Check(_) => "check".to_string(),
                     HitKind::Slider(..) => "slider".to_string(),
@@ -9461,7 +9610,17 @@ impl CraftApp {
                     if clk {
                         fired_ctx = true;
                         self.ctx_menu = None;
+                        self.ctx_sub = None;
                         self.do_row_act(a, id);
+                    }
+                }
+                HitKind::CtxSub(n) => {
+                    if hov {
+                        self.ctx_sub = Some(n);
+                    }
+                    if clk {
+                        fired_ctx = true;
+                        self.ctx_sub = Some(n);
                     }
                 }
                 HitKind::Btn(b) => {
