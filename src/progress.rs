@@ -278,6 +278,28 @@ const COL_NUM_W: f32 = 24.0;
 const COL_DL_X: f32 = IN_R - 170.0;
 const COL_TOT_X: f32 = IN_R - 80.0;
 
+/// A soft white highlight that fades out to both sides. Its own mesh: the
+/// shared gradient helper paints opaque colours, which turned the fading
+/// ends of this highlight into a black band.
+fn sheen(p: &egui::Painter, r: egui::Rect) {
+    let clear = egui::Color32::from_white_alpha(0);
+    let mid = egui::Color32::from_white_alpha(80);
+    let xs = [r.min.x, r.center().x, r.max.x];
+    let cols = [clear, mid, clear];
+    let mut mesh = egui::Mesh::default();
+    for (x, c) in xs.iter().zip(cols) {
+        for y in [r.min.y, r.max.y] {
+            mesh.vertices.push(egui::epaint::Vertex { pos: egui::pos2(*x, y), uv: egui::epaint::WHITE_UV, color: c });
+        }
+    }
+    // Two quads: left half (0,1,2,3) and right half (2,3,4,5).
+    for q in [0u32, 2] {
+        mesh.add_triangle(q, q + 1, q + 2);
+        mesh.add_triangle(q + 1, q + 3, q + 2);
+    }
+    p.add(egui::Shape::mesh(mesh));
+}
+
 /// Part rows the card grows to; beyond this the table scrolls.
 const MAX_PART_ROWS: usize = 6;
 
@@ -1253,11 +1275,7 @@ impl ProgressApp {
                 }
                 let sw = (w * 0.35).clamp(24.0, 120.0);
                 let sx = fill.min.x - sw + ((t / 1.6).fract()) * (w + sw * 2.0);
-                let half = sw / 2.0;
-                let left = egui::Rect::from_min_size(egui::pos2(sx, fill.min.y), egui::vec2(half, PROG_H));
-                let right = egui::Rect::from_min_size(egui::pos2(sx + half, fill.min.y), egui::vec2(half, PROG_H));
-                dm_gradient_x(&clip, left, 0.0, egui::Color32::TRANSPARENT, egui::Color32::from_white_alpha(70));
-                dm_gradient_x(&clip, right, 0.0, egui::Color32::from_white_alpha(70), egui::Color32::TRANSPARENT);
+                sheen(&clip, egui::Rect::from_min_size(egui::pos2(sx, fill.min.y), egui::vec2(sw, PROG_H)));
                 ui.ctx().request_repaint_after(Duration::from_millis(40));
             }
         }

@@ -81,5 +81,10 @@
   "Smaller file": "ছোট ফাইল",
   "Convert": "রূপান্তর",
   "Move to queue": "কিউতে সরান",
-  "Main": "প্রধান"
+  "Main": "প্রধান",
+  "Queues": "কিউ",
+  "Grabber": "গ্র্যাবার",
+  "Queues: start, stop, schedule (also in Tasks)": "কিউ: শুরু, বন্ধ, সময়সূচি (Tasks মেনুতেও আছে)",
+  "Start queue": "কিউ শুরু",
+  "Stop queue": "কিউ বন্ধ"
 }
