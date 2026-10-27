@@ -1243,6 +1243,7 @@ dependencies = [
  "ab_glyph",
  "anyhow",
  "arboard",
+ "cc",
  "chrono",
  "clap",
  "dirs 5.0.1",

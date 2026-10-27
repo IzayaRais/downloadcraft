@@ -18,6 +18,12 @@ fn main() {
     println!("cargo:rerun-if-changed=Cargo.toml");
     println!("cargo:rerun-if-changed=VERSION");
 
+    // zig (the Linux release packages) lacks libgcc's CPU feature table,
+    // which UnRAR's feature checks read: link an empty one.
+    if std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("linux") && built_with_zig() {
+        println!("cargo:rerun-if-changed=build/cpu_model.c");
+        cc::Build::new().file("build/cpu_model.c").compile("dc_cpu_model");
+    }
     if std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("windows") {
         if let Err(e) = windows_resources() { println!("cargo:warning=windows resources not embedded: {e}"); }
         // MinGW: the RAR reader is C++ and asks for `-lstdc++ -lpthread`,
@@ -167,4 +173,9 @@ fn static_cxx_runtime() -> Result<(), String> {
     }
     println!("cargo:rustc-link-search=native={}", dir.display());
     Ok(())
+}
+
+/// cargo-zigbuild points the C compiler variables at its zig wrappers.
+fn built_with_zig() -> bool {
+    std::env::vars().any(|(k, v)| (k == "CC" || k == "TARGET_CC" || k.starts_with("CC_")) && v.contains("zig"))
 }

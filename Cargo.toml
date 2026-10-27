@@ -58,6 +58,10 @@ windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_System_
 [target.'cfg(unix)'.dependencies]
 shlex = "2"
 
+[build-dependencies]
+# Only for the Linux zig builds (see build.rs).
+cc = "1"
+
 [dev-dependencies]
 sevenz-rust2 = { version = "0.24", default-features = false, features = ["compress", "util"] }
 rcgen = "0.13"
