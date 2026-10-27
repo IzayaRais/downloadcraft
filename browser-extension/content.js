@@ -1440,7 +1440,18 @@
       window.removeEventListener("pointerup",onUp,true);
       window.removeEventListener("pointercancel",onCancel,true);
       if(cancel){if(moved){barPosition=previous;positionRevision++;syncDismissControls();}}
-      else if(moved){suppressClick=true;setTimeout(()=>{suppressClick=false;},0);if(!document.fullscreenElement)rememberBarPosition();ev.preventDefault();ev.stopPropagation();}
+      else if(moved){
+        suppressClick=true;setTimeout(()=>{suppressClick=false;},0);
+        if(!document.fullscreenElement)rememberBarPosition();
+        ev.preventDefault();ev.stopPropagation();
+        if(onShorts() && host.id==="dc-yt-btn"){
+          const row=shortsControlRow();
+          const q=row && row.getBoundingClientRect();
+          const home=q && ev.clientX>=q.left-60 && ev.clientX<=q.right+20 && ev.clientY>=q.top-24 && ev.clientY<=q.bottom+24;
+          setShortsBarFree(!home);
+          if(home)placeInPlayer(host,document.getElementById("dc-yt-panel"));
+        }
+      }
     };
     const onUp=ev=>finish(ev,false);
     const onCancel=ev=>finish(ev,true);
@@ -1501,6 +1512,17 @@
     return best;
   }
 
+  // Dragged out of a Short's control row: stays where it was dropped on
+  // Shorts too (dropping it back on the row returns it there).
+  let shortsBarFree = false;
+  try {
+    chrome.storage.local.get({ shortsBarFree: false }, (r) => { if (!chrome.runtime.lastError) shortsBarFree = !!(r && r.shortsBarFree); });
+  } catch (e) { /* stays in the row */ }
+  function setShortsBarFree(v) {
+    shortsBarFree = v;
+    try { chrome.storage.local.set({ shortsBarFree: v }); } catch (e) { /* this page only */ }
+  }
+
   // The top-right control row (More, Full screen) of the Short on screen.
   function shortsControlRow() {
     let best = null;
@@ -1517,6 +1539,8 @@
 
   function placeInPlayer(btn, panel) {
     if (!btn) return false;
+    // Being dragged: the pointer decides where it goes.
+    if (activeBarDrag === btn) return true;
     const setArrow = (side) => {
       if (!panel) return;
       const a = panel.querySelector('[data-dc-p="arrow"]');
@@ -1539,8 +1563,10 @@
     // just left of its More (and Full screen) buttons. It opens on hover.
     if (player && player.id === "shorts-player") {
       btn.setAttribute("data-dc-compact", "");
-      const row = shortsControlRow();
+      const row = shortsBarFree && barPosition ? null : shortsControlRow();
       if (row) {
+        // One button per row: a previous Short's button never stays beside it.
+        row.querySelectorAll("[data-dc-bar]").forEach((x) => { if (x !== btn) { if (x.__dcClose) x.__dcClose.remove(); x.remove(); } });
         btn.style.position = "relative";
         btn.style.top = btn.style.right = btn.style.left = btn.style.bottom = "auto";
         btn.style.width = "max-content";
@@ -1762,7 +1788,6 @@
       :host([data-dc-compact]:not(:hover)) .bar:not(:focus-within) .label { display:none; }
       :host([data-dc-compact]:not(:hover)) .bar:not(:focus-within) .download { padding:0 4px; }
       :host([data-dc-compact]:not(:hover)) .bar:not(:focus-within) { padding:0 1px; }
-      :host([data-dc-compact]) .grip { display:none; }
       /* Shorts: hidden while the feed scrolls, back for the next Short. */
       :host([data-dc-scrolling]) .bar { opacity:0 !important; pointer-events:none; transition:opacity .1s ease; }
       button { all:unset;box-sizing:border-box;display:flex;align-items:center;justify-content:center;cursor:pointer;
@@ -1837,7 +1862,7 @@
               try {
                 h.removeAttribute("data-dc-scrolling");
                 // The next Short may have its own control row by now.
-                if (h.id === "dc-yt-btn") placeInPlayer(h, document.getElementById("dc-yt-panel"));
+                if (h.id === "dc-yt-btn" && h.isConnected && document.getElementById("dc-yt-btn") === h) placeInPlayer(h, document.getElementById("dc-yt-panel"));
               } catch (e) { /* gone */ }
             }, 450);
           });
