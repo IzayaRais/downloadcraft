@@ -445,6 +445,7 @@ pub(crate) const MI_TUNE: &str = "\u{e429}";
 pub(crate) const MI_INSERT_FILE: &str = "\u{e24d}";
 /// Collapsed / expanded affordances for the sidebar sections.
 const MI_OPEN: &str = "\u{e89e}";
+const MI_ARROW_DOWN: &str = "\u{e5db}";
 const MI_CHECK: &str = "\u{e5ca}";
 /// Popup-menu label prefixes: a ticked choice, and an unticked one in the
 /// same group (indented to line up with the ticked one).
@@ -6079,6 +6080,16 @@ impl eframe::App for CraftApp {
                     );
                     let hov = self.man.hover(&rest);
                     let t = ctx.animate_bool_with_time(egui::Id::new("update_chip"), hov, 0.22);
+                    // Blink for the first seconds after an update is found,
+                    // so it is noticed; then it rests.
+                    let now = ui.input(|i| i.time);
+                    let since = ctx.data_mut(|d| *d.get_temp_mut_or_insert_with(egui::Id::new("update_chip_since"), || now));
+                    let blink = if now - since < 6.0 && !hov {
+                        ctx.request_repaint_after(std::time::Duration::from_millis(50));
+                        0.5 + 0.5 * ((now - since) as f32 * 5.0).sin()
+                    } else {
+                        0.0
+                    };
                     let label = p.layout_no_wrap(
                         "Update".to_owned(),
                         crate::fonts::semi(10.5),
@@ -6090,16 +6101,23 @@ impl eframe::App for CraftApp {
                         egui::vec2(w, 28.0),
                     );
                     p.rect_filled(chip, 14.0, wash(pl().txt, if hov { 20 } else { 12 }));
+                    if blink > 0.0 {
+                        p.rect_filled(chip, 14.0, pl().primary.gamma_multiply(0.35 * blink));
+                        p.rect_stroke(chip, 14.0, egui::Stroke::new(1.5_f32, pl().primary.gamma_multiply(blink)), egui::StrokeKind::Inside);
+                    }
+                    // The whole arrow (head included) from the icon font: the
+                    // hand-drawn strokes lost their head at this size.
                     let ib = egui::Rect::from_min_size(
                         egui::pos2(chip.left() + 7.0, cy - 7.0),
                         egui::Vec2::splat(14.0),
                     );
-                    let s = ib.width() / 24.0;
-                    let m = |x: f32, y: f32| egui::pos2(ib.min.x + x * s, ib.min.y + y * s);
-                    let st = egui::Stroke::new((2.0 * s).max(1.0), pl().primary);
-                    p.line_segment([m(12.0, 3.5), m(12.0, 13.5)], st);
-                    p.line_segment([m(7.5, 9.0), m(12.0, 13.5)], st);
-                    p.line_segment([m(12.0, 13.5), m(16.5, 9.0)], st);
+                    p.text(
+                        egui::pos2(chip.left() + 14.0, cy),
+                        egui::Align2::CENTER_CENTER,
+                        MI_ARROW_DOWN,
+                        crate::fonts::icon(16.0),
+                        pl().primary,
+                    );
                     if t > 0.01 {
                         p.galley(
                             egui::pos2(ib.right() + 5.0, cy - label.size().y / 2.0),
@@ -6120,14 +6138,30 @@ impl eframe::App for CraftApp {
                     right = chip.left() - 8.0;
                 }
 
-                // ---- search: rounded pill with the magnifier inside, no
-                // second inner box (`.search-box`) ----
+                // ---- search: a round magnifier at rest; pointing at it opens
+                // the box with the cursor in it, leaving it closes it again
+                // (it stays open while it holds a search) ----
+                const SEARCH_W: f32 = 176.0;
+                let search_id = egui::Id::new("search");
+                let focused = ui.memory(|m| m.has_focus(search_id));
+                // Hover on the open box's whole width while it is open, so
+                // the pointer can move onto the text without closing it.
+                let open_w = ctx.data(|d| d.get_temp::<f32>(egui::Id::new("search_w"))).unwrap_or(28.0);
+                let hot = egui::Rect::from_min_size(egui::pos2(right - open_w, cy - 14.0), egui::vec2(open_w, 28.0));
+                let hov = self.man.hover(&hot);
+                let open = hov || !self.search.is_empty();
+                let t = ctx.animate_bool_with_time(egui::Id::new("search_open"), open, 0.18);
+                let w = 28.0 + t * (SEARCH_W - 28.0);
+                ctx.data_mut(|d| d.insert_temp(egui::Id::new("search_w"), w));
+                if open && !focused && t > 0.6 {
+                    ui.memory_mut(|m| m.request_focus(search_id));
+                } else if !open && focused && t < 0.4 {
+                    ui.memory_mut(|m| m.surrender_focus(search_id));
+                }
                 let pill = egui::Rect::from_min_size(
-                    egui::pos2(right - 176.0, cy - 14.0),
-                    egui::vec2(176.0, 28.0),
+                    egui::pos2(right - w, cy - 14.0),
+                    egui::vec2(w, 28.0),
                 );
-                let focused = ui.memory(|m| m.has_focus(egui::Id::new("search")));
-                let hov = self.man.hover(&pill);
                 if focused {
                     // 3 px accent glow, where the concept uses box-shadow.
                     p.rect_stroke(
@@ -6148,29 +6182,32 @@ impl eframe::App for CraftApp {
                     egui::StrokeKind::Inside,
                 );
                 p.text(
-                    egui::pos2(pill.left() + 17.5, cy),
+                    egui::pos2(pill.left() + 14.0 + 3.5 * t, cy),
                     egui::Align2::CENTER_CENTER,
                     MI_SEARCH.to_string(),
-                    crate::fonts::icon(11.0),
-                    pl().dim,
+                    crate::fonts::icon(if t > 0.5 { 11.0 } else { 14.0 }),
+                    if hov { pl().txt } else { pl().dim },
                 );
-                let inner = egui::Rect::from_min_max(
-                    egui::pos2(pill.left() + 30.0, pill.top() + 4.0),
-                    egui::pos2(pill.right() - 10.0, pill.bottom() - 4.0),
-                );
-                let mut fui = ui.new_child(
-                    egui::UiBuilder::new()
-                        .max_rect(inner)
-                        .layout(egui::Layout::left_to_right(egui::Align::Center)),
-                );
-                mtext_bare(
-                    &mut fui,
-                    "search",
-                    &mut self.search,
-                    "Search in the List",
-                    inner.width(),
-                    crate::fonts::reg(10.5),
-                );
+                if t > 0.35 {
+                    let inner = egui::Rect::from_min_max(
+                        egui::pos2(pill.left() + 30.0, pill.top() + 4.0),
+                        egui::pos2(pill.right() - 10.0, pill.bottom() - 4.0),
+                    );
+                    let mut fui = ui.new_child(
+                        egui::UiBuilder::new()
+                            .max_rect(inner)
+                            .layout(egui::Layout::left_to_right(egui::Align::Center)),
+                    );
+                    fui.set_clip_rect(inner);
+                    mtext_bare(
+                        &mut fui,
+                        "search",
+                        &mut self.search,
+                        "Search in the List",
+                        inner.width(),
+                        crate::fonts::reg(10.5),
+                    );
+                }
                 self.hits.push((HitKind::Field("search"), pill));
                 live.push(pill);
 
