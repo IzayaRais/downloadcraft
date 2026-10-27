@@ -517,7 +517,7 @@ impl EngineOpts {
         // P2: pooled keepalive connections (segmented/chunked/HLS/DASH open
         // dozens of short requests per file) + TCP keepalives so throttled
         // CDN idle sockets don't die mid-range. H2/IPv6 stay OFF until a
-        // live CDN proof run clears them (see P2 in docs/ENGINE_ROADMAP.md).
+        // live CDN proof run clears them (see docs/ROADMAP.md).
         // Captured headers ride on every request, and on a redirect reqwest
         // strips only Authorization/Cookie: an x-* token or Origin would
         // follow a redirect to any host. Refuse redirects that leave the

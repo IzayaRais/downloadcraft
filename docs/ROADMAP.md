@@ -1,0 +1,47 @@
+# Download Craft: what is still open
+
+The one roadmap. It lists only what is not done yet. Everything else from the
+earlier engine, IDM-parity and extension roadmaps is built and in the code.
+
+Updated 28 Oct 2026, branch `feat/dynamic-engine`.
+
+**Priority:** 🔴 do before the next release · 🟠 worth doing soon · 🟢 when there is time.
+
+## Before the next release
+
+| | Item | Notes |
+|---|---|---|
+| 🔴 | Raise the version | `Cargo.toml` and `VERSION` still say 0.9.8, the same as the published release, so no copy would see the new release as newer. Use 0.9.9 or 0.10.0 and tag the release to match. |
+| 🔴 | Release the one-click updater | Copies already out there (0.9.8) only download the zip. Their users update by hand once, to the release that contains the updater; after that, Update now replaces the files and restarts. Attach the portable zip from `scripts/package.py` as usual: GitHub adds the checksum the updater checks. |
+| 🔴 | Firefox add-on ID | `browser-extension/manifest-firefox.json` and the Firefox host manifest in `src/app.rs` use `send-to-download-craft@example`. Change both to an address you own before the first AMO upload: AMO fixes the ID for good. |
+| 🟠 | Store IDs for Edge and Opera | Once the extension is listed there, add the IDs those stores assign to `STORE_EXTENSION_IDS` in `src/app.rs` (see `docs/STORE_LISTING.md`). |
+
+## Not tested against the real thing yet
+
+| | Item | Notes |
+|---|---|---|
+| 🟠 | NTLM / Kerberos logins | Built on Windows' WinHTTP and tested with a local login server; never run against a real company (NTLM/Negotiate) server. |
+| 🟠 | PAC proxy scripts | Tested with Windows' auto-detect only; no PAC server was available. |
+| 🟠 | Browser hand-off on real sites | Extension tests and the native host pass, and Facebook and YouTube were used day to day; pause/resume, POST downloads, Alt-click and page-fetch have not all been clicked through on real sites. |
+
+## Engine and protocols
+
+| | Item | Notes |
+|---|---|---|
+| 🟢 | SFTP | Needs an SSH library; do not hand-write SSH. |
+| 🟢 | BitTorrent / magnet links | Needs a torrent library; do not hand-write the protocol. |
+| 🟢 | More error recovery | IDM handles many rare server faults ("restart types"). Add them as real downloads turn them up; the common ones (416, 429/503 with Retry-After, expired links, HTTP/2, IPv6, NTLM hand-over, FTP behind NAT) are done. |
+
+## Browser extension
+
+| | Item | Notes |
+|---|---|---|
+| 🟠 | Instagram reels | Instagram CDN files are recognised, but there is no extractor like the Facebook one (reel id, the visible player, its own qualities). |
+| 🟢 | Permission audit | Check every permission in `manifest.json` is still used before a store review; the reasons are in `docs/STORE_LISTING.md`. |
+| 🟢 | Welcome page per browser | The page covers private-window access; wording for Edge / Opera / Firefox and an "app too old" state are not there. |
+| 🟢 | Binary native messaging | IDM sends binary frames; JSON works and is fast enough, so only if a measurement says otherwise. |
+
+## Decided against
+
+- A native overlay panel over the video player (IDM's): the in-page button works on every system and is kept.
+- DRM-protected streams (Widevine, FairPlay): never.
