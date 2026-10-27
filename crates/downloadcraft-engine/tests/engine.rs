@@ -311,7 +311,10 @@ async fn a_slow_connection_does_not_hold_the_download_back() {
 
 #[tokio::test]
 async fn a_server_without_ranges_still_works() {
-    let srv = Server::start(Behaviour { size: 3 * MIB, no_ranges: true, ..Default::default() }).await;
+    // A paced server: unpaced, a fast OS lets every extra connection's full
+    // reply land in socket buffers before the engine drops it, and `served`
+    // counts what the server wrote, not what the engine read.
+    let srv = Server::start(Behaviour { size: 3 * MIB, no_ranges: true, rate: 4 * MIB as u64, ..Default::default() }).await;
     let dest = tmp("noranges");
     let progress = Arc::new(Progress::default());
     let job = Job::new(srv.url("/f"), &dest).size_hint(Some(3 * MIB as u64), true);
