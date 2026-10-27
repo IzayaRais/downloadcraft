@@ -1353,7 +1353,9 @@
     const parent=document.documentElement;
     if(host.parentNode!==parent)parent.appendChild(host);
     const width=Math.max(0,Math.min(barWidth(host),window.innerWidth-16));
-    host.style.position="fixed";host.style.width=width+"px";
+    // Sized by its content: a fixed width cut the bar off when the drag
+    // handle appeared on hover (or a compact bar opened).
+    host.style.position="fixed";host.style.width="max-content";
     host.style.right="auto";host.style.bottom="auto";
     host.style.left=(8+barPosition.x*Math.max(0,window.innerWidth-width-16))+"px";
     host.style.top=(8+barPosition.y*Math.max(0,window.innerHeight-44))+"px";
@@ -1518,8 +1520,11 @@
       a.style.borderRightColor = top ? "transparent" : T.border;
       a.style.borderBottomColor = top ? "transparent" : T.border;
     };
-    if(applySavedBarPosition(btn)){positionDraggedPanel(btn,panel);return true;}
     const player = ytPlayer();
+    // Shorts: a compact round button that opens on hover.
+    if (player && player.id === "shorts-player") btn.setAttribute("data-dc-compact", "");
+    else btn.removeAttribute("data-dc-compact");
+    if(applySavedBarPosition(btn)){positionDraggedPanel(btn,panel);return true;}
     if (player) {
       btn.style.position = "absolute";
       // Shorts keep their own More / Full screen buttons in the top-right
@@ -1722,6 +1727,11 @@
         /* See-through until pointed at: the video stays visible. */
         opacity:.32;transition:opacity .15s ease; }
       :host(:hover) .bar, .bar:focus-within, :host([data-dc-awake]) .bar { opacity:1; }
+      /* Compact (Shorts): just the round arrow; pointing at it opens the
+         whole bar. */
+      :host([data-dc-compact]:not(:hover)) .bar:not(:focus-within) .label { display:none; }
+      :host([data-dc-compact]:not(:hover)) .bar:not(:focus-within) .download { padding:0 4px; }
+      :host([data-dc-compact]:not(:hover)) .bar:not(:focus-within) { padding:0 1px; }
       button { all:unset;box-sizing:border-box;display:flex;align-items:center;justify-content:center;cursor:pointer;
         color:var(--fg);background:transparent;font:600 12.5px/1.2 system-ui,sans-serif; }
       button:hover { background:var(--hover); }
@@ -1767,7 +1777,15 @@
   // A new button (a new video) and a scroll show the bar fully for a few
   // seconds, so people notice it, before it fades to see-through.
   const BAR_AWAKE_MS = 3000;
+  // Shorts: only the first one shows the bar fully; scrolling on to the
+  // next ones leaves it see-through until pointed at.
+  let shortsWoken = false;
+  const onShorts = () => /^\/shorts\//.test(location.pathname);
   function wakeBar(host) {
+    if (onShorts()) {
+      if (shortsWoken) return;
+      shortsWoken = true;
+    }
     try {
       host.setAttribute("data-dc-awake", "1");
       clearTimeout(host.__dcAwakeT);
@@ -2396,7 +2414,7 @@
       host.style.display=shown ? "block" : "none";
       if(activeBarDrag===host || applySavedBarPosition(host))return;
       host.style.position="fixed";host.style.right="auto";host.style.bottom="auto";
-      host.style.width=Math.max(0,width)+"px";
+      host.style.width="max-content";host.style.maxWidth=Math.max(0,r.width-16)+"px";
       host.style.left=Math.max(8,Math.min(vw-width-8,r.right-width-8))+"px";
       host.style.top=Math.max(8,Math.min(vh-36,r.top+8))+"px";
     });
