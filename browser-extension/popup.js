@@ -1,3 +1,12 @@
+// Static popup text in the browser's language (_locales); English stays
+// when a language has no entry.
+try {
+  document.querySelectorAll("[data-i18n]").forEach((el) => {
+    const m = chrome.i18n && chrome.i18n.getMessage(el.getAttribute("data-i18n"));
+    if (m) el.textContent = m;
+  });
+} catch (e) { /* keep English */ }
+
 const $ = (id) => document.getElementById(id);
 
 // Promise-style calls (`await api.*` below) work in both engines: Firefox

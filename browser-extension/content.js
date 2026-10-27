@@ -1579,7 +1579,7 @@
           if (!hit.has(p.st.url) || !p.item || !p.item.el.isConnected) continue;
           if (p.item.el.getAttribute("data-dc-queued")) continue;
           p.item.el.setAttribute("data-dc-queued", "1");
-          p.item.fmtEl.textContent = "✓ Queued";
+          p.item.fmtEl.textContent = dcT("queued", "✓ Queued");
           p.item.el.title = "Already in the download queue";
           p.item.el.onclick = (ev) => {
             ev.stopPropagation();
@@ -1800,6 +1800,10 @@
   };
   function dcThemeMode() { return DCUI ? DCUI.dcThemeMode() : "dark"; }
   function dcSetTheme(mode) { if (DCUI) DCUI.dcSetTheme(mode); }
+  // Text in the browser's language (_locales), English when there is none.
+  function dcT(key, english) {
+    try { return (chrome.i18n && chrome.i18n.getMessage(key)) || english; } catch (e) { return english; }
+  }
   function dcPanelTokens() { return (DCUI && DCUI.panelTokens(dcThemeMode())) || DC_FALLBACK; }
   function paintDcPanel(root) { if (root && DCUI) DCUI.paintDcPanel(root); }
   function allPanels() { try { return [...document.querySelectorAll("[data-dc-panel]")]; } catch (e) { return []; } }
@@ -1927,7 +1931,7 @@
     sendIcon.setAttribute("data-dc-p", "icon");
     const sendTxt = document.createElement("div");
     sendTxt.style.cssText = "flex:1;min-width:0;";
-    sendTxt.appendChild(dcText(s.sendLabel || "Send video link to app", "text", "font-size:11px;"));
+    sendTxt.appendChild(dcText(s.sendLabel || dcT("panelSendLink", "Send video link to app"), "text", "font-size:11px;"));
     sendTxt.appendChild(dcText(s.hint || "", "muted", "font-size:9px;margin-top:1px;line-height:1.35;"));
     sendRow.appendChild(sendIcon);
     sendRow.appendChild(sendTxt);
@@ -2001,7 +2005,7 @@
     const gridHead = document.createElement("div");
     gridHead.style.cssText = "display:flex;align-items:center;justify-content:space-between;margin-bottom:6px;";
     const badge = dcText("", "badge", "font-size:9px;padding:2px 6px;border-radius:8px;");
-    gridHead.appendChild(dcText("Video Files", "muted", "font-size:10px;font-weight:600;letter-spacing:.5px;text-transform:uppercase;"));
+    gridHead.appendChild(dcText(dcT("panelVideoFiles", "Video Files"), "muted", "font-size:10px;font-weight:600;letter-spacing:.5px;text-transform:uppercase;"));
     gridHead.appendChild(badge);
     const grid = document.createElement("div");
     grid.style.cssText = "display:grid;grid-template-columns:1fr 1fr;gap:5px;";
@@ -2015,7 +2019,7 @@
     chipsSec.style.cssText = "padding:8px 12px;";
     const chipsHead = document.createElement("div");
     chipsHead.style.cssText = "display:flex;align-items:center;justify-content:space-between;margin-bottom:6px;";
-    chipsHead.appendChild(dcText("Other Files", "muted", "font-size:10px;font-weight:600;letter-spacing:.5px;text-transform:uppercase;"));
+    chipsHead.appendChild(dcText(dcT("panelOtherFiles", "Other Files"), "muted", "font-size:10px;font-weight:600;letter-spacing:.5px;text-transform:uppercase;"));
     const chipsWrap = document.createElement("div");
     chipsWrap.style.cssText = "display:flex;gap:6px;flex-wrap:wrap;";
     chipsSec.appendChild(chipsHead);
@@ -2043,11 +2047,11 @@
       };
       return b;
     };
-    const primary = mkBtn(s.primaryLabel || "Download", "btnp", () => {
+    const primary = mkBtn(s.primaryLabel || dcT("panelDownload", "Download"), "btnp", () => {
       hidePanels();
       if (s.onPrimary) s.onPrimary();
     }, ICON_DOWN);
-    const cancel = mkBtn("Cancel", "btn", () => {
+    const cancel = mkBtn(dcT("panelCancel", "Cancel"), "btn", () => {
       hidePanels();
       if (s.onClose) s.onClose();
     }, null);
@@ -2056,8 +2060,8 @@
       if (s.onClose) s.onClose();
     }, ICON_CLOSE);
     close.style.flex = "0 0 36px";
-    close.title = "Close";
-    close.setAttribute("aria-label", "Close");
+    close.title = dcT("panelClose", "Close");
+    close.setAttribute("aria-label", close.title);
     actions.appendChild(primary);
     actions.appendChild(cancel);
     actions.appendChild(close);
@@ -2423,7 +2427,7 @@
       oldBtn.remove();
       if (oldPanel) oldPanel.remove();
     }
-    const btn = videoDownloadBar("Choose video quality in Download Craft");
+    const btn = videoDownloadBar(dcT("barChooseQuality", "Choose video quality in Download Craft"));
     btn.id = "dc-yt-btn";
     btn.dataset.vid = info.videoId;
     btn.dataset.gen = String(GEN);
@@ -2615,7 +2619,7 @@
       if (api.panel.style.display !== "none") { api.hide(); return; }
       if (ready) { open(); return; }
       ytOpenWhenReady = info.videoId;
-      barBusy(btn, "Resolving…");
+      barBusy(btn, dcT("busyResolving", "Resolving…"));
       waitFor(() => {
         refreshYouTube();
         const cur = document.getElementById("dc-yt-btn");
@@ -2634,7 +2638,7 @@
     addDismissControl(btn,key,api.panel);
     if (ytOpenWhenReady === info.videoId) {
       if (ready) { ytOpenWhenReady = ""; setTimeout(open, 0); }
-      else barBusy(btn, "Resolving…");
+      else barBusy(btn, dcT("busyResolving", "Resolving…"));
     }
   }
 
@@ -2734,7 +2738,7 @@
         // Skip tiny preview thumbnails.
         const r = v.getBoundingClientRect ? v.getBoundingClientRect() : null;
         if (r && (r.width < 120 || r.height < 70)) continue;
-        const pill = videoDownloadBar("Download this video with Download Craft");
+        const pill = videoDownloadBar(dcT("barDownloadVideo", "Download this video with Download Craft"));
         pill.setAttribute("data-dc-pill", "1");
         pill.dataset.gen = String(GEN);
         pill.style.position = "absolute";
@@ -2769,7 +2773,7 @@
             if (pill.__dcBusy) return;
             const src = String((v && (v.currentSrc || v.src)) || "");
             const pick = (items) => bestSniffed(items, { streamPlayer: /^blob:/i.test(src) || !!(v && v.srcObject) });
-            barBusy(pill, "Capturing…");
+            barBusy(pill, dcT("busyCapturing", "Capturing…"));
             waitFor(() => sniffedNow().then(pick), (best) => {
               barBusy(pill, null);
               if (best) {
@@ -2819,7 +2823,7 @@
       res: "",
       size: "",
       format: "MP4",
-      hint: "Pick a quality below, or send the link as-is.",
+      hint: dcT("panelHint", "Pick a quality below, or send the link as-is."),
       onSendLink: () => sendDownload(location.href, fname, null, null, null, null, first.dur || null),
       onPrimary: () => {
         const it = api.selected();
@@ -2885,7 +2889,7 @@
       if (!rows.length && !order.missing) rows.push(...data.rows);
       return rows.length ? { info, data, rows } : null;
     };
-    barBusy(pill, "Resolving…");
+    barBusy(pill, dcT("busyResolving", "Resolving…"));
     waitFor(gather, (got) => {
       barBusy(pill, null);
       if (!got) {

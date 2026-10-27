@@ -3851,6 +3851,7 @@ impl CraftApp {
             log_key: item.id.to_string(),
             mirrors: item.mirrors.clone(),
             http2: false,
+            any_ip: false,
             digest: Default::default(),
         };
         let shared2 = shared.clone();

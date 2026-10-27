@@ -30,7 +30,7 @@ How it was built:
 | 2.5 | ✅ | Site logins (host pattern → user/password, password encrypted with DPAPI) |
 | 2.6 | ✅ | Segmented FTP with resume, and FTPS: `ftpes://` (explicit) and `ftps://` (implicit on 990), data connections encrypted too, several encrypted connections at once. Servers behind NAT that announce a private address are handled |
 | 2.7 | ✅ | Temporary folder setting; moved across drives at the end |
-| 2.8 | ◐ | Added: HTTP/2 retry, rename on a fallback name, NTLM/Negotiate hand-over on 401, FTP servers that announce a private address or skip TLS close_notify. The long tail of IDM's recovery paths stays open-ended |
+| 2.8 | ◐ | Added: HTTP/2 retry, rename on a fallback name, NTLM/Negotiate hand-over on 401, a retry allowing IPv6 after a failed lookup or an unreachable host, plain-language messages for redirect loops and bad certificates, FTP servers that announce a private address or skip TLS close_notify. (416, 429/503 with Retry-After and expired links were already handled.) IDM's long tail stays open-ended |
 | 2.9 | ✅ | Log tab in the progress window (`logs/<id>.log`) |
 | 2.10 | ✅ | "Refresh download address": opens the page, the next capture of the same size continues the file |
 | 3.1 | ✅ | Named queues with their own limits and schedules; "Move to queue" in the row menu |
@@ -50,7 +50,7 @@ How it was built:
 | 6.3 | ✅ | `docs/STORE_LISTING.md`: texts, permission reasons, privacy policy, per-store steps |
 | 6.4 | ✅ | Opera reads Chrome's host key, which the app registers at every start; store IDs can be allowed through `STORE_EXTENSION_IDS` |
 | 7.1 | ✅ | Optional sounds for finished and failed downloads |
-| 7.2 | ◐ | App: language files (`lang/<code>.json`), built-in Bengali, picker in Settings → Appearance; the toolbar, sidebar, row menu, Settings and the File Info / progress / complete dialogs use it. Extension: `_locales` (English, Bengali) for its name, description and right-click menu. The page panels and the popup are still English |
+| 7.2 | ✅ | App: language files (`lang/<code>.json`), built-in Bengali, picker in Settings → Appearance; the main window, Settings and the File Info / progress / complete dialogs use it. Extension: `_locales` (English, Bengali) for its name, menu, popup and in-page download panels. More languages are a file each |
 | 7.3 | ✅ | Speed graph in the progress window |
 | 7.4 | ✅ | Statistics (today, this month) |
 | 7.5 | ✅ | Links and files can be dropped on the main window and the basket. Dropping on the tray icon is not possible: Windows does not deliver drops to notification-area icons (IDM uses a floating drop target, which the basket is) |

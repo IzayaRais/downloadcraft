@@ -1,6 +1,101 @@
 {
-  "extName": { "message": "Download Craft-এ পাঠান" },
-  "extDescription": { "message": "ডাউনলোড আর ভিডিও Download Craft-এ পাঠায় — অথবা ব্রাউজারেই নামিয়ে নেয়।" },
-  "menuDownload": { "message": "Download Craft দিয়ে ডাউনলোড করুন" },
-  "menuDownloadAll": { "message": "সব লিংক Download Craft দিয়ে ডাউনলোড করুন" }
+  "extName": {
+    "message": "Download Craft-এ পাঠান"
+  },
+  "extDescription": {
+    "message": "ডাউনলোড আর ভিডিও Download Craft-এ পাঠায় — অথবা ব্রাউজারেই নামিয়ে নেয়।"
+  },
+  "menuDownload": {
+    "message": "Download Craft দিয়ে ডাউনলোড করুন"
+  },
+  "menuDownloadAll": {
+    "message": "সব লিংক Download Craft দিয়ে ডাউনলোড করুন"
+  },
+  "busyResolving": {
+    "message": "খোঁজা হচ্ছে…"
+  },
+  "busyCapturing": {
+    "message": "ধরা হচ্ছে…"
+  },
+  "barChooseQuality": {
+    "message": "Download Craft-এ ভিডিওর মান বাছুন"
+  },
+  "barDownloadVideo": {
+    "message": "ভিডিওটি Download Craft দিয়ে ডাউনলোড করুন"
+  },
+  "panelHint": {
+    "message": "নিচ থেকে মান বাছুন, অথবা লিংকটাই পাঠান।"
+  },
+  "panelSendLink": {
+    "message": "ভিডিওর লিংক অ্যাপে পাঠান"
+  },
+  "panelVideoFiles": {
+    "message": "ভিডিও ফাইল"
+  },
+  "panelOtherFiles": {
+    "message": "অন্যান্য ফাইল"
+  },
+  "panelDownload": {
+    "message": "ডাউনলোড"
+  },
+  "panelCancel": {
+    "message": "বাতিল"
+  },
+  "panelClose": {
+    "message": "বন্ধ করুন"
+  },
+  "queued": {
+    "message": "✓ কিউতে যোগ হয়েছে"
+  },
+  "popCapture": {
+    "message": "ব্রাউজারের ডাউনলোড ধরুন"
+  },
+  "popChecking": {
+    "message": "দেখা হচ্ছে…"
+  },
+  "popDeep": {
+    "message": "গভীর ভিডিও খোঁজ"
+  },
+  "popDownloads": {
+    "message": "ডাউনলোড"
+  },
+  "popVideoHint": {
+    "message": "পেজে ভিডিও খুঁজে প্লেয়ারে ডাউনলোড বার দেখায়।"
+  },
+  "popCaptureHint": {
+    "message": "প্রতিটি ডাউনলোড Download Craft-এ পাঠায়।"
+  },
+  "popHideBubble": {
+    "message": "ব্রাউজারের ডাউনলোড বাবল লুকান"
+  },
+  "popMinSize": {
+    "message": "এর চেয়ে ছোট ফাইল বাদ দিন (KB)"
+  },
+  "popNeverSites": {
+    "message": "এই সাইটগুলো থেকে কখনো ধরবেন না"
+  },
+  "popDeepHint": {
+    "message": "লুকানো স্ট্রিম খুঁজতে নামহীন রেসপন্সের প্রথম 4 KB পড়ে।"
+  },
+  "popSaveFilters": {
+    "message": "ফিল্টার সংরক্ষণ"
+  },
+  "popSend": {
+    "message": "পাঠান"
+  },
+  "popSettings": {
+    "message": "সেটিংস"
+  },
+  "popRestoreButtons": {
+    "message": "লুকানো ভিডিও বোতাম আবার দেখান"
+  },
+  "popVideoDetection": {
+    "message": "ভিডিও খোঁজা"
+  },
+  "popVideos": {
+    "message": "ভিডিও"
+  },
+  "popBubbleHint": {
+    "message": "যখন ধরা চালু এবং অ্যাপ সংযুক্ত।"
+  }
 }

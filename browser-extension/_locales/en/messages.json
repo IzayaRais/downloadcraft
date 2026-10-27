@@ -1,6 +1,101 @@
 {
-  "extName": { "message": "Send to Download Craft" },
-  "extDescription": { "message": "Sends downloads and videos to Download Craft — or downloads them right in the browser." },
-  "menuDownload": { "message": "Download with Download Craft" },
-  "menuDownloadAll": { "message": "Download all links with Download Craft" }
+  "extName": {
+    "message": "Send to Download Craft"
+  },
+  "extDescription": {
+    "message": "Sends downloads and videos to Download Craft — or downloads them right in the browser."
+  },
+  "menuDownload": {
+    "message": "Download with Download Craft"
+  },
+  "menuDownloadAll": {
+    "message": "Download all links with Download Craft"
+  },
+  "busyResolving": {
+    "message": "Resolving…"
+  },
+  "busyCapturing": {
+    "message": "Capturing…"
+  },
+  "barChooseQuality": {
+    "message": "Choose video quality in Download Craft"
+  },
+  "barDownloadVideo": {
+    "message": "Download this video with Download Craft"
+  },
+  "panelHint": {
+    "message": "Pick a quality below, or send the link as-is."
+  },
+  "panelSendLink": {
+    "message": "Send video link to app"
+  },
+  "panelVideoFiles": {
+    "message": "Video Files"
+  },
+  "panelOtherFiles": {
+    "message": "Other Files"
+  },
+  "panelDownload": {
+    "message": "Download"
+  },
+  "panelCancel": {
+    "message": "Cancel"
+  },
+  "panelClose": {
+    "message": "Close"
+  },
+  "queued": {
+    "message": "✓ Queued"
+  },
+  "popCapture": {
+    "message": "Capture browser downloads"
+  },
+  "popChecking": {
+    "message": "Checking…"
+  },
+  "popDeep": {
+    "message": "Deep video detection"
+  },
+  "popDownloads": {
+    "message": "Downloads"
+  },
+  "popVideoHint": {
+    "message": "Find videos on pages and show the download bar on players."
+  },
+  "popCaptureHint": {
+    "message": "Hand every download to Download Craft."
+  },
+  "popHideBubble": {
+    "message": "Hide browser download bubble"
+  },
+  "popMinSize": {
+    "message": "Ignore files smaller than (KB)"
+  },
+  "popNeverSites": {
+    "message": "Never capture from these sites"
+  },
+  "popDeepHint": {
+    "message": "Reads the first 4 KB of unlabeled responses to find hidden streams."
+  },
+  "popSaveFilters": {
+    "message": "Save filters"
+  },
+  "popSend": {
+    "message": "Send"
+  },
+  "popSettings": {
+    "message": "Settings"
+  },
+  "popRestoreButtons": {
+    "message": "Show hidden video buttons again"
+  },
+  "popVideoDetection": {
+    "message": "Video detection"
+  },
+  "popVideos": {
+    "message": "Videos"
+  },
+  "popBubbleHint": {
+    "message": "While capture is on and the app is connected."
+  }
 }

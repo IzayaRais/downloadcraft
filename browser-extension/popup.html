@@ -119,12 +119,12 @@ label.fl { display:block; color:var(--dim); font-size:11px; margin:2px 0 4px; }
 <div class="top">
   <div class="logo"><svg viewBox="0 0 24 24" fill="none" stroke="#fff" stroke-width="2.6" stroke-linecap="round" stroke-linejoin="round"><path d="M12 4v11M7 10l5 5 5-5M5 20h14"/></svg></div>
   <div class="brand">Download Craft</div>
-  <div class="conn" id="conn">Checking…</div>
+  <div class="conn" id="conn" data-i18n="popChecking">Checking…</div>
 </div>
 <div class="tabs">
-  <button class="tab on" id="tabVideos">Videos<span class="n" id="count"></span></button>
-  <button class="tab" id="tabDownloads">Downloads<span class="n" id="dlCount"></span></button>
-  <button class="tab" id="tabSettings">Settings</button>
+  <button class="tab on" id="tabVideos" data-i18n="popVideos">Videos<span class="n" id="count"></span></button>
+  <button class="tab" id="tabDownloads" data-i18n="popDownloads">Downloads<span class="n" id="dlCount"></span></button>
+  <button class="tab" id="tabSettings" data-i18n="popSettings">Settings</button>
 </div>
 
 <div id="viewVideos">
@@ -141,7 +141,7 @@ label.fl { display:block; color:var(--dim); font-size:11px; margin:2px 0 4px; }
     <div id="videos"></div>
     <div class="manual">
       <input type="text" id="url" placeholder="Paste a link to download…">
-      <button class="btn primary" id="send">Send</button>
+      <button class="btn primary" id="send" data-i18n="popSend">Send</button>
     </div>
   </div>
 </div>
@@ -151,22 +151,22 @@ label.fl { display:block; color:var(--dim); font-size:11px; margin:2px 0 4px; }
 </div>
 
 <div class="view" id="viewSettings" hidden>
-  <div class="opt"><div class="txt"><b>Capture browser downloads</b><span>Hand every download to Download Craft.</span></div>
+  <div class="opt"><div class="txt"><b data-i18n="popCapture">Capture browser downloads</b><span data-i18n="popCaptureHint">Hand every download to Download Craft.</span></div>
     <label class="sw"><input type="checkbox" id="auto"><i></i></label></div>
-  <div class="opt"><div class="txt"><b>Video detection</b><span>Find videos on pages and show the download bar on players.</span></div>
+  <div class="opt"><div class="txt"><b data-i18n="popVideoDetection">Video detection</b><span data-i18n="popVideoHint">Find videos on pages and show the download bar on players.</span></div>
     <label class="sw"><input type="checkbox" id="detect"><i></i></label></div>
-  <div class="opt"><div class="txt"><b>Deep video detection</b><span>Reads the first 4 KB of unlabeled responses to find hidden streams.</span></div>
+  <div class="opt"><div class="txt"><b data-i18n="popDeep">Deep video detection</b><span data-i18n="popDeepHint">Reads the first 4 KB of unlabeled responses to find hidden streams.</span></div>
     <label class="sw"><input type="checkbox" id="deep"><i></i></label></div>
-  <div class="opt"><div class="txt"><b>Hide browser download bubble</b><span>While capture is on and the app is connected.</span></div>
+  <div class="opt"><div class="txt"><b data-i18n="popHideBubble">Hide browser download bubble</b><span data-i18n="popBubbleHint">While capture is on and the app is connected.</span></div>
     <label class="sw"><input type="checkbox" id="hideUI"><i></i></label></div>
   <div class="opt" style="display:block">
-    <label class="fl" for="minSize">Ignore files smaller than (KB)</label>
+    <label class="fl" for="minSize" data-i18n="popMinSize">Ignore files smaller than (KB)</label>
     <input type="text" id="minSize" placeholder="100">
-    <label class="fl" for="block" style="margin-top:8px">Never capture from these sites</label>
+    <label class="fl" for="block" style="margin-top:8px" data-i18n="popNeverSites">Never capture from these sites</label>
     <input type="text" id="block" placeholder="example.com, other.org">
-    <div class="row" style="margin-top:8px;justify-content:flex-end"><button class="btn primary" id="saveFilters">Save filters</button></div>
+    <div class="row" style="margin-top:8px;justify-content:flex-end"><button class="btn primary" id="saveFilters" data-i18n="popSaveFilters">Save filters</button></div>
   </div>
-  <div class="row"><button class="btn" id="restoreVideoButtons">Show hidden video buttons again</button></div>
+  <div class="row"><button class="btn" id="restoreVideoButtons" data-i18n="popRestoreButtons">Show hidden video buttons again</button></div>
 </div>
 <div id="status"></div>
 <script src="rank.js"></script>

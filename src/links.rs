@@ -242,6 +242,7 @@ struct LinksApp {
     _rt: std::sync::Arc<tokio::runtime::Runtime>,
     notice: String,
     centered: bool,
+    focused: bool,
     done: bool,
     exited: bool,
 }
@@ -486,7 +487,9 @@ impl LinksApp {
         ui.horizontal(|ui| {
             ui.spacing_mut().item_spacing.x = 8.0;
             // Search field.
-            let (r, _) = ui.allocate_exact_size(Vec2::new(250.0, 30.0), Sense::hover());
+            // Narrower on a small window, so the type chips keep their room.
+            let search_w = (ui.available_width() * 0.3).clamp(150.0, 250.0);
+            let (r, _) = ui.allocate_exact_size(Vec2::new(search_w, 30.0), Sense::hover());
             let focused = ui.memory(|m| m.focused() == Some(egui::Id::new("links-q")));
             ui.painter().rect(r, 6.0, t.bg, Stroke::new(1.0, if focused { t.primary } else { t.card_bd }), egui::StrokeKind::Inside);
             ui.painter().text(Pos2::new(r.min.x + 16.0, r.center().y), Align2::CENTER_CENTER, crate::app::MI_SEARCH, icon(15.0), t.dim);
@@ -790,7 +793,15 @@ impl LinksApp {
                 self.by_category = val;
             }
         }
-        let path = Rect::from_min_size(Pos2::new(seg.max.x + 8.0, row_y - 15.0), Vec2::new(330.0, 30.0));
+        // The action buttons are laid out from the right below; the folder
+        // field takes what is left between them and the choice, up to 330.
+        let dl_label = if n > 0 { format!("Download ({n})") } else { "Download".to_string() };
+        let buttons_w: f32 = [(dl_label.as_str(), true), ("Add to queue", true), ("Cancel", false)]
+            .iter()
+            .map(|(l, g)| crate::shaped::width(&p, l, &semi(12.0)) + if *g { 48.0 } else { 32.0 } + 8.0)
+            .sum();
+        let path_w = (area.max.x - buttons_w - 8.0 - (seg.max.x + 8.0)).clamp(90.0, 330.0);
+        let path = Rect::from_min_size(Pos2::new(seg.max.x + 8.0, row_y - 15.0), Vec2::new(path_w, 30.0));
         p.rect(path, 6.0, t.bg, Stroke::new(1.0, t.card_bd), egui::StrokeKind::Inside);
         let browse = Rect::from_min_size(Pos2::new(path.max.x - 70.0, path.min.y + 4.0), Vec2::new(66.0, 22.0));
         if self.by_category {
@@ -815,7 +826,6 @@ impl LinksApp {
         }
         // Actions, right-aligned on the bottom line.
         let mut right = area.max.x;
-        let dl_label = if n > 0 { format!("Download ({n})") } else { "Download".to_string() };
         let buttons: [(&str, String, bool, bool, &str); 3] = [
             ("dl", dl_label, true, n > 0, "Queue the checked files and start them"),
             ("queue", "Add to queue".into(), false, n > 0, "Queue the checked files without starting them"),
@@ -889,6 +899,10 @@ const COLS_DEFAULT: [f32; 3] = [340.0, 130.0, 96.0];
 /// for "Download from" (never under 140).
 fn col_widths(stored: &[f32; 3], avail: f32) -> [f32; 4] {
     let [n, t, s] = *stored;
+    // A narrow window takes the room from the name column first, so
+    // "Download from" stays readable instead of running off the edge.
+    let over = (n + t + s + 140.0 - avail).max(0.0);
+    let n = (n - over).max(160.0);
     let flex = (avail - (n + t + s)).max(140.0);
     [n, t, s, flex]
 }
@@ -896,6 +910,16 @@ fn col_widths(stored: &[f32; 3], avail: f32) -> [f32; 4] {
 /// Drag the divider after column `i` by `dx`: it follows the pointer, so the
 /// column on its left grows by what the one on its right loses; the flexible
 /// "Download from" column absorbs the change when it is one of the two.
+#[cfg(test)]
+#[test]
+fn narrow_windows_shrink_the_name_column() {
+    let w = col_widths(&[340.0, 130.0, 96.0], 620.0);
+    assert!(w.iter().sum::<f32>() <= 620.0 + 0.5, "{w:?}");
+    assert!(w[3] >= 140.0 && w[0] >= 160.0);
+    // Wide: unchanged, the rest goes to "Download from".
+    assert_eq!(col_widths(&[340.0, 130.0, 96.0], 1000.0), [340.0, 130.0, 96.0, 434.0]);
+}
+
 fn drag_divider(stored: &[f32; 3], i: usize, dx: f32) -> [f32; 3] {
     let mut out = *stored;
     if i + 1 >= 3 {
@@ -1021,13 +1045,14 @@ pub fn run() -> eframe::Result<()> {
         _rt: rt,
         notice: String::new(),
         centered: false,
+        focused: false,
         done: false,
         exited: false,
     };
     let mut viewport = egui::ViewportBuilder::default()
         .with_title("Download all links — Download Craft")
         .with_inner_size([LINKS_W, LINKS_H])
-        .with_min_inner_size([760.0, 420.0])
+        .with_min_inner_size([640.0, 380.0])
         .with_resizable(true)
         .with_always_on_top();
     if let Ok(icon) = eframe::icon_data::from_png_bytes(include_bytes!("../assets/icon.png")) {
@@ -1045,8 +1070,19 @@ pub fn run() -> eframe::Result<()> {
     )
 }
 
-const LINKS_W: f32 = 1000.0;
-const LINKS_H: f32 = 640.0;
+const LINKS_W: f32 = 860.0;
+const LINKS_H: f32 = 540.0;
+
+/// The window's opening size: the design size, but never more than about
+/// half of the screen's free area (on a small or zoomed screen the full
+/// size covered everything behind it).
+fn links_size(work: Option<egui::Rect>) -> egui::Vec2 {
+    let (w, h) = match work {
+        Some(r) if r.width() > 120.0 && r.height() > 120.0 => (r.width() * 0.55, r.height() * 0.62),
+        _ => (LINKS_W, LINKS_H),
+    };
+    egui::vec2(LINKS_W.min(w).max(640.0), LINKS_H.min(h).max(380.0))
+}
 
 impl eframe::App for LinksApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
@@ -1070,8 +1106,13 @@ impl eframe::App for LinksApp {
             }
             return;
         }
-        if !self.centered && crate::model::center_window(ctx, egui::vec2(LINKS_W, LINKS_H)) {
-            self.centered = true;
+        if !self.centered {
+            let size = links_size(crate::model::work_area_rect(ctx));
+            ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(size));
+            self.centered = crate::model::center_window(ctx, size);
+        }
+        if self.centered && !self.focused {
+            self.focused = true;
             ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
         }
         self.collect_probes();

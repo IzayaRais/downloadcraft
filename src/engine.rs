@@ -217,6 +217,10 @@ pub struct EngineOpts {
     /// whole point of a segmented download). The fallback chain turns it on
     /// for servers that refuse HTTP/1.1.
     pub http2: bool,
+    /// Connect over IPv6 too (off: connections are bound to IPv4, see
+    /// client_builder). The fallback chain turns it on for a host that has
+    /// no working IPv4 path or failed its name lookup.
+    pub any_ip: bool,
     /// HTTP Digest login learned from the server's challenge (shared by
     /// every clone of these options).
     pub digest: Arc<std::sync::Mutex<Option<DigestAuth>>>,
@@ -402,6 +406,7 @@ impl Default for EngineOpts {
             log_key: String::new(),
             mirrors: Vec::new(),
             http2: false,
+            any_ip: false,
             digest: Default::default(),
         }
     }
@@ -535,7 +540,6 @@ impl EngineOpts {
         let mut b = reqwest::Client::builder()
             .user_agent(self.user_agent.clone())
             .redirect(redirect)
-            .local_address(std::net::IpAddr::from([0, 0, 0, 0]))
             .tcp_nodelay(true)
             .pool_idle_timeout(std::time::Duration::from_secs(30))
             .pool_max_idle_per_host(16)
@@ -544,6 +548,9 @@ impl EngineOpts {
             // Connect timeout ONLY: reqwest's `timeout` limits the whole
             // transfer, which wrongly kills big files on slow links.
             b = b.connect_timeout(std::time::Duration::from_secs(self.timeout_secs));
+        }
+        if !self.any_ip {
+            b = b.local_address(std::net::IpAddr::from([0, 0, 0, 0]));
         }
         if !self.http2 {
             b = b.http1_only();
@@ -948,6 +955,37 @@ fn http_code_err(url: &str, code: u16) -> anyhow::Error {
         Some(s) => anyhow!("HTTP {s}"),
         None => anyhow!("HTTP {code}"),
     }
+}
+
+/// Errors that mean no connection was made at all (name lookup, routing).
+fn unreachable_host(low: &str) -> bool {
+    [
+        "dns error",
+        "failed to lookup address",
+        "no such host",
+        "name or service not known",
+        "network is unreachable",
+        "host is unreachable",
+        "address not available",
+        "requested address is not valid",
+        "no route to host",
+    ]
+    .iter()
+    .any(|k| low.contains(k))
+}
+
+/// Plain words for failures whose raw text helps nobody: a redirect loop
+/// (almost always a login or cookie wall) and certificate problems (never
+/// bypassed).
+pub(crate) fn explain_failure(raw: &str) -> Option<&'static str> {
+    let low = raw.to_ascii_lowercase();
+    if low.contains("too many redirects") || low.contains("redirect loop") {
+        return Some("the server keeps redirecting (usually a login or cookie wall) — open the page in the browser and capture the download with the extension");
+    }
+    if low.contains("certificate") || low.contains("unknownissuer") || low.contains("invalid peer certificate") {
+        return Some("the site's security certificate is not valid (expired, self-signed or for another name) — Download Craft does not download from it");
+    }
+    None
 }
 
 fn is_final_http_error(e: &anyhow::Error) -> bool {
@@ -3970,7 +4008,10 @@ pub async fn download(
         job_log(&log, format!("failed: {e:#}"));
         if let Err(e) = fallback_chain(e, &url, &dest, connections, &opts, &shared).await {
             job_log(&log, format!("gave up: {e:#}"));
-            return Err(e);
+            return Err(match explain_failure(&format!("{e:#}")) {
+                Some(why) => e.context(why),
+                None => e,
+            });
         }
     }
     if let Some(n) = mutex_guard(&shared.note).clone() {
@@ -4050,6 +4091,21 @@ async fn fallback_chain(
         shared.set_note("Windows login (NTLM/Negotiate) - one connection");
         reset_counters(shared);
         match crate::winauth::download(url, &actual, opts, shared).await {
+            Ok(()) => return Ok(()),
+            Err(e) => err = e,
+        }
+    }
+    // No connection at all: a name lookup that failed for a moment, or a
+    // host reachable only over IPv6 (connections are bound to IPv4). One
+    // more try after a pause, allowing IPv6.
+    let low = format!("{err:#}").to_ascii_lowercase();
+    if !opts.any_ip && shared.downloaded.load(Ordering::SeqCst) == 0 && unreachable_host(&low) {
+        job_log(&opts.log_key, "could not reach the server: trying again (IPv6 allowed)");
+        tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+        let mut o2 = opts.clone();
+        o2.any_ip = true;
+        reset_counters(shared);
+        match download_inner(url.to_string(), dest.clone(), connections, o2, shared.clone()).await {
             Ok(()) => return Ok(()),
             Err(e) => err = e,
         }
@@ -11197,5 +11253,32 @@ mod browser_capture_tests {
         // for the progressive stream.
         assert!(ytdlp_preferred(&hd));
         assert!(!ytdlp_preferred(&sd));
+    }
+}
+
+#[cfg(test)]
+mod recovery_tests {
+    use super::*;
+
+    #[test]
+    fn unreachable_hosts_are_told_apart_from_refusals() {
+        assert!(unreachable_host("network: error sending request: dns error: failed to lookup address information"));
+        assert!(unreachable_host("connect: no route to host"));
+        assert!(!unreachable_host("http 404 not found"));
+        assert!(!unreachable_host("server refused (403 forbidden)"));
+    }
+
+    #[test]
+    fn redirect_loops_and_bad_certificates_are_explained() {
+        assert!(explain_failure("error following redirect: too many redirects").unwrap().contains("login"));
+        assert!(explain_failure("invalid peer certificate: UnknownIssuer").unwrap().contains("certificate"));
+        assert!(explain_failure("HTTP 500").is_none());
+    }
+
+    #[test]
+    fn ipv6_is_allowed_only_when_asked() {
+        let o = EngineOpts { any_ip: true, ..Default::default() };
+        assert!(o.build_client().is_ok());
+        assert!(EngineOpts::default().build_client().is_ok());
     }
 }
