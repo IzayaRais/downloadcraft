@@ -1546,6 +1546,9 @@ pub(crate) fn modern_scrollbars(ui: &mut egui::Ui) {
         interact_handle_opacity: 1.0,
     };
     let v = &mut st.visuals;
+    // egui lets scroll content paint a few pixels past its viewport; above
+    // the list that put rows over the column titles while scrolling.
+    v.clip_rect_margin = 0.0;
     v.extreme_bg_color = egui::Color32::TRANSPARENT;
     v.widgets.inactive.bg_fill = pl().dim.gamma_multiply(0.30);
     v.widgets.hovered.bg_fill = pl().dim.gamma_multiply(0.55);
@@ -6528,6 +6531,7 @@ impl eframe::App for CraftApp {
                     // hit-testing stays exact under scrolling ----
                     // Both bars always shown, below and beside the rows.
                     modern_scrollbars(ui);
+                    let body_top = ui.cursor().min.y;
                     let body_h = (ui.available_height() - 4.0).max(80.0);
                     ui.scope(|ui| {
                             egui::ScrollArea::both()
@@ -6545,6 +6549,13 @@ impl eframe::App for CraftApp {
                                     // so its hit would reach over the toolbar
                                     // and swallow the buttons there. Every hit
                                     // is therefore clipped to the viewport.
+                                    // Rows never paint above the line under the
+                                    // column titles.
+                                    let c = ui.clip_rect();
+                                    ui.set_clip_rect(egui::Rect::from_min_max(
+                                        egui::pos2(c.min.x, c.min.y.max(body_top)),
+                                        c.max,
+                                    ));
                                     let view = ui.clip_rect();
                                     // How far the rows are scrolled sideways:
                                     // the header follows it.

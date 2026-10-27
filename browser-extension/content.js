@@ -1361,6 +1361,13 @@
   }
   function positionDraggedPanel(host,panel) {
     if(!panel || !barPosition)return;
+    placePanelBy(host,panel);
+  }
+  // The quality menu next to its button, on the page itself (fixed, kept
+  // inside the window): inside the player it was cut off by the player's
+  // own edges, sometimes hiding the Download row.
+  function placePanelBy(host,panel) {
+    if(!host || !panel)return;
     const parent=document.fullscreenElement || document.documentElement;
     if(panel.parentNode!==parent)parent.appendChild(panel);
     const r=host.getBoundingClientRect();
@@ -1464,6 +1471,20 @@
   // falling back to a fixed viewport corner when no player is found. The
   // bubble's arrow always points back at the circle (up when the panel sits
   // below it, down when it sits above it).
+  // The open quality menu follows its button while the page scrolls or the
+  // window changes size.
+  let openMenu = null;
+  const followMenu = () => {
+    const m = openMenu;
+    if (!m) return;
+    if (!m.btn.isConnected || !m.panel.isConnected || m.panel.style.display === "none") { openMenu = null; return; }
+    placePanelBy(m.btn, m.panel);
+  };
+  try {
+    window.addEventListener("scroll", followMenu, { capture: true, passive: true });
+    window.addEventListener("resize", followMenu, { passive: true });
+  } catch (e) { /* best effort */ }
+
   function placeInPlayer(btn, panel) {
     if (!btn) return false;
     const setArrow = (side) => {
@@ -1494,14 +1515,7 @@
       // width would pin the bar mid-player once the player grows.
       btn.style.left = "auto";
       btn.style.width = "";
-      if (panel) {
-        panel.style.position = "absolute";
-        panel.style.top = "56px";
-        panel.style.right = "12px";
-        panel.style.bottom = "auto";
-        panel.style.left = "auto";
-        if (panel.parentElement !== player) player.appendChild(panel);
-      }
+      // The menu is placed on the page when it opens (placePanelBy).
       setArrow("top");
       if (btn.parentElement !== player) player.appendChild(btn);
       return true;
@@ -1657,12 +1671,14 @@
     const light = T.mode === "light";
     const set = (k, v) => bar.style.setProperty(k, v);
     set("--bg", T.card);
+    set("--glass", light ? "rgba(255,255,255,.92)" : "rgba(14,16,24,.86)");
+    set("--acc", light ? "#6d5df5" : "#7c6cf6");
     set("--fg", T.text);
     set("--line", T.border);
     set("--hover", T.hover);
     set("--dim", T.dim);
     set("--ok", light ? "#168047" : "#4ade80");
-    set("--shadow", light ? "0 1px 5px rgba(15,23,42,.18)" : "0 2px 8px rgba(0,0,0,.45)");
+    set("--shadow", light ? "0 4px 14px rgba(15,23,42,.18)" : "0 6px 20px rgba(0,0,0,.45)");
     set("--x-bg", light ? "#ffe9ec" : "rgba(239,68,68,.18)");
     set("--x-fg", light ? "#a91d2b" : "#fca5a5");
     host.style.colorScheme = light ? "light" : "dark";
@@ -1679,24 +1695,29 @@
   function videoDownloadBar(title) {
     const host = document.createElement("div");
     host.title = title;
-    host.style.cssText = "all:initial;display:block;height:28px;margin:0;padding:0;border:0;box-sizing:border-box;z-index:2147483647;";
+    host.style.cssText = "all:initial;display:block;height:34px;margin:0;padding:0;border:0;box-sizing:border-box;z-index:2147483647;";
     const root = host.attachShadow({mode:"open"});
     const style = document.createElement("style");
     style.textContent = `
       * { box-sizing:border-box; }
-      .bar { display:inline-flex;width:max-content;max-width:100%;height:28px;overflow:hidden;
-        border:1px solid var(--line);border-radius:6px;background:var(--bg);box-shadow:var(--shadow);
-        font:12px/1.2 system-ui,sans-serif;opacity:.55;transition:opacity .15s ease; }
+      .bar { display:inline-flex;align-items:center;gap:2px;width:max-content;max-width:100%;height:34px;
+        padding:0 4px;overflow:hidden;border:1px solid var(--line);border-radius:17px;background:var(--glass);
+        box-shadow:var(--shadow);font:12px/1.2 system-ui,sans-serif;
+        /* See-through until pointed at: the video stays visible. */
+        opacity:.32;transition:opacity .15s ease; }
       :host(:hover) .bar, .bar:focus-within { opacity:1; }
       button { all:unset;box-sizing:border-box;display:flex;align-items:center;justify-content:center;cursor:pointer;
-        color:var(--fg);background:transparent;font:600 12px/1.2 system-ui,sans-serif; }
+        color:var(--fg);background:transparent;font:600 12.5px/1.2 system-ui,sans-serif; }
       button:hover { background:var(--hover); }
-      button:focus-visible { outline:2px solid #3b82f6;outline-offset:-3px; }
-      .grip { flex:0 0 16px;width:16px;cursor:grab;color:var(--dim);touch-action:none; }
+      button:focus-visible { outline:2px solid var(--acc);outline-offset:-2px; }
+      .grip { flex:0 0 0;width:0;opacity:0;height:26px;border-radius:13px;cursor:grab;color:var(--dim);touch-action:none;
+        transition:width .15s ease,opacity .15s ease; }
+      :host(:hover) .grip, .bar:focus-within .grip { flex-basis:16px;width:16px;opacity:1; }
       .grip:active { cursor:grabbing; }
-      .download { touch-action:none;flex:0 0 auto;gap:5px;padding:0 7px 0 3px; }
+      .download { touch-action:none;flex:0 0 auto;gap:8px;height:28px;padding:0 12px 0 2px;border-radius:14px; }
+      .dot { width:24px;height:24px;border-radius:12px;background:var(--acc);color:#fff;display:flex;align-items:center;justify-content:center;flex:none; }
       .label { white-space:nowrap; }
-      .close { flex:0 0 24px;width:24px;border-left:1px solid var(--line);color:var(--dim); }
+      .close { flex:0 0 26px;width:26px;height:26px;border-radius:13px;color:var(--dim); }
       .close:hover { color:var(--x-fg);background:var(--x-bg); }
       [hidden] { display:none !important; }
       svg { display:block;flex:none;width:14px;height:14px;pointer-events:none; }
@@ -1704,9 +1725,10 @@
     const bar = document.createElement("div");bar.className="bar";
     const main = document.createElement("button");main.type="button";main.className="download";
     main.title=title;main.setAttribute("aria-label","Download this video");
-    const arrow=svgIcon(14,ICON_DOWN,2.5);arrow.style.color="var(--ok)";
-    main.appendChild(arrow);
-    const label=document.createElement("span");label.className="label";label.textContent="Download this video";
+    const dot=document.createElement("span");dot.className="dot";
+    dot.appendChild(svgIcon(13,ICON_DOWN,2.6));
+    main.appendChild(dot);
+    const label=document.createElement("span");label.className="label";label.textContent=dcT("barDownload","Download");
     main.appendChild(label);
     const close=document.createElement("button");close.type="button";close.className="close";close.hidden=true;
     close.setAttribute("data-dc-dismiss","1");
@@ -2610,7 +2632,8 @@
       barBusy(btn, null);
       hidePanels();
       api.show();
-      positionDraggedPanel(btn, api.panel);
+      placePanelBy(btn, api.panel);
+      openMenu = { btn, panel: api.panel };
     };
     btn.__dcOpen = open;
     btn.onclick = (ev) => {

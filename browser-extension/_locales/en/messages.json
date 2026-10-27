@@ -97,5 +97,8 @@
   },
   "popBubbleHint": {
     "message": "While capture is on and the app is connected."
+  },
+  "barDownload": {
+    "message": "Download"
   }
 }

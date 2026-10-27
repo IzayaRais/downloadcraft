@@ -97,5 +97,8 @@
   },
   "popBubbleHint": {
     "message": "যখন ধরা চালু এবং অ্যাপ সংযুক্ত।"
+  },
+  "barDownload": {
+    "message": "ডাউনলোড"
   }
 }
