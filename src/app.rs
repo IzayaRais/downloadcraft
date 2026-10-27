@@ -1865,7 +1865,8 @@ impl SortCol {
             SortCol::Status => Some("\u{e917}"), // donut_large
             SortCol::Speed => Some("\u{e9e4}"),  // speed
             SortCol::Eta => Some("\u{e8b5}"),    // schedule
-            SortCol::Name | SortCol::Date => None,
+            SortCol::Date => Some("\u{e935}"),   // calendar_today
+            SortCol::Name => None,
         }
     }
     fn title(&self) -> &'static str {
@@ -1875,7 +1876,7 @@ impl SortCol {
             SortCol::Status => "Status",
             SortCol::Speed => "Speed",
             SortCol::Eta => "Time Left",
-            SortCol::Date => "Date Added",
+            SortCol::Date => "Date",
         }
     }
 }
@@ -6852,9 +6853,9 @@ impl eframe::App for CraftApp {
                             } else {
                                 pl().dim
                             };
-                            // Size, Status, Speed and Time Left: an icon and the title,
-                            // centred over values that are centred too. Name reads from
-                            // the left; Date lines up on the right.
+                            // Size, Status, Speed, Time Left and Date: an icon and the
+                            // title, centred over values that are centred too. Name
+                            // reads from the left.
                             match col.icon() {
                                 Some(icon) => header_icon_text(ui.painter(), r, icon, &txt, color),
                                 None => cell_text(ui.painter(), r, &txt, 9.5, color, !matches!(*col, SortCol::Name)),
@@ -6988,13 +6989,8 @@ impl eframe::App for CraftApp {
                                         );
                                         let hl = rrect.shrink2(egui::vec2(2.0, 1.0));
                                         if sel {
+                                            // The tint alone marks the selection (no outline).
                                             ui.painter().rect_filled(hl, 6.0, pl().sel_bg);
-                                            ui.painter().rect_stroke(
-                                                hl,
-                                                6.0,
-                                                egui::Stroke::new(1.0_f32, pl().sel_bd),
-                                                egui::StrokeKind::Inside,
-                                            );
                                         } else if self.man.hover(&rrect) {
                                             ui.painter().rect_filled(hl, 6.0, pl().hover_bg);
                                         }
@@ -7098,7 +7094,7 @@ impl eframe::App for CraftApp {
                                             cell_text_center(&p, crect, eta_s, 10.0, pl().dim);
                                         }
                                         SortCol::Date => {
-                                            cell_text(&p, crect, &date, 10.0, pl().dim, true);
+                                            cell_text_center(&p, crect, &date, 10.0, pl().dim);
                                         }
                                     }
                                     x += w;
