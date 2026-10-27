@@ -1800,7 +1800,9 @@
       :host([data-dc-scrolling]) .bar { opacity:0 !important; pointer-events:none; transition:opacity .1s ease; }
       button { all:unset;box-sizing:border-box;display:flex;align-items:center;justify-content:center;cursor:pointer;
         color:var(--fg);background:transparent;font:600 12.5px/1.2 system-ui,sans-serif; }
-      button:hover { background:var(--hover); }
+      /* Pointing anywhere at the bar lights the whole bar (one control);
+         only × keeps a hover of its own. */
+      :host(:hover) .bar { box-shadow:var(--shadow), inset 0 0 0 999px var(--hover); }
       button:focus-visible { outline:2px solid var(--acc);outline-offset:-2px; }
       .grip { flex:0 0 0;width:0;opacity:0;height:26px;border-radius:13px;cursor:grab;color:var(--dim);touch-action:none;
         transition:width .15s ease,opacity .15s ease; }
@@ -2225,16 +2227,9 @@
       hidePanels();
       if (s.onClose) s.onClose();
     }, null);
-    const close = mkBtn("", "btn", () => {
-      hidePanels();
-      if (s.onClose) s.onClose();
-    }, ICON_CLOSE);
-    close.style.flex = "0 0 36px";
-    close.title = dcT("panelClose", "Close");
-    close.setAttribute("aria-label", close.title);
+    // Cancel closes the menu; a second × beside it did the same.
     actions.appendChild(primary);
     actions.appendChild(cancel);
-    actions.appendChild(close);
     inner.appendChild(actions);
 
     panel.appendChild(inner);
