@@ -351,12 +351,13 @@ mod tests {
     fn unpack_finds_the_program_and_refuses_escaping_paths() {
         let d = tmp("unpack");
         let z = d.join("u.zip");
-        make_zip(&z, &[("DC-1.0/download_craft.exe", b"new exe"), ("DC-1.0/browser-extension/content.js", b"js")]);
+        let exe = format!("DC-1.0/{}", exe_name());
+        make_zip(&z, &[(exe.as_str(), b"new exe"), ("DC-1.0/browser-extension/content.js", b"js")]);
         let root = unpack(&z).unwrap();
         assert!(root.ends_with("DC-1.0"));
         assert_eq!(std::fs::read(root.join("browser-extension/content.js")).unwrap(), b"js");
         let bad = d.join("bad.zip");
-        make_zip(&bad, &[("../evil.txt", b"x"), ("download_craft.exe", b"e")]);
+        make_zip(&bad, &[("../evil.txt", b"x"), (exe_name(), b"e")]);
         assert!(unpack(&bad).is_err());
         assert!(!d.join("evil.txt").exists());
     }

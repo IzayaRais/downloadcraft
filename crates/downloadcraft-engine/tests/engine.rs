@@ -357,9 +357,13 @@ async fn stopped_downloads_resume_where_they_were() {
     let control = Arc::new(Control::default());
     let progress = Arc::new(Progress::default());
     let job = Job::new(srv.url("/f"), &dest).size_hint(Some(6 * MIB as u64), true);
-    let c = control.clone();
+    let (c, pr) = (control.clone(), progress.clone());
+    // Stop once some bytes have landed: a fixed delay raced an optimized
+    // build that finished the file first.
     tokio::spawn(async move {
-        tokio::time::sleep(Duration::from_millis(1500)).await;
+        while pr.downloaded() < 512 * 1024 {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
         c.cancel();
     });
     let err = dl.download(job.clone(), progress.clone(), control).await.unwrap_err();
@@ -379,12 +383,15 @@ async fn a_changed_file_is_not_stitched_onto_old_bytes() {
     let dl = Downloader::new(reqwest::Client::new()).config(quick());
     let control = Arc::new(Control::default());
     let job = Job::new(srv.url("/f"), &dest).size_hint(Some(4 * MIB as u64), true);
-    let c = control.clone();
+    let progress = Arc::new(Progress::default());
+    let (c, pr) = (control.clone(), progress.clone());
     tokio::spawn(async move {
-        tokio::time::sleep(Duration::from_millis(1000)).await;
+        while pr.downloaded() < 512 * 1024 {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
         c.cancel();
     });
-    let _ = dl.download(job.clone(), Arc::new(Progress::default()), control).await;
+    let _ = dl.download(job.clone(), progress, control).await;
     srv.version.store(2, Ordering::SeqCst); // new ETag, new bytes
     let (log, ev) = recorder();
     get(&dl.clone().on_event(ev), job).await.unwrap();
@@ -406,7 +413,10 @@ async fn html_instead_of_the_file_is_refused() {
 async fn an_expired_redirect_target_is_renewed_through_the_original_url() {
     let srv = Server::start(Behaviour { size: 6 * MIB, expire_after: 2 * MIB, rate: 4 * MIB as u64, ..Default::default() }).await;
     let dest = tmp("expiring");
-    let out = get(&Downloader::new(reqwest::Client::new()).config(quick()), Job::new(srv.url("/start"), &dest))
+    // Small requests: one long request per connection could finish the file
+    // without ever asking again, so the expiry would never be met.
+    let cfg = Config { max_request: Some(512 * 1024), ..quick() };
+    let out = get(&Downloader::new(reqwest::Client::new()).config(cfg), Job::new(srv.url("/start"), &dest))
         .await
         .unwrap();
     assert_eq!(std::fs::read(&dest).unwrap(), body(6 * MIB, 1));
@@ -419,7 +429,8 @@ async fn the_refresh_hook_replaces_a_dead_link() {
     let srv = Server::start(Behaviour { size: 4 * MIB, old_dies_after: MIB, rate: 2 * MIB as u64, ..Default::default() }).await;
     let dest = tmp("refresh");
     let fresh = srv.url("/new");
-    let dl = Downloader::new(reqwest::Client::new()).config(quick()).on_link_expired(Arc::new(move |_old| {
+    let cfg = Config { max_request: Some(512 * 1024), ..quick() };
+    let dl = Downloader::new(reqwest::Client::new()).config(cfg).on_link_expired(Arc::new(move |_old| {
         let fresh = fresh.clone();
         Box::pin(async move { Some(fresh) })
     }));
