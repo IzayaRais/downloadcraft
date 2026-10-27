@@ -1050,6 +1050,9 @@ const LINKS_H: f32 = 640.0;
 
 impl eframe::App for LinksApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        if let Some(text) = crate::i18n::take_font_text() {
+            crate::fonts::ensure_text(ctx, &text);
+        }
         crate::fonts::ensure_text(ctx, &self.title);
         for r in &self.rows {
             crate::fonts::ensure_text(ctx, &r.name);

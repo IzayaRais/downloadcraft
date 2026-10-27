@@ -1,0 +1,6 @@
+{
+  "extName": { "message": "Send to Download Craft" },
+  "extDescription": { "message": "Sends downloads and videos to Download Craft — or downloads them right in the browser." },
+  "menuDownload": { "message": "Download with Download Craft" },
+  "menuDownloadAll": { "message": "Download all links with Download Craft" }
+}

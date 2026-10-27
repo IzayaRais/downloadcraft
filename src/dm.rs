@@ -85,6 +85,7 @@ pub fn dm_field(
     hint: &str,
     password: bool,
 ) -> egui::Rect {
+    let hint = crate::i18n::t(hint);
     dm_box(ui.painter(), rect);
     let inner = egui::Rect::from_min_max(
         egui::pos2(rect.min.x + 13.0, rect.min.y + 1.0),
@@ -468,6 +469,7 @@ pub fn btn_flat_c(
     label: &str,
     col: egui::Color32,
 ) {
+    let label = crate::i18n::t(label);
     if hov {
         p.rect_filled(r, DM_RAD, pl().dm_hover);
     }

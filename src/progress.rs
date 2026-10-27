@@ -306,6 +306,7 @@ fn info_row(
     col: egui::Color32,
     font: egui::FontId,
 ) {
+    let label = crate::i18n::t(label);
         let y = o.y + INFO_Y + ROW_STEP * i as f32;
         let lw = crate::shaped::width(p, label, &reg(13.0));
         crate::shaped::draw(
@@ -340,6 +341,7 @@ fn kv_row(
     col: egui::Color32,
     font: egui::FontId,
 ) {
+    let label = crate::i18n::t(label);
     let lf = reg(12.0);
     let lw = crate::shaped::width(p, label, &lf);
     crate::shaped::draw(
@@ -559,6 +561,9 @@ impl eframe::App for ProgressApp {
     }
 
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        if let Some(text) = crate::i18n::take_font_text() {
+            crate::fonts::ensure_text(ctx, &text);
+        }
         if let Some(it) = &self.item {
             crate::fonts::ensure_text(ctx, &it.filename);
         }

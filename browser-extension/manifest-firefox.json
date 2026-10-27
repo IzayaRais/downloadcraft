@@ -1,8 +1,9 @@
 {
   "manifest_version": 3,
-  "name": "Send to Download Craft",
+  "name": "__MSG_extName__",
+  "default_locale": "en",
   "version": "0.9.8",
-  "description": "Sends downloads and videos to Download Craft — or downloads them right in the browser.",
+  "description": "__MSG_extDescription__",
   "permissions": [
     "nativeMessaging",
     "contextMenus",

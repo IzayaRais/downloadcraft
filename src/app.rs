@@ -1922,6 +1922,9 @@ pub struct CraftApp {
     /// in the start page's folder.
     grab_levels: usize,
     grab_stay: bool,
+    /// Saved grabber setups and the name typed for the current one.
+    grab_projects: Vec<crate::model::GrabProject>,
+    grab_project_name: String,
     grab_busy: bool,
     grab_results: Vec<crate::grabber::GrabLink>,
     grab_notice: String,
@@ -2111,6 +2114,8 @@ impl CraftApp {
             grab_depth: false,
             grab_levels: 1,
             grab_stay: true,
+            grab_projects: crate::model::grab_projects(),
+            grab_project_name: String::new(),
             grab_busy: false,
             grab_results: Vec::new(),
             grab_notice: String::new(),
@@ -3299,10 +3304,14 @@ impl CraftApp {
         } else {
             self.user_agent.clone()
         };
+        // Settings -> Site logins also open pages behind a login.
+        let (username, password) = crate::model::login_for(&url).unwrap_or_default();
         let opts = EngineOpts {
             user_agent: ua,
             timeout_secs: self.timeout_secs,
             proxy_url: self.proxy_url.clone(),
+            username,
+            password,
             ..Default::default()
         };
         self.rt.spawn(async move {
@@ -7121,6 +7130,61 @@ impl eframe::App for CraftApp {
                             ui.checkbox(&mut self.grab_stay, "Stay inside the start page's folder");
                         });
                     }
+                    // Saved projects: load one, or save the current setup.
+                    ui.horizontal(|ui| {
+                        let mut load: Option<crate::model::GrabProject> = None;
+                        let mut delete: Option<usize> = None;
+                        egui::ComboBox::from_id_salt("grab_projects")
+                            .selected_text(if self.grab_projects.is_empty() { "No saved projects" } else { "Saved projects…" })
+                            .show_ui(ui, |ui| {
+                                for (i, p) in self.grab_projects.iter().enumerate() {
+                                    ui.horizontal(|ui| {
+                                        if ui.selectable_label(false, &p.name).on_hover_text(&p.url).clicked() {
+                                            load = Some(p.clone());
+                                        }
+                                        if ui.small_button("✕").on_hover_text("Delete this project").clicked() {
+                                            delete = Some(i);
+                                        }
+                                    });
+                                }
+                            });
+                        ui.add(egui::TextEdit::singleline(&mut self.grab_project_name).hint_text("Project name").desired_width(150.0));
+                        if ui.button("Save project").clicked() {
+                            let name = if self.grab_project_name.trim().is_empty() {
+                                url::Url::parse(self.grab_url.trim()).ok().and_then(|u| u.host_str().map(str::to_string)).unwrap_or_else(|| "Project".into())
+                            } else {
+                                self.grab_project_name.trim().to_string()
+                            };
+                            let p = crate::model::GrabProject {
+                                name: name.clone(),
+                                url: self.grab_url.trim().to_string(),
+                                exts: self.grab_exts.clone(),
+                                follow: self.grab_depth,
+                                levels: self.grab_levels,
+                                stay: self.grab_stay,
+                            };
+                            self.grab_projects.retain(|x| x.name != name);
+                            self.grab_projects.push(p);
+                            self.grab_notice = if crate::model::save_grab_projects(&self.grab_projects) {
+                                format!("Saved project \"{name}\".")
+                            } else {
+                                "Could not save the project.".into()
+                            };
+                        }
+                        if let Some(p) = load {
+                            self.grab_url = p.url;
+                            self.grab_exts = p.exts;
+                            self.grab_depth = p.follow;
+                            self.grab_levels = p.levels.clamp(1, 5);
+                            self.grab_stay = p.stay;
+                            self.grab_project_name = p.name.clone();
+                            self.grab_notice = format!("Loaded \"{}\" - press Find Links to run it again.", p.name);
+                        }
+                        if let Some(i) = delete {
+                            self.grab_projects.remove(i);
+                            crate::model::save_grab_projects(&self.grab_projects);
+                        }
+                    });
                     if !self.grab_notice.is_empty() {
                         ui.colored_label(pl().notice, &self.grab_notice);
                     }

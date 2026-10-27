@@ -23,6 +23,7 @@ mod progress;
 mod settings;
 mod shaped;
 mod sysproxy;
+mod winauth;
 #[cfg(windows)]
 mod tray;
 #[cfg(not(windows))]

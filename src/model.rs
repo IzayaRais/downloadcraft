@@ -627,12 +627,12 @@ fn percent_decode(s: &str) -> String {
 
 pub fn is_download_url(s: &str) -> bool {
     let t = s.trim();
-    // `ftps://` passes the gate so the engine can refuse it loudly with
-    // guidance (instead of a generic "not a URL" message).
+    // FTPS: `ftps://` (implicit on 990, else explicit) and `ftpes://`.
     (t.starts_with("http://")
         || t.starts_with("https://")
         || t.starts_with("ftp://")
-        || t.starts_with("ftps://"))
+        || t.starts_with("ftps://")
+        || t.starts_with("ftpes://"))
         && t.len() < 2048
         && !t.contains(' ')
 }
@@ -1108,6 +1108,34 @@ fn protect(data: &[u8], _encrypt: bool) -> Option<Vec<u8>> {
 }
 
 /// The saved logins (passwords decrypted).
+/// A saved Site Grabber setup (IDM's grabber projects): run it again later
+/// to pick up what the site added.
+#[derive(Debug, Clone, Default, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct GrabProject {
+    pub name: String,
+    pub url: String,
+    pub exts: String,
+    pub follow: bool,
+    pub levels: usize,
+    pub stay: bool,
+}
+
+fn grab_projects_path() -> Option<std::path::PathBuf> {
+    config_dir().map(|d| d.join("grab_projects.json"))
+}
+
+pub fn grab_projects() -> Vec<GrabProject> {
+    grab_projects_path()
+        .and_then(|p| std::fs::read_to_string(p).ok())
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_default()
+}
+
+pub fn save_grab_projects(list: &[GrabProject]) -> bool {
+    let Some(p) = grab_projects_path() else { return false };
+    serde_json::to_string_pretty(list).ok().is_some_and(|j| std::fs::write(p, j).is_ok())
+}
+
 pub fn site_logins() -> Vec<SiteLogin> {
     let stored: Vec<StoredLogin> = logins_path()
         .and_then(|p| std::fs::read_to_string(p).ok())

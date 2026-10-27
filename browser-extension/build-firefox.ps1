@@ -28,6 +28,7 @@ foreach ($f in "rank.js", "streams.js", "mp4merge.js", "browserdl.js", "bridge.j
   Copy-Item (Join-Path $here $f) $stage
 }
 Copy-Item (Join-Path $here "icons\*.png") (Join-Path $stage "icons")
+Copy-Item (Join-Path $here "_locales") (Join-Path $stage "_locales") -Recurse
 Copy-Item (Join-Path $here "manifest-firefox.json") (Join-Path $stage "manifest.json")
 
 if (Test-Path $Out) { Remove-Item $Out -Force }

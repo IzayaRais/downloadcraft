@@ -378,6 +378,7 @@ fn check_row(
     checked: bool,
     label: &str,
 ) -> egui::Response {
+    let label = crate::i18n::t(label);
     let r = ui.interact(rect, egui::Id::new(("popup-check", id)), egui::Sense::click());
     if r.hovered() {
         ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
@@ -856,6 +857,9 @@ impl eframe::App for ConfirmApp {
     /// Same bulletproofing as the progress window: Close can no-op, so back
     /// it with a delayed exit once the dialog is done.
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        if let Some(text) = crate::i18n::take_font_text() {
+            crate::fonts::ensure_text(ctx, &text);
+        }
         crate::fonts::ensure_text(ctx, &self.filename);
         crate::fonts::ensure_text(ctx, &self.description);
         if self.done {
@@ -1353,7 +1357,7 @@ impl eframe::App for ConfirmApp {
             p.text(
                 dl_r.center(),
                 egui::Align2::CENTER_CENTER,
-                "Download",
+                crate::i18n::t("Download"),
                 semi(13.0),
                 egui::Color32::WHITE,
             );

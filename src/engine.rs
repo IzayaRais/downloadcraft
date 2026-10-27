@@ -4042,6 +4042,18 @@ async fn fallback_chain(
             }
         }
     }
+    // A company server that wants a Windows login (NTLM / Kerberos): the
+    // pooled client cannot answer it, Windows' own HTTP stack can.
+    let low = format!("{err:#}").to_ascii_lowercase();
+    if low.contains("401") && url.starts_with("http") && crate::winauth::server_wants_windows_login(opts, url).await {
+        job_log(&opts.log_key, "server wants an NTLM/Negotiate login: using Windows' HTTP stack");
+        shared.set_note("Windows login (NTLM/Negotiate) - one connection");
+        reset_counters(shared);
+        match crate::winauth::download(url, &actual, opts, shared).await {
+            Ok(()) => return Ok(()),
+            Err(e) => err = e,
+        }
+    }
     // A server that refuses HTTP/1.1 (505, or a protocol error before any
     // byte): try once more over HTTP/2.
     let low = format!("{err:#}").to_ascii_lowercase();
@@ -4232,7 +4244,8 @@ async fn download_inner(
     }
     // Route playlists before the progressive path so we never save a
     // playlist file as if it were the video.
-    if url.to_ascii_lowercase().starts_with("ftp://") || url.to_ascii_lowercase().starts_with("ftps://") {
+    let lower = url.to_ascii_lowercase();
+    if lower.starts_with("ftp://") || lower.starts_with("ftps://") || lower.starts_with("ftpes://") {
         // Plain-FTP backend (P3): own connection, same resume contract.
         let _job = claim_dest_job(&dest).ok_or_else(|| {
             anyhow!("this destination is already downloading elsewhere — wait for it or remove the duplicate queue entry")

@@ -12,32 +12,32 @@ How it was built:
 **Priority:** 🔴 users notice it often · 🟠 power users expect it · 🟢 nice to have.
 **Effort:** S = a day or less · M = a few days · L = a week or more.
 
-## Status (25 Oct 2026, after the "do all" pass)
+## Status (27 Oct 2026)
 
 ✅ done · ◐ partly done · ✗ not done (with the reason). Everything is in local commits on `feat/dynamic-engine`; nothing is pushed.
 
 | # | Status | What there is now |
 |---|---|---|
 | 1.1 | ✅ | Redraws once a second while downloads run, never while idle or hidden; the Add URL pulse stops after 6 s |
-| 1.2 | ◐ | Fonts load only for the scripts on screen. Settings window 186 → 72 MB. The main window was not profiled again |
+| 1.2 | ◐ | Fonts load only for the scripts on screen. Settings window 186 → 72 MB; the main window starts at about 154 MB (it showed 256 MB after hours of use). Not profiled with a heap tool yet |
 | 1.3 | ✅ | Release profile (`lto = "thin"`, one codegen unit, stripped): 32.4 → 15.0 MB |
 | 1.4 | ✗ | Start-up time was not measured |
 | 1.5 | ✅ | Live connection (one host process per browser session) |
 | 2.1 | ✅ | Up to 32 connections (app, CLI, engine) |
 | 2.2 | ✅ | HTTP/2 retry when a server fails over HTTP/1.1 |
 | 2.3 | ✅ | Mirrors: `url \| mirror` in Add URL; the engine spreads segments and drops bad mirrors |
-| 2.4 | ◐ | Digest login done. NTLM/Kerberos not done (needs SSPI and a Windows domain server to test) |
+| 2.4 | ✅ | Digest in the engine. NTLM and Negotiate (Kerberos) through Windows' WinHTTP when a server asks for them: the signed-in user on intranet servers, or the download's username (DOMAIN\user) and password. One connection, resumable. Tested with a local login server; not yet against a real NTLM server |
 | 2.5 | ✅ | Site logins (host pattern → user/password, password encrypted with DPAPI) |
-| 2.6 | ◐ | Segmented FTP with resume done. FTPS not done |
+| 2.6 | ✅ | Segmented FTP with resume, and FTPS: `ftpes://` (explicit) and `ftps://` (implicit on 990), data connections encrypted too, several encrypted connections at once. Servers behind NAT that announce a private address are handled |
 | 2.7 | ✅ | Temporary folder setting; moved across drives at the end |
-| 2.8 | ◐ | HTTP/2 fallback and rename-on-fallback-name added; the long tail of IDM's recovery paths stays open-ended |
+| 2.8 | ◐ | Added: HTTP/2 retry, rename on a fallback name, NTLM/Negotiate hand-over on 401, FTP servers that announce a private address or skip TLS close_notify. The long tail of IDM's recovery paths stays open-ended |
 | 2.9 | ✅ | Log tab in the progress window (`logs/<id>.log`) |
 | 2.10 | ✅ | "Refresh download address": opens the page, the next capture of the same size continues the file |
 | 3.1 | ✅ | Named queues with their own limits and schedules; "Move to queue" in the row menu |
 | 3.2 | ✅ | Queue sync: checks finished files for newer server versions |
 | 3.3 | ✅ | Quota: at most N MB per X hours |
 | 3.4 | ✅ | The File Info dialog's Add button queues without starting (IDM's "Download Later") |
-| 4.1 | ◐ | Grabber follows links up to 5 levels, can stay in the start folder, filters by file type. Saved projects and grabber logins not done |
+| 4.1 | ✅ | Grabber follows links up to 5 levels, can stay in the start folder, filters by file type, uses Settings → Site logins, and saves projects to run again |
 | 4.2 | ✅ | Batch patterns `(001-200)` / `(a-z)` open a pick list |
 | 4.3 | ✅ | Row menu "ZIP: pick files": lists the archive by Range requests, fetches only the picked files |
 | 4.4 | ✅ | Import of IDM `.ef2` lists |
@@ -46,14 +46,14 @@ How it was built:
 | 5.2 | ✗ | On purpose: the in-page bar stays (see the row below) |
 | 5.3 | ✅ | Subtitles saved next to the video (yt-dlp, SRT when FFmpeg is there) |
 | 6.1 | ✅ | Windows PAC scripts and auto-detect, asked per host through WinHTTP (engine and yt-dlp). Tested with auto-detect only; no PAC server was available |
-| 6.2 | ◐ | 151 extension tests pass, and the native host was driven over stdio (hello, settings push, query, list). Not clicked through on real sites in a browser |
+| 6.2 | ◐ | 156 extension tests pass, and the native host was driven over stdio. Real-site use found one bug, now fixed: the Facebook feed's button took a neighbouring video, and it now uses the clicked post's own video id. Not every hand-off path has been clicked through on real sites |
 | 6.3 | ✅ | `docs/STORE_LISTING.md`: texts, permission reasons, privacy policy, per-store steps |
 | 6.4 | ✅ | Opera reads Chrome's host key, which the app registers at every start; store IDs can be allowed through `STORE_EXTENSION_IDS` |
 | 7.1 | ✅ | Optional sounds for finished and failed downloads |
-| 7.2 | ◐ | App: language files (`lang/<code>.json`), built-in Bengali, picker in Settings → Appearance. The toolbar, sidebar, row menu and Settings use it; dialogs and the extension (`_locales`) do not yet |
+| 7.2 | ◐ | App: language files (`lang/<code>.json`), built-in Bengali, picker in Settings → Appearance; the toolbar, sidebar, row menu, Settings and the File Info / progress / complete dialogs use it. Extension: `_locales` (English, Bengali) for its name, description and right-click menu. The page panels and the popup are still English |
 | 7.3 | ✅ | Speed graph in the progress window |
 | 7.4 | ✅ | Statistics (today, this month) |
-| 7.5 | ◐ | Links and files can be dropped on the main window; dropping on the tray icon is not done |
+| 7.5 | ✅ | Links and files can be dropped on the main window and the basket. Dropping on the tray icon is not possible: Windows does not deliver drops to notification-area icons (IDM uses a floating drop target, which the basket is) |
 | 7.6 | ✅ | Ctrl+A, Delete, Space, Enter in the list |
 
 ---

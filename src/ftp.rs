@@ -1,12 +1,15 @@
-//! Plain-FTP backend (P3): `ftp://[user:pass@]host[:port]/path` downloads
+//! FTP backend (P3): `ftp://[user:pass@]host[:port]/path` downloads
 //! with PASV binary transfers and REST resume, bound to the same `.dcpart`
 //! + `.dcmeta` resume contract as HTTP (`RESUME` offsets from another URL
 //! are discarded, never resumed into this file).
 //!
-//! Clean-room RFC 959 subset, zero new dependencies: control connection
+//! Clean-room RFC 959 subset: control connection
 //! (USER/PASS/TYPE I/SIZE/PASV/REST/RETR/QUIT) + one PASV data connection
-//! per transfer. FTPS/SFTP are NOT attempted — an `ftps://` URL is
-//! rejected loudly instead of silently downgrading to plaintext.
+//! per transfer. FTPS (RFC 4217) wraps both in TLS: `ftpes://` (and
+//! `ftps://` on a port other than 990) is explicit (`AUTH TLS` on the plain
+//! port), `ftps://` on 990 or with no port is implicit. Both protect the data
+//! connection too (`PBSZ 0`, `PROT P`); there is never a silent fallback to
+//! plain text. SFTP is a different protocol and not supported.
 //!
 //! Only `download_ftp()` is public; the tiny line protocol + fixture
 //! server live here for unit tests.
@@ -15,7 +18,21 @@ use crate::engine::{io_message, mutex_guard, resume_offset, EngineOpts, RateLimi
 use anyhow::{anyhow, Result};
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
+use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt};
+
+/// Control-connection halves and a data connection, plain or TLS alike.
+type CtlR = tokio::io::BufReader<Box<dyn AsyncRead + Unpin + Send>>;
+type CtlW = Box<dyn AsyncWrite + Unpin + Send>;
+type DataStream = Box<dyn AsyncRead + Unpin + Send>;
+
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum Tls {
+    None,
+    /// `AUTH TLS` on the plain control connection.
+    Explicit,
+    /// TLS from the first byte (port 990).
+    Implicit,
+}
 
 struct FtpTarget {
     host: String,
@@ -23,18 +40,18 @@ struct FtpTarget {
     user: String,
     pass: String,
     path: String,
+    tls: Tls,
 }
 
 fn parse_target(url: &str) -> Result<FtpTarget> {
-    if url.to_ascii_lowercase().starts_with("ftps://") {
-        return Err(anyhow!(
-            "FTPS (FTP over TLS) is not supported — use plain ftp:// or https://"
-        ));
-    }
     let u = url::Url::parse(url).map_err(|_| anyhow!("bad ftp URL: {url}"))?;
-    if u.scheme() != "ftp" {
-        return Err(anyhow!("not an ftp URL: {url}"));
-    }
+    let tls = match u.scheme() {
+        "ftp" => Tls::None,
+        "ftpes" => Tls::Explicit,
+        "ftps" if matches!(u.port(), None | Some(990)) => Tls::Implicit,
+        "ftps" => Tls::Explicit,
+        _ => return Err(anyhow!("not an ftp URL: {url}")),
+    };
     let host = u.host_str().unwrap_or("").to_string();
     if host.is_empty() {
         return Err(anyhow!("ftp URL has no host: {url}"));
@@ -43,7 +60,7 @@ fn parse_target(url: &str) -> Result<FtpTarget> {
     // real names (`ftp://h/My%20File.zip` is the file "My File.zip").
     Ok(FtpTarget {
         host,
-        port: u.port().unwrap_or(21),
+        port: u.port().unwrap_or(if tls == Tls::Implicit { 990 } else { 21 }),
         user: if u.username().is_empty() {
             "anonymous".to_string()
         } else {
@@ -51,6 +68,135 @@ fn parse_target(url: &str) -> Result<FtpTarget> {
         },
         pass: u.password().map(percent_decode).unwrap_or_else(|| "anonymous@".to_string()),
         path: if u.path().is_empty() { "/".to_string() } else { percent_decode(u.path()) },
+        tls,
+    })
+}
+
+/// One TLS setup for every FTPS connection: the shared session cache lets a
+/// data connection resume the control connection's session, which servers
+/// such as vsftpd (`require_ssl_reuse`) insist on.
+fn tls_connector() -> tokio_rustls::TlsConnector {
+    static CFG: std::sync::OnceLock<Arc<rustls::ClientConfig>> = std::sync::OnceLock::new();
+    let cfg = CFG.get_or_init(|| {
+        let mut roots = rustls::RootCertStore::empty();
+        for c in rustls_native_certs::load_native_certs().certs {
+            let _ = roots.add(c);
+        }
+        #[cfg(test)]
+        if let Some(extra) = tests::TEST_ROOT.get() {
+            let _ = roots.add(extra.clone());
+        }
+        let provider = Arc::new(rustls::crypto::ring::default_provider());
+        Arc::new(
+            rustls::ClientConfig::builder_with_provider(provider)
+                .with_safe_default_protocol_versions()
+                .expect("TLS versions")
+                .with_root_certificates(roots)
+                .with_no_client_auth(),
+        )
+    });
+    tokio_rustls::TlsConnector::from(cfg.clone())
+}
+
+async fn tls_wrap(t: &FtpTarget, tcp: tokio::net::TcpStream) -> Result<tokio_rustls::client::TlsStream<tokio::net::TcpStream>> {
+    let name = rustls::pki_types::ServerName::try_from(t.host.clone())
+        .map_err(|_| anyhow!("FTPS: {} is not a valid server name", t.host))?;
+    tls_connector().connect(name, tcp).await.map_err(|e| {
+        let m = e.to_string();
+        if m.contains("certificate") || m.contains("UnknownIssuer") {
+            anyhow!("FTPS: the server's certificate is not trusted ({m})")
+        } else {
+            anyhow!("FTPS: TLS handshake failed ({m})")
+        }
+    })
+}
+
+fn split_boxed<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(s: S) -> (CtlR, CtlW) {
+    let (rd, wr) = tokio::io::split(s);
+    (tokio::io::BufReader::new(Box::new(rd) as Box<dyn AsyncRead + Unpin + Send>), Box::new(wr))
+}
+
+/// Connect the control connection, TLS first when the URL asks for it, and
+/// read the greeting.
+async fn connect_control(t: &FtpTarget, connect_to: u64) -> Result<(CtlR, CtlW)> {
+    let tcp = tokio::time::timeout(
+        std::time::Duration::from_secs(connect_to),
+        tokio::net::TcpStream::connect((t.host.as_str(), t.port)),
+    )
+    .await
+    .map_err(|_| anyhow!("ftp connect timed out ({connect_to}s) — resuming"))?
+    .map_err(|e| anyhow!("ftp connect: {e}"))?;
+    let _ = tcp.set_nodelay(true);
+    match t.tls {
+        Tls::None => {
+            let (mut r, w) = split_boxed(tcp);
+            greeting(&mut r).await?;
+            Ok((r, w))
+        }
+        Tls::Implicit => {
+            let (mut r, w) = split_boxed(tls_wrap(t, tcp).await?);
+            greeting(&mut r).await?;
+            Ok((r, w))
+        }
+        Tls::Explicit => {
+            // The greeting and AUTH happen in the clear; the server sends
+            // nothing after 234 until the handshake, so the buffer is empty.
+            let mut br = tokio::io::BufReader::new(tcp);
+            greeting(&mut br).await?;
+            br.get_mut().write_all(b"AUTH TLS\r\n").await.map_err(|e| anyhow!(io_message(&e)))?;
+            let (code, text) = read_reply(&mut br).await?;
+            if code != 234 {
+                return Err(anyhow!("FTPS: the server does not offer TLS ({code} {text})"));
+            }
+            Ok(split_boxed(tls_wrap(t, br.into_inner()).await?))
+        }
+    }
+}
+
+async fn greeting<R: AsyncBufRead + Unpin>(r: &mut R) -> Result<()> {
+    let (code, text) = read_reply(r).await?;
+    if !(220..300).contains(&code) {
+        return Err(anyhow!("ftp server refused ({code} {text})"));
+    }
+    Ok(())
+}
+
+/// The data connection for a PASV reply. Some servers behind NAT announce a
+/// private or empty address: then the control connection's host is used.
+async fn open_data(t: &FtpTarget, pasv_text: &str) -> Result<tokio::net::TcpStream> {
+    let (ip, port) = parse_pasv(pasv_text)?;
+    let host = match ip.parse::<std::net::Ipv4Addr>() {
+        Ok(a) if a.is_unspecified() || (a.is_private() && !host_is_private(&t.host)) => t.host.clone(),
+        _ => ip,
+    };
+    let s = tokio::net::TcpStream::connect((host.as_str(), port)).await.map_err(|e| anyhow!("ftp data connect: {e}"))?;
+    let _ = s.set_nodelay(true);
+    Ok(s)
+}
+
+/// Many FTPS servers close the data connection without TLS's close_notify;
+/// that is the end of the file, not an error (the size check still catches
+/// a short file).
+fn data_eof(e: std::io::Error) -> std::io::Result<usize> {
+    if e.kind() == std::io::ErrorKind::UnexpectedEof {
+        Ok(0)
+    } else {
+        Err(e)
+    }
+}
+
+fn host_is_private(host: &str) -> bool {
+    match host.parse::<std::net::Ipv4Addr>() {
+        Ok(a) => a.is_private() || a.is_loopback(),
+        Err(_) => host.eq_ignore_ascii_case("localhost"),
+    }
+}
+
+/// After the server accepted RETR: TLS on the data connection for FTPS.
+async fn start_data(t: &FtpTarget, tcp: tokio::net::TcpStream) -> Result<DataStream> {
+    Ok(match t.tls {
+        Tls::None => Box::new(tcp),
+        _ => Box::new(tls_wrap(t, tcp).await?),
     })
 }
 
@@ -75,9 +221,7 @@ fn percent_decode(s: &str) -> String {
 
 /// Read one reply (single- or multi-line `code-…code …`) from the control
 /// connection. Returns (code, full text).
-async fn read_reply(
-    r: &mut tokio::io::BufReader<tokio::net::tcp::OwnedReadHalf>,
-) -> Result<(u32, String)> {
+async fn read_reply<R: AsyncBufRead + Unpin>(r: &mut R) -> Result<(u32, String)> {
     let mut text = String::new();
     let mut code = 0u32;
     loop {
@@ -102,11 +246,7 @@ async fn read_reply(
     Ok((code, text.trim().to_string()))
 }
 
-async fn cmd(
-    w: &mut tokio::net::tcp::OwnedWriteHalf,
-    r: &mut tokio::io::BufReader<tokio::net::tcp::OwnedReadHalf>,
-    line: &str,
-) -> Result<(u32, String)> {
+async fn cmd<W: AsyncWrite + Unpin, R: AsyncBufRead + Unpin>(w: &mut W, r: &mut R, line: &str) -> Result<(u32, String)> {
     w.write_all(line.as_bytes()).await.map_err(|e| anyhow!(io_message(&e)))?;
     w.write_all(b"\r\n").await.map_err(|e| anyhow!(io_message(&e)))?;
     w.flush().await.map_err(|e| anyhow!(io_message(&e)))?;
@@ -185,36 +325,8 @@ async fn download_ftp_single(
     let max_retries = opts.max_retries.max(1);
 
     // Control connection with a connect timeout (a blackhole host must not
-    // hang the queue forever).
-    let ctrl = tokio::time::timeout(
-        std::time::Duration::from_secs(connect_to),
-        tokio::net::TcpStream::connect((t.host.as_str(), t.port)),
-    )
-    .await
-    .map_err(|_| anyhow!("ftp connect timed out ({connect_to}s) — resuming"))?
-    .map_err(|e| anyhow!("ftp connect: {e}"))?;
-    let (cr, cw) = ctrl.into_split();
-    let mut r = tokio::io::BufReader::new(cr);
-    let mut w = cw;
-
-    let (code, text) = read_reply(&mut r).await?;
-    if !(220..300).contains(&code) {
-        return Err(anyhow!("ftp server refused ({code} {text})"));
-    }
-    let (code, _) = cmd(&mut w, &mut r, &format!("USER {}", t.user)).await?;
-    if code == 331 || code == 332 {
-        let (code, text) = cmd(&mut w, &mut r, &format!("PASS {}", t.pass)).await?;
-        if !(200..300).contains(&code) {
-            let _ = cmd(&mut w, &mut r, "QUIT").await;
-            return Err(anyhow!("ftp login refused ({code} {text}) — check the username/password in the Add dialog"));
-        }
-    } else if !(200..300).contains(&code) {
-        return Err(anyhow!("ftp login refused ({code}) — check the username/password"));
-    }
-    let (code, text) = cmd(&mut w, &mut r, "TYPE I").await?;
-    if !(200..300).contains(&code) {
-        return Err(anyhow!("ftp server refused binary mode ({code} {text})"));
-    }
+    // hang the queue forever), login, binary mode.
+    let (mut r, mut w) = ftp_login(&t, connect_to).await?;
     // SIZE is optional (some servers hide it): unknown total still streams.
     let mut total: Option<u64> = None;
     let (code, text) = cmd(&mut w, &mut r, &format!("SIZE {}", t.path)).await?;
@@ -343,8 +455,8 @@ async fn download_ftp_single(
 /// Mid-stream cuts surface as errors so the retry loop resumes them.
 async fn transfer_once(
     t: &FtpTarget,
-    w: &mut tokio::net::tcp::OwnedWriteHalf,
-    r: &mut tokio::io::BufReader<tokio::net::tcp::OwnedReadHalf>,
+    w: &mut CtlW,
+    r: &mut CtlR,
     tmp: &std::path::PathBuf,
     offset: u64,
     stall_secs: u64,
@@ -355,13 +467,10 @@ async fn transfer_once(
     if !(200..300).contains(&code) {
         return Err(anyhow!("ftp PASV refused ({code} {text})"));
     }
-    let (ip, port) = parse_pasv(&text)?;
     // Open the data connection as soon as PASV names it, before RETR: some
     // servers (vsftpd, ProFTPD) wait for it before sending "150", while we
     // used to wait for "150" before connecting, so both sides waited.
-    let mut data = tokio::net::TcpStream::connect((ip.as_str(), port))
-        .await
-        .map_err(|e| anyhow!("ftp data connect: {e}"))?;
+    let data_tcp = open_data(t, &text).await?;
     if offset > 0 {
         let (code, text) = cmd(w, r, &format!("REST {offset}")).await?;
         if !(300..400).contains(&code) {
@@ -372,6 +481,7 @@ async fn transfer_once(
     if !(100..200).contains(&code) {
         return Err(anyhow!("ftp retrieve refused ({code} {text})"));
     }
+    let mut data = start_data(t, data_tcp).await?;
     #[allow(clippy::suspicious_open_options)]
     let mut file = tokio::fs::OpenOptions::new()
         .create(true)
@@ -389,6 +499,7 @@ async fn transfer_once(
         let n = tokio::time::timeout(std::time::Duration::from_secs(stall_secs), data.read(&mut buf))
             .await
             .map_err(|_| anyhow!("stalled (no data for {stall_secs}s) — resuming"))?
+            .or_else(data_eof)
             .map_err(|e| anyhow!("ftp data: {e}"))?;
         if n == 0 {
             break;
@@ -420,32 +531,25 @@ async fn transfer_once(
 // ---- segmented FTP (IDM's FTPSession: several logins, one part each) --------
 
 /// Log in on a fresh control connection and switch to binary mode.
-async fn ftp_login(
-    t: &FtpTarget,
-    connect_to: u64,
-) -> Result<(tokio::io::BufReader<tokio::net::tcp::OwnedReadHalf>, tokio::net::tcp::OwnedWriteHalf)> {
-    let ctrl = tokio::time::timeout(
-        std::time::Duration::from_secs(connect_to),
-        tokio::net::TcpStream::connect((t.host.as_str(), t.port)),
-    )
-    .await
-    .map_err(|_| anyhow!("ftp connect timed out ({connect_to}s)"))?
-    .map_err(|e| anyhow!("ftp connect: {e}"))?;
-    let (cr, cw) = ctrl.into_split();
-    let mut r = tokio::io::BufReader::new(cr);
-    let mut w = cw;
-    let (code, text) = read_reply(&mut r).await?;
-    if !(220..300).contains(&code) {
-        return Err(anyhow!("ftp server refused ({code} {text})"));
-    }
+async fn ftp_login(t: &FtpTarget, connect_to: u64) -> Result<(CtlR, CtlW)> {
+    let (mut r, mut w) = connect_control(t, connect_to).await?;
     let (code, _) = cmd(&mut w, &mut r, &format!("USER {}", t.user)).await?;
     if code == 331 || code == 332 {
         let (code, text) = cmd(&mut w, &mut r, &format!("PASS {}", t.pass)).await?;
         if !(200..300).contains(&code) {
-            return Err(anyhow!("ftp login refused ({code} {text})"));
+            let _ = cmd(&mut w, &mut r, "QUIT").await;
+            return Err(anyhow!("ftp login refused ({code} {text}) — check the username/password in the Add dialog"));
         }
     } else if !(200..300).contains(&code) {
-        return Err(anyhow!("ftp login refused ({code})"));
+        return Err(anyhow!("ftp login refused ({code}) — check the username/password"));
+    }
+    if t.tls != Tls::None {
+        // Protect the data connections too (RFC 4217).
+        let _ = cmd(&mut w, &mut r, "PBSZ 0").await?;
+        let (code, text) = cmd(&mut w, &mut r, "PROT P").await?;
+        if !(200..300).contains(&code) {
+            return Err(anyhow!("FTPS: the server refused encrypted data connections ({code} {text})"));
+        }
     }
     let (code, text) = cmd(&mut w, &mut r, "TYPE I").await?;
     if !(200..300).contains(&code) {
@@ -494,8 +598,7 @@ async fn ftp_part(
             if !(200..300).contains(&code) {
                 return Err(anyhow!("ftp PASV refused ({code} {text})"));
             }
-            let (ip, port) = parse_pasv(&text)?;
-            let mut sock = tokio::net::TcpStream::connect((ip.as_str(), port)).await.map_err(|e| anyhow!("ftp data connect: {e}"))?;
+            let data_tcp = open_data(&t, &text).await?;
             let at = start + done.load(Ordering::SeqCst);
             if at > 0 {
                 let (code, text) = cmd(&mut w, &mut r, &format!("REST {at}")).await?;
@@ -507,6 +610,7 @@ async fn ftp_part(
             if !(100..200).contains(&code) {
                 return Err(anyhow!("ftp retrieve refused ({code} {text})"));
             }
+            let mut sock = start_data(&t, data_tcp).await?;
             let mut file = tokio::fs::OpenOptions::new().write(true).open(&data).await.map_err(|e| anyhow!(io_message(&e)))?;
             file.seek(std::io::SeekFrom::Start(at)).await?;
             let mut buf = vec![0u8; 64 * 1024];
@@ -516,7 +620,8 @@ async fn ftp_part(
                 let n = tokio::time::timeout(std::time::Duration::from_secs(stall_secs), sock.read(&mut buf[..want]))
                     .await
                     .map_err(|_| anyhow!("stalled (no data for {stall_secs}s)"))?
-                    .map_err(|e| anyhow!("ftp data: {e}"))?;
+                    .or_else(data_eof)
+            .map_err(|e| anyhow!("ftp data: {e}"))?;
                 if n == 0 {
                     break;
                 }
@@ -635,6 +740,7 @@ async fn try_segmented_ftp(
 
 #[cfg(test)]
 mod tests {
+    use tokio::io::{AsyncRead, AsyncWrite};
     use super::*;
 
     #[test]
@@ -646,11 +752,57 @@ mod tests {
         assert_eq!(percent_decode("bad%zz%4"), "bad%zz%4");
     }
 
+    /// The test server's certificate, trusted by `tls_connector` in tests.
+    pub(super) static TEST_ROOT: std::sync::OnceLock<rustls::pki_types::CertificateDer<'static>> = std::sync::OnceLock::new();
+
+    /// A TLS server setup for "localhost" whose certificate the client trusts.
+    fn test_tls() -> Arc<rustls::ServerConfig> {
+        static CFG: std::sync::OnceLock<Arc<rustls::ServerConfig>> = std::sync::OnceLock::new();
+        CFG.get_or_init(|| {
+            let ck = rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).unwrap();
+            let cert = ck.cert.der().clone();
+            let key = rustls::pki_types::PrivateKeyDer::Pkcs8(ck.key_pair.serialize_der().into());
+            let _ = TEST_ROOT.set(cert.clone());
+            let provider = Arc::new(rustls::crypto::ring::default_provider());
+            Arc::new(
+                rustls::ServerConfig::builder_with_provider(provider)
+                    .with_safe_default_protocol_versions()
+                    .unwrap()
+                    .with_no_client_auth()
+                    .with_single_cert(vec![cert], key)
+                    .unwrap(),
+            )
+        })
+        .clone()
+    }
+
+    type SrvR = tokio::io::BufReader<Box<dyn AsyncRead + Unpin + Send>>;
+    type SrvW = Box<dyn AsyncWrite + Unpin + Send>;
+
+    fn srv_split<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(s: S) -> (SrvR, SrvW) {
+        let (rd, wr) = tokio::io::split(s);
+        (tokio::io::BufReader::new(Box::new(rd) as Box<dyn AsyncRead + Unpin + Send>), Box::new(wr))
+    }
+
+    async fn send(w: &mut SrvW, s: &str) {
+        let _ = w.write_all(s.as_bytes()).await;
+        let _ = w.flush().await;
+    }
+
     /// Minimal in-process FTP server (localhost only): one canned file,
-    /// optional login gate, REST offsets, PASV data sends. Pending data
-    /// listeners + REST offsets live in per-connection shared state.
+    /// optional login gate, REST offsets, PASV data sends. With `tls` it is
+    /// an FTPS server: explicit (`AUTH TLS`) or, with `implicit`, TLS from the
+    /// first byte; `PROT P` encrypts the data connections.
     async fn spawn_ftp(body: Vec<u8>, want_user: Option<(String, String)>) -> std::net::SocketAddr {
-        use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
+        spawn_ftp_tls(body, want_user, None, false).await
+    }
+
+    async fn spawn_ftp_tls(
+        body: Vec<u8>,
+        want_user: Option<(String, String)>,
+        tls: Option<Arc<rustls::ServerConfig>>,
+        implicit: bool,
+    ) -> std::net::SocketAddr {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let body = Arc::new(body);
@@ -659,21 +811,20 @@ mod tests {
                 let Ok((ctrl, _)) = listener.accept().await else { break };
                 let body = body.clone();
                 let want = want_user.clone();
+                let tls = tls.clone();
                 tokio::spawn(async move {
-                    let (cr, cw) = ctrl.into_split();
-                    let mut r = tokio::io::BufReader::new(cr);
-                    let mut w = cw;
-                    async fn send(
-                        w: &mut tokio::net::tcp::OwnedWriteHalf,
-                        s: &str,
-                    ) {
-                        use tokio::io::AsyncWriteExt;
-                        let _ = w.write_all(s.as_bytes()).await;
-                        let _ = w.flush().await;
-                    }
+                    let acceptor = tls.clone().map(tokio_rustls::TlsAcceptor::from);
+                    let (mut r, mut w) = match (&acceptor, implicit) {
+                        (Some(acc), true) => match acc.accept(ctrl).await {
+                            Ok(s) => srv_split(s),
+                            Err(_) => return,
+                        },
+                        _ => srv_split(ctrl),
+                    };
                     send(&mut w, "220 dc-test ftp\r\n").await;
                     let pending: Arc<std::sync::Mutex<(Option<tokio::net::TcpListener>, u64)>> =
                         Arc::new(std::sync::Mutex::new((None, 0)));
+                    let mut prot_p = false;
                     let mut line = String::new();
                     loop {
                         line.clear();
@@ -683,6 +834,24 @@ mod tests {
                         let t = line.trim().to_string();
                         let (verb, arg) = t.split_once(' ').map(|(a, b)| (a.to_ascii_uppercase(), b.to_string())).unwrap_or((t.to_ascii_uppercase(), String::new()));
                         match verb.as_str() {
+                            "AUTH" => {
+                                let Some(acc) = acceptor.clone() else {
+                                    send(&mut w, "502 no TLS here\r\n").await;
+                                    continue;
+                                };
+                                send(&mut w, "234 go ahead\r\n").await;
+                                // Rejoin the halves of the plain socket and
+                                // start TLS on it.
+                                let rd = r.into_inner();
+                                let joined = tokio::io::join(rd, w);
+                                let Ok(s) = acc.accept(joined).await else { return };
+                                (r, w) = srv_split(s);
+                            }
+                            "PBSZ" => send(&mut w, "200 pbsz ok\r\n").await,
+                            "PROT" => {
+                                prot_p = arg.eq_ignore_ascii_case("P");
+                                send(&mut w, "200 prot ok\r\n").await;
+                            }
                             "USER" => {
                                 if let Some((u, _)) = &want {
                                     if arg != *u {
@@ -746,9 +915,22 @@ mod tests {
                                     continue;
                                 };
                                 let body = body.clone();
+                                let data_tls = if prot_p { acceptor.clone() } else { None };
                                 tokio::spawn(async move {
-                                    if let Ok((mut ds, _)) = dl.accept().await {
-                                        let _ = ds.write_all(&body[off.min(body.len() as u64) as usize..]).await;
+                                    if let Ok((ds, _)) = dl.accept().await {
+                                        let part = &body[off.min(body.len() as u64) as usize..];
+                                        match data_tls {
+                                            Some(acc) => {
+                                                if let Ok(mut s) = acc.accept(ds).await {
+                                                    let _ = s.write_all(part).await;
+                                                    let _ = s.shutdown().await;
+                                                }
+                                            }
+                                            None => {
+                                                let mut ds = ds;
+                                                let _ = ds.write_all(part).await;
+                                            }
+                                        }
                                     }
                                 });
                                 send(&mut w, "150 opening data\r\n").await;
@@ -838,6 +1020,57 @@ mod tests {
         let dest = dir.join("auth2.bin");
         dl(&format!("ftp://tester:s3cret@{addr}/file.bin"), &dest).await.expect("good login");
         assert_eq!(std::fs::read(&dest).unwrap().len(), 1000);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn ftps_urls_pick_the_tls_mode() {
+        assert_eq!(parse_target("ftp://h/f").unwrap().tls, Tls::None);
+        let t = parse_target("ftps://h/f").unwrap();
+        assert_eq!((t.tls, t.port), (Tls::Implicit, 990));
+        assert_eq!(parse_target("ftps://h:21/f").unwrap().tls, Tls::Explicit);
+        let t = parse_target("ftpes://h/f").unwrap();
+        assert_eq!((t.tls, t.port), (Tls::Explicit, 21));
+        assert!(parse_target("sftp://h/f").is_err());
+    }
+
+    #[tokio::test]
+    async fn ftps_explicit_and_implicit_download() {
+        let body: Vec<u8> = (0..300_000u32).map(|i| (i % 253) as u8).collect();
+        let dir = std::env::temp_dir().join(format!("dc_ftps_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        // Explicit: AUTH TLS on the plain port; resume included.
+        let addr = spawn_ftp_tls(body.clone(), None, Some(test_tls()), false).await;
+        let url = format!("ftpes://localhost:{}/file.bin", addr.port());
+        let dest = dir.join("explicit.bin");
+        dl(&url, &dest).await.expect("explicit ftps");
+        assert_eq!(std::fs::read(&dest).unwrap(), body);
+        let dest = dir.join("explicit-resume.bin");
+        std::fs::write(dest.with_extension("dcpart"), &body[..70_000]).unwrap();
+        dl(&url, &dest).await.expect("explicit ftps resume");
+        assert_eq!(std::fs::read(&dest).unwrap(), body);
+        // Implicit: TLS from the first byte.
+        let addr = spawn_ftp_tls(body.clone(), None, Some(test_tls()), true).await;
+        // (`ftps://` on a port other than 990 means explicit, so the target
+        // is built directly to reach a test port.)
+        let t = FtpTarget { host: "localhost".into(), port: addr.port(), user: "anonymous".into(), pass: "x".into(), path: "/file.bin".into(), tls: Tls::Implicit };
+        let (mut r, mut w) = ftp_login(&t, 10).await.expect("implicit login");
+        // Several encrypted connections at once (segmented FTPS).
+        let big: Vec<u8> = (0..9_000_000u32).map(|i| (i.wrapping_mul(13) % 241) as u8).collect();
+        let seg = spawn_ftp_tls(big.clone(), None, Some(test_tls()), false).await;
+        let dest = dir.join("segmented.bin");
+        let shared = Arc::new(SharedState::new());
+        download_ftp(&format!("ftpes://localhost:{}/file.bin", seg.port()), &dest, &ftp_opts(), shared.clone(), Arc::new(RateLimiter::new(0)), 3)
+            .await
+            .expect("segmented ftps");
+        assert_eq!(std::fs::read(&dest).unwrap(), big);
+        assert_eq!(mutex_guard(&shared.part_total).len(), 3);
+        let (code, _) = cmd(&mut w, &mut r, "SIZE /file.bin").await.unwrap();
+        assert_eq!(code, 213);
+        // A server without TLS is refused, never downgraded.
+        let plain = spawn_ftp(body, None).await;
+        let err = dl(&format!("ftpes://localhost:{}/file.bin", plain.port()), &dir.join("no.bin")).await.expect_err("no tls");
+        assert!(format!("{err:#}").contains("does not offer TLS"), "got {err:#}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

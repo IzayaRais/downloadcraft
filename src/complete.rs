@@ -130,7 +130,7 @@ impl CompleteApp {
         p.text(
             egui::pos2(o.x + SUM_X, o.y + DOC_Y),
             egui::Align2::LEFT_TOP,
-            "Download complete".to_string(),
+            crate::i18n::t("Download complete").to_string(),
             semi(13.0),
             pl().cg_txt,
         );
@@ -183,15 +183,18 @@ impl CompleteApp {
                     "open" => crate::app::open_path(&path, false),
                     "open-with" => open_with(&path),
                     "folder" => crate::app::open_path(&path, true),
-                    _ => close_soon(&ctx),
+                    _ => {}
                 }
+                // As in IDM, every action ends the dialog: the opened file,
+                // picker or folder is its own process and outlives it.
+                close_soon(&ctx);
             }
         }
 
         // ---- opt-out ----
         let cbr = at(o, PAD_X, CHK_Y, CHK_S, CHK_S);
         let lw = p
-            .layout_no_wrap(CHK_TXT.to_string(), reg(10.0), pl().cg_dim)
+            .layout_no_wrap(crate::i18n::t(CHK_TXT).to_string(), reg(10.0), pl().cg_dim)
             .size()
             .x;
         let hit = at(
@@ -226,7 +229,7 @@ impl CompleteApp {
         p.text(
             egui::pos2(o.x + CHK_LBL_X, cbr.center().y),
             egui::Align2::LEFT_CENTER,
-            CHK_TXT.to_string(),
+            crate::i18n::t(CHK_TXT).to_string(),
             reg(10.0),
             pl().cg_dim,
         );
@@ -258,7 +261,7 @@ impl CompleteApp {
         p.text(
             egui::pos2(o.x + TITLE_X, o.y + HDR_CY),
             egui::Align2::LEFT_CENTER,
-            "Download complete".to_string(),
+            crate::i18n::t("Download complete").to_string(),
             semi(13.0),
             pl().cg_txt,
         );
@@ -310,6 +313,7 @@ impl CompleteApp {
 /// wraps (`word-break: break-all`); the card is a fixed height, so long URLs
 /// and paths are middle-elided to keep both ends readable.
 fn field(p: &egui::Painter, o: egui::Pos2, y: f32, label: &str, value: &str) {
+    let label = crate::i18n::t(label);
     p.text(
         egui::pos2(o.x + PAD_X, o.y + y),
         egui::Align2::LEFT_TOP,
@@ -339,6 +343,7 @@ fn field(p: &egui::Painter, o: egui::Pos2, y: f32, label: &str, value: &str) {
 
 /// The concept's button: outlined box, 11px label.
 fn dlg_btn(p: &egui::Painter, r: egui::Rect, hov: bool, label: &str) {
+    let label = crate::i18n::t(label);
     p.rect_filled(r, 3.0, if hov { pl().cg_hover } else { pl().cg_box_bg });
     p.rect_stroke(
         r,
@@ -435,6 +440,9 @@ impl eframe::App for CompleteApp {
     }
 
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        if let Some(text) = crate::i18n::take_font_text() {
+            crate::fonts::ensure_text(ctx, &text);
+        }
         crate::fonts::ensure_text(ctx, &self.item.filename);
         // Follow theme switches made in the main app while this dialog is up
         // (separate process: ui.json is the only channel).

@@ -782,20 +782,25 @@ async function sendToHostPing() {
   await syncBrowserDownloadUI();
 }
 
+// Text from _locales in the browser's language, English when there is none.
+function msg(key, english) {
+  try { return (chrome.i18n && chrome.i18n.getMessage(key)) || english; } catch (e) { return english; }
+}
+
 chrome.runtime.onInstalled.addListener((details) => {
   if (details && details.reason === "install") showWelcome("install");
   // removeAll first: re-installs otherwise fail with duplicate-id.
   api.contextMenus.removeAll().then(() => {
     chrome.contextMenus.create({
       id: "send-to-download-craft",
-      title: "Download with Download Craft",
+      title: msg("menuDownload", "Download with Download Craft"),
       contexts: ["link", "video", "audio"],
     });
     // IDM's "Download all links": every link on the page (or in the
     // selection) into the app's pick-and-queue list.
     chrome.contextMenus.create({
       id: "download-all-links",
-      title: "Download all links with Download Craft",
+      title: msg("menuDownloadAll", "Download all links with Download Craft"),
       contexts: ["page", "selection"],
     });
     // IDM's "Download with IDM" on the browser's own downloads page: hand an
@@ -804,7 +809,7 @@ chrome.runtime.onInstalled.addListener((details) => {
       try {
         chrome.contextMenus.create({
           id: "download-item",
-          title: "Download with Download Craft",
+          title: msg("menuDownload", "Download with Download Craft"),
           contexts: ["link"],
           documentUrlPatterns: ["chrome://downloads/*"],
         }, () => void chrome.runtime.lastError);
