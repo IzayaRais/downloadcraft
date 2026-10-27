@@ -1705,7 +1705,7 @@
         box-shadow:var(--shadow);font:12px/1.2 system-ui,sans-serif;
         /* See-through until pointed at: the video stays visible. */
         opacity:.32;transition:opacity .15s ease; }
-      :host(:hover) .bar, .bar:focus-within { opacity:1; }
+      :host(:hover) .bar, .bar:focus-within, :host([data-dc-awake]) .bar { opacity:1; }
       button { all:unset;box-sizing:border-box;display:flex;align-items:center;justify-content:center;cursor:pointer;
         color:var(--fg);background:transparent;font:600 12.5px/1.2 system-ui,sans-serif; }
       button:hover { background:var(--hover); }
@@ -1744,8 +1744,29 @@
     host.__dcMain=main;host.__dcClose=close;host.__dcLabel=label;
     host.setAttribute("data-dc-bar","1");
     paintBar(host);
+    wakeBar(host);
     return host;
   }
+
+  // A new button (a new video) and a scroll show the bar fully for a few
+  // seconds, so people notice it, before it fades to see-through.
+  const BAR_AWAKE_MS = 3000;
+  function wakeBar(host) {
+    try {
+      host.setAttribute("data-dc-awake", "1");
+      clearTimeout(host.__dcAwakeT);
+      host.__dcAwakeT = setTimeout(() => { try { host.removeAttribute("data-dc-awake"); } catch (e) { /* gone */ } }, BAR_AWAKE_MS);
+    } catch (e) { /* best effort */ }
+  }
+  let lastScrollWake = 0;
+  try {
+    window.addEventListener("scroll", () => {
+      const now = Date.now();
+      if (now - lastScrollWake < 400) return;
+      lastScrollWake = now;
+      try { document.querySelectorAll("[data-dc-bar]").forEach(wakeBar); } catch (e) { /* ignore */ }
+    }, { capture: true, passive: true });
+  } catch (e) { /* best effort */ }
 
   // A click that came before the page had loaded its video data waits for it:
   // the bar says so ("Resolving…") instead of sending a half-known link.
@@ -2438,6 +2459,7 @@
     // NOTE: the old button/panel were already dropped above when they
     // belonged to an older generation, so reaching here means same-generation
     // DOM.
+    let keepFaded = false;
     if (oldBtn && oldBtn.isConnected) {
       if (oldBtn.dataset.sig === sig) {
         // Same content: keep everything, just re-anchor (the player
@@ -2446,10 +2468,18 @@
         addDismissControl(oldBtn,key,oldPanel);
         return;
       }
+      // Rebuilt for the same video (its qualities arrived): keep it faded
+      // if it already faded, instead of flashing it solid again.
+      keepFaded = oldBtn.dataset.vid === info.videoId && !oldBtn.hasAttribute("data-dc-awake");
       oldBtn.remove();
       if (oldPanel) oldPanel.remove();
     }
     const btn = videoDownloadBar(dcT("barChooseQuality", "Choose video quality in Download Craft"));
+    btn.dataset.vid = info.videoId || "";
+    if (keepFaded) {
+      clearTimeout(btn.__dcAwakeT);
+      btn.removeAttribute("data-dc-awake");
+    }
     btn.id = "dc-yt-btn";
     btn.dataset.vid = info.videoId;
     btn.dataset.gen = String(GEN);
