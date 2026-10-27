@@ -470,9 +470,44 @@
       } else if (k === "toggle") {
         el.style.color = T.text;
         el.style.borderColor = T.toggleBorder;
-        el.textContent = T.toggle;
+        if (!toggleIcon(el, T.toggle === "☀" ? "sun" : "moon")) el.textContent = T.toggle;
       }
     });
+  }
+
+  // The light/dark switch as a drawn icon (a sun in dark mode, a moon in
+  // light mode). False where no DOM can draw it (the caller writes a glyph).
+  const TOGGLE_PATHS = {
+    sun: ["M12 8a4 4 0 1 0 0 8a4 4 0 1 0 0-8z", "M12 2v2M12 20v2M4.9 4.9l1.4 1.4M17.7 17.7l1.4 1.4M2 12h2M20 12h2M4.9 19.1l1.4-1.4M17.7 6.3l1.4-1.4"],
+    moon: ["M20.5 14.5A8.5 8.5 0 0 1 9.5 3.5a8.5 8.5 0 1 0 11 11z"],
+  };
+  function toggleIcon(el, kind) {
+    try {
+      const doc = el.ownerDocument;
+      if (!doc || !doc.createElementNS) return false;
+      if (el.getAttribute("data-dc-icon") === kind) return true;
+      const NS = "http://www.w3.org/2000/svg";
+      const svg = doc.createElementNS(NS, "svg");
+      svg.setAttribute("viewBox", "0 0 24 24");
+      svg.setAttribute("width", "13");
+      svg.setAttribute("height", "13");
+      svg.setAttribute("fill", "none");
+      svg.setAttribute("stroke", "currentColor");
+      svg.setAttribute("stroke-width", "2");
+      svg.setAttribute("stroke-linecap", "round");
+      svg.setAttribute("stroke-linejoin", "round");
+      svg.style.cssText = "display:block;margin:auto;pointer-events:none;";
+      for (const d of TOGGLE_PATHS[kind]) {
+        const path = doc.createElementNS(NS, "path");
+        path.setAttribute("d", d);
+        svg.appendChild(path);
+      }
+      el.textContent = "";
+      el.appendChild(svg);
+      el.setAttribute("data-dc-icon", kind);
+      el.title = kind === "sun" ? "Light theme" : "Dark theme";
+      return true;
+    } catch (e) { return false; }
   }
 
   // In-page theme: auto from prefers-color-scheme, overridable per page via

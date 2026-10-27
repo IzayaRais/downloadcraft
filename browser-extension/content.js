@@ -1992,7 +1992,7 @@
     b.type = "button";
     b.setAttribute("data-dc-p", "toggle");
     b.title = "Toggle light / dark";
-    b.style.cssText = "flex:0 0 auto;width:22px;height:22px;padding:0;margin:0;border-radius:999px;"
+    b.style.cssText = "flex:0 0 auto;width:24px;height:24px;padding:0;margin:0;border-radius:999px;display:grid;place-items:center;"
       + "border:1px solid;background:transparent;cursor:pointer;font:11px/1 system-ui,sans-serif;";
     b.onclick = (ev) => {
       if (ev && ev.stopPropagation) ev.stopPropagation();

@@ -728,9 +728,11 @@ fn status_bar_at(p: &egui::Painter, rect: egui::Rect, text: &str, frac: f32, col
 /// A status as a coloured dot and text (the redesign's list style).
 fn status_dot_at(p: &egui::Painter, rect: egui::Rect, text: &str, color: egui::Color32) {
     let font = egui::FontId::proportional(11.0);
-    let x0 = rect.min.x + 10.0;
+    let shown = truncate_to_width(p, text, font.clone(), color, (rect.width() - 30.0).max(12.0));
+    let tw = p.layout_no_wrap(shown.clone(), font.clone(), color).size().x;
+    // Dot (6) + gap (5) + word, the pair centred under the header.
+    let x0 = (rect.center().x - (11.0 + tw) / 2.0).max(rect.min.x + 6.0);
     p.circle_filled(egui::pos2(x0 + 3.0, rect.center().y), 3.0, color);
-    let shown = truncate_to_width(p, text, font.clone(), color, (rect.max.x - x0 - 14.0).max(12.0));
     p.text(egui::pos2(x0 + 11.0, rect.center().y), egui::Align2::LEFT_CENTER, shown, font, color);
 }
 
@@ -1401,6 +1403,32 @@ fn cell_text(
     crate::shaped::draw(p, pos, align, &shown, egui::FontId::proportional(size), color);
 }
 
+/// Text centred in a cell (the Size, Speed and Time Left values).
+fn cell_text_center(p: &egui::Painter, rect: egui::Rect, text: &str, size: f32, color: egui::Color32) {
+    let avail = (rect.width() - 12.0).max(12.0);
+    let shown = truncate_to_width(p, text, egui::FontId::proportional(size), color, avail);
+    crate::shaped::draw(p, rect.center(), egui::Align2::CENTER_CENTER, &shown, egui::FontId::proportional(size), color);
+}
+
+/// A column header as icon + title, the pair centred in the cell; the
+/// icon is dropped when the column is too narrow for both.
+fn header_icon_text(p: &egui::Painter, rect: egui::Rect, icon: &str, text: &str, color: egui::Color32) {
+    const GAP: f32 = 5.0;
+    let font = egui::FontId::proportional(9.5);
+    let icon_font = crate::fonts::icon(12.5);
+    let iw = p.layout_no_wrap(icon.to_string(), icon_font.clone(), color).size().x;
+    let avail = (rect.width() - 12.0).max(12.0);
+    let tw = p.layout_no_wrap(text.to_string(), font.clone(), color).size().x;
+    if iw + GAP + tw > avail {
+        let shown = truncate_to_width(p, text, font.clone(), color, avail);
+        crate::shaped::draw(p, rect.center(), egui::Align2::CENTER_CENTER, &shown, font, color);
+        return;
+    }
+    let x0 = rect.center().x - (iw + GAP + tw) / 2.0;
+    p.text(egui::pos2(x0, rect.center().y), egui::Align2::LEFT_CENTER, icon, icon_font, color);
+    crate::shaped::draw(p, egui::pos2(x0 + iw + GAP, rect.center().y), egui::Align2::LEFT_CENTER, text, font, color);
+}
+
 /// Truncate `text` with an ellipsis so it fits `max_w` (painter-measured).
 ///
 /// Widths come from `shaped` so the measurement matches what is drawn for the
@@ -1828,6 +1856,16 @@ impl SortCol {
             "eta" => Some(SortCol::Eta),
             "date" => Some(SortCol::Date),
             _ => None,
+        }
+    }
+    /// The header icon of the centred columns.
+    fn icon(&self) -> Option<&'static str> {
+        match self {
+            SortCol::Size => Some("\u{e623}"),   // sd_storage
+            SortCol::Status => Some("\u{e917}"), // donut_large
+            SortCol::Speed => Some("\u{e9e4}"),  // speed
+            SortCol::Eta => Some("\u{e8b5}"),    // schedule
+            SortCol::Name | SortCol::Date => None,
         }
     }
     fn title(&self) -> &'static str {
@@ -6814,9 +6852,13 @@ impl eframe::App for CraftApp {
                             } else {
                                 pl().dim
                             };
-                            // Name and Status read from the left (statuses are a dot and
-                            // text); the numbers line up on the right.
-                            cell_text(ui.painter(), r, &txt, 9.5, color, !matches!(*col, SortCol::Name | SortCol::Status));
+                            // Size, Status, Speed and Time Left: an icon and the title,
+                            // centred over values that are centred too. Name reads from
+                            // the left; Date lines up on the right.
+                            match col.icon() {
+                                Some(icon) => header_icon_text(ui.painter(), r, icon, &txt, color),
+                                None => cell_text(ui.painter(), r, &txt, 9.5, color, !matches!(*col, SortCol::Name)),
+                            }
                             self.hits.push((HitKind::HdrCol(*col), r.intersect(hdr_clip)));
                             {
                                 // Divider grab strip on the column's right edge
@@ -7009,7 +7051,7 @@ impl eframe::App for CraftApp {
                                             );
                                         }
                                         SortCol::Size => {
-                                            cell_text(&p, crect, &size_s, 11.0, pl().dim, true);
+                                            cell_text_center(&p, crect, &size_s, 11.0, pl().dim);
                                         }
                                         SortCol::Status => match &st {
                                             Status::Downloading => {
@@ -7024,7 +7066,7 @@ impl eframe::App for CraftApp {
                                                 status_bar_at(&p, crect, &text, prog, pl().primary);
                                             }
                                             Status::Queued => {
-                                                cell_text(&p, crect, "Added", 10.5, pl().dim, true);
+                                                cell_text_center(&p, crect, "Added", 10.5, pl().dim);
                                             }
                                             Status::Paused => {
                                                 status_bar_at(
@@ -7048,12 +7090,12 @@ impl eframe::App for CraftApp {
                                             } else {
                                                 "-".to_string()
                                             };
-                                            cell_text(&p, crect, &spd_s, 10.0, pl().dim, true);
+                                            cell_text_center(&p, crect, &spd_s, 10.0, pl().dim);
                                         }
                                         SortCol::Eta => {
                                             let eta_s: &str =
                                                 if eta == "-" { "-" } else { &eta };
-                                            cell_text(&p, crect, eta_s, 10.0, pl().dim, true);
+                                            cell_text_center(&p, crect, eta_s, 10.0, pl().dim);
                                         }
                                         SortCol::Date => {
                                             cell_text(&p, crect, &date, 10.0, pl().dim, true);
